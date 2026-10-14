@@ -1,0 +1,9 @@
+foundationdb/
+redb/
+misskey
+sharkey
+target/
+data/
+libfdb_c*.so
+repo.zip
+.claude/settings.local.json

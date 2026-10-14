@@ -1,0 +1,20 @@
+# Phase 2 interop backing services: one postgres (databases `misskey` and
+# `sharkey`) and one redis, bound to loopback only. Used by
+# scripts/smoke-phase2.sh; images are pulled from the public registry.
+name: pinetree-interop
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: interop
+      POSTGRES_PASSWORD: interop
+      POSTGRES_DB: postgres
+    ports:
+      - "127.0.0.1:15432:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "127.0.0.1:16379:6379"
