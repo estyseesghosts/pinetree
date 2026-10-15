@@ -7,6 +7,8 @@
 //!   multicast, unspecified, IPv6 unique-local/link-local/loopback, plus
 //!   IPv4-mapped IPv6 addresses) unless explicitly allowed by an allowlist
 //!   or `allow_private_ips` flag for local federation testing.
+//!   `allow_private_ips` is an SSRF exemption ONLY: it never affects TLS
+//!   certificate verification, which is always enforced on HTTPS requests.
 //! - Connect and read timeouts (default 10s)
 //! - Redirect limit (default ≤ 3 hops, rejecting `https` → `http` downgrades
 //!   and re-validating every redirect target against SSRF rules)
@@ -40,6 +42,9 @@ pub const MAX_REDIRECTS: usize = 3;
 pub struct SafeHttpConfig {
     pub timeout: Duration,
     pub max_redirects: usize,
+    /// SSRF exemption ONLY for local federation testing (env
+    /// `PINETREE_ALLOW_PRIVATE_IPS`): skips private/reserved-IP rejection.
+    /// NEVER affects TLS certificate verification, which stays enforced.
     pub allow_private_ips: bool,
     pub allowed_hosts: Vec<String>,
     pub user_agent: String,
@@ -266,6 +271,48 @@ pub struct SafeHttpClient {
     pub config: SafeHttpConfig,
 }
 
+/// Build the `curl` argument list for one HTTPS federation request.
+///
+/// This is the single place the HTTPS argument list is constructed, so tests
+/// can assert on the real flags (rather than a copy). TLS certificate
+/// verification is always on: the list never contains `-k`/`--insecure`,
+/// regardless of `allow_private_ips` (which exempts SSRF checks only).
+fn curl_args(
+    method: &str,
+    full_url: &str,
+    resolve: &str,
+    headers: &[(&str, &str)],
+    body_present: bool,
+    timeout_secs: u64,
+    max_bytes: usize,
+) -> Vec<String> {
+    let mut args = vec![
+        "-sS".to_string(),
+        "-i".to_string(),
+        "--http1.1".to_string(),
+        "--max-redirs".to_string(),
+        "0".to_string(),
+        "--max-time".to_string(),
+        timeout_secs.to_string(),
+        "--max-filesize".to_string(),
+        max_bytes.to_string(),
+        "--resolve".to_string(),
+        resolve.to_string(),
+        "-X".to_string(),
+        method.to_ascii_uppercase(),
+    ];
+    for (k, v) in headers {
+        args.push("-H".to_string());
+        args.push(format!("{k}: {v}"));
+    }
+    if body_present {
+        args.push("--data-binary".to_string());
+        args.push("@-".to_string());
+    }
+    args.push(full_url.to_string());
+    args
+}
+
 impl SafeHttpClient {
     pub fn new(config: SafeHttpConfig) -> Self {
         Self { config }
@@ -418,33 +465,25 @@ impl SafeHttpClient {
     ) -> Result<SafeHttpResponse, String> {
         let addr = addrs[0];
         let timeout_secs = self.config.timeout.as_secs().max(1);
+        let args = curl_args(
+            method,
+            full_url,
+            &format!("{}:{}:{}", parsed.host, parsed.port, addr.ip()),
+            extra_headers,
+            body.is_some(),
+            timeout_secs,
+            max_response_bytes,
+        );
         let mut cmd = Command::new("curl");
-        cmd.arg("-sS")
-            .arg("-i")
-            .arg("--http1.1")
-            .arg("--max-redirs")
-            .arg("0")
-            .arg("--max-time")
-            .arg(timeout_secs.to_string())
-            .arg("--max-filesize")
-            .arg(max_response_bytes.to_string())
-            .arg("--resolve")
-            .arg(format!("{}:{}:{}", parsed.host, parsed.port, addr.ip()))
-            .arg("-X")
-            .arg(method.to_ascii_uppercase());
-        if self.config.allow_private_ips {
-            cmd.arg("-k");
-        }
-        for (k, v) in extra_headers {
-            cmd.arg("-H").arg(format!("{k}: {v}"));
+        for a in &args {
+            cmd.arg(a);
         }
         if body.is_some() {
-            cmd.arg("--data-binary").arg("@-");
             cmd.stdin(Stdio::piped());
         } else {
             cmd.stdin(Stdio::null());
         }
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).arg(full_url);
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let mut child = cmd.spawn().map_err(|e| format!("spawn curl: {e}"))?;
         if let Some(b) = body {
@@ -1023,5 +1062,57 @@ mod tests {
         assert!(size_err.contains("exceeds limit"), "got {size_err}");
 
         drop(handle);
+    }
+
+    #[test]
+    fn curl_args_never_disable_tls_and_keep_ssrf_pins() {
+        let headers = [
+            ("Host", "example.social"),
+            ("Content-Type", "application/activity+json"),
+        ];
+        let args = curl_args(
+            "POST",
+            "https://example.social/inbox",
+            "example.social:443:93.184.216.34",
+            &headers,
+            true,
+            10,
+            65_536,
+        );
+        assert!(
+            !args.iter().any(|a| a == "-k" || a == "--insecure"),
+            "curl args must never disable TLS verification: {args:?}"
+        );
+        let resolve_pos = args
+            .iter()
+            .position(|a| a == "--resolve")
+            .expect("curl args must pin DNS with --resolve");
+        assert_eq!(args[resolve_pos + 1], "example.social:443:93.184.216.34");
+        let redirs_pos = args
+            .iter()
+            .position(|a| a == "--max-redirs")
+            .expect("curl args must cap redirects");
+        assert_eq!(args[redirs_pos + 1], "0");
+
+        // GET without body: same TLS and pinning guarantees.
+        let get_args = curl_args(
+            "GET",
+            "https://example.social/users/alice",
+            "example.social:443:93.184.216.34",
+            &headers[..1],
+            false,
+            10,
+            65_536,
+        );
+        assert!(
+            !get_args.iter().any(|a| a == "-k" || a == "--insecure"),
+            "curl GET args must never disable TLS verification: {get_args:?}"
+        );
+        assert!(get_args.iter().any(|a| a == "--resolve"));
+        let get_redirs = get_args
+            .iter()
+            .position(|a| a == "--max-redirs")
+            .expect("curl GET args must cap redirects");
+        assert_eq!(get_args[get_redirs + 1], "0");
     }
 }
