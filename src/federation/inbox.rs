@@ -9,6 +9,8 @@
 //! (SSRF guards). Error bodies are empty or short strings; public URLs are
 //! built from `public_url`/actor URIs only, never socket peers.
 
+use std::sync::Arc;
+
 use axum::{
     body::Bytes,
     extract::{Path, State},
@@ -25,7 +27,6 @@ use crate::activitypub::objects::{
 use crate::activitypub::signatures::{
     actor_uri_from_key_id, parse_signature_header, verify_http_signature,
 };
-use crate::api::misskey::ApiState;
 use crate::application::commands::AppServices;
 use crate::application::ports::{Clock, CreateNoteInput, PortError, TimelineCursor, UpdateAccountPatch};
 use crate::domain::account::Account;
@@ -46,21 +47,21 @@ pub const MAX_CLOCK_SKEW_SECS: i64 = 300;
 
 /// `POST /inbox` — shared inbox.
 pub async fn inbox_handler(
-    State(state): State<ApiState>,
+    State(services): State<Arc<AppServices>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    run_blocking(move || process_inbox(&state, None, headers, body)).await
+    run_blocking(move || process_inbox(&services, None, headers, body)).await
 }
 
 /// `POST /users/{id}/inbox` — personal inbox.
 pub async fn user_inbox_handler(
-    State(state): State<ApiState>,
+    State(services): State<Arc<AppServices>>,
     Path(id): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    run_blocking(move || process_inbox(&state, Some(id.as_str()), headers, body)).await
+    run_blocking(move || process_inbox(&services, Some(id.as_str()), headers, body)).await
 }
 
 /// Inbox processing does blocking storage and key-fetch I/O; keep it off the
@@ -72,13 +73,11 @@ async fn run_blocking<F: FnOnce() -> Response + Send + 'static>(f: F) -> Respons
 }
 
 fn process_inbox(
-    state: &ApiState,
+    services: &AppServices,
     user_id: Option<&str>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let services = &state.services;
-
     if body.len() > MAX_INBOX_BODY_BYTES {
         return payload_too_large();
     }

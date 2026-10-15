@@ -61,21 +61,14 @@ pub struct ApiState {
 }
 
 /// Build the full Phase 1 Axum router.
+///
+/// Misskey client routes run with the full [`ApiState`]; the ActivityPub /
+/// federation routes (WebFinger, actors, notes, inboxes) run with just
+/// `Arc<AppServices>` so those adapters stay decoupled from the Misskey
+/// adapter.
 pub fn build_router(state: ApiState) -> Router {
-    Router::new()
-        .route("/healthz", get(healthz))
-        .route("/files/{id}", get(serve_file))
-        .route("/files/{id}/{name}", get(serve_file_named))
-        .route("/identicon/{id}", get(identicon))
-        .route("/miauth/{session}", get(miauth_page).post(miauth_submit))
-        .route("/miauth/{session}/check", post(miauth_check))
-        .route("/api/miauth/{session}/check", post(miauth_check))
-        .route("/signup", post(signup))
-        .route("/api/signup", post(signup))
-        .route("/signin", post(signin))
-        .route("/api/signin", post(signin))
-        .route("/api/drive/files/create", post(drive_files_create))
-        .route("/api/{*endpoint}", post(api_dispatch))
+    let services = state.services.clone();
+    let federation_routes = Router::new()
         .route("/.well-known/webfinger", get(ap_webfinger::webfinger))
         .route("/.well-known/host-meta", get(ap_webfinger::host_meta_xrd))
         .route(
@@ -114,9 +107,25 @@ pub fn build_router(state: ApiState) -> Router {
         )
         .route("/inbox", post(fed_inbox::inbox_handler))
         .route("/users/{id}/inbox", post(fed_inbox::user_inbox_handler))
+        .with_state(services);
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/files/{id}", get(serve_file))
+        .route("/files/{id}/{name}", get(serve_file_named))
+        .route("/identicon/{id}", get(identicon))
+        .route("/miauth/{session}", get(miauth_page).post(miauth_submit))
+        .route("/miauth/{session}/check", post(miauth_check))
+        .route("/api/miauth/{session}/check", post(miauth_check))
+        .route("/signup", post(signup))
+        .route("/api/signup", post(signup))
+        .route("/signin", post(signin))
+        .route("/api/signin", post(signin))
+        .route("/api/drive/files/create", post(drive_files_create))
+        .route("/api/{*endpoint}", post(api_dispatch))
         // Drive uploads carry media bytes; lift axum's 2 MiB default cap.
         .layer(DefaultBodyLimit::disable())
         .with_state(state)
+        .merge(federation_routes)
 }
 
 // --- Small helpers ---------------------------------------------------------

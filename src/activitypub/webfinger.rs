@@ -8,6 +8,7 @@
 //! `{public_url}/users/{account_id}` form.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use axum::{
     extract::{Query, State},
@@ -16,8 +17,7 @@ use axum::{
 };
 use serde_json::{Value, json};
 
-use crate::api::misskey::ApiState;
-use crate::api::misskey::packers::PACKER_VERSION;
+use crate::activitypub::PACKER_VERSION;
 use crate::application::commands::AppServices;
 use crate::application::ports::TimelineCursor;
 use crate::domain::account::Account;
@@ -122,20 +122,20 @@ pub fn render_host_meta_jrd(public_url: &str) -> Value {
 }
 
 /// `GET /.well-known/host-meta` (XRD).
-pub async fn host_meta_xrd(State(state): State<ApiState>) -> Response {
+pub async fn host_meta_xrd(State(services): State<Arc<AppServices>>) -> Response {
     text_response(
         StatusCode::OK,
         CONTENT_TYPE_XRD,
-        render_host_meta_xrd(&state.services.public_url),
+        render_host_meta_xrd(&services.public_url),
     )
 }
 
 /// `GET /.well-known/host-meta.json` (JRD).
-pub async fn host_meta_json(State(state): State<ApiState>) -> Response {
+pub async fn host_meta_json(State(services): State<Arc<AppServices>>) -> Response {
     json_response(
         StatusCode::OK,
         CONTENT_TYPE_JRD,
-        &render_host_meta_jrd(&state.services.public_url),
+        &render_host_meta_jrd(&services.public_url),
     )
 }
 
@@ -350,7 +350,7 @@ fn wants_xrd(accept: Option<&str>) -> bool {
 
 /// `GET /.well-known/webfinger?resource=...`.
 pub async fn webfinger(
-    State(state): State<ApiState>,
+    State(services): State<Arc<AppServices>>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
@@ -358,7 +358,7 @@ pub async fn webfinger(
     if resource.trim().is_empty() {
         return error_response(StatusCode::BAD_REQUEST);
     }
-    let account = match resolve_webfinger_resource(&state.services, resource) {
+    let account = match resolve_webfinger_resource(&services, resource) {
         Ok(account) => account,
         Err(status) => return error_response(status),
     };
@@ -369,7 +369,7 @@ pub async fn webfinger(
         let mut response = text_response(
             StatusCode::OK,
             CONTENT_TYPE_XRD,
-            render_webfinger_xrd(&account, &state.services.public_url),
+            render_webfinger_xrd(&account, &services.public_url),
         );
         response.headers_mut().insert(
             header::VARY,
@@ -384,7 +384,7 @@ pub async fn webfinger(
         let mut response = json_response(
             StatusCode::OK,
             CONTENT_TYPE_JRD,
-            &render_webfinger_jrd(&account, &state.services.public_url),
+            &render_webfinger_jrd(&account, &services.public_url),
         );
         response.headers_mut().insert(
             header::VARY,
@@ -492,11 +492,11 @@ pub fn render_nodeinfo(services: &AppServices, version: &str) -> Value {
 }
 
 /// `GET /.well-known/nodeinfo`.
-pub async fn well_known_nodeinfo(State(state): State<ApiState>) -> Response {
+pub async fn well_known_nodeinfo(State(services): State<Arc<AppServices>>) -> Response {
     let mut response = json_response(
         StatusCode::OK,
         "application/json; charset=utf-8",
-        &render_well_known_nodeinfo(&state.services.public_url),
+        &render_well_known_nodeinfo(&services.public_url),
     );
     response.headers_mut().insert(
         header::CACHE_CONTROL,
@@ -506,11 +506,11 @@ pub async fn well_known_nodeinfo(State(state): State<ApiState>) -> Response {
 }
 
 /// `GET /nodeinfo/2.0`.
-pub async fn nodeinfo_2_0(State(state): State<ApiState>) -> Response {
+pub async fn nodeinfo_2_0(State(services): State<Arc<AppServices>>) -> Response {
     let mut response = json_response(
         StatusCode::OK,
         CONTENT_TYPE_NODEINFO_2_0,
-        &render_nodeinfo(&state.services, "2.0"),
+        &render_nodeinfo(&services, "2.0"),
     );
     response.headers_mut().insert(
         header::CACHE_CONTROL,
@@ -520,11 +520,11 @@ pub async fn nodeinfo_2_0(State(state): State<ApiState>) -> Response {
 }
 
 /// `GET /nodeinfo/2.1`.
-pub async fn nodeinfo_2_1(State(state): State<ApiState>) -> Response {
+pub async fn nodeinfo_2_1(State(services): State<Arc<AppServices>>) -> Response {
     let mut response = json_response(
         StatusCode::OK,
         CONTENT_TYPE_NODEINFO_2_1,
-        &render_nodeinfo(&state.services, "2.1"),
+        &render_nodeinfo(&services, "2.1"),
     );
     response.headers_mut().insert(
         header::CACHE_CONTROL,
@@ -554,8 +554,6 @@ mod tests {
     use crate::domain::notification::Notification;
     use crate::domain::reaction::Reaction;
     use crate::federation::delivery::{SafeHttpClient, SafeHttpConfig};
-    use crate::federation::retry::DestinationTracker;
-    use crate::jobs::worker::JobWorker;
 
     struct Mem {
         accounts: Mutex<HashMap<String, Account>>,
@@ -875,7 +873,7 @@ mod tests {
         }
     }
 
-    fn test_state(public_url: &str) -> (ApiState, Arc<Mem>) {
+    fn test_state(public_url: &str) -> (Arc<AppServices>, Arc<Mem>) {
         let clock = Arc::new(ManualClock::new(1_760_400_000_123));
         let ids = Arc::new(AidxGenerator::with_node_id(clock.clone(), "test", 0));
         let mem = Arc::new(Mem::empty());
@@ -903,22 +901,7 @@ mod tests {
             prohibited_words: Vec::new(),
             sensitive_words: Vec::new(),
         });
-        let state = ApiState {
-            services: services.clone(),
-            worker: Arc::new(JobWorker {
-                clock: clock.clone(),
-                ids,
-                jobs: mem.clone(),
-                notifications: mem.clone(),
-                streaming: mem.clone(),
-                services,
-                delivery_tracker: Arc::new(DestinationTracker::new()),
-                lease_duration_ms: 30_000,
-                base_backoff_ms: 1_000,
-            }),
-            rate_limiter: Arc::new(crate::api::misskey::response::RateLimiter::new(clock)),
-        };
-        (state, mem)
+        (services, mem)
     }
 
     fn alice(id: &str) -> Account {
@@ -950,7 +933,7 @@ mod tests {
         let (state, mem) = test_state("https://example.local");
         let account = alice("aid00000000000001");
         mem.insert_account(account.clone());
-        let services = &state.services;
+        let services = &state;
         let canonical = "https://example.local/users/aid00000000000001";
 
         let forms = [
@@ -991,10 +974,10 @@ mod tests {
         service.username_lower = "system.actor".to_string();
         mem.insert_account(service);
         let resolved =
-            resolve_webfinger_resource(&state.services, "acct:system.actor@example.local")
+            resolve_webfinger_resource(&state, "acct:system.actor@example.local")
                 .expect("system.actor resolves");
         assert_eq!(
-            resolved.actor_url(&state.services.public_url),
+            resolved.actor_url(&state.public_url),
             "https://example.local/users/aid00000000000009"
         );
     }
@@ -1004,12 +987,12 @@ mod tests {
         let (state, mem) = test_state("https://example.local");
         mem.insert_account(alice("aid00000000000001"));
         assert_eq!(
-            resolve_webfinger_resource(&state.services, "acct:alice@other.example")
+            resolve_webfinger_resource(&state, "acct:alice@other.example")
                 .unwrap_err(),
             StatusCode::UNPROCESSABLE_ENTITY
         );
         assert_eq!(
-            resolve_webfinger_resource(&state.services, "alice@other.example").unwrap_err(),
+            resolve_webfinger_resource(&state, "alice@other.example").unwrap_err(),
             StatusCode::UNPROCESSABLE_ENTITY
         );
     }
@@ -1020,7 +1003,7 @@ mod tests {
         mem.insert_account(alice("aid00000000000001"));
 
         assert_eq!(
-            resolve_webfinger_resource(&state.services, "acct:bob@example.local").unwrap_err(),
+            resolve_webfinger_resource(&state, "acct:bob@example.local").unwrap_err(),
             StatusCode::NOT_FOUND
         );
 
@@ -1030,7 +1013,7 @@ mod tests {
         suspended.is_suspended = true;
         mem.insert_account(suspended);
         assert_eq!(
-            resolve_webfinger_resource(&state.services, "acct:suspended@example.local")
+            resolve_webfinger_resource(&state, "acct:suspended@example.local")
                 .unwrap_err(),
             StatusCode::NOT_FOUND
         );
@@ -1041,7 +1024,7 @@ mod tests {
         deleted.is_deleted = true;
         mem.insert_account(deleted);
         assert_eq!(
-            resolve_webfinger_resource(&state.services, "acct:deleted@example.local").unwrap_err(),
+            resolve_webfinger_resource(&state, "acct:deleted@example.local").unwrap_err(),
             StatusCode::NOT_FOUND
         );
 
@@ -1052,7 +1035,7 @@ mod tests {
         mem.insert_account(remote);
         // Remote accounts share no username namespace with local webfinger.
         assert_eq!(
-            resolve_webfinger_resource(&state.services, "acct:remote@example.local").unwrap_err(),
+            resolve_webfinger_resource(&state, "acct:remote@example.local").unwrap_err(),
             StatusCode::NOT_FOUND
         );
     }
@@ -1133,7 +1116,7 @@ mod tests {
         // hand-mutated account instead of store round-tripping.
         let mut tricky = alice("aid00000000000001");
         tricky.username = "alice&bob".to_string();
-        let xml = render_webfinger_xrd(&tricky, &state.services.public_url);
+        let xml = render_webfinger_xrd(&tricky, &state.public_url);
         assert!(xml.contains("acct:alice&amp;bob@example.local"));
         assert!(!xml.contains("alice&bob"));
     }
@@ -1226,7 +1209,7 @@ mod tests {
         assert_eq!(doc["metadata"]["maxNoteTextLength"], 3000);
 
         // 2.1 carries the extra software link fields.
-        let doc21 = render_nodeinfo(&state.services, "2.1");
+        let doc21 = render_nodeinfo(&state, "2.1");
         assert_eq!(doc21["software"]["homepage"], "https://misskey-hub.net");
         assert!(doc21["software"].get("repository").is_some());
     }

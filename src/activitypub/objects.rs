@@ -7,6 +7,7 @@
 //! `_misskey_reaction` alongside `content` per proposal §7.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use axum::{
     extract::{Path, State},
@@ -16,9 +17,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::activitypub::format_millis;
 use crate::activitypub::webfinger::extract_host;
-use crate::api::misskey::ApiState;
-use crate::api::misskey::packers::format_millis;
 use crate::application::commands::AppServices;
 use crate::application::ports::PortError;
 use crate::domain::account::Account;
@@ -1143,11 +1143,11 @@ fn ap_response(status: StatusCode, body: &Value) -> Response {
 /// public/home local notes, `410 Gone` `Tombstone` for deleted notes, and
 /// `404 Not Found` for non-public or local-only notes.
 pub async fn get_note_ap(
-    State(state): State<ApiState>,
+    State(services): State<Arc<AppServices>>,
     Path(id): Path<String>,
 ) -> Response {
-    let base = state.services.public_url.trim_end_matches('/');
-    let note = match state.services.notes.get_note_including_deleted(&id) {
+    let base = services.public_url.trim_end_matches('/');
+    let note = match services.notes.get_note_including_deleted(&id) {
         Ok(Some(n)) => n,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -1165,7 +1165,7 @@ pub async fn get_note_ap(
     {
         return StatusCode::NOT_FOUND.into_response();
     }
-    match render_note_object(&state.services, &note, true) {
+    match render_note_object(&services, &note, true) {
         Ok(doc) => ap_response(StatusCode::OK, &doc),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -1174,10 +1174,10 @@ pub async fn get_note_ap(
 /// `GET /notes/{id}/activity` — serves the `Create(Note)` or `Announce`
 /// ActivityPub document for a local public/home note.
 pub async fn get_note_activity_ap(
-    State(state): State<ApiState>,
+    State(services): State<Arc<AppServices>>,
     Path(id): Path<String>,
 ) -> Response {
-    let note = match state.services.notes.get_note(&id) {
+    let note = match services.notes.get_note(&id) {
         Ok(Some(n)) => n,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -1189,7 +1189,7 @@ pub async fn get_note_activity_ap(
     {
         return StatusCode::NOT_FOUND.into_response();
     }
-    match render_create_or_announce_for_note(&state.services, &note) {
+    match render_create_or_announce_for_note(&services, &note) {
         Ok(doc) => ap_response(StatusCode::OK, &doc),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }

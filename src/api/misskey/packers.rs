@@ -17,15 +17,11 @@ use crate::domain::note::{Note, Visibility};
 use crate::domain::visibility::{ViewerContext, is_visible};
 
 /// Misskey server version we claim compatibility with.
-pub const PACKER_VERSION: &str = "2026.10.1-alpha.0";
+pub use crate::activitypub::PACKER_VERSION;
 
 /// Millisecond timestamps as ISO-8601 UTC strings
 /// (`"YYYY-MM-DDTHH:MM:SS.sssZ"`).
-pub fn format_millis(ms: i64) -> String {
-    let dt: chrono::DateTime<chrono::Utc> =
-        chrono::DateTime::from_timestamp_millis(ms).unwrap_or_default();
-    dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-}
+pub use crate::activitypub::format_millis;
 
 fn avatar_url(account: &Account, public_url: &str) -> String {
     let base = public_url.trim_end_matches('/');

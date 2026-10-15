@@ -5,6 +5,7 @@
 //! never expose node hostnames.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
@@ -14,12 +15,11 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::activitypub::format_millis;
 use crate::activitypub::objects::{
     AP_CONTENT_TYPE, ap_context, is_ap_accept, render_create_or_announce_for_note,
 };
 use crate::activitypub::webfinger::extract_host;
-use crate::api::misskey::ApiState;
-use crate::api::misskey::packers::format_millis;
 use crate::application::commands::AppServices;
 use crate::application::ports::{PortError, TimelineCursor};
 use crate::domain::account::Account;
@@ -463,16 +463,16 @@ fn find_visible_local_user(services: &AppServices, id: &str) -> Result<Account, 
 /// `GET /users/{id}` — serves the ActivityPub Actor JSON-LD document (or a
 /// `302 Found` redirect to `/@{username}` when a browser requests HTML).
 pub async fn get_actor(
-    State(state): State<ApiState>,
+    State(services): State<Arc<AppServices>>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let account = match find_visible_local_user(&state.services, &id) {
+    let account = match find_visible_local_user(&services, &id) {
         Ok(a) => a,
         Err(code) => return code.into_response(),
     };
     if !is_ap_accept(&headers) {
-        let base = state.services.public_url.trim_end_matches('/');
+        let base = services.public_url.trim_end_matches('/');
         let location = format!("{base}/@{}", account.username);
         let mut resp_headers = HeaderMap::new();
         if let Ok(hv) = HeaderValue::from_str(&location) {
@@ -480,7 +480,7 @@ pub async fn get_actor(
         }
         return (StatusCode::FOUND, resp_headers, String::new()).into_response();
     }
-    match render_actor_document(&state.services, &account) {
+    match render_actor_document(&services, &account) {
         Ok(doc) => ap_json_response(StatusCode::OK, &doc, Some(CACHE_ACTOR)),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -489,12 +489,12 @@ pub async fn get_actor(
 /// `GET /@{acct}` — serves the ActivityPub Actor document when requested with
 /// an ActivityPub `Accept` header, or `404`/`200` profile placeholder otherwise.
 pub async fn get_at_profile(
-    State(state): State<ApiState>,
+    State(services): State<Arc<AppServices>>,
     Path(acct): Path<String>,
     headers: HeaderMap,
 ) -> Response {
     let raw = acct.trim().trim_start_matches('@');
-    let local_host = extract_host(&state.services.public_url);
+    let local_host = extract_host(&services.public_url);
     let username = if let Some((u, h)) = raw.split_once('@') {
         if !h.eq_ignore_ascii_case(&local_host) {
             return StatusCode::NOT_FOUND.into_response();
@@ -510,8 +510,7 @@ pub async fn get_at_profile(
     } else {
         username.to_ascii_lowercase()
     };
-    let account = match state
-        .services
+    let account = match services
         .accounts
         .find_by_username_and_host(&lookup_name, None)
     {
@@ -519,12 +518,12 @@ pub async fn get_at_profile(
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
     if is_ap_accept(&headers) {
-        match render_actor_document(&state.services, &account) {
+        match render_actor_document(&services, &account) {
             Ok(doc) => ap_json_response(StatusCode::OK, &doc, Some(CACHE_ACTOR)),
             Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         }
     } else {
-        match render_actor_document(&state.services, &account) {
+        match render_actor_document(&services, &account) {
             Ok(doc) => ap_json_response(StatusCode::OK, &doc, Some(CACHE_ACTOR)),
             Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         }
@@ -533,14 +532,14 @@ pub async fn get_at_profile(
 
 /// `GET /users/{id}/publickey` — serves the actor's public key object.
 pub async fn get_actor_public_key(
-    State(state): State<ApiState>,
+    State(services): State<Arc<AppServices>>,
     Path(id): Path<String>,
 ) -> Response {
-    let account = match find_visible_local_user(&state.services, &id) {
+    let account = match find_visible_local_user(&services, &id) {
         Ok(a) => a,
         Err(code) => return code.into_response(),
     };
-    match render_public_key_document(&state.services, &account) {
+    match render_public_key_document(&services, &account) {
         Ok(doc) => ap_json_response(StatusCode::OK, &doc, Some(CACHE_ACTOR)),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -549,19 +548,18 @@ pub async fn get_actor_public_key(
 /// `GET /users/{id}/outbox` — ActivityPub `OrderedCollection` / `OrderedCollectionPage`
 /// of the actor's public/home non-local-only notes wrapped in `Create` or `Announce`.
 pub async fn get_actor_outbox(
-    State(state): State<ApiState>,
+    State(services): State<Arc<AppServices>>,
     Path(id): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    let account = match find_visible_local_user(&state.services, &id) {
+    let account = match find_visible_local_user(&services, &id) {
         Ok(a) => a,
         Err(code) => return code.into_response(),
     };
-    let base = state.services.public_url.trim_end_matches('/');
+    let base = services.public_url.trim_end_matches('/');
     let outbox_url = format!("{base}/users/{}/outbox", account.id);
 
-    let notes = match state
-        .services
+    let notes = match services
         .notes
         .notes_by_author(&account.id, &TimelineCursor::with_limit(50))
     {
@@ -581,7 +579,7 @@ pub async fn get_actor_outbox(
     if params.get("page").map(|v| v == "true").unwrap_or(false) {
         let mut items = Vec::with_capacity(visible_notes.len());
         for note in &visible_notes {
-            if let Ok(act) = render_create_or_announce_for_note(&state.services, note) {
+            if let Ok(act) = render_create_or_announce_for_note(&services, note) {
                 items.push(act);
             }
         }
@@ -608,24 +606,23 @@ pub async fn get_actor_outbox(
 
 /// `GET /users/{id}/followers` — ActivityPub `OrderedCollection` of follower actor URIs.
 pub async fn get_actor_followers(
-    State(state): State<ApiState>,
+    State(services): State<Arc<AppServices>>,
     Path(id): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    let account = match find_visible_local_user(&state.services, &id) {
+    let account = match find_visible_local_user(&services, &id) {
         Ok(a) => a,
         Err(code) => return code.into_response(),
     };
-    let base = state.services.public_url.trim_end_matches('/');
+    let base = services.public_url.trim_end_matches('/');
     let coll_url = format!("{base}/users/{}/followers", account.id);
-    let follows = state
-        .services
+    let follows = services
         .follows
         .followers_of(&account.id, None, 200)
         .unwrap_or_default();
     let mut uris = Vec::with_capacity(follows.len());
     for f in &follows {
-        if let Ok(Some(acc)) = state.services.accounts.find_by_id(&f.follower_id) {
+        if let Ok(Some(acc)) = services.accounts.find_by_id(&f.follower_id) {
             uris.push(Value::String(acc.actor_url(base)));
         }
     }
@@ -653,24 +650,23 @@ pub async fn get_actor_followers(
 
 /// `GET /users/{id}/following` — ActivityPub `OrderedCollection` of followee actor URIs.
 pub async fn get_actor_following(
-    State(state): State<ApiState>,
+    State(services): State<Arc<AppServices>>,
     Path(id): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    let account = match find_visible_local_user(&state.services, &id) {
+    let account = match find_visible_local_user(&services, &id) {
         Ok(a) => a,
         Err(code) => return code.into_response(),
     };
-    let base = state.services.public_url.trim_end_matches('/');
+    let base = services.public_url.trim_end_matches('/');
     let coll_url = format!("{base}/users/{}/following", account.id);
-    let follows = state
-        .services
+    let follows = services
         .follows
         .following_of(&account.id, None, 200)
         .unwrap_or_default();
     let mut uris = Vec::with_capacity(follows.len());
     for f in &follows {
-        if let Ok(Some(acc)) = state.services.accounts.find_by_id(&f.followee_id) {
+        if let Ok(Some(acc)) = services.accounts.find_by_id(&f.followee_id) {
             uris.push(Value::String(acc.actor_url(base)));
         }
     }
@@ -698,14 +694,14 @@ pub async fn get_actor_following(
 
 /// `GET /users/{id}/collections/featured` — ActivityPub featured notes `OrderedCollection`.
 pub async fn get_actor_featured(
-    State(state): State<ApiState>,
+    State(services): State<Arc<AppServices>>,
     Path(id): Path<String>,
 ) -> Response {
-    let account = match find_visible_local_user(&state.services, &id) {
+    let account = match find_visible_local_user(&services, &id) {
         Ok(a) => a,
         Err(code) => return code.into_response(),
     };
-    let base = state.services.public_url.trim_end_matches('/');
+    let base = services.public_url.trim_end_matches('/');
     let coll_url = format!("{base}/users/{}/collections/featured", account.id);
     let collection = json!({
         "@context": ap_context(),
