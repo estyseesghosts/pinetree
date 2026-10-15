@@ -66,12 +66,17 @@ Job envelope:
 | `idempotency_key` | required; handlers must tolerate redelivery |
 | `not_before` | earliest execution time (backoff without new rows) |
 | `attempts`, `lease_expires` | worker bookkeeping |
+| `failed`, `fail_reason` | terminal quarantine state: `failed` leaves the claimable set but stays inspectable; `fail_reason` records why (`bad-payload: …`, `permanent-failure: …`, `retry-exhausted`) |
 
 Operations:
 
-- `claim_next(lease_duration) -> Job?` — atomically assigns the oldest due, unleased job. Lease expiry re-makes it claimable: crash-safe, at-least-once redelivery.
-- `complete(job_id)` — terminal success.
-- `fail(job_id, retry_at)` — increments attempts, sets `not_before`; poison jobs stay visible via `attempts` for later dead-letter policy (dead-letter handling deferred to the delivery contract).
+- `claim_next(lease_duration) -> Job?` — atomically assigns the oldest due, unleased job. Lease expiry re-makes it claimable: crash-safe, at-least-once redelivery. Quarantined (`failed`) jobs are never returned.
+- `complete(job_id)` — terminal success. No-op success on missing jobs.
+- `fail(job_id, retry_at)` — increments attempts, sets `not_before`; no-op success on missing jobs and on already-quarantined jobs (terminal state is sticky, never re-queued). When attempts reach `MAX_JOB_ATTEMPTS` (8) the job auto-quarantines with reason `retry-exhausted` instead of rescheduling.
+- `fail_permanent(job_id, reason)` — quarantine: the job leaves the claimable set but stays inspectable via `get_job` with `failed == true` and `fail_reason` recorded. Idempotent (keeps the first reason); no-op success on missing jobs.
+- `pending_count()` — counts actionable (non-quarantined) jobs only.
+
+> **Superseded (2026-10-15, Phase 2.5 Slice 5):** the `fail` line above replaces the original "`fail(job_id, retry_at)` — increments attempts, sets `not_before`; poison jobs stay visible via `attempts` for later dead-letter policy (dead-letter handling deferred to the delivery contract)." Dead-letter handling is no longer deferred: workers quarantine bad payloads (`bad-payload: …`) and delivery `PermanentFailure`s (`permanent-failure: …`, logged) via `fail_permanent`, and retry exhaustion quarantines with `retry-exhausted` for every job kind (port-level cap `MAX_JOB_ATTEMPTS = 8`, shared with the worker). Quarantined rows are excluded from `claim_next`/`pending_count` but retained for inspection. The legacy-payload no-op branch in the federation outbox is removed: unparseable `FederateDeliver` payloads are `Validation` failures the worker quarantines.
 
 Guarantees: a committed job is never lost (durable before the local operation that created it is acknowledged, proposal §7); delivery is at-least-once with handler-side idempotency, never assumed exactly-once (proposal §5).
 

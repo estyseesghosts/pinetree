@@ -26,10 +26,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use pinetree::application::commands::AppServices;
 use pinetree::application::ports::{
-    AccountStore, ActivityDedup, CreateAccountInput, CreateNoteInput, FollowStore,
-    InsertMediaInput, JobKind, JobQueue, MediaStore, NewJob, NoteStore, PortError,
-    TimelineCursor, MAX_JOB_PAYLOAD_BYTES,
+    AccountStore, ActivityDedup, BlobStore, CreateAccountInput, CreateNoteInput, FollowStore,
+    InsertMediaInput, JobKind, JobQueue, MediaStore, NewJob, NoopStreamingSink, NoteStore,
+    NotificationStore, PortError, StreamingSink, TimelineCursor, MAX_JOB_ATTEMPTS,
+    MAX_JOB_PAYLOAD_BYTES,
 };
 use pinetree::domain::id::{Clock, ManualClock};
 use pinetree::domain::note::{Note, Visibility};
@@ -37,6 +39,11 @@ use pinetree::domain::policy::{
     ViewerContext, is_eligible_for_federated_timeline, is_eligible_for_federation_delivery,
     is_eligible_for_local_timeline, is_visible,
 };
+use pinetree::federation::delivery::{SafeHttpClient, SafeHttpConfig};
+use pinetree::federation::outbox::FederateDeliverPayload;
+use pinetree::federation::retry::DestinationTracker;
+use pinetree::jobs::worker::JobWorker;
+use pinetree::media::storage::FsBlobStore;
 use pinetree::persistence::redb::RedbStore;
 
 // ---------------------------------------------------------------------------
@@ -121,12 +128,16 @@ fn streaming_job(clock: &ManualClock, key: &str) -> NewJob {
 }
 
 fn federate_job(clock: &ManualClock, key: &str) -> NewJob {
-    NewJob {
-        kind: JobKind::FederateDeliver,
-        payload: br#"{"op":"follow"}"#.to_vec(),
-        idempotency_key: key.to_string(),
-        not_before: clock.now_ms(),
-    }
+    // Minimal well-formed Follow payload (parseable by the delivery path;
+    // never executed in the suites that use this fixture).
+    let payload = FederateDeliverPayload::Follow {
+        follow_id: format!("{key}:follow"),
+        follower_id: format!("{key}:follower"),
+        followee_id: format!("{key}:followee"),
+        inbox_url: "https://example.local/inbox".to_string(),
+    };
+    NewJob::new_json(JobKind::FederateDeliver, &payload, key, clock.now_ms())
+        .expect("federate fixture is a valid payload")
 }
 
 fn create_user<S: AccountStore>(store: &S, handle: &str) -> pinetree::domain::account::Account {
@@ -761,6 +772,364 @@ fn b6_payload_bound() {
     let clock = test_clock();
     let store = factory.open(clock.clone());
     case_b6_payload_bound(&*store, &clock);
+}
+
+// ---------------------------------------------------------------------------
+// Group B continued — terminal job failure / quarantine (Phase 2.5 Slice 5)
+// ---------------------------------------------------------------------------
+
+fn case_b7_quarantine_never_reclaimed<S: ConformanceStore>(store: &S, clock: &ManualClock) {
+    let alice = create_user(store, "alice");
+    note_with_job(store, clock, &alice.id, "quarantine me", "b7:job");
+    let claimed = store.claim_next(60_000).expect("claim").expect("job");
+    store
+        .fail_permanent(&claimed.id, "b7: poison payload")
+        .expect("quarantine");
+    // Even far past any lease/backoff, the job is never re-claimed.
+    clock.advance_ms(3_600_000);
+    assert!(
+        store.claim_next(60_000).expect("claim").is_none(),
+        "quarantined job is never re-claimed"
+    );
+    // ...but the row stays inspectable with attempts + reason recorded.
+    let stored = store
+        .get_job(&claimed.id)
+        .expect("get_job")
+        .expect("quarantined row stays inspectable");
+    assert!(stored.failed, "failed flag set");
+    assert_eq!(
+        stored.fail_reason.as_deref(),
+        Some("b7: poison payload"),
+        "quarantine reason recorded"
+    );
+    assert_eq!(stored.attempts, claimed.attempts, "attempts preserved");
+    // Repeat quarantine is an idempotent no-op that keeps the first reason.
+    store
+        .fail_permanent(&claimed.id, "b7: second reason")
+        .expect("repeat quarantine is a no-op");
+    let again = store
+        .get_job(&claimed.id)
+        .expect("get_job")
+        .expect("row still there");
+    assert_eq!(
+        again.fail_reason.as_deref(),
+        Some("b7: poison payload"),
+        "first reason wins"
+    );
+    // `fail` on a quarantined job is a no-op success that never re-queues it.
+    store
+        .fail(&claimed.id, clock.now_ms())
+        .expect("fail on quarantined job is a no-op");
+    clock.advance_ms(3_600_000);
+    assert!(
+        store.claim_next(60_000).expect("claim").is_none(),
+        "fail() must not resurrect a quarantined job"
+    );
+    assert_eq!(
+        store.pending_count().expect("count"),
+        0,
+        "quarantined jobs are not pending work"
+    );
+}
+
+#[test]
+fn b7_quarantine_never_reclaimed() {
+    let factory = RedbFactory::fresh("b7");
+    let clock = test_clock();
+    let store = factory.open(clock.clone());
+    case_b7_quarantine_never_reclaimed(&*store, &clock);
+}
+
+fn case_b8_terminal_ops_on_missing<S: ConformanceStore>(store: &S, clock: &ManualClock) {
+    // Terminal operations on missing jobs are no-op successes (as `complete`
+    // already was); they add no unbounded error paths for workers.
+    store
+        .fail("job:missing", clock.now_ms())
+        .expect("fail on missing job is a no-op success");
+    store
+        .fail_permanent("job:missing", "no such job")
+        .expect("fail_permanent on missing job is a no-op success");
+    store
+        .complete("job:missing")
+        .expect("complete on missing job is a no-op success");
+}
+
+#[test]
+fn b8_terminal_ops_on_missing() {
+    let factory = RedbFactory::fresh("b8");
+    let clock = test_clock();
+    let store = factory.open(clock.clone());
+    case_b8_terminal_ops_on_missing(&*store, &clock);
+}
+
+fn case_b9_retry_exhaustion_quarantines<S: ConformanceStore>(store: &S, clock: &ManualClock) {
+    assert_eq!(MAX_JOB_ATTEMPTS, 8, "retry budget pins the contract");
+    let alice = create_user(store, "alice");
+    note_with_job(store, clock, &alice.id, "exhaust me", "b9:job");
+    let first = store.claim_next(60_000).expect("claim").expect("job");
+    let job_id = first.id.clone();
+    store.fail(&job_id, clock.now_ms()).expect("fail 1");
+    for _ in 1..MAX_JOB_ATTEMPTS {
+        clock.advance_ms(1);
+        let claimed = store
+            .claim_next(60_000)
+            .expect("claim")
+            .expect("job still claimable before the cap");
+        assert_eq!(claimed.id, job_id);
+        store.fail(&job_id, clock.now_ms()).expect("fail");
+    }
+    // The cap-crossing `fail` auto-quarantined instead of rescheduling.
+    clock.advance_ms(3_600_000);
+    assert!(
+        store.claim_next(60_000).expect("claim").is_none(),
+        "exhausted job is never re-claimed"
+    );
+    let stored = store
+        .get_job(&job_id)
+        .expect("get_job")
+        .expect("exhausted row stays inspectable");
+    assert!(stored.failed, "failed flag set");
+    assert_eq!(stored.attempts, MAX_JOB_ATTEMPTS, "attempts stop at the cap");
+    assert_eq!(
+        stored.fail_reason.as_deref(),
+        Some("retry-exhausted"),
+        "exhaustion reason recorded"
+    );
+}
+
+#[test]
+fn b9_retry_exhaustion_quarantines() {
+    let factory = RedbFactory::fresh("b9");
+    let clock = test_clock();
+    let store = factory.open(clock.clone());
+    case_b9_retry_exhaustion_quarantines(&*store, &clock);
+}
+
+/// Full single-node stack over a redb factory path with a controllable clock
+/// and a caller-chosen streaming sink, mirroring
+/// `tests/crash_recovery.rs::open_stack` plus a worker.
+fn open_worker_stack(
+    factory: &RedbFactory,
+    clock: Arc<ManualClock>,
+    streaming: Arc<dyn StreamingSink>,
+) -> (Arc<RedbStore>, Arc<AppServices>, JobWorker) {
+    let store = factory.open(clock.clone());
+    let blobs = Arc::new(
+        FsBlobStore::new(factory.path().parent().expect("temp parent").join("blobs"))
+            .expect("open blob store"),
+    );
+    let clock_port: Arc<dyn Clock> = clock.clone();
+    let services = Arc::new(AppServices {
+        clock: clock_port.clone(),
+        ids: store.ids().clone(),
+        accounts: store.clone(),
+        notes: store.clone(),
+        follows: store.clone(),
+        reactions: store.clone(),
+        jobs: store.clone(),
+        media: store.clone(),
+        blobs: blobs.clone(),
+        notifications: store.clone(),
+        auth: store.clone(),
+        streaming: Arc::new(NoopStreamingSink),
+        dedup: store.clone() as Arc<dyn ActivityDedup>,
+        federation_http: SafeHttpClient::new(SafeHttpConfig {
+            allow_private_ips: true,
+            ..Default::default()
+        }),
+        public_url: "https://example.local".to_string(),
+        max_file_size: 10_000_000,
+        preserved_usernames: Vec::new(),
+        prohibited_words: Vec::new(),
+        sensitive_words: Vec::new(),
+    });
+    let worker = JobWorker {
+        clock: clock_port,
+        ids: store.ids().clone(),
+        jobs: store.clone(),
+        notifications: store.clone(),
+        streaming,
+        services: services.clone(),
+        delivery_tracker: Arc::new(DestinationTracker::new()),
+        lease_duration_ms: 60_000,
+        base_backoff_ms: 10,
+    };
+    (store, services, worker)
+}
+
+/// Claim a job only to learn its id, then release it as due immediately so a
+/// later `process_one` picks it up (counting one attempt).
+fn claim_id_and_release<S: ConformanceStore>(store: &S, clock: &ManualClock) -> String {
+    let claimed = store.claim_next(60_000).expect("claim").expect("job");
+    let id = claimed.id.clone();
+    store.fail(&id, clock.now_ms()).expect("release");
+    id
+}
+
+/// B10: the worker quarantines a Notify job with an unparseable payload
+/// (reason recorded) instead of retrying it forever.
+#[test]
+fn b10_worker_quarantines_bad_notify_payload() {
+    let factory = RedbFactory::fresh("b10");
+    let clock = test_clock();
+    let streaming: Arc<dyn StreamingSink> = Arc::new(NoopStreamingSink);
+    let (store, _services, worker) = open_worker_stack(&factory, clock.clone(), streaming);
+    let alice = create_user(&*store, "alice");
+    let bad = NewJob {
+        kind: JobKind::Notify,
+        payload: b"not-json{{{".to_vec(),
+        idempotency_key: "b10:bad".to_string(),
+        not_before: clock.now_ms(),
+    };
+    store
+        .create_note(
+            CreateNoteInput::simple_public(&alice.id, "bad notify"),
+            vec![bad],
+        )
+        .expect("enqueue job with garbage payload");
+    let job_id = claim_id_and_release(&*store, &clock);
+    assert!(
+        worker.process_one().expect("process"),
+        "worker handled the job"
+    );
+    assert!(
+        store.claim_next(60_000).expect("claim").is_none(),
+        "bad-payload job is never re-claimed"
+    );
+    let stored = store
+        .get_job(&job_id)
+        .expect("get_job")
+        .expect("quarantined row stays inspectable");
+    assert!(stored.failed, "failed flag set");
+    let reason = stored.fail_reason.clone().unwrap_or_default();
+    assert!(
+        reason.contains("bad-payload"),
+        "quarantine reason recorded, got {reason:?}"
+    );
+    assert_eq!(
+        store.pending_count().expect("count"),
+        0,
+        "quarantined jobs are not pending work"
+    );
+}
+
+/// B11: the worker quarantines a FederateDeliver job whose inbox answers with
+/// a permanent (4xx) failure, recording the reason.
+#[test]
+fn b11_worker_quarantines_permanent_federate_failure() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    // Stub inbox: every POST gets a 400. The worker needs exactly one hit.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub inbox");
+    let addr = listener.local_addr().expect("stub addr");
+    std::thread::spawn(move || {
+        for _ in 0..8 {
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(
+                b"HTTP/1.1 400 Bad Request\r\ncontent-length: 11\r\nconnection: close\r\n\r\nbad request",
+            );
+            let _ = stream.flush();
+        }
+    });
+
+    let factory = RedbFactory::fresh("b11");
+    let clock = test_clock();
+    let streaming: Arc<dyn StreamingSink> = Arc::new(NoopStreamingSink);
+    let (store, _services, worker) = open_worker_stack(&factory, clock.clone(), streaming);
+    let alice = create_user(&*store, "alice");
+    let bob = create_user(&*store, "bob");
+    let payload = FederateDeliverPayload::Follow {
+        follow_id: "b11:follow".to_string(),
+        follower_id: alice.id.clone(),
+        followee_id: bob.id.clone(),
+        inbox_url: format!("http://{addr}/inbox"),
+    };
+    let job = NewJob::new_json(
+        JobKind::FederateDeliver,
+        &payload,
+        "b11:deliver",
+        clock.now_ms(),
+    )
+    .expect("valid follow payload");
+    store
+        .follow(&alice.id, &bob.id, false, None, vec![job])
+        .expect("follow with deliver job");
+    let job_id = claim_id_and_release(&*store, &clock);
+    assert!(
+        worker.process_one().expect("process"),
+        "worker handled the job"
+    );
+    assert!(
+        store.claim_next(60_000).expect("claim").is_none(),
+        "permanently-failed job is never re-claimed"
+    );
+    let stored = store
+        .get_job(&job_id)
+        .expect("get_job")
+        .expect("quarantined row stays inspectable");
+    assert!(stored.failed, "failed flag set");
+    let reason = stored.fail_reason.clone().unwrap_or_default();
+    assert!(
+        reason.contains("permanent-failure") && reason.contains("400"),
+        "quarantine reason recorded, got {reason:?}"
+    );
+}
+
+struct AlwaysFailSink;
+
+impl StreamingSink for AlwaysFailSink {
+    fn publish(&self, _event_type: &str, _payload: &[u8]) -> Result<(), PortError> {
+        Err(PortError::StorageUnavailable("b12: sink down".to_string()))
+    }
+}
+
+/// B12: retry exhaustion at the worker level quarantines after the cap for a
+/// non-federate kind (StreamingPublish), with the reason recorded.
+#[test]
+fn b12_worker_retry_exhaustion_quarantines() {
+    let factory = RedbFactory::fresh("b12");
+    let clock = test_clock();
+    let streaming: Arc<dyn StreamingSink> = Arc::new(AlwaysFailSink);
+    let (store, _services, worker) = open_worker_stack(&factory, clock.clone(), streaming);
+    let alice = create_user(&*store, "alice");
+    note_with_job(&*store, &clock, &alice.id, "exhaust me", "b12:job");
+    // The releasing fail counts as attempt 1; the worker then retries until
+    // the cap (attempts 2..=7 reschedule, the attempt-8 claim quarantines).
+    let job_id = claim_id_and_release(&*store, &clock);
+    let mut processed = 0;
+    for _ in 0..MAX_JOB_ATTEMPTS as usize {
+        clock.advance_ms(61_000);
+        if !worker.process_one().expect("process") {
+            break;
+        }
+        processed += 1;
+    }
+    assert_eq!(processed, 7, "worker retried until the cap, then quarantined");
+    assert!(
+        !worker.process_one().expect("process"),
+        "quarantined job is never re-claimed"
+    );
+    let stored = store
+        .get_job(&job_id)
+        .expect("get_job")
+        .expect("exhausted row stays inspectable");
+    assert!(stored.failed, "failed flag set");
+    assert_eq!(stored.attempts, 7, "attempts stop where the worker quarantined");
+    assert_eq!(
+        stored.fail_reason.as_deref(),
+        Some("retry-exhausted"),
+        "exhaustion reason recorded"
+    );
+    assert_eq!(
+        store.pending_count().expect("count"),
+        0,
+        "quarantined jobs are not pending work"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -176,12 +176,11 @@ pub fn execute_federate_deliver(
     tracker: &DestinationTracker,
     payload_bytes: &[u8],
 ) -> Result<DeliveryOutcome, PortError> {
-    // Legacy/conformance test payloads like `{"op":"follow"}` without required
-    // fields are treated as no-op successes so Phase 1 conformance tests pass.
-    let parsed: FederateDeliverPayload = match serde_json::from_slice(payload_bytes) {
-        Ok(p) => p,
-        Err(_) => return Ok(DeliveryOutcome::Delivered),
-    };
+    // Malformed payloads are caller faults, not delivery results: report a
+    // parse failure so the worker quarantines the job with a reason instead
+    // of retrying (or silently dropping) it.
+    let parsed: FederateDeliverPayload = serde_json::from_slice(payload_bytes)
+        .map_err(|e| PortError::Validation(format!("federate payload invalid: {e}")))?;
 
     let base = services.public_url.trim_end_matches('/');
 

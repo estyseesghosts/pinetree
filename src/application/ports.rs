@@ -194,6 +194,12 @@ pub enum JobKind {
     TimelineMaterialize,
 }
 
+/// Maximum `fail()` retries before a job is auto-quarantined as
+/// terminally failed (see `JobQueue::fail_permanent`). Mirrors the
+/// `MAX_DELIVERY_ATTEMPTS` delivery budget so every job kind shares one
+/// exhaustion bound.
+pub const MAX_JOB_ATTEMPTS: u32 = 8;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewJob {
     pub kind: JobKind,
@@ -254,12 +260,32 @@ pub struct Job {
     pub not_before: i64,
     pub attempts: u32,
     pub lease_expires: Option<i64>,
+    /// Terminal failure flag. Quarantined jobs leave the claimable set but
+    /// stay inspectable via `get_job`. Defaults to `false` so rows written
+    /// before this field existed still decode.
+    #[serde(default)]
+    pub failed: bool,
+    /// Human-readable quarantine reason (`bad-payload: …`,
+    /// `permanent-failure: …`, `retry-exhausted`). `None` unless quarantined.
+    #[serde(default)]
+    pub fail_reason: Option<String>,
 }
 
 pub trait JobQueue: Send + Sync {
     fn claim_next(&self, lease_duration_ms: i64) -> Result<Option<Job>, PortError>;
     fn complete(&self, job_id: &str) -> Result<(), PortError>;
     fn fail(&self, job_id: &str, retry_at_ms: i64) -> Result<(), PortError>;
+    /// Quarantine a job as terminally failed: it leaves the claimable set
+    /// (never returned by `claim_next` again) but stays inspectable via
+    /// `get_job` with `failed == true` and `fail_reason` recorded.
+    /// Idempotent: repeating it (or calling it on a missing job) is a
+    /// no-op success that keeps the first recorded reason.
+    /// The provided default is a no-op so in-memory test doubles keep
+    /// compiling; durable backends must override it.
+    fn fail_permanent(&self, job_id: &str, reason: &str) -> Result<(), PortError> {
+        let _ = (job_id, reason);
+        Ok(())
+    }
     fn get_job(&self, job_id: &str) -> Result<Option<Job>, PortError>;
     fn pending_count(&self) -> Result<usize, PortError>;
 }

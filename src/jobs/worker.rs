@@ -4,11 +4,10 @@ use crate::application::commands::AppServices;
 use crate::application::events::NotifyJobPayload;
 use crate::application::ports::{
     Clock, IdGenerator, Job, JobKind, JobQueue, NotificationStore, PortError, StreamingSink,
+    MAX_JOB_ATTEMPTS,
 };
 use crate::domain::notification::Notification;
-use crate::federation::retry::{
-    DeliveryOutcome, DestinationTracker, MAX_DELIVERY_ATTEMPTS,
-};
+use crate::federation::retry::{DeliveryOutcome, DestinationTracker};
 
 /// In-process durable-job worker (Phase 1, single node).
 pub struct JobWorker {
@@ -23,6 +22,17 @@ pub struct JobWorker {
     pub base_backoff_ms: i64,
 }
 
+/// How a claimed job's record is settled after its handler runs.
+enum Disposition {
+    /// Handler succeeded: remove the row.
+    Done,
+    /// Handler failed retryably: reschedule with backoff, quarantining when
+    /// the retry budget (`MAX_JOB_ATTEMPTS`) is exhausted.
+    Retry,
+    /// Handler failed terminally: quarantine with the recorded reason.
+    Quarantine(String),
+}
+
 impl JobWorker {
     pub fn process_one(&self) -> Result<bool, PortError> {
         let claimed = self.jobs.claim_next(self.lease_duration_ms)?;
@@ -30,25 +40,57 @@ impl JobWorker {
             None => return Ok(false),
             Some(job) => job,
         };
-        let outcome: Result<(), PortError> = match job.kind {
-            JobKind::Notify => self.handle_notify(&job.payload, &job.idempotency_key),
-            JobKind::StreamingPublish => self.streaming.publish("streaming", &job.payload),
-            JobKind::FederateDeliver => self.handle_federate_deliver(&job),
-            JobKind::TimelineMaterialize => Ok(()),
+        let disposition: Result<Disposition, PortError> = match job.kind {
+            JobKind::Notify => match self.handle_notify(&job.payload, &job.idempotency_key) {
+                Ok(()) => Ok(Disposition::Done),
+                // Unparseable payloads can never succeed on retry.
+                Err(PortError::Validation(reason)) => {
+                    Ok(Disposition::Quarantine(format!("bad-payload: {reason}")))
+                }
+                Err(_) => Ok(Disposition::Retry),
+            },
+            JobKind::StreamingPublish => match self.streaming.publish("streaming", &job.payload)
+            {
+                Ok(()) => Ok(Disposition::Done),
+                Err(PortError::Validation(reason)) => {
+                    Ok(Disposition::Quarantine(format!("bad-payload: {reason}")))
+                }
+                Err(_) => Ok(Disposition::Retry),
+            },
+            JobKind::FederateDeliver => self.dispatch_federate(&job),
+            JobKind::TimelineMaterialize => Ok(Disposition::Done),
         };
-        match outcome {
-            Ok(()) => {
+        // Storage errors from the settlement calls below propagate to the
+        // caller, as before (drain/spawn behavior unchanged).
+        match disposition? {
+            Disposition::Done => {
                 self.jobs.complete(&job.id)?;
-                Ok(true)
             }
-            Err(_) => {
-                let shift = job.attempts.min(10);
-                let backoff = self.base_backoff_ms.saturating_mul(1_i64 << shift);
-                let retry_at = self.clock.now_ms().saturating_add(backoff);
-                self.jobs.fail(&job.id, retry_at)?;
-                Ok(true)
+            Disposition::Retry => {
+                if job.attempts + 1 >= MAX_JOB_ATTEMPTS {
+                    // Retry budget exhausted for any kind: quarantine with a
+                    // recorded reason instead of retrying forever.
+                    self.quarantine(&job, "retry-exhausted")?;
+                } else {
+                    let shift = job.attempts.min(10);
+                    let backoff = self.base_backoff_ms.saturating_mul(1_i64 << shift);
+                    let retry_at = self.clock.now_ms().saturating_add(backoff);
+                    self.jobs.fail(&job.id, retry_at)?;
+                }
+            }
+            Disposition::Quarantine(reason) => {
+                self.quarantine(&job, &reason)?;
             }
         }
+        Ok(true)
+    }
+
+    fn quarantine(&self, job: &Job, reason: &str) -> Result<(), PortError> {
+        eprintln!(
+            "quarantining job {} ({:?}) after {} attempts: {reason}",
+            job.id, job.kind, job.attempts
+        );
+        self.jobs.fail_permanent(&job.id, reason)
     }
 
     fn handle_notify(&self, payload: &[u8], idempotency_key: &str) -> Result<(), PortError> {
@@ -77,26 +119,28 @@ impl JobWorker {
         }
     }
 
-    fn handle_federate_deliver(&self, job: &Job) -> Result<(), PortError> {
-        let outcome = crate::federation::outbox::execute_federate_deliver(
+    fn dispatch_federate(&self, job: &Job) -> Result<Disposition, PortError> {
+        let outcome = match crate::federation::outbox::execute_federate_deliver(
             &self.services,
             &self.services.federation_http,
             &self.delivery_tracker,
             &job.payload,
-        )?;
-        match outcome {
-            DeliveryOutcome::Delivered | DeliveryOutcome::PermanentFailure(_) => Ok(()),
-            DeliveryOutcome::TransientFailure(_) => {
-                if job.attempts + 1 >= MAX_DELIVERY_ATTEMPTS {
-                    // Attempts exhausted: complete instead of retrying forever.
-                    Ok(())
-                } else {
-                    // `fail()` reschedules with backoff via `process_one`.
-                    Err(PortError::StorageUnavailable(
-                        "transient federate deliver failure".into(),
-                    ))
-                }
+        ) {
+            Ok(outcome) => outcome,
+            // Unparseable payloads can never succeed on retry.
+            Err(PortError::Validation(reason)) => {
+                return Ok(Disposition::Quarantine(format!("bad-payload: {reason}")));
             }
+            Err(e) => return Err(e),
+        };
+        match outcome {
+            DeliveryOutcome::Delivered => Ok(Disposition::Done),
+            DeliveryOutcome::PermanentFailure(reason) => Ok(Disposition::Quarantine(format!(
+                "permanent-failure: {reason}"
+            ))),
+            // `fail()` reschedules with backoff via `process_one`, which
+            // quarantines once the retry budget is exhausted.
+            DeliveryOutcome::TransientFailure(_) => Ok(Disposition::Retry),
         }
     }
 

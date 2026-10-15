@@ -10,7 +10,7 @@ use crate::application::ports::{
     CreateAccountInput, CreateNoteInput, FollowStore, IdGenerator, InsertMediaInput, Job,
     JobQueue, LegacyAuthSessionRecord, MediaStore, MiAuthSessionRecord, NewJob, NoteStore,
     NotificationStore, PortError, ReactionStore, RemotePublicKeyRecord, TimelineCursor,
-    UpdateAccountPatch,
+    UpdateAccountPatch, MAX_JOB_ATTEMPTS,
 };
 use crate::domain::account::{validate_local_username, Account};
 use crate::domain::follow::{Follow, FollowNotify};
@@ -194,6 +194,8 @@ impl RedbStore {
                 not_before: new_job.not_before,
                 attempts: 0,
                 lease_expires: None,
+                failed: false,
+                fail_reason: None,
             };
             let encoded = encode_json(&job)?;
             jobs_table
@@ -1425,6 +1427,11 @@ impl JobQueue for RedbStore {
                 let job_id = job_id_str.to_string();
                 if let Some(jg) = jobs_table.get(job_id.as_str()).map_err(map_redb_err)? {
                     let job: Job = decode_json(jg.value())?;
+                    // Terminal (quarantined) jobs never re-enter the claimable
+                    // set even if a stale due-index entry still points at one.
+                    if job.failed {
+                        continue;
+                    }
                     let lease_expired = match job.lease_expires {
                         None => true,
                         Some(exp) => exp <= now,
@@ -1485,21 +1492,67 @@ impl JobQueue for RedbStore {
             let mut due_table = write_txn.open_table(JOBS_DUE_INDEX).map_err(map_redb_err)?;
             let mut job: Job = match jobs_table.get(job_id).map_err(map_redb_err)? {
                 Some(jg) => decode_json(jg.value())?,
-                None => return Err(PortError::NotFound(format!("job {job_id} not found"))),
+                // Missing jobs are a no-op success, like `complete`.
+                None => return Ok(()),
             };
+            // Terminal state is sticky: `fail` never re-queues a quarantined job.
+            if job.failed {
+                return Ok(());
+            }
             let _ = due_table.remove((job.not_before, job_id));
             if let Some(exp) = job.lease_expires {
                 let _ = due_table.remove((exp, job_id));
             }
             job.attempts = job.attempts.saturating_add(1);
-            job.not_before = retry_at_ms;
+            job.lease_expires = None;
+            if job.attempts >= MAX_JOB_ATTEMPTS {
+                // Retry budget exhausted: auto-quarantine instead of
+                // rescheduling forever. Same reason string the worker uses
+                // when it quarantines for exhaustion directly.
+                job.failed = true;
+                job.fail_reason = Some("retry-exhausted".to_string());
+                let encoded = encode_json(&job)?;
+                jobs_table
+                    .insert(job_id, encoded.as_slice())
+                    .map_err(map_redb_err)?;
+            } else {
+                job.not_before = retry_at_ms;
+                let encoded = encode_json(&job)?;
+                jobs_table
+                    .insert(job_id, encoded.as_slice())
+                    .map_err(map_redb_err)?;
+                due_table
+                    .insert((retry_at_ms, job_id), &1u8)
+                    .map_err(map_redb_err)?;
+            }
+        }
+        self.commit_write(write_txn)
+    }
+
+    fn fail_permanent(&self, job_id: &str, reason: &str) -> Result<(), PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            let mut jobs_table = write_txn.open_table(JOBS).map_err(map_redb_err)?;
+            let mut due_table = write_txn.open_table(JOBS_DUE_INDEX).map_err(map_redb_err)?;
+            let mut job: Job = match jobs_table.get(job_id).map_err(map_redb_err)? {
+                Some(jg) => decode_json(jg.value())?,
+                // Missing jobs are a no-op success, like `complete`.
+                None => return Ok(()),
+            };
+            // Idempotent: keep the first recorded reason.
+            if job.failed {
+                return Ok(());
+            }
+            let _ = due_table.remove((job.not_before, job_id));
+            if let Some(exp) = job.lease_expires {
+                let _ = due_table.remove((exp, job_id));
+            }
+            job.failed = true;
+            job.fail_reason = Some(truncate_fail_reason(reason));
             job.lease_expires = None;
             let encoded = encode_json(&job)?;
             jobs_table
                 .insert(job_id, encoded.as_slice())
-                .map_err(map_redb_err)?;
-            due_table
-                .insert((retry_at_ms, job_id), &1u8)
                 .map_err(map_redb_err)?;
         }
         self.commit_write(write_txn)
@@ -1515,15 +1568,28 @@ impl JobQueue for RedbStore {
     }
 
     fn pending_count(&self) -> Result<usize, PortError> {
+        // Counts actionable (non-terminal) jobs only: quarantined rows stay
+        // in the table for inspection via `get_job` but are not pending work,
+        // so drains that loop on `pending_count() == 0` still terminate.
         let read_txn = self.db.begin_read().map_err(map_redb_err)?;
         let table = read_txn.open_table(JOBS).map_err(map_redb_err)?;
         let mut count = 0usize;
         for entry in table.iter().map_err(map_redb_err)? {
-            let _ = entry.map_err(map_redb_err)?;
-            count += 1;
+            let (_, val) = entry.map_err(map_redb_err)?;
+            let job: Job = decode_json(val.value())?;
+            if !job.failed {
+                count += 1;
+            }
         }
         Ok(count)
     }
+}
+
+/// Cap a quarantine reason so an unbounded remote response body can never
+/// bloat a job row (reasons stay far under the 64 KiB job payload cap).
+fn truncate_fail_reason(reason: &str) -> String {
+    const MAX_REASON_CHARS: usize = 512;
+    reason.chars().take(MAX_REASON_CHARS).collect()
 }
 
 impl FollowStore for RedbStore {
