@@ -12,7 +12,7 @@ Source of truth: `sns-server-proposal.md`. If this file and the proposal disagre
 
 Contracts are frozen (see `docs/README.md`); Phase 1 may scaffold the Rust crate from them. The throwaway conformance harness lives outside the repo at `/tmp/opencode/phase0-harness` — do not move it into `src/`.
 
-## Current phase: Phase 3 — Client compatibility and streaming (Phase 2 exited 2026-10-14)
+## Current phase: Phase 3 — Client compatibility and streaming (Phase 2 exited 2026-10-14; Phase 2.5 cleanup slices 0–8 landed 2026-10-15, entry gate verifying)
 
 Phase 0 exit: all boxes checked in `docs/phase-0-exit-criteria.md` — contracts frozen, note+job atomicity proven on an in-memory harness (15/15 green), FDB client verified live (7.3.77 cluster, crate 0.11.0/`fdb-7_3`, atomic pair + latencies + failure surface; see `docs/fdb-verification.md` §6).
 
@@ -20,7 +20,7 @@ Phase 1 exit: all boxes checked in `docs/phase-1-exit-criteria.md` — `pinetree
 
 Phase 2 exit: all boxes checked in `docs/phase-2-exit-criteria.md` — WebFinger/NodeInfo, actors + keys, HTTP signatures, shared/personal inboxes, core activities, atomic dedup, durable delivery with retry, remote media; live four-server interop (real Misskey `2026.10.1-alpha.0`, real Sharkey `2025.4.7`, 2× pinetree) green via `scripts/smoke-phase2.sh` (see `state/logs/2026-10-14-phase-2-complete.md`; how to run each server: `docs/phase-2-interop-howto.md`).
 
-Phase 3 scope (proposal §9): client compatibility and streaming. Known gaps carried over: no `users/notes`, `notes/renotes`, `users/followers`, streaming route.
+Phase 3 scope (proposal §9): client compatibility and streaming. Known gaps carried over: no `users/notes`, `notes/renotes`, Misskey API `users/followers` endpoint (the followers store `FollowStore::followers_of` and the ActivityPub followers collection exist — only the Misskey client endpoint is missing), streaming route.
 
 ## State maintenance (required every work session)
 
