@@ -92,6 +92,21 @@ pub fn pack_user_detailed_not_me(
         ),
         _ => (false, false),
     };
+    let (pending_from_you, pending_to_you) = match viewer_id {
+        Some(viewer) if viewer != account.id => (
+            services
+                .follows
+                .get_follow_request(viewer, &account.id)
+                .map(|r| r.is_some())
+                .unwrap_or(false),
+            services
+                .follows
+                .get_follow_request(&account.id, viewer)
+                .map(|r| r.is_some())
+                .unwrap_or(false),
+        ),
+        _ => (false, false),
+    };
     let mut obj = pack_user_lite(account, &services.public_url, now)
         .as_object()
         .cloned()
@@ -174,11 +189,11 @@ pub fn pack_user_detailed_not_me(
     obj.insert("isFollowed".to_string(), Value::Bool(is_followed));
     obj.insert(
         "hasPendingFollowRequestFromYou".to_string(),
-        Value::Bool(false),
+        Value::Bool(pending_from_you),
     );
     obj.insert(
         "hasPendingFollowRequestToYou".to_string(),
-        Value::Bool(false),
+        Value::Bool(pending_to_you),
     );
     obj.insert("isBlocking".to_string(), Value::Bool(false));
     obj.insert("isBlocked".to_string(), Value::Bool(false));

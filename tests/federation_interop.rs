@@ -334,5 +334,27 @@ fn federation_interop_four_servers() {
         let tn = node(&nodes, t);
         poll(&format!("{t} has 0 followers"), || (followers_count(&c, tn) == 0).then_some(()));
     }
+
+    // --- locked account: a Misskey user's follow stays pending until accepted
+    {
+        let (mk, p3) = (node(&nodes, "mk"), node(&nodes, "p3"));
+        let (s, r) = call(&c, &p3.base, "i/update", Some(&p3.token), &json!({"isLocked": true}));
+        assert_eq!(s, 200, "p3 lock: {r}");
+        let (s, r) = call(&c, &mk.base, "following/create", Some(&mk.token), &json!({"userId": remote_id[&("mk", "p3")]}));
+        assert!(s == 200 || s == 204, "mk follows locked p3: {s} {r}");
+        let mk_uid = poll("p3 lists mk's pending request", || {
+            let (s, r) = call(&c, &p3.base, "following/requests/list", Some(&p3.token), &json!({}));
+            (s == 200).then(|| r.as_array().and_then(|a| a.first().map(|e| e["follower"]["id"].as_str().unwrap_or("").to_string()))).flatten()
+        });
+        assert_eq!(followers_count(&c, p3), 0, "pending request must not count as a follower");
+        let (s, r) = call(&c, &p3.base, "following/requests/accept", Some(&p3.token), &json!({"userId": mk_uid}));
+        assert!((200..300).contains(&s), "p3 accepts mk: {s} {r}");
+        poll("p3 has 1 follower after accept", || (followers_count(&c, p3) == 1).then_some(()));
+        poll("mk unfollows locked p3", || {
+            let (s, _) = call(&c, &mk.base, "following/delete", Some(&mk.token), &json!({"userId": remote_id[&("mk", "p3")]}));
+            (200..300).contains(&s).then_some(())
+        });
+        poll("p3 back to 0 followers", || (followers_count(&c, p3) == 0).then_some(()));
+    }
     println!("INTEROP_OK");
 }

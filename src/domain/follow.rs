@@ -17,6 +17,17 @@ pub struct Follow {
     pub notify: Option<FollowNotify>,
 }
 
+/// Pending follow request (mirrors Misskey's `FollowRequest`). Not a follow
+/// edge: it never feeds `follows_author`, fan-out, counters or AP collections.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FollowRequest {
+    pub id: String,
+    pub follower_id: String,
+    pub followee_id: String,
+    pub with_replies: bool,
+    pub notify: Option<FollowNotify>,
+}
+
 impl Follow {
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.follower_id.is_empty() || self.followee_id.is_empty() {

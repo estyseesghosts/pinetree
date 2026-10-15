@@ -108,3 +108,7 @@ Reads never need transactions spanning writes. Initial read surface (fan-out-on-
 2. Lease durations and retry schedule numbers (deferred to the delivery contract; conformance tests need at least the backoff shape).
 3. ~~`specified`-visibility model (`visible_users`)~~ — resolved by visibility policy §6 (supported, non-empty list required).
 4. Cursor/limit defaults and maxima for the paginated reads — belongs to the endpoint manifest (client-visible behavior).
+
+## Superseding note — Phase 2.6 slice 4 (2026-10-15)
+
+`FollowStore` gains `request_follow`, `get_follow_request`, `follow_requests_to`, `accept_follow_request` (request delete + edge + counters + jobs in one txn) and `remove_follow_request` (reject/cancel + jobs in one txn). `ActivityDedup` gains `record_follow_request_activity`. Contract rules: `follow` supersedes a pending request for the same pair; `unfollow` of a pair with only a pending request removes it (and succeeds); `NotFound(NO_FOLLOW_REQUEST)` when accept/remove find none. Conformance cells F1–F5 in `tests/conformance.rs` (FDB inherits them).

@@ -65,3 +65,7 @@ Deleted/tombstoned notes are invisible to all non-author viewers regardless of l
 ## 6. Unblocks `specified` in `create_note`
 
 The ports contract (`docs/application-ports.md` §5) deferred `visible_users` to this document. Decision: `specified` is fully supported. `create_note` with `visibility = specified` requires a non-empty `visible_user_ids` (all resolvable accounts, local or known remote); otherwise `Validation`. Replies to `specified` notes inherit per §2. The application-ports open decision #3 is hereby resolved; `application-ports.md` should drop that row at freeze.
+
+## Superseding note — Phase 2.6 slice 4 (2026-10-15)
+
+`follows_author` is true only for accepted follow edges. A pending `FollowRequest` grants no followers-only read access and no federation fan-out until accepted (conformance F5). Locked accounts: inbound Follow and local `following/create` create a request; no auto-Accept.

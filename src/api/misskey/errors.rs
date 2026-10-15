@@ -37,6 +37,7 @@ pub const NO_SUCH_FILE_ID: &str = "b6992544-63e7-67f0-fa7f-32444b1b5306";
 pub const CONTAINS_PROHIBITED_WORDS_ID: &str = "aa6e01d3-a85c-669d-758a-76aab43af334";
 pub const FOLLOWEE_IS_YOURSELF_ID: &str = "26fbe7bb-a331-4857-af17-205b426669a9";
 pub const ALREADY_FOLLOWING_ID: &str = "35387507-38c7-4cb9-9197-300b93783fa0";
+pub const NO_FOLLOW_REQUEST_ID: &str = "bcde4f8b-0913-4614-8736-2e2d5fa29d5b";
 pub const NOT_FOLLOWING_ID: &str = "7f6e1c2d-9f9b-4c1a-9e2a-9b9b9b9b9b01";
 pub const ALREADY_REACTED_ID: &str = "71efcf98-86d6-4e2b-b2ad-9d032369366b";
 pub const NOT_REACTED_ID: &str = "7f6e1c2d-9f9b-4c1a-9e2a-9b9b9b9b9b02";
@@ -337,6 +338,7 @@ fn is_known_client_code(code: &str) -> bool {
             | "CONTAINS_TOO_MANY_MENTIONS"
             | "FOLLOWEE_IS_YOURSELF"
             | "ALREADY_FOLLOWING"
+            | "NO_FOLLOW_REQUEST"
             | "NOT_FOLLOWING"
             | "ALREADY_REACTED"
             | "NOT_REACTED"
@@ -401,6 +403,7 @@ fn lookup_known_code(code: &str) -> Option<(&'static str, &'static str, u16, &'s
         ),
         "NO_SUCH_NOTE" => ("No such note.", NO_SUCH_NOTE_ID, 400, "client"),
         "NO_SUCH_USER" => ("No such user.", NO_SUCH_USER_ID, 400, "client"),
+        "NO_FOLLOW_REQUEST" => ("No follow request.", NO_FOLLOW_REQUEST_ID, 400, "client"),
         "NO_SUCH_REPLY_TARGET" => (
             "No such reply target.",
             NO_SUCH_REPLY_TARGET_ID,

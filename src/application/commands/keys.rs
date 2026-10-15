@@ -63,6 +63,13 @@ impl AppServices {
     }
 
     /// Cache a remote actor's public key in storage.
+    ///
+    /// Slice 2 (C1): a key id is bound to the first actor URI it was cached
+    /// for. Re-caching the same `(key_id, actor_uri)` pair (e.g. after key
+    /// rotation, where the PEM changes but the owner does not) overwrites
+    /// normally; caching the same `key_id` under a *different* `actor_uri`
+    /// is refused with [`PortError::Conflict`] so a malicious actor document
+    /// cannot rebind (poison) another actor's key id.
     pub fn cache_remote_public_key(
         &self,
         key_id: &str,
@@ -70,11 +77,21 @@ impl AppServices {
         account_id: Option<String>,
         public_key_pem: &str,
     ) -> Result<RemotePublicKeyRecord, PortError> {
+        if let Some(existing) = self.auth.get_remote_public_key(key_id)? {
+            if existing.actor_uri != actor_uri {
+                return Err(PortError::Conflict(format!(
+                    "remote public key {key_id} is already cached for {}",
+                    existing.actor_uri
+                )));
+            }
+        }
         let record = RemotePublicKeyRecord {
             key_id: key_id.to_string(),
             actor_uri: actor_uri.to_string(),
             account_id,
-            public_key_pem: public_key_pem.to_string(),
+            // Canonicalize: `parse_remote_actor` trims the PEM, so trim here
+            // too or the same key compares differently by ingest path.
+            public_key_pem: public_key_pem.trim().to_string(),
             fetched_at_ms: self.now_ms(),
         };
         self.auth.save_remote_public_key(record.clone())?;

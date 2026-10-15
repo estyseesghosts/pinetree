@@ -78,6 +78,41 @@ pub fn parse_url_host(url: &str) -> Option<(String, String)> {
     Some((format!("{scheme_lower}://{host_port}"), host_port))
 }
 
+/// Check that `key_id` is owned by the actor at `actor_uri`: either equal
+/// to it, or `{actor}#fragment` / `{actor}/sub-path`, in all cases on the
+/// same origin (scheme + host) as the actor. Anything else (notably another
+/// actor's id) is rejected so a malicious document cannot advertise a key
+/// id it does not own and poison the public-key cache (Slice 2, C1).
+fn key_id_belongs_to_actor(actor_uri: &str, key_id: &str) -> bool {
+    let actor = actor_uri.trim();
+    let key = key_id.trim();
+    if actor.is_empty() || key.is_empty() {
+        return false;
+    }
+    let (Some((actor_origin, _)), Some((key_origin, _))) =
+        (parse_url_host(actor), parse_url_host(key))
+    else {
+        return false;
+    };
+    if actor_origin != key_origin {
+        return false;
+    }
+    if key == actor {
+        return true;
+    }
+    let Some(rest) = key.strip_prefix(actor) else {
+        return false;
+    };
+    match rest.as_bytes().first() {
+        // `{actor}#fragment` with a non-empty fragment.
+        Some(b'#') => rest.len() > 1,
+        // `{actor}/sub-path` with a non-empty path remainder (a bare `/`,
+        // `/?query` or `/#fragment` is not a key under the actor).
+        Some(b'/') => rest.len() > 1 && !matches!(rest.as_bytes()[1], b'?' | b'#'),
+        _ => false,
+    }
+}
+
 /// Parse an ActivityPub Actor JSON document into [`ParsedRemoteActor`].
 pub fn parse_remote_actor(doc: &Value) -> Result<ParsedRemoteActor, String> {
     let obj = doc
@@ -89,8 +124,9 @@ pub fn parse_remote_actor(doc: &Value) -> Result<ParsedRemoteActor, String> {
         .ok_or_else(|| "actor missing id".to_string())?
         .trim()
         .to_string();
-    let (_, host) =
+    let (actor_origin, host) =
         parse_url_host(&uri).ok_or_else(|| format!("invalid actor id URL: {uri}"))?;
+    let actor_scheme = actor_origin.split("://").next().unwrap_or("");
 
     let actor_type = match obj.get("type") {
         Some(Value::String(s)) => s.clone(),
@@ -129,11 +165,25 @@ pub fn parse_remote_actor(doc: &Value) -> Result<ParsedRemoteActor, String> {
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "actor missing inbox".to_string())?
         .to_string();
-    let (_, inbox_host) =
+    let (inbox_origin, inbox_host) =
         parse_url_host(&inbox).ok_or_else(|| format!("invalid inbox URL: {inbox}"))?;
     if inbox_host != host {
         return Err(format!(
             "actor inbox host {inbox_host} does not match actor host {host}"
+        ));
+    }
+    // Slice 3 (H5): the inbox is required, so violations reject the actor.
+    // Length fails fast at parse, matching the `Account::validate` 1..=512
+    // bound (re-checked at upsert); an https actor must not name an http
+    // inbox (downgrade refused). Plain-http actors (local test rigs) still
+    // pass.
+    if inbox.chars().count() > 512 {
+        return Err(format!("invalid inbox URL (over 512 chars): {inbox}"));
+    }
+    let inbox_scheme = inbox_origin.split("://").next().unwrap_or("");
+    if actor_scheme == "https" && inbox_scheme == "http" {
+        return Err(format!(
+            "actor inbox {inbox} downgrades https actor {uri} to http"
         ));
     }
 
@@ -144,7 +194,24 @@ pub fn parse_remote_actor(doc: &Value) -> Result<ParsedRemoteActor, String> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned);
+        .map(ToOwned::to_owned)
+        // Slice 3 (H5): same parser and same rules as the personal inbox,
+        // but never reject the actor — drop an invalid sharedInbox (None)
+        // and fall back to the personal inbox, so actors without a usable
+        // sharedInbox still federate.
+        .filter(|s| {
+            if s.chars().count() > 512 {
+                return false;
+            }
+            let Some((shared_origin, shared_host)) = parse_url_host(s) else {
+                return false;
+            };
+            if shared_host != host {
+                return false;
+            }
+            let shared_scheme = shared_origin.split("://").next().unwrap_or("");
+            !(actor_scheme == "https" && shared_scheme == "http")
+        });
 
     let public_key = obj
         .get("publicKey")
@@ -165,6 +232,15 @@ pub fn parse_remote_actor(doc: &Value) -> Result<ParsedRemoteActor, String> {
                 uri
             ));
         }
+    }
+    // Slice 2 (C1): the key id must belong to this actor (exact id,
+    // fragment, or sub-path on the same origin). `owner` alone is not
+    // enough: an attacker could omit it, or set it to its own id, while
+    // advertising a victim's key id.
+    if !key_id_belongs_to_actor(&uri, &public_key_id) {
+        return Err(format!(
+            "publicKey id {public_key_id} is not owned by actor id {uri}"
+        ));
     }
     let public_key_pem = public_key
         .get("publicKeyPem")
@@ -711,4 +787,291 @@ pub async fn get_actor_featured(
         "orderedItems": [],
     });
     ap_json_response(StatusCode::OK, &collection, None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use serde_json::json;
+
+    use crate::application::ports::{
+        AccountStore, ActivityDedup, BlobStore, Clock, IdGenerator, NoopStreamingSink,
+    };
+    use crate::domain::id::{AidxGenerator, ManualClock};
+    use crate::federation::delivery::{
+        SafeHttpClient, SafeHttpConfig, upsert_remote_actor_from_doc,
+    };
+    use crate::media::storage::FsBlobStore;
+    use crate::persistence::redb::RedbStore;
+
+    /// Fixture PEM: `parse_remote_actor` and the key cache store the string
+    /// opaquely, so signature validity is irrelevant here.
+    const FIXTURE_PEM: &str =
+        "-----BEGIN PUBLIC KEY-----\nZmFrZXJlbW90ZXN0a2V5\n-----END PUBLIC KEY-----";
+
+    fn actor_doc(id: &str, username: &str, inbox: &str, shared_inbox: Option<&str>) -> Value {
+        let mut doc = json!({
+            "id": id,
+            "type": "Person",
+            "preferredUsername": username,
+            "inbox": inbox,
+            "publicKey": {
+                "id": format!("{id}#main-key"),
+                "type": "Key",
+                "owner": id,
+                "publicKeyPem": FIXTURE_PEM,
+            },
+        });
+        if let Some(shared) = shared_inbox {
+            doc["endpoints"] = json!({ "sharedInbox": shared });
+        }
+        doc
+    }
+
+    fn test_services(prefix: &str) -> AppServices {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "pinetree-inbox-url-{}-{prefix}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_760_400_000_000));
+        let ids: Arc<dyn IdGenerator> = Arc::new(AidxGenerator::new(clock.clone()));
+        let store = RedbStore::open(dir.join("test.redb"), clock.clone(), ids.clone()).unwrap();
+        let blobs: Arc<dyn BlobStore> = Arc::new(FsBlobStore::new(dir.join("blobs")).unwrap());
+        AppServices {
+            clock,
+            ids,
+            accounts: store.clone(),
+            notes: store.clone(),
+            follows: store.clone(),
+            reactions: store.clone(),
+            jobs: store.clone(),
+            media: store.clone(),
+            blobs,
+            notifications: store.clone(),
+            auth: store.clone(),
+            streaming: Arc::new(NoopStreamingSink),
+            dedup: store.clone() as Arc<dyn ActivityDedup>,
+            federation_http: SafeHttpClient::new(SafeHttpConfig {
+                allow_private_ips: true,
+                ..Default::default()
+            }),
+            public_url: "https://pinetree.local".to_string(),
+            max_file_size: 10 * 1024 * 1024,
+            preserved_usernames: Vec::new(),
+            prohibited_words: Vec::new(),
+            sensitive_words: Vec::new(),
+        }
+    }
+
+    // Slice 3 (H5): a sharedInbox on another host is dropped (None) so
+    // delivery falls back to the personal inbox; the actor still parses.
+    #[test]
+    fn shared_inbox_on_other_host_falls_back_to_personal_inbox() {
+        let doc = actor_doc(
+            "https://remote.example/users/alice",
+            "alice",
+            "https://remote.example/users/alice/inbox",
+            Some("https://relay.other.example/inbox"),
+        );
+        let parsed = parse_remote_actor(&doc)
+            .expect("actor with third-party sharedInbox must still parse");
+        assert_eq!(parsed.inbox, "https://remote.example/users/alice/inbox");
+        assert_eq!(parsed.shared_inbox, None);
+    }
+
+    // Slice 3 (H5): an https actor must not name an http sharedInbox
+    // (downgrade refused); drop it, don't reject the actor.
+    #[test]
+    fn https_actor_http_shared_inbox_downgrade_dropped() {
+        let doc = actor_doc(
+            "https://remote.example/users/alice",
+            "alice",
+            "https://remote.example/users/alice/inbox",
+            Some("http://remote.example/inbox"),
+        );
+        let parsed = parse_remote_actor(&doc)
+            .expect("actor with downgraded sharedInbox must still parse");
+        assert_eq!(parsed.shared_inbox, None);
+    }
+
+    // Slice 3 (H5): an unparseable sharedInbox is dropped, not fatal.
+    #[test]
+    fn unparseable_shared_inbox_dropped() {
+        let doc = actor_doc(
+            "https://remote.example/users/alice",
+            "alice",
+            "https://remote.example/users/alice/inbox",
+            Some("not a url"),
+        );
+        let parsed = parse_remote_actor(&doc)
+            .expect("actor with garbage sharedInbox must still parse");
+        assert_eq!(parsed.shared_inbox, None);
+    }
+
+    // Slice 3 (H5): the personal inbox is required, so an https→http
+    // downgrade there rejects the whole actor.
+    #[test]
+    fn https_actor_http_personal_inbox_rejected() {
+        let doc = actor_doc(
+            "https://remote.example/users/alice",
+            "alice",
+            "http://remote.example/users/alice/inbox",
+            Some("https://remote.example/inbox"),
+        );
+        assert!(
+            parse_remote_actor(&doc).is_err(),
+            "https actor with http inbox must be rejected"
+        );
+    }
+
+    // Slice 3 (H5): overlong URLs — sharedInbox (>512 chars) drops to None,
+    // personal inbox (>512) rejects the actor (fail fast at parse, matching
+    // the `Account::validate` 512-char bound).
+    #[test]
+    fn overlong_inbox_urls_rejected_or_dropped() {
+        let long_shared = format!("https://remote.example/{}", "x".repeat(600));
+        assert!(
+            long_shared.chars().count() > 512,
+            "fixture must exceed the 512-char bound"
+        );
+        let doc = actor_doc(
+            "https://remote.example/users/alice",
+            "alice",
+            "https://remote.example/users/alice/inbox",
+            Some(long_shared.as_str()),
+        );
+        let parsed = parse_remote_actor(&doc)
+            .expect("actor with overlong sharedInbox must still parse");
+        assert_eq!(parsed.shared_inbox, None);
+
+        let long_inbox = format!(
+            "https://remote.example/users/alice/inbox/{}",
+            "x".repeat(600)
+        );
+        assert!(
+            long_inbox.chars().count() > 512,
+            "fixture must exceed the 512-char bound"
+        );
+        let doc = actor_doc(
+            "https://remote.example/users/alice",
+            "alice",
+            &long_inbox,
+            Some("https://remote.example/inbox"),
+        );
+        assert!(
+            parse_remote_actor(&doc).is_err(),
+            "overlong personal inbox must be rejected"
+        );
+    }
+
+    // Slice 3 (H5): plain-http actors (local test rigs use http) keep working.
+    #[test]
+    fn http_actor_with_http_inboxes_accepted() {
+        let doc = actor_doc(
+            "http://127.0.0.1:3000/users/alice",
+            "alice",
+            "http://127.0.0.1:3000/users/alice/inbox",
+            Some("http://127.0.0.1:3000/inbox"),
+        );
+        let parsed = parse_remote_actor(&doc).expect("http actor must still parse");
+        assert_eq!(parsed.inbox, "http://127.0.0.1:3000/users/alice/inbox");
+        assert_eq!(
+            parsed.shared_inbox.as_deref(),
+            Some("http://127.0.0.1:3000/inbox")
+        );
+    }
+
+    // Slice 3 (H5) upsert level: sharedInbox fallback flows into
+    // `account.shared_inbox == None` with the personal inbox kept, and
+    // `Account::validate` is enforced on the upsert path.
+    #[test]
+    fn upsert_applies_inbox_validation_and_shared_inbox_fallback() {
+        let services = test_services("upsert");
+
+        // Third-party sharedInbox: upsert succeeds, falls back to personal.
+        let id = "https://remote.example/users/alice";
+        let doc = actor_doc(
+            id,
+            "alice",
+            "https://remote.example/users/alice/inbox",
+            Some("https://relay.other.example/inbox"),
+        );
+        let (account, parsed) =
+            upsert_remote_actor_from_doc(&services, id, &doc)
+                .expect("third-party sharedInbox must fall back");
+        assert_eq!(parsed.shared_inbox, None);
+        assert_eq!(account.shared_inbox, None);
+        assert_eq!(
+            account.inbox.as_deref(),
+            Some("https://remote.example/users/alice/inbox")
+        );
+
+        // https→http sharedInbox downgrade: upsert succeeds with None.
+        let id = "https://remote.example/users/bob";
+        let doc = actor_doc(
+            id,
+            "bob",
+            "https://remote.example/users/bob/inbox",
+            Some("http://remote.example/inbox"),
+        );
+        let (account, _) =
+            upsert_remote_actor_from_doc(&services, id, &doc)
+                .expect("downgraded sharedInbox must fall back");
+        assert_eq!(account.shared_inbox, None);
+
+        // Overlong sharedInbox: upsert succeeds with None (not a store error).
+        let long_shared = format!("https://remote.example/{}", "x".repeat(600));
+        let id = "https://remote.example/users/carol";
+        let doc = actor_doc(
+            id,
+            "carol",
+            "https://remote.example/users/carol/inbox",
+            Some(long_shared.as_str()),
+        );
+        let (account, _) =
+            upsert_remote_actor_from_doc(&services, id, &doc)
+                .expect("overlong sharedInbox must fall back");
+        assert_eq!(account.shared_inbox, None);
+
+        // https actor + http personal inbox: upsert rejected.
+        let id = "https://remote.example/users/dave";
+        let doc = actor_doc(
+            id,
+            "dave",
+            "http://remote.example/users/dave/inbox",
+            Some("https://remote.example/inbox"),
+        );
+        assert!(
+            upsert_remote_actor_from_doc(&services, id, &doc).is_err(),
+            "https actor with http inbox must not upsert"
+        );
+
+        // `Account::validate` on the upsert path: a hostile remote
+        // preferredUsername that fails domain validation must not upsert.
+        let id = "https://remote.example/users/erin";
+        let doc = actor_doc(
+            id,
+            "not a valid name!",
+            "https://remote.example/users/erin/inbox",
+            Some("https://remote.example/inbox"),
+        );
+        // Sanity: the username really is domain-invalid.
+        assert!(
+            crate::domain::account::validate_remote_username("not a valid name!").is_err()
+        );
+        assert!(
+            upsert_remote_actor_from_doc(&services, id, &doc).is_err(),
+            "domain-invalid username must not upsert"
+        );
+        // The failed upsert must not have cached anything.
+        assert!(
+            services.accounts.find_by_uri(id).expect("lookup").is_none(),
+            "rejected actor must leave no account row"
+        );
+    }
 }

@@ -40,29 +40,22 @@ impl JobWorker {
             None => return Ok(false),
             Some(job) => job,
         };
-        let disposition: Result<Disposition, PortError> = match job.kind {
-            JobKind::Notify => match self.handle_notify(&job.payload, &job.idempotency_key) {
-                Ok(()) => Ok(Disposition::Done),
-                // Unparseable payloads can never succeed on retry.
-                Err(PortError::Validation(reason)) => {
-                    Ok(Disposition::Quarantine(format!("bad-payload: {reason}")))
-                }
-                Err(_) => Ok(Disposition::Retry),
-            },
-            JobKind::StreamingPublish => match self.streaming.publish("streaming", &job.payload)
-            {
-                Ok(()) => Ok(Disposition::Done),
-                Err(PortError::Validation(reason)) => {
-                    Ok(Disposition::Quarantine(format!("bad-payload: {reason}")))
-                }
-                Err(_) => Ok(Disposition::Retry),
-            },
-            JobKind::FederateDeliver => self.dispatch_federate(&job),
-            JobKind::TimelineMaterialize => Ok(Disposition::Done),
-        };
+        // Panic containment: a panicking handler must quarantine the job
+        // (burning no extra attempt beyond the lease-reclaim count) instead
+        // of unwinding the worker and looping forever on the same job.
+        let dispatch: Result<Disposition, PortError> =
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.dispatch_job(&job)
+            })) {
+                Ok(inner) => inner,
+                Err(payload) => Ok(Disposition::Quarantine(format!(
+                    "panic: {}",
+                    panic_payload_message(&payload)
+                ))),
+            };
         // Storage errors from the settlement calls below propagate to the
         // caller, as before (drain/spawn behavior unchanged).
-        match disposition? {
+        match dispatch? {
             Disposition::Done => {
                 self.jobs.complete(&job.id)?;
             }
@@ -83,6 +76,29 @@ impl JobWorker {
             }
         }
         Ok(true)
+    }
+
+    fn dispatch_job(&self, job: &Job) -> Result<Disposition, PortError> {
+        match job.kind {
+            JobKind::Notify => match self.handle_notify(&job.payload, &job.idempotency_key) {
+                Ok(()) => Ok(Disposition::Done),
+                // Unparseable payloads can never succeed on retry.
+                Err(PortError::Validation(reason)) => {
+                    Ok(Disposition::Quarantine(format!("bad-payload: {reason}")))
+                }
+                Err(_) => Ok(Disposition::Retry),
+            },
+            JobKind::StreamingPublish => match self.streaming.publish("streaming", &job.payload)
+            {
+                Ok(()) => Ok(Disposition::Done),
+                Err(PortError::Validation(reason)) => {
+                    Ok(Disposition::Quarantine(format!("bad-payload: {reason}")))
+                }
+                Err(_) => Ok(Disposition::Retry),
+            },
+            JobKind::FederateDeliver => self.dispatch_federate(&job),
+            JobKind::TimelineMaterialize => Ok(Disposition::Done),
+        }
     }
 
     fn quarantine(&self, job: &Job, reason: &str) -> Result<(), PortError> {
@@ -147,10 +163,20 @@ impl JobWorker {
     pub fn drain(&self, max_steps: usize) -> Result<usize, PortError> {
         let mut done = 0;
         for _ in 0..max_steps {
-            if !self.process_one()? {
-                break;
+            // Resilient: a panic escaping `process_one` (e.g. a storage
+            // panic outside the contained handler dispatch) must not unwind
+            // the drain caller. The lease is left to expire — and expiry now
+            // counts as an attempt — so the job is retried/quarantined
+            // instead of wedging the loop.
+            let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.process_one()
+            }));
+            match step {
+                Ok(Ok(true)) => done += 1,
+                Ok(Ok(false)) => break,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => continue,
             }
-            done += 1;
         }
         Ok(done)
     }
@@ -162,13 +188,36 @@ impl JobWorker {
         tokio::spawn(async move {
             loop {
                 let this = Arc::clone(&self);
-                let worked = tokio::task::spawn_blocking(move || this.process_one().unwrap_or(false))
-                    .await
-                    .unwrap_or(false);
+                // `process_one` already quarantines handler panics via
+                // `catch_unwind`; this outer catch only guards panics that
+                // escape settlement/storage so the background loop never dies
+                // silently. Either way the lease is settled (quarantine) or
+                // left to expire (which counts as an attempt).
+                let worked = tokio::task::spawn_blocking(move || {
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        this.process_one()
+                    })) {
+                        Ok(Ok(v)) => v,
+                        Ok(Err(_)) => false,
+                        Err(_) => false,
+                    }
+                })
+                .await
+                .unwrap_or(false);
                 if !worked {
                     tokio::time::sleep(poll_interval).await;
                 }
             }
         })
+    }
+}
+
+fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
     }
 }

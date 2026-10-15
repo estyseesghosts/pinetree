@@ -102,3 +102,7 @@ Must-carry subset of `MiDriveFile` (M `models/DriveFile.ts`). Bytes are never he
 1. ~~Exact `text` max length and media `size_bytes` cap~~ — resolved: text API-max 3000 (manifest §4); media cap is instance config surfacing `MAX_FILE_SIZE_EXCEEDED`.
 2. Custom-emoji model (names are carried; resolution/rollout deferred with polls-era compat work).
 3. ~~Display-name/description/profile fields~~ — resolved: manifest §3 subset (`description` ≤1500, `location` ≤50, `birthday`, avatar/banner, flags) joins the Account type above; `fields[]`, decorations, mute/notification config deferred to Phase 3 with `UNSUPPORTED_FIELD`.
+
+## Superseding note — Phase 2.6 slice 4 (2026-10-15)
+
+Added `FollowRequest { id, follower_id, followee_id, with_replies, notify }` (decision D-a: a separate record mirroring Misskey's `FollowRequest`, not a state field on `Follow`). A request is **not** an edge: it never feeds `follows_author`, `followers_of` fan-out, counters or AP collections. `NotificationKind` gains `ReceiveFollowRequest` (wire type `receiveFollowRequest`). See `state/logs/2026-10-15-phase2-6-slice4-follow-requests.md`.

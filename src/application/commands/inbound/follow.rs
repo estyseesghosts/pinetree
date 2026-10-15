@@ -6,7 +6,8 @@ use crate::domain::follow::Follow;
 use crate::domain::notification::NotificationKind;
 
 impl AppServices {
-    /// Record an inbound `Follow`, notifying the followee and auto-accepting
+    /// Record an inbound `Follow` (pending request if the followee is a locked
+    /// local account), notifying the followee and auto-accepting
     /// when the followee is an unlocked local account and the follower is
     /// remote. A commit race that surfaces as `Conflict` (already following)
     /// is treated as success.
@@ -17,11 +18,20 @@ impl AppServices {
         followee_id: &str,
         with_replies: bool,
     ) -> Result<Option<Follow>, PortError> {
+        let locked_local = self
+            .accounts
+            .find_by_id(followee_id)?
+            .map(|a| a.is_local() && a.is_locked)
+            .unwrap_or(false);
         let mut jobs = Vec::new();
         jobs.push(self.notify_job(
             followee_id,
             follower_id,
-            NotificationKind::Follow,
+            if locked_local {
+                NotificationKind::ReceiveFollowRequest
+            } else {
+                NotificationKind::Follow
+            },
             None,
             None,
             "inbound-follow",
@@ -68,6 +78,21 @@ impl AppServices {
                     );
                 }
             }
+        }
+        if locked_local {
+            // Locked account: pending until the owner accepts. No auto-Accept.
+            return match self.dedup.record_follow_request_activity(
+                activity_id,
+                follower_id,
+                followee_id,
+                with_replies,
+                None,
+                jobs,
+            ) {
+                Ok(_) => Ok(None),
+                Err(PortError::Conflict(_)) => Ok(None),
+                Err(e) => Err(e),
+            };
         }
         match self.dedup.record_follow_activity(
             activity_id,

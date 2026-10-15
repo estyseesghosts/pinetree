@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::domain::account::Account;
-use crate::domain::follow::{Follow, FollowNotify};
+use crate::domain::follow::{Follow, FollowNotify, FollowRequest};
 pub use crate::domain::id::{Clock, DomainError, IdGenerator, PortError};
 use crate::domain::media::{MediaMeta, MediaProperties};
 use crate::domain::note::{Note, ReactionAcceptance, Visibility};
@@ -272,6 +272,13 @@ pub struct Job {
 }
 
 pub trait JobQueue: Send + Sync {
+    /// Claim the next due job and hold it under a lease until
+    /// `lease_duration_ms` past now. Reclaiming an expired lease (a job
+    /// whose `lease_expires` is `Some(exp)` with `exp <= now`) counts as an
+    /// attempt: the backend increments `attempts` (`saturating_add(1)`) and,
+    /// when `attempts >= MAX_JOB_ATTEMPTS`, quarantines the job
+    /// (`failed = true`, `fail_reason = "retry-exhausted"`) instead of
+    /// returning it. Fresh jobs (`lease_expires == None`) never increment.
     fn claim_next(&self, lease_duration_ms: i64) -> Result<Option<Job>, PortError>;
     fn complete(&self, job_id: &str) -> Result<(), PortError>;
     fn fail(&self, job_id: &str, retry_at_ms: i64) -> Result<(), PortError>;
@@ -323,6 +330,64 @@ pub trait FollowStore: Send + Sync {
         cursor: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Follow>, PortError>;
+
+    // --- Pending follow requests (Phase 2.6 slice 4, decision D-a). A request
+    // is NOT a follow edge: it never affects `is_following`, `followers_of`,
+    // counters or visibility until accepted.
+    /// Record a pending request. `Conflict(ALREADY_FOLLOWING)` if an edge
+    /// exists, `Conflict(ALREADY_REQUESTED)` if a request exists.
+    fn request_follow(
+        &self,
+        follower_id: &str,
+        followee_id: &str,
+        with_replies: bool,
+        notify: Option<FollowNotify>,
+        jobs: Vec<NewJob>,
+    ) -> Result<FollowRequest, PortError> {
+        let _ = (follower_id, followee_id, with_replies, notify, jobs);
+        unimplemented!("FollowStore::request_follow not implemented")
+    }
+    fn get_follow_request(
+        &self,
+        follower_id: &str,
+        followee_id: &str,
+    ) -> Result<Option<FollowRequest>, PortError> {
+        let _ = (follower_id, followee_id);
+        Ok(None)
+    }
+    /// Pending requests addressed to `account_id`, ordered by follower id.
+    fn follow_requests_to(
+        &self,
+        account_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<FollowRequest>, PortError> {
+        let _ = (account_id, cursor, limit);
+        Ok(Vec::new())
+    }
+    /// Atomically delete the request, create the follow edge (counters
+    /// included) and enqueue `jobs`. `NotFound(NO_FOLLOW_REQUEST)` if
+    /// there is no request.
+    fn accept_follow_request(
+        &self,
+        follower_id: &str,
+        followee_id: &str,
+        jobs: Vec<NewJob>,
+    ) -> Result<Follow, PortError> {
+        let _ = (follower_id, followee_id, jobs);
+        unimplemented!("FollowStore::accept_follow_request not implemented")
+    }
+    /// Atomically delete the request (reject or cancel) and enqueue `jobs`.
+    /// `NotFound(NO_FOLLOW_REQUEST)` if there is no request.
+    fn remove_follow_request(
+        &self,
+        follower_id: &str,
+        followee_id: &str,
+        jobs: Vec<NewJob>,
+    ) -> Result<(), PortError> {
+        let _ = (follower_id, followee_id, jobs);
+        unimplemented!("FollowStore::remove_follow_request not implemented")
+    }
 }
 
 pub trait ReactionStore: Send + Sync {
@@ -390,6 +455,27 @@ pub trait ActivityDedup: Send + Sync {
             jobs,
         );
         unimplemented!("ActivityDedup::record_follow_activity not implemented")
+    }
+    /// Dedup + record a pending request from an inbound Follow to a locked
+    /// account. `Ok(None)` when the activity id was already seen.
+    fn record_follow_request_activity(
+        &self,
+        activity_id: &str,
+        follower_id: &str,
+        followee_id: &str,
+        with_replies: bool,
+        notify: Option<FollowNotify>,
+        jobs: Vec<NewJob>,
+    ) -> Result<Option<FollowRequest>, PortError> {
+        let _ = (
+            activity_id,
+            follower_id,
+            followee_id,
+            with_replies,
+            notify,
+            jobs,
+        );
+        unimplemented!("ActivityDedup::record_follow_request_activity not implemented")
     }
     fn record_unfollow_activity(
         &self,

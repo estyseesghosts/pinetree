@@ -4,6 +4,7 @@
 #[serde(rename_all = "camelCase")]
 pub enum NotificationKind {
     Follow,
+    ReceiveFollowRequest,
     Mention,
     Reply,
     Renote,

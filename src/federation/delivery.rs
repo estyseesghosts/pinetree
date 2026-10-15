@@ -277,6 +277,17 @@ pub struct SafeHttpClient {
 /// can assert on the real flags (rather than a copy). TLS certificate
 /// verification is always on: the list never contains `-k`/`--insecure`,
 /// regardless of `allow_private_ips` (which exempts SSRF checks only).
+///
+/// Framing: `--raw` disables curl's Transfer-Encoding decoding so
+/// `read_http_response` sees the real wire framing on both the plain-HTTP
+/// and curl-HTTPS paths (curl would otherwise de-chunk before our parser
+/// runs, double-decoding chunked bodies to empty/error).
+///
+/// Config isolation: `-q` ignores `~/.curlrc` (a local operator config must
+/// never change federation framing/TLS), and `--noproxy "*"` bypasses any
+/// proxy env (`http_proxy`/`https_proxy`/`all_proxy`). Proxies are NOT a
+/// supported config: federation pins DNS via `--resolve` to the
+/// SSRF-validated address, which a proxy would silently bypass.
 fn curl_args(
     method: &str,
     full_url: &str,
@@ -289,6 +300,10 @@ fn curl_args(
     let mut args = vec![
         "-sS".to_string(),
         "-i".to_string(),
+        "-q".to_string(),
+        "--noproxy".to_string(),
+        "*".to_string(),
+        "--raw".to_string(),
         "--http1.1".to_string(),
         "--max-redirs".to_string(),
         "0".to_string(),
@@ -523,65 +538,108 @@ fn read_http_response(
     final_url: &str,
 ) -> Result<SafeHttpResponse, String> {
     const MAX_HEADER_BYTES: usize = 32 * 1024;
+    const MAX_INTERIM_BLOCKS: usize = 8;
     let mut raw = Vec::with_capacity(4096);
     let mut chunk = [0u8; 4096];
-    let header_end: usize;
 
-    loop {
-        let n = reader
-            .read(&mut chunk)
-            .map_err(|e| format!("read response headers: {e}"))?;
-        if n == 0 {
-            return Err("unexpected EOF before HTTP response headers completed".to_string());
-        }
-        raw.extend_from_slice(&chunk[..n]);
-        if let Some(pos) = find_subslice(&raw, b"\r\n\r\n") {
-            header_end = pos + 4;
+    // Skip interim header blocks (1xx, plus proxy CONNECT
+    // `200 Connection established`) and return the final block.
+    let (status, headers, content_length, is_chunked, body_raw) = {
+        let mut final_block: Option<(u16, Vec<(String, String)>, Option<usize>, bool, Vec<u8>)> =
+            None;
+        for _ in 0..=MAX_INTERIM_BLOCKS {
+            let header_end: usize = loop {
+                let n = reader
+                    .read(&mut chunk)
+                    .map_err(|e| format!("read response headers: {e}"))?;
+                if n == 0 {
+                    // No more bytes: if we already buffered a terminator,
+                    // fall through to parse; otherwise the headers are
+                    // truncated.
+                    if let Some(pos) = find_subslice(&raw, b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                    return Err(
+                        "unexpected EOF before HTTP response headers completed".to_string()
+                    );
+                }
+                raw.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = find_subslice(&raw, b"\r\n\r\n") {
+                    break pos + 4;
+                }
+                if raw.len() > MAX_HEADER_BYTES {
+                    return Err("HTTP response headers exceeded 32 KiB limit".to_string());
+                }
+            };
+            // Enforce the per-block cap even when the whole block arrived
+            // in previously buffered bytes.
+            if header_end > MAX_HEADER_BYTES + 4 {
+                return Err("HTTP response headers exceeded 32 KiB limit".to_string());
+            }
+
+            let header_str = std::str::from_utf8(
+                raw.get(..header_end.saturating_sub(4)).ok_or(
+                    "HTTP response headers are not valid UTF-8".to_string(),
+                )?,
+            )
+            .map_err(|_| "HTTP response headers are not valid UTF-8".to_string())?;
+            let mut lines = header_str.split("\r\n");
+            let status_line = lines.next().ok_or("empty HTTP status line")?.to_string();
+            let mut status_parts = status_line.split_whitespace();
+            let _http_ver = status_parts.next().ok_or("malformed HTTP status line")?;
+            let status: u16 = status_parts
+                .next()
+                .ok_or("HTTP status line missing code")?
+                .parse()
+                .map_err(|_| format!("invalid HTTP status code in {status_line}"))?;
+
+            let mut headers = Vec::new();
+            let mut content_length: Option<usize> = None;
+            let mut is_chunked = false;
+            for line in lines {
+                if let Some((k, v)) = line.split_once(':') {
+                    let name = k.trim().to_string();
+                    let val = v.trim().to_string();
+                    if name.eq_ignore_ascii_case("content-length") {
+                        if let Ok(len) = val.parse::<usize>() {
+                            if len > max_body_bytes {
+                                return Err(format!(
+                                    "response Content-Length {len} exceeds limit {max_body_bytes}"
+                                ));
+                            }
+                            content_length = Some(len);
+                        }
+                    } else if name.eq_ignore_ascii_case("transfer-encoding")
+                        && val.to_ascii_lowercase().contains("chunked")
+                    {
+                        is_chunked = true;
+                    }
+                    headers.push((name, val));
+                }
+            }
+
+            // Interim blocks carry no body: discard the block and parse the
+            // next one from the already-buffered remainder.
+            let is_interim = (100..200).contains(&status)
+                || (status == 200
+                    && status_line
+                        .to_ascii_lowercase()
+                        .contains("connection established"));
+            if is_interim {
+                raw = raw.get(header_end..).unwrap_or(&[]).to_vec();
+                if raw.len() > MAX_HEADER_BYTES {
+                    return Err("HTTP response headers exceeded 32 KiB limit".to_string());
+                }
+                continue;
+            }
+
+            let body_raw = raw.get(header_end..).unwrap_or(&[]).to_vec();
+            final_block = Some((status, headers, content_length, is_chunked, body_raw));
             break;
         }
-        if raw.len() > MAX_HEADER_BYTES {
-            return Err("HTTP response headers exceeded 32 KiB limit".to_string());
-        }
-    }
-
-    let header_str = std::str::from_utf8(&raw[..header_end - 4])
-        .map_err(|_| "HTTP response headers are not valid UTF-8".to_string())?;
-    let mut lines = header_str.split("\r\n");
-    let status_line = lines.next().ok_or("empty HTTP status line")?;
-    let mut status_parts = status_line.split_whitespace();
-    let _http_ver = status_parts.next().ok_or("malformed HTTP status line")?;
-    let status: u16 = status_parts
-        .next()
-        .ok_or("HTTP status line missing code")?
-        .parse()
-        .map_err(|_| format!("invalid HTTP status code in {status_line}"))?;
-
-    let mut headers = Vec::new();
-    let mut content_length: Option<usize> = None;
-    let mut is_chunked = false;
-    for line in lines {
-        if let Some((k, v)) = line.split_once(':') {
-            let name = k.trim().to_string();
-            let val = v.trim().to_string();
-            if name.eq_ignore_ascii_case("content-length") {
-                if let Ok(len) = val.parse::<usize>() {
-                    if len > max_body_bytes {
-                        return Err(format!(
-                            "response Content-Length {len} exceeds limit {max_body_bytes}"
-                        ));
-                    }
-                    content_length = Some(len);
-                }
-            } else if name.eq_ignore_ascii_case("transfer-encoding")
-                && val.to_ascii_lowercase().contains("chunked")
-            {
-                is_chunked = true;
-            }
-            headers.push((name, val));
-        }
-    }
-
-    let mut body_raw = raw[header_end..].to_vec();
+        final_block.ok_or_else(|| "too many interim HTTP response header blocks".to_string())?
+    };
+    let mut body_raw = body_raw;
     if body_raw.len() > max_body_bytes + 512 && !is_chunked {
         return Err(format!(
             "response body exceeded max size of {max_body_bytes} bytes"
@@ -641,25 +699,92 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 fn decode_chunked(mut input: &[u8]) -> Result<Vec<u8>, String> {
+    let total_budget = input.len();
     let mut out = Vec::new();
+    let mut saw_terminal = false;
     loop {
-        let Some(crlf) = find_subslice(input, b"\r\n") else {
+        if input.is_empty() {
             break;
+        }
+        let Some(crlf) = find_subslice(input, b"\r\n") else {
+            return Err("truncated chunked body: size line without CRLF".to_string());
         };
-        let size_line = std::str::from_utf8(&input[..crlf])
+        let line_bytes = input
+            .get(..crlf)
+            .ok_or_else(|| "invalid chunk size line".to_string())?;
+        let size_line = std::str::from_utf8(line_bytes)
             .map_err(|_| "invalid chunk size line".to_string())?;
-        let hex_part = size_line.split(';').next().unwrap_or("").trim();
+        let (hex_raw, ext_raw) = match size_line.split_once(';') {
+            Some((h, e)) => (h, Some(e)),
+            None => (size_line, None),
+        };
+        let hex_part = hex_raw.trim();
+        if hex_part.is_empty() {
+            return Err("invalid chunk size: empty".to_string());
+        }
+        if !hex_part.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!("invalid chunk size: {hex_part}"));
+        }
+        // Chunk extensions (after ';') must be visible ASCII (plus SP/TAB);
+        // control bytes, DEL, or non-ASCII garbage are rejected.
+        if let Some(ext) = ext_raw {
+            if ext.is_empty() {
+                return Err("invalid chunk extension: empty".to_string());
+            }
+            for c in ext.chars() {
+                if c == '\t' || c == ' ' {
+                    continue;
+                }
+                if !c.is_ascii() || (c as u32) < 0x21 || (c as u32) > 0x7e {
+                    return Err("invalid chunk extension".to_string());
+                }
+            }
+        }
         let chunk_size = usize::from_str_radix(hex_part, 16)
             .map_err(|_| format!("invalid chunk size: {hex_part}"))?;
-        input = &input[crlf + 2..];
+        input = input
+            .get(crlf + 2..)
+            .ok_or_else(|| "truncated chunked body".to_string())?;
         if chunk_size == 0 {
+            saw_terminal = true;
             break;
         }
-        if input.len() < chunk_size + 2 {
+        // Overflow-safe framing: `chunk_size + 2` (data + trailing CRLF)
+        // must fit and be fully present in the remaining input. The decoded
+        // output can never exceed the encoded input length, so a chunk
+        // larger than the remaining budget is truncated/garbage.
+        let framed = chunk_size
+            .checked_add(2)
+            .ok_or_else(|| "invalid chunk size: overflow".to_string())?;
+        if framed > input.len() {
             return Err("truncated chunked body".to_string());
         }
-        out.extend_from_slice(&input[..chunk_size]);
-        input = &input[chunk_size + 2..];
+        if chunk_size > total_budget {
+            return Err("truncated chunked body".to_string());
+        }
+        let next_len = out
+            .len()
+            .checked_add(chunk_size)
+            .ok_or_else(|| "invalid chunk size: overflow".to_string())?;
+        if next_len > total_budget {
+            return Err("chunked body exceeds input budget".to_string());
+        }
+        let data = input
+            .get(..chunk_size)
+            .ok_or_else(|| "truncated chunked body".to_string())?;
+        let trailer = input
+            .get(chunk_size..framed)
+            .ok_or_else(|| "truncated chunked body".to_string())?;
+        if trailer != b"\r\n" {
+            return Err("invalid chunk trailer: missing CRLF".to_string());
+        }
+        out.extend_from_slice(data);
+        input = input
+            .get(framed..)
+            .ok_or_else(|| "truncated chunked body".to_string())?;
+    }
+    if !saw_terminal {
+        return Err("truncated chunked body: missing terminal chunk".to_string());
     }
     Ok(out)
 }
@@ -892,30 +1017,33 @@ pub fn upsert_remote_actor_from_doc(
         })?
     };
 
-    // Cache both `{actor}#main-key` and `{actor}/publickey` so signature
-    // lookups succeed without another roundtrip.
+    // Slice 3 (H5): run domain validation on the upsert path (both the
+    // freshly created and the previously stored account) before caching any
+    // key, so overlong or otherwise illegal inbox/URI/username values from
+    // the document are refused even if parsing ever let them through.
+    // (`PortError` is an alias for `DomainError`, so `?` preserves the
+    // `Validation` variant the slice asks to map to.)
+    account.validate()?;
+
+    // Slice 2 (C1): cache only the key id the actor document actually
+    // advertises. The old speculative `{actor}/publickey` alias wrote cache
+    // rows for key ids the actor never claimed, widening the poisoning
+    // surface; lookups for any other key-id shape refetch instead.
     services.cache_remote_public_key(
         &parsed.public_key_id,
         &parsed.uri,
         Some(account.id.clone()),
         &parsed.public_key_pem,
     )?;
-    let alt_key_id = format!("{}/publickey", parsed.uri.trim_end_matches('/'));
-    if alt_key_id != parsed.public_key_id {
-        services.cache_remote_public_key(
-            &alt_key_id,
-            &parsed.uri,
-            Some(account.id.clone()),
-            &parsed.public_key_pem,
-        )?;
-    }
 
     Ok((account, parsed))
 }
 
-/// Resolve a signer `keyId` to `(actor_uri, public_key_pem)`, consulting the
-/// local cache first and fetching the remote actor document on miss (or when
-/// `force_refresh` is true).
+/// Resolve a signer `keyId` to `(owner_actor_uri, public_key_pem)`,
+/// consulting the local cache first and fetching the remote actor document
+/// on miss (or when `force_refresh` is true). The returned URI is the key's
+/// owner: callers must compare the activity actor against it, never against
+/// a string derived from the keyId.
 pub fn resolve_remote_public_key(
     services: &AppServices,
     client: &SafeHttpClient,
@@ -929,6 +1057,15 @@ pub fn resolve_remote_public_key(
     }
     let actor_uri = actor_uri_from_key_id(key_id);
     let (_account, parsed) = fetch_and_upsert_remote_actor(services, client, &actor_uri)?;
+    // Slice 2 (C1): the fetched document must actually advertise the
+    // requested key id. Without this, a keyId naming one actor could
+    // resolve to a key owned by another.
+    if parsed.public_key_id.trim() != key_id.trim() {
+        return Err(PortError::Validation(format!(
+            "fetched publicKey id {} does not match requested key id {key_id}",
+            parsed.public_key_id
+        )));
+    }
     Ok((parsed.uri, parsed.public_key_pem))
 }
 
@@ -1114,5 +1251,65 @@ mod tests {
             .position(|a| a == "--max-redirs")
             .expect("curl GET args must cap redirects");
         assert_eq!(get_args[get_redirs + 1], "0");
+
+        // Slice 1 framing: curl must not de-chunk (our parser does), and
+        // operator config / proxy env must never change federation behavior
+        // (proxies are NOT a supported config: DNS is pinned via --resolve).
+        for (label, a) in [("POST", &args), ("GET", &get_args)] {
+            assert!(
+                a.iter().any(|x| x == "--raw"),
+                "{label} curl args must pass --raw so read_http_response sees real framing: {a:?}"
+            );
+            assert!(
+                a.iter().any(|x| x == "-q"),
+                "{label} curl args must pass -q to ignore .curlrc: {a:?}"
+            );
+            let noproxy_pos = a
+                .iter()
+                .position(|x| x == "--noproxy")
+                .expect("--noproxy must bypass proxy env");
+            assert_eq!(a[noproxy_pos + 1], "*");
+        }
+    }
+
+    #[test]
+    fn decode_chunked_hardening_rejects_garbage_without_panicking() {
+        // Overflow: 16 f's parse to u64::MAX; `+ 2` must be checked, not panic.
+        assert!(decode_chunked(b"ffffffffffffffff\r\n").is_err());
+        // Truncated body: declared 5, only 2 bytes present.
+        assert!(decode_chunked(b"5\r\nhe").is_err());
+        // Missing CRLF trailer after chunk data.
+        assert!(decode_chunked(b"5\r\nhelloXX0\r\n\r\n").is_err());
+        // Chunk-extension garbage with control bytes must be rejected.
+        assert!(decode_chunked(b"5;ext=\x01\x02\r\nhello\r\n0\r\n\r\n").is_err());
+        // Empty and invalid hex.
+        assert!(decode_chunked(b"\r\n\r\n").is_err());
+        assert!(decode_chunked(b"zz\r\nhello\r\n0\r\n\r\n").is_err());
+        // Missing terminal zero chunk is truncation, not a body.
+        assert!(decode_chunked(b"5\r\nhello\r\n").is_err());
+        // Valid chunked with a token extension still decodes.
+        let decoded = decode_chunked(b"5;ext=foo\r\nhello\r\n0\r\n\r\n")
+            .expect("valid token extension must decode");
+        assert_eq!(decoded, b"hello");
+    }
+
+    #[test]
+    fn read_http_response_skips_100_continue_and_decodes_chunked() {
+        let raw = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5;ext=foo\r\nhello\r\n0\r\n\r\n";
+        let mut cursor = std::io::Cursor::new(raw.to_vec());
+        let resp = read_http_response(&mut cursor, 65_536, "https://example.social/x")
+            .expect("100 Continue prefix must be skipped");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"hello");
+    }
+
+    #[test]
+    fn read_http_response_skips_proxy_connect_block() {
+        let raw = b"HTTP/1.1 200 Connection established\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        let mut cursor = std::io::Cursor::new(raw.to_vec());
+        let resp = read_http_response(&mut cursor, 65_536, "https://example.social/y")
+            .expect("proxy CONNECT block must be skipped");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"hello");
     }
 }

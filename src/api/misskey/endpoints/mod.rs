@@ -1808,6 +1808,62 @@ fn api_dispatch_blocking(
             .into_response())
         }
 
+        "following/requests/list" => {
+            check_allowed_fields(&obj, &["limit", "sinceId", "untilId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:account")?;
+            let reqs = state
+                .services
+                .follows
+                .follow_requests_to(&caller.account.id, None, 100)
+                .map_err(ApiError::from_port_error)?;
+            let now = state.services.clock.now_ms();
+            let mut out = Vec::new();
+            for r in reqs {
+                let (Some(f), Some(t)) = (
+                    state.services.accounts.find_by_id(&r.follower_id).map_err(ApiError::from_port_error)?,
+                    state.services.accounts.find_by_id(&r.followee_id).map_err(ApiError::from_port_error)?,
+                ) else {
+                    continue;
+                };
+                out.push(serde_json::json!({
+                    "id": r.id,
+                    "follower": pack_user_lite(&f, &state.services.public_url, now),
+                    "followee": pack_user_lite(&t, &state.services.public_url, now),
+                }));
+            }
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        "following/requests/accept" | "following/requests/reject" | "following/requests/cancel" => {
+            check_allowed_fields(&obj, &["userId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:following")?;
+            state.rate_limiter.check(&rate_key, endpoint.as_str())?;
+            let user_id = required_str(&obj, "userId")?;
+            let me = caller.account.id.clone();
+            match endpoint.as_str() {
+                "following/requests/accept" => state.services.accept_follow_request(&me, &user_id).map(|_| ()),
+                "following/requests/reject" => state.services.reject_follow_request(&me, &user_id),
+                _ => state.services.cancel_follow_request(&me, &user_id),
+            }
+            .map_err(ApiError::from_port_error)?;
+            state.worker.drain(64).map_err(ApiError::from_port_error)?;
+            if endpoint.as_str() == "following/requests/cancel" {
+                let followee = state
+                    .services
+                    .users_show_by_id(&user_id)
+                    .map_err(ApiError::from_port_error)?;
+                return Ok(Json(pack_user_lite(
+                    &followee,
+                    &state.services.public_url,
+                    state.services.clock.now_ms(),
+                ))
+                .into_response());
+            }
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
         "notes/timeline" => {
             check_allowed_fields(
                 &obj,

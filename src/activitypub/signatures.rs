@@ -312,6 +312,11 @@ fn split_quoted_commas(s: &str) -> Vec<String> {
 }
 
 /// Map `{actor}#main-key` and `{actor}/publickey` back to `{actor}`.
+///
+/// Slice 2 (C1): this is only a fetch locator (turning a keyId into the
+/// actor document to download). It must never be used as authority: inbox
+/// authentication compares `activity.actor` against the key's cached owner,
+/// and the fetched document's `publicKey.id` must equal the requested keyId.
 pub fn actor_uri_from_key_id(key_id: &str) -> String {
     if let Some((actor, _)) = key_id.split_once('#') {
         return actor.to_string();

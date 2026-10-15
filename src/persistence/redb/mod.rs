@@ -13,7 +13,7 @@ use crate::application::ports::{
     UpdateAccountPatch, MAX_JOB_ATTEMPTS,
 };
 use crate::domain::account::{validate_local_username, Account};
-use crate::domain::follow::{Follow, FollowNotify};
+use crate::domain::follow::{Follow, FollowNotify, FollowRequest};
 use crate::domain::id::{parse_aidx_time, AidxGenerator};
 use crate::domain::media::MediaMeta;
 use crate::domain::note::{extract_hashtags, extract_mentions, Note};
@@ -32,6 +32,10 @@ const FOLLOWS_FORWARD: TableDefinition<(&str, &str), &[u8]> =
     TableDefinition::new("follows_forward");
 const FOLLOWS_REVERSE: TableDefinition<(&str, &str), &[u8]> =
     TableDefinition::new("follows_reverse");
+const FOLLOW_REQ_FORWARD: TableDefinition<(&str, &str), &[u8]> =
+    TableDefinition::new("follow_requests_forward");
+const FOLLOW_REQ_REVERSE: TableDefinition<(&str, &str), &[u8]> =
+    TableDefinition::new("follow_requests_reverse");
 const REACTIONS: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new("reactions");
 const JOBS: TableDefinition<&str, &[u8]> = TableDefinition::new("jobs");
 const JOBS_DUE_INDEX: TableDefinition<(i64, &str), u8> = TableDefinition::new("jobs_due_index");
@@ -120,6 +124,8 @@ impl RedbStore {
         let _ = write_txn.open_table(NOTES_BY_AUTHOR).map_err(map_redb_err)?;
         let _ = write_txn.open_table(FOLLOWS_FORWARD).map_err(map_redb_err)?;
         let _ = write_txn.open_table(FOLLOWS_REVERSE).map_err(map_redb_err)?;
+        let _ = write_txn.open_table(FOLLOW_REQ_FORWARD).map_err(map_redb_err)?;
+        let _ = write_txn.open_table(FOLLOW_REQ_REVERSE).map_err(map_redb_err)?;
         let _ = write_txn.open_table(REACTIONS).map_err(map_redb_err)?;
         let _ = write_txn.open_table(JOBS).map_err(map_redb_err)?;
         let _ = write_txn.open_table(JOBS_DUE_INDEX).map_err(map_redb_err)?;
@@ -516,6 +522,79 @@ impl RedbStore {
         Ok(())
     }
 
+    /// Remove a pending request (both index rows). Returns whether one existed.
+    fn delete_follow_request_rows(
+        &self,
+        write_txn: &WriteTransaction,
+        follower_id: &str,
+        followee_id: &str,
+    ) -> Result<bool, PortError> {
+        let mut fwd = write_txn.open_table(FOLLOW_REQ_FORWARD).map_err(map_redb_err)?;
+        let mut rev = write_txn.open_table(FOLLOW_REQ_REVERSE).map_err(map_redb_err)?;
+        let existed = fwd
+            .remove((follower_id, followee_id))
+            .map_err(map_redb_err)?
+            .is_some();
+        rev.remove((followee_id, follower_id)).map_err(map_redb_err)?;
+        Ok(existed)
+    }
+
+    fn request_follow_in_txn(
+        &self,
+        write_txn: &WriteTransaction,
+        follower_id: &str,
+        followee_id: &str,
+        with_replies: bool,
+        notify: Option<FollowNotify>,
+        jobs: Vec<NewJob>,
+    ) -> Result<FollowRequest, PortError> {
+        if follower_id == followee_id {
+            return Err(PortError::Validation("FOLLOWEE_IS_YOURSELF".to_string()));
+        }
+        for job in &jobs {
+            job.validate()?;
+        }
+        let req = FollowRequest {
+            id: self.ids.generate(),
+            follower_id: follower_id.to_string(),
+            followee_id: followee_id.to_string(),
+            with_replies,
+            notify,
+        };
+        {
+            let accounts = write_txn.open_table(ACCOUNTS).map_err(map_redb_err)?;
+            let edges = write_txn.open_table(FOLLOWS_FORWARD).map_err(map_redb_err)?;
+            let mut fwd = write_txn.open_table(FOLLOW_REQ_FORWARD).map_err(map_redb_err)?;
+            let mut rev = write_txn.open_table(FOLLOW_REQ_REVERSE).map_err(map_redb_err)?;
+            for id in [follower_id, followee_id] {
+                if accounts.get(id).map_err(map_redb_err)?.is_none() {
+                    return Err(PortError::NotFound("NO_SUCH_USER".to_string()));
+                }
+            }
+            if edges
+                .get((follower_id, followee_id))
+                .map_err(map_redb_err)?
+                .is_some()
+            {
+                return Err(PortError::Conflict("ALREADY_FOLLOWING".to_string()));
+            }
+            if fwd
+                .get((follower_id, followee_id))
+                .map_err(map_redb_err)?
+                .is_some()
+            {
+                return Err(PortError::Conflict("ALREADY_REQUESTED".to_string()));
+            }
+            let bytes = encode_json(&req)?;
+            fwd.insert((follower_id, followee_id), bytes.as_slice())
+                .map_err(map_redb_err)?;
+            rev.insert((followee_id, follower_id), bytes.as_slice())
+                .map_err(map_redb_err)?;
+        }
+        self.enqueue_jobs_in_txn(write_txn, jobs, None)?;
+        Ok(req)
+    }
+
     fn follow_in_txn(
         &self,
         write_txn: &WriteTransaction,
@@ -540,6 +619,8 @@ impl RedbStore {
             notify,
         };
         follow.validate()?;
+        // An edge supersedes any pending request for the same pair.
+        self.delete_follow_request_rows(write_txn, follower_id, followee_id)?;
 
         {
             let mut accounts_table = write_txn.open_table(ACCOUNTS).map_err(map_redb_err)?;
@@ -602,12 +683,24 @@ impl RedbStore {
         for job in &jobs {
             job.validate()?;
         }
+        // Undo/cancel of a still-pending request removes the request instead.
+        let had_request = self.delete_follow_request_rows(write_txn, follower_id, followee_id)?;
 
         {
             let mut accounts_table = write_txn.open_table(ACCOUNTS).map_err(map_redb_err)?;
             let mut fwd_table = write_txn.open_table(FOLLOWS_FORWARD).map_err(map_redb_err)?;
             let mut rev_table = write_txn.open_table(FOLLOWS_REVERSE).map_err(map_redb_err)?;
 
+            if had_request
+                && fwd_table
+                    .get((follower_id, followee_id))
+                    .map_err(map_redb_err)?
+                    .is_none()
+            {
+                drop((accounts_table, fwd_table, rev_table));
+                self.enqueue_jobs_in_txn(write_txn, jobs, None)?;
+                return Ok(());
+            }
             if accounts_table
                 .get(followee_id)
                 .map_err(map_redb_err)?
@@ -1444,19 +1537,47 @@ impl JobQueue for RedbStore {
             }
 
             if let Some((old_due, job_id, mut job)) = candidate {
+                let was_leased = job.lease_expires.is_some();
                 let new_lease = now + lease_duration_ms.max(1);
                 due_table
                     .remove((old_due, job_id.as_str()))
                     .map_err(map_redb_err)?;
-                job.lease_expires = Some(new_lease);
-                let encoded = encode_json(&job)?;
-                jobs_table
-                    .insert(job.id.as_str(), encoded.as_slice())
-                    .map_err(map_redb_err)?;
-                due_table
-                    .insert((new_lease, job.id.as_str()), &1u8)
-                    .map_err(map_redb_err)?;
-                Some(job)
+                // Reclaiming an expired lease counts as an attempt: a job
+                // whose handler panicked/crashed without settling must burn
+                // retry budget instead of looping forever. Fresh jobs
+                // (`lease_expires == None`) must NOT increment.
+                let quarantined = if was_leased {
+                    job.attempts = job.attempts.saturating_add(1);
+                    if job.attempts >= MAX_JOB_ATTEMPTS {
+                        job.failed = true;
+                        job.fail_reason = Some("retry-exhausted".to_string());
+                        job.lease_expires = None;
+                        let encoded = encode_json(&job)?;
+                        jobs_table
+                            .insert(job.id.as_str(), encoded.as_slice())
+                            .map_err(map_redb_err)?;
+                        // No new due-index entry: quarantined jobs leave the
+                        // claimable set but stay inspectable via `get_job`.
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if quarantined {
+                    None
+                } else {
+                    job.lease_expires = Some(new_lease);
+                    let encoded = encode_json(&job)?;
+                    jobs_table
+                        .insert(job.id.as_str(), encoded.as_slice())
+                        .map_err(map_redb_err)?;
+                    due_table
+                        .insert((new_lease, job.id.as_str()), &1u8)
+                        .map_err(map_redb_err)?;
+                    Some(job)
+                }
             } else {
                 None
             }
@@ -1601,66 +1722,15 @@ impl FollowStore for RedbStore {
         notify: Option<FollowNotify>,
         jobs: Vec<NewJob>,
     ) -> Result<Follow, PortError> {
-        if follower_id == followee_id {
-            return Err(PortError::Validation("FOLLOWEE_IS_YOURSELF".to_string()));
-        }
-        for job in &jobs {
-            job.validate()?;
-        }
-
-        let follow = Follow {
-            id: self.ids.generate(),
-            follower_id: follower_id.to_string(),
-            followee_id: followee_id.to_string(),
+        let write_txn = self.begin_write()?;
+        let follow = self.follow_in_txn(
+            &write_txn,
+            follower_id,
+            followee_id,
             with_replies,
             notify,
-        };
-        follow.validate()?;
-
-        let write_txn = self.begin_write()?;
-        {
-            let mut accounts_table = write_txn.open_table(ACCOUNTS).map_err(map_redb_err)?;
-            let mut fwd_table = write_txn.open_table(FOLLOWS_FORWARD).map_err(map_redb_err)?;
-            let mut rev_table = write_txn.open_table(FOLLOWS_REVERSE).map_err(map_redb_err)?;
-
-            if fwd_table
-                .get((follower_id, followee_id))
-                .map_err(map_redb_err)?
-                .is_some()
-            {
-                return Err(PortError::Conflict("ALREADY_FOLLOWING".to_string()));
-            }
-
-            let mut follower: Account = match accounts_table.get(follower_id).map_err(map_redb_err)? {
-                Some(g) => decode_json(g.value())?,
-                None => return Err(PortError::NotFound("NO_SUCH_USER".to_string())),
-            };
-            let mut followee: Account = match accounts_table.get(followee_id).map_err(map_redb_err)? {
-                Some(g) => decode_json(g.value())?,
-                None => return Err(PortError::NotFound("NO_SUCH_USER".to_string())),
-            };
-
-            follower.following_count = follower.following_count.saturating_add(1);
-            followee.followers_count = followee.followers_count.saturating_add(1);
-
-            let follower_bytes = encode_json(&follower)?;
-            let followee_bytes = encode_json(&followee)?;
-            accounts_table
-                .insert(follower.id.as_str(), follower_bytes.as_slice())
-                .map_err(map_redb_err)?;
-            accounts_table
-                .insert(followee.id.as_str(), followee_bytes.as_slice())
-                .map_err(map_redb_err)?;
-
-            let follow_bytes = encode_json(&follow)?;
-            fwd_table
-                .insert((follower_id, followee_id), follow_bytes.as_slice())
-                .map_err(map_redb_err)?;
-            rev_table
-                .insert((followee_id, follower_id), follow_bytes.as_slice())
-                .map_err(map_redb_err)?;
-        }
-        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+            jobs,
+        )?;
         self.commit_write(write_txn)?;
         Ok(follow)
     }
@@ -1671,65 +1741,10 @@ impl FollowStore for RedbStore {
         followee_id: &str,
         jobs: Vec<NewJob>,
     ) -> Result<(), PortError> {
-        if follower_id == followee_id {
-            return Err(PortError::Validation("FOLLOWEE_IS_YOURSELF".to_string()));
-        }
-        for job in &jobs {
-            job.validate()?;
-        }
-
         let write_txn = self.begin_write()?;
-        {
-            let mut accounts_table = write_txn.open_table(ACCOUNTS).map_err(map_redb_err)?;
-            let mut fwd_table = write_txn.open_table(FOLLOWS_FORWARD).map_err(map_redb_err)?;
-            let mut rev_table = write_txn.open_table(FOLLOWS_REVERSE).map_err(map_redb_err)?;
-
-            if accounts_table
-                .get(followee_id)
-                .map_err(map_redb_err)?
-                .is_none()
-            {
-                return Err(PortError::NotFound("NO_SUCH_USER".to_string()));
-            }
-            if fwd_table
-                .remove((follower_id, followee_id))
-                .map_err(map_redb_err)?
-                .is_none()
-            {
-                return Err(PortError::Validation("NOT_FOLLOWING".to_string()));
-            }
-            rev_table
-                .remove((followee_id, follower_id))
-                .map_err(map_redb_err)?;
-
-            let follower_opt: Option<Account> =
-                match accounts_table.get(follower_id).map_err(map_redb_err)? {
-                    Some(g) => Some(decode_json(g.value())?),
-                    None => None,
-                };
-            if let Some(mut follower) = follower_opt {
-                follower.following_count = follower.following_count.saturating_sub(1);
-                let b = encode_json(&follower)?;
-                accounts_table
-                    .insert(follower.id.as_str(), b.as_slice())
-                    .map_err(map_redb_err)?;
-            }
-
-            let followee_opt: Option<Account> =
-                match accounts_table.get(followee_id).map_err(map_redb_err)? {
-                    Some(g) => Some(decode_json(g.value())?),
-                    None => None,
-                };
-            if let Some(mut followee) = followee_opt {
-                followee.followers_count = followee.followers_count.saturating_sub(1);
-                let b = encode_json(&followee)?;
-                accounts_table
-                    .insert(followee.id.as_str(), b.as_slice())
-                    .map_err(map_redb_err)?;
-            }
-        }
-        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
-        self.commit_write(write_txn)
+        self.unfollow_in_txn(&write_txn, follower_id, followee_id, jobs)?;
+        self.commit_write(write_txn)?;
+        Ok(())
     }
 
     fn is_following(&self, follower_id: &str, followee_id: &str) -> Result<bool, PortError> {
@@ -1811,6 +1826,114 @@ impl FollowStore for RedbStore {
             }
         }
         Ok(out)
+    }
+
+    fn request_follow(
+        &self,
+        follower_id: &str,
+        followee_id: &str,
+        with_replies: bool,
+        notify: Option<FollowNotify>,
+        jobs: Vec<NewJob>,
+    ) -> Result<FollowRequest, PortError> {
+        let write_txn = self.begin_write()?;
+        let req = self.request_follow_in_txn(
+            &write_txn,
+            follower_id,
+            followee_id,
+            with_replies,
+            notify,
+            jobs,
+        )?;
+        self.commit_write(write_txn)?;
+        Ok(req)
+    }
+
+    fn get_follow_request(
+        &self,
+        follower_id: &str,
+        followee_id: &str,
+    ) -> Result<Option<FollowRequest>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let t = read_txn.open_table(FOLLOW_REQ_FORWARD).map_err(map_redb_err)?;
+        match t.get((follower_id, followee_id)).map_err(map_redb_err)? {
+            Some(g) => Ok(Some(decode_json(g.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn follow_requests_to(
+        &self,
+        account_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<FollowRequest>, PortError> {
+        let limit = if limit == 0 { 100 } else { limit };
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let t = read_txn.open_table(FOLLOW_REQ_REVERSE).map_err(map_redb_err)?;
+        let start = cursor.unwrap_or("");
+        let mut out = Vec::new();
+        for entry in t
+            .range((account_id, start)..=(account_id, "\u{10ffff}"))
+            .map_err(map_redb_err)?
+        {
+            let (k, v) = entry.map_err(map_redb_err)?;
+            if Some(k.value().1) == cursor {
+                continue;
+            }
+            out.push(decode_json(v.value())?);
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    fn accept_follow_request(
+        &self,
+        follower_id: &str,
+        followee_id: &str,
+        jobs: Vec<NewJob>,
+    ) -> Result<Follow, PortError> {
+        let write_txn = self.begin_write()?;
+        let req: FollowRequest = {
+            let t = write_txn.open_table(FOLLOW_REQ_FORWARD).map_err(map_redb_err)?;
+            let got = t.get((follower_id, followee_id)).map_err(map_redb_err)?;
+            match got {
+                Some(g) => decode_json(g.value())?,
+                None => {
+                    return Err(PortError::NotFound("NO_FOLLOW_REQUEST".to_string()))
+                }
+            }
+        };
+        let follow = self.follow_in_txn(
+            &write_txn,
+            follower_id,
+            followee_id,
+            req.with_replies,
+            req.notify,
+            jobs,
+        )?;
+        self.commit_write(write_txn)?;
+        Ok(follow)
+    }
+
+    fn remove_follow_request(
+        &self,
+        follower_id: &str,
+        followee_id: &str,
+        jobs: Vec<NewJob>,
+    ) -> Result<(), PortError> {
+        for job in &jobs {
+            job.validate()?;
+        }
+        let write_txn = self.begin_write()?;
+        if !self.delete_follow_request_rows(&write_txn, follower_id, followee_id)? {
+            return Err(PortError::NotFound("NO_FOLLOW_REQUEST".to_string()));
+        }
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)?;
+        Ok(())
     }
 }
 
@@ -2039,6 +2162,32 @@ impl ActivityDedup for RedbStore {
         )?;
         self.commit_write(write_txn)?;
         Ok(Some(follow))
+    }
+
+    fn record_follow_request_activity(
+        &self,
+        activity_id: &str,
+        follower_id: &str,
+        followee_id: &str,
+        with_replies: bool,
+        notify: Option<FollowNotify>,
+        jobs: Vec<NewJob>,
+    ) -> Result<Option<FollowRequest>, PortError> {
+        let write_txn = self.begin_write()?;
+        if self.check_and_mark_dedup_in_txn(&write_txn, activity_id)? {
+            let _ = write_txn.abort();
+            return Ok(None);
+        }
+        let req = self.request_follow_in_txn(
+            &write_txn,
+            follower_id,
+            followee_id,
+            with_replies,
+            notify,
+            jobs,
+        )?;
+        self.commit_write(write_txn)?;
+        Ok(Some(req))
     }
 
     fn record_unfollow_activity(
