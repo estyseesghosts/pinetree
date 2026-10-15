@@ -24,5 +24,17 @@
   - [x] Slice 7 decoupling: grep shows zero `api::misskey` outside `src/api`
     (one allowed doc comment).
   - [x] Slice 8 visibility: decision logged, no code change.
-- Phase 3 entry gate: RUNNING at commit time (clean-clone `cargo test` +
-  `scripts/smoke-phase2.sh`); results appended in the gate-evidence commit.
+- Phase 3 entry gate: GREEN (2026-10-15, this tree at `c95dcf6`):
+  - clean-clone `cargo test` in `/tmp/opencode/phase25-gate`: 108 lib + 1
+    live `misskey-js` client-smoke + 35 conformance + 2 crash-recovery +
+    2 federation + 1 interop + 1 minrepro = 150/150, 0 failed. Prerequisite:
+    recreate the documented `misskey`/`sharkey` symlinks (AGENTS.md workspace
+    setup) — without them `client_smoke` fails (missing checkout) and the 6
+    packer snapshots skip. This settles Slice 1's open decision for the whole
+    repo: redb is pinned on crates.io (no extra step); reference checkouts are
+    the only extra clone step, already documented in AGENTS.md.
+  - `SHARKEY_NODE_BIN=/tmp/claude-0/node22/node-v22.23.3-linux-x64/bin
+    ./scripts/smoke-phase2.sh`: `INTEROP_OK` + `SMOKE_OK` (real Misskey
+    2026.10.1-alpha.0 + Sharkey 2025.4.7 + 2× pinetree; the trailing `Killed`
+    lines are the script's own teardown). System node is v24; Sharkey still
+    requires Node 22 (`engines` field) — same as Phase 2.

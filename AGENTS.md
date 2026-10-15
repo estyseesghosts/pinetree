@@ -12,7 +12,7 @@ Source of truth: `sns-server-proposal.md`. If this file and the proposal disagre
 
 Contracts are frozen (see `docs/README.md`); Phase 1 may scaffold the Rust crate from them. The throwaway conformance harness lives outside the repo at `/tmp/opencode/phase0-harness` — do not move it into `src/`.
 
-## Current phase: Phase 3 — Client compatibility and streaming (Phase 2 exited 2026-10-14; Phase 2.5 cleanup slices 0–8 landed 2026-10-15, entry gate verifying)
+## Current phase: Phase 3 — Client compatibility and streaming (Phase 2 exited 2026-10-14; Phase 2.5 cleanup slices 0–9 complete and gate-green 2026-10-15)
 
 Phase 0 exit: all boxes checked in `docs/phase-0-exit-criteria.md` — contracts frozen, note+job atomicity proven on an in-memory harness (15/15 green), FDB client verified live (7.3.77 cluster, crate 0.11.0/`fdb-7_3`, atomic pair + latencies + failure surface; see `docs/fdb-verification.md` §6).
 
