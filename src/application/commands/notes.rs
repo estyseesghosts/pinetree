@@ -18,10 +18,18 @@ impl AppServices {
         let reply_target = match input.reply_to.as_deref() {
             None => None,
             Some(id) => match self.notes.get_note(id)? {
-                None => {
-                    return Err(PortError::NotFound("NO_SUCH_REPLY_TARGET".to_string()));
+                // Missing and invisible targets are indistinguishable so a
+                // reply cannot probe for the existence of hidden notes (D8).
+                None => return Err(PortError::NotFound("NO_SUCH_NOTE".to_string())),
+                Some(note) => {
+                    let follows_author = note.author_id == input.author_id
+                        || self.follows.is_following(&input.author_id, &note.author_id)?;
+                    let viewer = ViewerContext::local_user(&input.author_id, follows_author);
+                    if note.is_deleted || !is_visible(&note, &viewer) {
+                        return Err(PortError::NotFound("NO_SUCH_NOTE".to_string()));
+                    }
+                    Some(note)
                 }
-                Some(note) => Some(note),
             },
         };
         let renote_target = match input.renote_of.as_deref() {
