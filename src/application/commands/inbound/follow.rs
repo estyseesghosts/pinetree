@@ -126,9 +126,12 @@ impl AppServices {
         }
     }
 
-    /// Record an inbound `Reject(Follow)`: dedup the Reject id, then
-    /// best-effort remove the follow edge. Returns `Ok(false)` only when the
-    /// Reject itself was already seen.
+    /// Record an inbound `Reject(Follow)`: atomically dedup the Reject id and
+    /// remove the follow edge in a single storage transaction, so a crash
+    /// between the two cannot leave the edge behind with the Reject marked
+    /// seen. Returns `Ok(false)` only when the Reject itself was already
+    /// seen. A missing follow edge still counts the Reject as seen
+    /// (`Ok(true)`).
     ///
     /// NOTE: the trailing `_with_replies` mirrors
     /// `handle_inbound_accept_follow` for call-site symmetry (the inbox
@@ -141,11 +144,13 @@ impl AppServices {
         followee_id: &str,
         _with_replies: bool,
     ) -> Result<bool, PortError> {
-        if self.dedup.check_and_record(activity_id)? {
-            return Ok(false);
-        }
-        match self.follows.unfollow(follower_id, followee_id, vec![]) {
-            Ok(()) => Ok(true),
+        match self.dedup.record_reject_follow_activity(
+            activity_id,
+            follower_id,
+            followee_id,
+            vec![],
+        ) {
+            Ok(v) => Ok(v),
             Err(PortError::Validation(msg)) if msg.contains("NOT_FOLLOWING") => Ok(true),
             Err(e) => Err(e),
         }

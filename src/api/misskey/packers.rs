@@ -857,6 +857,15 @@ mod tests {
         ) -> Result<Option<Note>, PortError> {
             Ok(None)
         }
+        fn record_reject_follow_activity(
+            &self,
+            _activity_id: &str,
+            _follower_id: &str,
+            _followee_id: &str,
+            _jobs: Vec<NewJob>,
+        ) -> Result<bool, PortError> {
+            Ok(false)
+        }
     }
 
     impl MediaStore for Mem {

@@ -1992,6 +1992,27 @@ impl ActivityDedup for RedbStore {
         Ok(true)
     }
 
+    fn record_reject_follow_activity(
+        &self,
+        activity_id: &str,
+        follower_id: &str,
+        followee_id: &str,
+        jobs: Vec<NewJob>,
+    ) -> Result<bool, PortError> {
+        let write_txn = self.begin_write()?;
+        if self.check_and_mark_dedup_in_txn(&write_txn, activity_id)? {
+            let _ = write_txn.abort();
+            return Ok(false);
+        }
+        match self.unfollow_in_txn(&write_txn, follower_id, followee_id, jobs) {
+            Ok(()) => {}
+            Err(PortError::Validation(msg)) if msg.contains("NOT_FOLLOWING") => {}
+            Err(e) => return Err(e),
+        }
+        self.commit_write(write_txn)?;
+        Ok(true)
+    }
+
     fn record_react_activity(
         &self,
         activity_id: &str,

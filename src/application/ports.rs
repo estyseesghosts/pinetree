@@ -326,9 +326,10 @@ pub trait ActivityDedup: Send + Sync {
     /// Forget a recorded activity id so a later delivery with the same id is
     /// processed again. Used when `Undo(Follow)` retracts a Follow whose id
     /// the sender reuses for every re-follow of the same pair (Misskey's
-    /// `/follows/{follower}/{followee}`). Default: no-op.
+    /// `/follows/{follower}/{followee}`). No silent default: backends and
+    /// test doubles must implement this explicitly.
     fn forget_activity(&self, _activity_id: &str) -> Result<(), PortError> {
-        Ok(())
+        unimplemented!("ActivityDedup::forget_activity not implemented")
     }
     fn record_note_activity(
         &self,
@@ -343,7 +344,7 @@ pub trait ActivityDedup: Send + Sync {
         jobs: Vec<NewJob>,
     ) -> Result<bool, PortError> {
         let _ = (activity_id, note_id, jobs);
-        Ok(false)
+        unimplemented!("ActivityDedup::record_delete_note_activity not implemented")
     }
     fn record_follow_activity(
         &self,
@@ -362,7 +363,7 @@ pub trait ActivityDedup: Send + Sync {
             notify,
             jobs,
         );
-        Ok(None)
+        unimplemented!("ActivityDedup::record_follow_activity not implemented")
     }
     fn record_unfollow_activity(
         &self,
@@ -372,8 +373,15 @@ pub trait ActivityDedup: Send + Sync {
         jobs: Vec<NewJob>,
     ) -> Result<bool, PortError> {
         let _ = (activity_id, follower_id, followee_id, jobs);
-        Ok(false)
+        unimplemented!("ActivityDedup::record_unfollow_activity not implemented")
     }
+    fn record_reject_follow_activity(
+        &self,
+        activity_id: &str,
+        follower_id: &str,
+        followee_id: &str,
+        jobs: Vec<NewJob>,
+    ) -> Result<bool, PortError>;
     fn record_react_activity(
         &self,
         activity_id: &str,
@@ -384,7 +392,7 @@ pub trait ActivityDedup: Send + Sync {
         jobs: Vec<NewJob>,
     ) -> Result<Option<Reaction>, PortError> {
         let _ = (activity_id, user_id, note_id, reaction, upsert, jobs);
-        Ok(None)
+        unimplemented!("ActivityDedup::record_react_activity not implemented")
     }
     fn record_unreact_activity(
         &self,
@@ -394,7 +402,7 @@ pub trait ActivityDedup: Send + Sync {
         jobs: Vec<NewJob>,
     ) -> Result<bool, PortError> {
         let _ = (activity_id, user_id, note_id, jobs);
-        Ok(false)
+        unimplemented!("ActivityDedup::record_unreact_activity not implemented")
     }
     fn record_update_account_activity(
         &self,
@@ -404,7 +412,7 @@ pub trait ActivityDedup: Send + Sync {
         jobs: Vec<NewJob>,
     ) -> Result<Option<Account>, PortError> {
         let _ = (activity_id, account_id, patch, jobs);
-        Ok(None)
+        unimplemented!("ActivityDedup::record_update_account_activity not implemented")
     }
 }
 
@@ -567,6 +575,16 @@ impl ActivityDedup for NoopActivityDedup {
         _jobs: Vec<NewJob>,
     ) -> Result<Option<Note>, PortError> {
         Ok(None)
+    }
+
+    fn record_reject_follow_activity(
+        &self,
+        _activity_id: &str,
+        _follower_id: &str,
+        _followee_id: &str,
+        _jobs: Vec<NewJob>,
+    ) -> Result<bool, PortError> {
+        Ok(false)
     }
 }
 

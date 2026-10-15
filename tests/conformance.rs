@@ -1017,6 +1017,121 @@ fn d3_concurrent_duplicates() {
     );
 }
 
+/// D4 normal path (generic over the store backend so FDB inherits it):
+/// first Reject removes the edge (`Ok(true)`), redelivery is a no-op
+/// (`Ok(false)`), and rejecting a missing edge still counts as seen
+/// (`Ok(true)`).
+fn case_d4_reject_follow<S: ConformanceStore>(store: &S) {
+    let alice = create_user(store, "alice");
+    let bob = create_user(store, "bob");
+    store
+        .follow(&alice.id, &bob.id, false, None, vec![])
+        .expect("follow");
+    assert!(
+        store.is_following(&alice.id, &bob.id).expect("is_following"),
+        "edge exists before the Reject"
+    );
+
+    // First delivery removes the edge.
+    assert_eq!(
+        store
+            .record_reject_follow_activity("activity:d4:1", &alice.id, &bob.id, vec![])
+            .expect("first reject"),
+        true,
+        "first Reject removes the edge"
+    );
+    assert!(
+        !store.is_following(&alice.id, &bob.id).expect("is_following"),
+        "edge is gone after the Reject"
+    );
+
+    // Redelivery of the same Reject id is a silent no-op.
+    assert_eq!(
+        store
+            .record_reject_follow_activity("activity:d4:1", &alice.id, &bob.id, vec![])
+            .expect("redelivery"),
+        false,
+        "redelivery observes already-seen"
+    );
+    assert!(
+        !store.is_following(&alice.id, &bob.id).expect("is_following"),
+        "edge stays gone after redelivery"
+    );
+
+    // Reject of a missing edge still counts the Reject as seen.
+    assert_eq!(
+        store
+            .record_reject_follow_activity("activity:d4:2", &alice.id, &bob.id, vec![])
+            .expect("reject of non-edge"),
+        true,
+        "Reject of a non-edge still returns Ok(true)"
+    );
+}
+
+#[test]
+fn d4_reject_follow() {
+    let factory = RedbFactory::fresh("d4");
+    let clock = test_clock();
+    let store = factory.open(clock);
+    case_d4_reject_follow(&*store);
+}
+
+/// D4 atomicity under injected crash (redb-specific, d2 style): abort before
+/// commit persists no dedup mark, no unfollow, and no job; the retry then
+/// removes the edge and redelivery is a no-op.
+#[test]
+fn d4_reject_follow_atomicity() {
+    let factory = RedbFactory::fresh("d4-atomic");
+    let clock = test_clock();
+    let store = factory.open(clock.clone());
+    let alice = create_user(&*store, "alice");
+    let bob = create_user(&*store, "bob");
+    store
+        .follow(&alice.id, &bob.id, false, None, vec![])
+        .expect("follow");
+
+    // Crashed-before-commit attempt persists nothing.
+    store.set_abort_before_commit(true);
+    let err = store
+        .record_reject_follow_activity(
+            "activity:d4a:1",
+            &alice.id,
+            &bob.id,
+            vec![streaming_job(&clock, "d4a:job")],
+        )
+        .expect_err("injected abort must fail");
+    assert!(
+        matches!(err, PortError::StorageUnavailable(_)),
+        "got {err:?}"
+    );
+    assert!(
+        store.is_following(&alice.id, &bob.id).expect("is_following"),
+        "crashed attempt removed no edge"
+    );
+    assert_eq!(store.pending_count().expect("count"), 0);
+
+    // The dedup mark rolled back too: the retry is treated as new and wins.
+    store.set_abort_before_commit(false);
+    assert_eq!(
+        store
+            .record_reject_follow_activity("activity:d4a:1", &alice.id, &bob.id, vec![])
+            .expect("retry"),
+        true,
+        "retry after the crash removes the edge"
+    );
+    assert!(
+        !store.is_following(&alice.id, &bob.id).expect("is_following"),
+        "edge is gone after the retry"
+    );
+    assert_eq!(
+        store
+            .record_reject_follow_activity("activity:d4a:1", &alice.id, &bob.id, vec![])
+            .expect("redelivery"),
+        false,
+        "redelivery observes already-seen"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Group E — visibility agreement
 // ---------------------------------------------------------------------------
