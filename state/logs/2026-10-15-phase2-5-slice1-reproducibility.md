@@ -1,0 +1,8 @@
+# 2026-10-15 — Phase 2.5 Slice 1: Repo reproducibility
+
+- `.gitignore` anchored: `foundationdb/`, `redb/`, `misskey`, `sharkey`, `target/`, `data/` → `/foundationdb/`, `/redb/`, `/misskey`, `/sharkey`, `/target/`, `/data/`. Unrelated entries (`libfdb_c*.so`, `repo.zip`, `.claude/settings.local.json`) kept.
+- Before: `src/api/misskey/*`, `src/persistence/redb/mod.rs`, `src/persistence/foundationdb/mod.rs` were `!!` (ignored) and untracked — `git ls-files --cached` lacked them. After anchoring they are `??` (not ignored); staged all nine:
+  - `src/api/misskey/auth.rs`, `src/api/misskey/endpoints/mod.rs`, `src/api/misskey/errors.rs`, `src/api/misskey/mod.rs`, `src/api/misskey/packers.rs`, `src/api/misskey/request.rs`, `src/api/misskey/response.rs` (seven), plus `src/persistence/redb/mod.rs` and `src/persistence/foundationdb/mod.rs` (empty module).
+- `redb` dependency: `Cargo.toml` `redb = { path = "redb" }` (root checkout, git-ignored, version 4.4.0) → `redb = "4.4.0"` from crates.io, per the doc's recommended default. `Cargo.lock` now records `source = "registry+https://github.com/rust-lang/crates.io-index"` + checksum `39178e0a…`.
+- Verification: `cargo test --lib` green (113 passed) after the switch; full `cargo test` green (113 lib + 1 client-smoke + 27 conformance + 2 crash-recovery + 2 federation + 1 interop + 1 minrepro, 0 failed); `git status --ignored` shows no source files ignored; clean-clone `cargo test` runs after this commit (see Slice 9 gate).
+- Open: `docs/phase2-5.md` itself remains untracked (`??`) — intentionally left for the Slice 9 docs commit so Slice 1 verification ("same tests green") is unaffected.
