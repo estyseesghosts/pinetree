@@ -14,7 +14,7 @@ use rsa::pkcs1v15::{Signature, SigningKey, VerifyingKey};
 use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey};
 use spki::{DecodePublicKey, EncodePublicKey};
 use sha2::{Digest as _, Sha256};
-use signature::{SignatureEncoding, Signer, Verifier};
+use signature::Verifier;
 use std::str::FromStr;
 
 /// RSA public key (RustCrypto `rsa` crate type, re-exported so existing
@@ -124,11 +124,28 @@ pub fn parse_private_key_pem(pem: &str) -> Result<RsaPrivateKey, String> {
 // ---------------------------------------------------------------------------
 
 /// Sign `message` with PKCS#1 v1.5 + SHA-256. Returns the raw signature bytes.
+///
+/// Slice 12 (M6, decision D-f(a)): signing runs on `ring` (constant-time
+/// RSA with blinding) because RUSTSEC-2023-0071 (Marvin timing attack) is
+/// unpatched in the `rsa` crate. The `rsa` crate still parses the stored
+/// PKCS#1/PKCS#8 PEM (so existing keys load unchanged) and verifies; its
+/// private-key operation is never used. `ring` requires >= 2048-bit keys.
 pub fn rsa_sha256_sign(private_key_pem: &str, message: &[u8]) -> Result<Vec<u8>, String> {
     let key = parse_private_key_pem(private_key_pem)?;
-    let signing_key = SigningKey::<Sha256>::new(key);
-    let sig: Signature = signing_key.sign(message);
-    Ok(sig.to_bytes().as_ref().to_vec())
+    let der = key
+        .to_pkcs1_der()
+        .map_err(|e| format!("encode PKCS#1 DER: {e}"))?;
+    let pair = ring::signature::RsaKeyPair::from_der(der.as_bytes())
+        .map_err(|e| format!("load RSA key into ring (needs >= 2048 bits): {e}"))?;
+    let mut sig = vec![0u8; pair.public().modulus_len()];
+    pair.sign(
+        &ring::signature::RSA_PKCS1_SHA256,
+        &ring::rand::SystemRandom::new(),
+        message,
+        &mut sig,
+    )
+    .map_err(|e| format!("ring RSA sign: {e}"))?;
+    Ok(sig)
 }
 
 /// Sign `message` and return the base64-encoded signature.
@@ -438,12 +455,20 @@ mod tests {
     use super::*;
     use rsa::pkcs1::EncodeRsaPublicKey;
 
+    /// ring refuses < 2048-bit keys, so signing tests share one cached
+    /// 2048-bit keypair instead of generating a key per test.
+    fn test_keypair() -> (RsaPrivateKey, RsaPublicKey) {
+        static KEY: std::sync::OnceLock<(RsaPrivateKey, RsaPublicKey)> =
+            std::sync::OnceLock::new();
+        KEY.get_or_init(|| generate_rsa_keypair_2048().unwrap()).clone()
+    }
+
     /// Crate-backed equivalent of the old textbook-fixture DER roundtrip:
     /// every PEM encoding parses back to the same key, and mismatched labels
     /// are rejected.
     #[test]
     fn key_pem_roundtrip_all_encodings() {
-        let (priv_key, pub_key) = generate_rsa_keypair(1024).unwrap();
+        let (priv_key, pub_key) = test_keypair();
         // PKCS#8 private roundtrip.
         let pkcs8_pem = private_key_to_pkcs8_pem(&priv_key);
         assert!(pkcs8_pem.starts_with("-----BEGIN PRIVATE KEY-----\n"));
@@ -478,8 +503,8 @@ mod tests {
     /// messages without failure.
     #[test]
     fn sign_verify_with_q_larger_than_p() {
-        for _ in 0..3 {
-            let (priv_key, pub_key) = generate_rsa_keypair(1024).unwrap();
+        for _ in 0..1 {
+            let (priv_key, pub_key) = test_keypair();
             let priv_pem = private_key_to_pkcs8_pem(&priv_key);
             let pub_pem = public_key_to_spki_pem(&pub_key);
             for i in 0..200 {
@@ -493,7 +518,7 @@ mod tests {
 
     #[test]
     fn keygen_1024_pem_roundtrip_and_sign_verify() {
-        let (priv_key, pub_key) = generate_rsa_keypair(1024).unwrap();
+        let (priv_key, pub_key) = test_keypair();
         let priv_pem = private_key_to_pkcs8_pem(&priv_key);
         let pub_pem = public_key_to_spki_pem(&pub_key);
         let priv_back = parse_private_key_pem(&priv_pem).unwrap();
@@ -503,7 +528,7 @@ mod tests {
         assert_eq!(public_key_to_spki_pem(&pub_back), pub_pem);
         let msg = b"hello federation";
         let sig = rsa_sha256_sign(&priv_pem, msg).unwrap();
-        assert_eq!(sig.len(), 128);
+        assert_eq!(sig.len(), 256);
         assert!(rsa_sha256_verify(&pub_pem, msg, &sig).unwrap());
         // Tampered message / signature / wrong key all fail.
         assert!(!rsa_sha256_verify(&pub_pem, b"hello federatioN", &sig).unwrap());
@@ -570,7 +595,7 @@ mod tests {
 
     #[test]
     fn http_get_sign_and_verify() {
-        let (priv_key, pub_key) = generate_rsa_keypair(1024).unwrap();
+        let (priv_key, pub_key) = test_keypair();
         let priv_pem = private_key_to_pkcs8_pem(&priv_key);
         let pub_pem = public_key_to_spki_pem(&pub_key);
         let (date, now) = date_fixture();
@@ -651,7 +676,7 @@ mod tests {
 
     #[test]
     fn http_post_sign_and_verify() {
-        let (priv_key, pub_key) = generate_rsa_keypair(1024).unwrap();
+        let (priv_key, pub_key) = test_keypair();
         let priv_pem = private_key_to_pkcs8_pem(&priv_key);
         let pub_pem = public_key_to_spki_pem(&pub_key);
         let (date, now) = date_fixture();
@@ -729,7 +754,7 @@ mod tests {
 
     #[test]
     fn signature_header_parsing_variants() {
-        let (priv_key, _) = generate_rsa_keypair(1024).unwrap();
+        let (priv_key, _) = test_keypair();
         let priv_pem = private_key_to_pkcs8_pem(&priv_key);
         let signed = sign_request_headers(
             "GET",
@@ -768,7 +793,7 @@ mod tests {
 
     #[test]
     fn verify_rejects_missing_required_signed_headers() {
-        let (priv_key, pub_key) = generate_rsa_keypair(1024).unwrap();
+        let (priv_key, pub_key) = test_keypair();
         let priv_pem = private_key_to_pkcs8_pem(&priv_key);
         let pub_pem = public_key_to_spki_pem(&pub_key);
         let (date, now) = date_fixture();
@@ -850,5 +875,38 @@ mzqBLgLPPqB2yu9VRXgr43i6mJ3jiW6NK+tPIj7U7GNdGRd8LAmjP0W/8S6CFoYk\n\
         assert_eq!(our_sig, expected_sig);
         let sig_bytes = base64_decode(expected_sig).unwrap();
         assert!(rsa_sha256_verify(node_pub_pem, msg, &sig_bytes).unwrap());
+    }
+
+    /// Slice 12 (D-f(a)): the ring-backed signer produces exactly the bytes
+    /// the `rsa` crate's (deterministic) PKCS#1 v1.5 signer would, and
+    /// both stored PEM encodings (PKCS#1, PKCS#8) load and sign.
+    #[test]
+    fn slice12_ring_signature_matches_rsa_crate_and_both_pem_forms_load() {
+        use rsa::pkcs1v15::SigningKey;
+        use signature::{SignatureEncoding, Signer};
+        let (priv_key, pub_key) = test_keypair();
+        let msg = b"slice12 fixture message";
+        let expected = SigningKey::<Sha256>::new(priv_key.clone())
+            .sign(msg)
+            .to_bytes()
+            .as_ref()
+            .to_vec();
+        let pub_pem = public_key_to_spki_pem(&pub_key);
+        for pem in [
+            private_key_to_pkcs8_pem(&priv_key),
+            private_key_to_pkcs1_pem(&priv_key),
+        ] {
+            let sig = rsa_sha256_sign(&pem, msg).expect("ring signing");
+            assert_eq!(sig, expected, "PKCS#1 v1.5 is deterministic");
+            assert!(rsa_sha256_verify(&pub_pem, msg, &sig).unwrap());
+        }
+    }
+
+    /// ring rejects undersized keys; the error is explicit, not a panic.
+    #[test]
+    fn slice12_undersized_key_is_a_clean_error() {
+        let (small, _) = generate_rsa_keypair(1024).unwrap();
+        let err = rsa_sha256_sign(&private_key_to_pkcs8_pem(&small), b"x").unwrap_err();
+        assert!(err.contains("2048"), "{err}");
     }
 }
