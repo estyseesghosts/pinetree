@@ -16,7 +16,15 @@ use crate::application::ports::Clock;
 
 pub use super::request::check_allowed_fields;
 
+const MINUTE_MS: u64 = 60_000;
 const HOUR_MS: u64 = 3_600_000;
+
+/// Slice 9 (H4): progressive delay after failed auth attempts. The delay
+/// before the next attempt is `AUTH_BACKOFF_BASE_MS` after the first
+/// failure in a window, doubling per further failure, capped at
+/// [`AUTH_BACKOFF_CAP_MS`].
+pub const AUTH_BACKOFF_BASE_MS: u64 = 1_000;
+pub const AUTH_BACKOFF_CAP_MS: u64 = 60_000;
 
 /// Configured limits for one endpoint bucket.
 #[derive(Debug, Clone, Copy)]
@@ -33,11 +41,28 @@ struct BucketState {
     last_ms: Option<i64>,
 }
 
+/// Failure-counted throttle for one auth bucket: a per-account limit and a
+/// per-IP limit, each a fixed window of *failed* attempts.
+#[derive(Debug, Clone, Copy)]
+pub struct AuthLimit {
+    pub account: BucketLimit,
+    pub ip: BucketLimit,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FailureState {
+    window_start_ms: i64,
+    failures: u64,
+    last_failure_ms: i64,
+}
+
 /// Fixed-window rate limiter keyed by `(account_id_or_ip, endpoint_bucket)`.
 pub struct RateLimiter {
     clock: Arc<dyn Clock>,
     limits: HashMap<String, BucketLimit>,
     state: Mutex<HashMap<(String, String), BucketState>>,
+    auth_limits: HashMap<String, AuthLimit>,
+    failures: Mutex<HashMap<(String, String), FailureState>>,
 }
 
 impl RateLimiter {
@@ -46,12 +71,14 @@ impl RateLimiter {
             clock,
             limits: HashMap::new(),
             state: Mutex::new(HashMap::new()),
+            auth_limits: HashMap::new(),
+            failures: Mutex::new(HashMap::new()),
         }
     }
 
     /// Misskey Phase 1 defaults (`docs/endpoint-manifest.md` §7 plus the
     /// `notes/reactions/delete` 60/h + 3 s and `drive/files/create` 120/h
-    /// buckets from `docs/phase-1-plan.md`).
+    /// buckets from `docs/phase-1-plan.md`), plus the slice 9 auth buckets.
     pub fn with_misskey_defaults(clock: Arc<dyn Clock>) -> Self {
         Self::new(clock)
             .with_limit("i/update", 20, HOUR_MS, None)
@@ -61,6 +88,101 @@ impl RateLimiter {
             .with_limit("following/delete", 100, HOUR_MS, None)
             .with_limit("notes/reactions/delete", 60, HOUR_MS, Some(3_000))
             .with_limit("drive/files/create", 120, HOUR_MS, None)
+            // Every signup attempt from one IP counts (see `check`).
+            .with_limit("auth/signup", 20, HOUR_MS, None)
+            // MiAuth check polls: every request counts per IP.
+            .with_limit("auth/miauth-check", 600, MINUTE_MS, None)
+            // Failed signin attempts: 10 per account and 30 per IP per minute.
+            .with_auth_limit("auth/signin", 10, 30, MINUTE_MS)
+            .with_auth_limit("auth/miauth", 10, 30, MINUTE_MS)
+    }
+
+    /// Failure-counted auth bucket: at most `max_per_account` failures per
+    /// account key and `max_per_ip` per IP key within `window_ms`.
+    pub fn with_auth_limit(
+        mut self,
+        bucket: impl Into<String>,
+        max_per_account: u64,
+        max_per_ip: u64,
+        window_ms: u64,
+    ) -> Self {
+        let limit = |max_per_window| BucketLimit {
+            max_per_window,
+            window_ms,
+            min_interval_ms: None,
+        };
+        self.auth_limits.insert(
+            bucket.into(),
+            AuthLimit {
+                account: limit(max_per_account),
+                ip: limit(max_per_ip),
+            },
+        );
+        self
+    }
+
+    /// Refuse an auth attempt before any credential check. Only failures are
+    /// counted, so a successful signin is never blocked by earlier successes.
+    /// Blocked when either key is over its window cap or still inside its
+    /// progressive delay. No lockout: every block expires with the window or
+    /// the delay. Buckets without an auth limit always pass.
+    pub fn check_auth_failures(
+        &self,
+        bucket: &str,
+        account_key: &str,
+        ip_key: &str,
+    ) -> Result<(), ApiError> {
+        let limit = match self.auth_limits.get(bucket) {
+            None => return Ok(()),
+            Some(limit) => *limit,
+        };
+        let now = self.clock.now_ms();
+        let states = self.failures.lock().unwrap_or_else(|e| e.into_inner());
+        let account = failure_retry_secs(
+            states.get(&(account_key.to_string(), bucket.to_string())).copied(),
+            limit.account,
+            now,
+        );
+        let ip = failure_retry_secs(
+            states.get(&(ip_key.to_string(), bucket.to_string())).copied(),
+            limit.ip,
+            now,
+        );
+        match account.into_iter().chain(ip).max() {
+            Some(retry_secs) => Err(ApiError::rate_limit_exceeded(retry_secs)),
+            None => Ok(()),
+        }
+    }
+
+    /// Count one failed auth attempt against both the account and IP keys.
+    pub fn record_auth_failure(&self, bucket: &str, account_key: &str, ip_key: &str) {
+        let limit = match self.auth_limits.get(bucket) {
+            None => return,
+            Some(limit) => *limit,
+        };
+        let now = self.clock.now_ms();
+        let mut states = self.failures.lock().unwrap_or_else(|e| e.into_inner());
+        for (key, bucket_limit) in [(account_key, limit.account), (ip_key, limit.ip)] {
+            let entry_key = (key.to_string(), bucket.to_string());
+            let next = match states.get(&entry_key).copied() {
+                Some(state)
+                    if (now.saturating_sub(state.window_start_ms) as u64)
+                        < bucket_limit.window_ms =>
+                {
+                    FailureState {
+                        window_start_ms: state.window_start_ms,
+                        failures: state.failures + 1,
+                        last_failure_ms: now,
+                    }
+                }
+                _ => FailureState {
+                    window_start_ms: now,
+                    failures: 1,
+                    last_failure_ms: now,
+                },
+            };
+            states.insert(entry_key, next);
+        }
     }
 
     pub fn with_limit(
@@ -127,6 +249,33 @@ impl RateLimiter {
 
 fn ceil_secs(ms: u64) -> u64 {
     ms.div_ceil(1000).max(1)
+}
+
+/// Progressive delay after `failures` (>= 1) failed attempts in a window.
+fn auth_backoff_ms(failures: u64) -> u64 {
+    let shift = failures.saturating_sub(1).min(16);
+    (AUTH_BACKOFF_BASE_MS << shift).min(AUTH_BACKOFF_CAP_MS)
+}
+
+/// Retry hint in seconds for one failure-counted key, or `None` when the key
+/// may attempt now: its window has expired, or it is under the cap and past
+/// its progressive delay.
+fn failure_retry_secs(state: Option<FailureState>, limit: BucketLimit, now: i64) -> Option<u64> {
+    let state = state?;
+    let window_end = state.window_start_ms.saturating_add(limit.window_ms as i64);
+    if now >= window_end {
+        return None;
+    }
+    if state.failures >= limit.max_per_window {
+        return Some(ceil_secs((window_end - now) as u64));
+    }
+    let backoff = auth_backoff_ms(state.failures);
+    let elapsed = now.saturating_sub(state.last_failure_ms).max(0) as u64;
+    if elapsed < backoff {
+        Some(ceil_secs(backoff - elapsed))
+    } else {
+        None
+    }
 }
 
 /// Slice 6 (H1, decision D-c): concurrent-upload slots for
@@ -259,5 +408,66 @@ mod tests {
         let err = slots.acquire("2.2.2.2").unwrap_err();
         assert_eq!(err.code, "RATE_LIMIT_EXCEEDED");
         assert_eq!(err.http_status, 429);
+    }
+
+    fn auth_limiter_at(now_ms: i64) -> (RateLimiter, Arc<ManualClock>) {
+        let clock = Arc::new(ManualClock::new(now_ms));
+        // 3 failures per account and 5 per IP within 60 s.
+        let limiter =
+            RateLimiter::new(clock.clone()).with_auth_limit("auth/signin", 3, 5, 60_000);
+        (limiter, clock)
+    }
+
+    #[test]
+    fn slice9_auth_failures_backoff_then_count_cap_then_window_expiry() {
+        let (limiter, clock) = auth_limiter_at(0);
+        let (acct, ip) = ("acct:alice", "ip:1.1.1.1");
+        assert!(limiter.check_auth_failures("auth/signin", acct, ip).is_ok());
+        // Failure 1 (t=0): progressive delay of 1 s before the next attempt.
+        limiter.record_auth_failure("auth/signin", acct, ip);
+        let err = limiter
+            .check_auth_failures("auth/signin", acct, ip)
+            .unwrap_err();
+        assert_eq!(err.code, "RATE_LIMIT_EXCEEDED");
+        assert_eq!(err.http_status, 429);
+        clock.advance_ms(1_000);
+        // Failure 2 (t=1 s): the delay doubles to 2 s.
+        assert!(limiter.check_auth_failures("auth/signin", acct, ip).is_ok());
+        limiter.record_auth_failure("auth/signin", acct, ip);
+        assert!(limiter.check_auth_failures("auth/signin", acct, ip).is_err());
+        clock.advance_ms(2_000);
+        // Failure 3 (t=3 s) reaches the per-account cap of 3.
+        assert!(limiter.check_auth_failures("auth/signin", acct, ip).is_ok());
+        limiter.record_auth_failure("auth/signin", acct, ip);
+        clock.advance_ms(30_000);
+        assert!(
+            limiter.check_auth_failures("auth/signin", acct, ip).is_err(),
+            "count cap holds until the window ends"
+        );
+        // The window expires at 60 s: no lockout beyond the window.
+        clock.advance_ms(30_000);
+        assert!(limiter.check_auth_failures("auth/signin", acct, ip).is_ok());
+    }
+
+    #[test]
+    fn slice9_many_accounts_from_one_ip_trip_the_ip_bucket() {
+        let (limiter, clock) = auth_limiter_at(0);
+        for n in 0..5 {
+            limiter.record_auth_failure("auth/signin", &format!("acct:user{n}"), "ip:2.2.2.2");
+        }
+        // A fresh account from the same IP is refused although it has no
+        // failures of its own.
+        let err = limiter
+            .check_auth_failures("auth/signin", "acct:fresh", "ip:2.2.2.2")
+            .unwrap_err();
+        assert_eq!(err.code, "RATE_LIMIT_EXCEEDED");
+        // Other IPs are unaffected.
+        assert!(limiter
+            .check_auth_failures("auth/signin", "acct:fresh", "ip:3.3.3.3")
+            .is_ok());
+        clock.advance_ms(60_000);
+        assert!(limiter
+            .check_auth_failures("auth/signin", "acct:fresh", "ip:2.2.2.2")
+            .is_ok());
     }
 }

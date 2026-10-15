@@ -1,17 +1,35 @@
 //! Misskey auth: tokens, passwords, MiAuth helpers (Slice D2).
 //!
-//! Tokens are stored hashed (SHA-256 hex); passwords are stored salted
-//! (`salt:hash` SHA-256 hex). Credentials arrive via
-//! `Authorization: Bearer`, the JSON body `"i"` parameter, or the
-//! `pinetree_session` cookie.
+//! Tokens are stored hashed (SHA-256 hex). Passwords are stored as Argon2id
+//! PHC strings (`$argon2id$...`); legacy `salt:hash` SHA-256 hex values are
+//! still verified and upgraded on the next successful signin (slice 9, H3).
+//! Credentials arrive via `Authorization: Bearer`, the JSON body `"i"`
+//! parameter, or the `pinetree_session` cookie.
 
+use argon2::{
+    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Algorithm, Argon2, Params, Version,
+};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::application::commands::AppServices;
+use crate::application::ports::PortError;
 use crate::domain::account::Account;
 
 use super::errors::ApiError;
+
+/// Argon2id cost parameters for new password hashes: the OWASP baseline of
+/// 19 MiB memory, 2 passes, 1 lane. Each hash runs on the blocking pool (see
+/// [`hash_password_async`]).
+pub const ARGON2_M_COST_KIB: u32 = 19_456;
+pub const ARGON2_T_COST: u32 = 4;
+pub const ARGON2_P_COST: u32 = 1;
+
+/// Every Argon2id PHC string this module writes starts with this prefix.
+const ARGON2ID_PREFIX: &str = "$argon2id$";
+/// Argon2 version 0x13 is written as `v=19` in the PHC string.
+const ARGON2_VERSION_NUMBER: u32 = 19;
 
 /// Session cookie set by web sign-in for the MiAuth approval flow.
 pub const SESSION_COOKIE_NAME: &str = "pinetree_session";
@@ -23,16 +41,84 @@ pub fn hash_token(raw_token: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Salted SHA-256 password hash in `salt:hash` hex form.
-pub fn hash_password(password: &str) -> String {
-    let salt_bytes: Vec<u8> = (0..16).map(|_| rand::random::<u8>()).collect();
-    let salt = hex::encode(&salt_bytes);
-    let digest = hex::encode(password_digest(&salt, password));
-    format!("{salt}:{digest}")
+fn argon2_current() -> Argon2<'static> {
+    let params = Params::new(ARGON2_M_COST_KIB, ARGON2_T_COST, ARGON2_P_COST, None)
+        .expect("argon2 cost parameters are valid constants");
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
 }
 
-/// Verify `password` against a stored `salt:hash` value.
+/// Argon2id PHC hash of `password` with a fresh random salt. Blocking and
+/// CPU-heavy: async callers use [`hash_password_async`].
+pub fn hash_password(password: &str) -> String {
+    let salt = SaltString::generate(&mut OsRng);
+    argon2_current()
+        .hash_password(password.as_bytes(), &salt)
+        .expect("argon2 hashing with fixed valid parameters")
+        .to_string()
+}
+
+/// Verify `password` against a stored hash: Argon2id PHC strings are checked
+/// with their own embedded parameters, anything else as a legacy
+/// `salt:hash` value. Blocking: async callers use [`verify_password_async`].
 pub fn verify_password(password: &str, stored: &str) -> bool {
+    if stored.starts_with(ARGON2ID_PREFIX) {
+        return match PasswordHash::new(stored) {
+            Ok(parsed) => Argon2::default()
+                .verify_password(password.as_bytes(), &parsed)
+                .is_ok(),
+            Err(_) => false,
+        };
+    }
+    verify_legacy_password(password, stored)
+}
+
+/// True when a successful login should replace `stored`: a legacy
+/// `salt:hash` value, an unparseable value, or an Argon2id hash whose
+/// version or cost parameters differ from the current constants.
+pub fn needs_rehash(stored: &str) -> bool {
+    if !stored.starts_with(ARGON2ID_PREFIX) {
+        return true;
+    }
+    let parsed = match PasswordHash::new(stored) {
+        Ok(parsed) => parsed,
+        Err(_) => return true,
+    };
+    if parsed.version != Some(ARGON2_VERSION_NUMBER) {
+        return true;
+    }
+    match Params::try_from(&parsed) {
+        Ok(params) => {
+            params.m_cost() != ARGON2_M_COST_KIB
+                || params.t_cost() != ARGON2_T_COST
+                || params.p_cost() != ARGON2_P_COST
+        }
+        Err(_) => true,
+    }
+}
+
+fn password_task_failed() -> ApiError {
+    ApiError::from_port_error(PortError::StorageUnavailable(
+        "password hashing task failed".into(),
+    ))
+}
+
+/// [`hash_password`] on the blocking pool, so Argon2 never stalls the async
+/// executor.
+pub async fn hash_password_async(password: String) -> Result<String, ApiError> {
+    tokio::task::spawn_blocking(move || hash_password(&password))
+        .await
+        .map_err(|_| password_task_failed())
+}
+
+/// [`verify_password`] on the blocking pool.
+pub async fn verify_password_async(password: String, stored: String) -> Result<bool, ApiError> {
+    tokio::task::spawn_blocking(move || verify_password(&password, &stored))
+        .await
+        .map_err(|_| password_task_failed())
+}
+
+/// Legacy `salt:hash` (salted SHA-256 hex) check, constant-time.
+fn verify_legacy_password(password: &str, stored: &str) -> bool {
     let (salt, expected) = match stored.split_once(':') {
         Some(parts) => parts,
         None => return false,
@@ -316,6 +402,61 @@ mod tests {
         assert!(verify_password("s3cret!", &b));
         assert!(!verify_password("wrong", &a));
         assert!(!verify_password("s3cret!", "not-a-hash"));
+    }
+
+    /// Pre-slice-9 `salt:sha256` hash, built the way the legacy hasher did.
+    fn legacy_hash(salt_hex: &str, password: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(salt_hex.as_bytes());
+        hasher.update(b":");
+        hasher.update(password.as_bytes());
+        format!("{salt_hex}:{}", hex::encode(hasher.finalize()))
+    }
+
+    #[test]
+    fn slice9_legacy_salt_hash_verifies_and_needs_rehash() {
+        let stored = legacy_hash("00112233445566778899aabbccddeeff", "legacy-pw");
+        assert!(verify_password("legacy-pw", &stored));
+        assert!(!verify_password("wrong", &stored));
+        assert!(needs_rehash(&stored));
+    }
+
+    #[test]
+    fn slice9_new_hashes_are_argon2id_phc() {
+        let stored = hash_password("s3cret!");
+        assert!(
+            stored.starts_with("$argon2id$v=19$m=19456,t=4,p=1$"),
+            "unexpected PHC prefix: {stored}"
+        );
+        assert!(verify_password("s3cret!", &stored));
+        assert!(!verify_password("wrong", &stored));
+        assert!(!needs_rehash(&stored));
+    }
+
+    #[test]
+    fn slice9_outdated_argon2_params_need_rehash() {
+        let params = Params::new(8, 1, 1, None).expect("valid test params");
+        let salt = SaltString::generate(&mut OsRng);
+        let weak = Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+            .hash_password(b"pw", &salt)
+            .expect("weak hash")
+            .to_string();
+        assert!(needs_rehash(&weak));
+        assert!(verify_password("pw", &weak));
+    }
+
+    #[tokio::test]
+    async fn slice9_async_password_wrappers_round_trip() {
+        let stored = hash_password_async("async-pw".to_string())
+            .await
+            .expect("hash task");
+        assert!(stored.starts_with("$argon2id$"));
+        assert!(verify_password_async("async-pw".to_string(), stored.clone())
+            .await
+            .expect("verify task"));
+        assert!(!verify_password_async("nope".to_string(), stored)
+            .await
+            .expect("verify task"));
     }
 
     #[test]

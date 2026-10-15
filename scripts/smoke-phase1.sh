@@ -221,7 +221,7 @@ async function miauth(username: string, password: string): Promise<string> {
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: form,
   });
-  assert(approved.ok, `POST /miauth/${session}: HTTP ${approved.status}`);
+  assert(approved.ok, `POST /miauth/${session}: HTTP ${approved.status} ${approved.ok ? "" : await approved.text()}`);
   async function check(): Promise<any> {
     const res = await fetch(`${ORIGIN}/api/miauth/${session}/check`, {
       method: "POST",

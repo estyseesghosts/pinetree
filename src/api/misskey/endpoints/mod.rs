@@ -8,11 +8,12 @@
 //! JSON), and the `POST /api/{endpoint}` JSON dispatcher.
 
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::{
     body::{Body, Bytes},
-    extract::{FromRequest, Multipart, Path, Query, Request, State},
+    extract::{ConnectInfo, FromRequest, Multipart, Path, Query, Request, State},
     http::{
         header::{AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE},
         HeaderMap, HeaderName, HeaderValue, StatusCode,
@@ -40,9 +41,9 @@ use crate::federation::inbox as fed_inbox;
 use crate::jobs::worker::JobWorker;
 
 use super::auth::{
-    authenticate, extract_raw_token, generate_random_token, hash_password, hash_token,
-    is_safe_callback_url, render_miauth_page, verify_password, AuthenticatedCaller,
-    SESSION_COOKIE_NAME,
+    authenticate, extract_raw_token, generate_random_token, hash_password_async, hash_token,
+    is_safe_callback_url, needs_rehash, render_miauth_page, verify_password_async,
+    AuthenticatedCaller, SESSION_COOKIE_NAME,
 };
 use super::errors::ApiError;
 use super::packers::{
@@ -53,13 +54,15 @@ use super::request::check_allowed_fields;
 use super::response::{RateLimiter, UploadSlots};
 
 /// Shared API state: application services, the durable-job worker, the
-/// Misskey rate limiter, and the concurrent-upload slots.
+/// Misskey rate limiter, the concurrent-upload slots, and the reverse
+/// proxies whose `X-Forwarded-For` is honored ([`client_ip`]).
 #[derive(Clone)]
 pub struct ApiState {
     pub services: Arc<AppServices>,
     pub worker: Arc<JobWorker>,
     pub rate_limiter: Arc<RateLimiter>,
     pub upload_slots: Arc<UploadSlots>,
+    pub trusted_proxies: Arc<Vec<IpAddr>>,
 }
 
 /// Build the full Phase 1 Axum router.
@@ -157,23 +160,36 @@ fn session_cookie_value(raw_token: &str) -> String {
     format!("{SESSION_COOKIE_NAME}={raw_token}; HttpOnly; Path=/")
 }
 
-fn client_ip(headers: &HeaderMap) -> String {
-    if let Some(forwarded) = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-    {
-        if let Some(first) = forwarded.split(',').next().map(str::trim) {
-            if !first.is_empty() {
-                return first.to_string();
+/// Client IP for rate limits and upload slots (slice 9, H4). The TCP peer is
+/// the client unless it is in `trusted_proxies`. Only then is
+/// `X-Forwarded-For` consulted: walk it right to left and take the first
+/// address that is not a trusted proxy, so a client cannot prepend a fake
+/// hop. An all-trusted chain uses its leftmost entry, and an unparseable
+/// entry falls back to the peer. `X-Real-IP` and headers from untrusted
+/// peers are ignored.
+fn client_ip(peer: SocketAddr, headers: &HeaderMap, trusted_proxies: &[IpAddr]) -> String {
+    let peer_ip = peer.ip();
+    if !trusted_proxies.contains(&peer_ip) {
+        return peer_ip.to_string();
+    }
+    let mut hops: Vec<IpAddr> = Vec::new();
+    for value in headers.get_all("x-forwarded-for") {
+        let Ok(text) = value.to_str() else {
+            return peer_ip.to_string();
+        };
+        for part in text.split(',') {
+            match part.trim().parse::<IpAddr>() {
+                Ok(ip) => hops.push(ip),
+                Err(_) => return peer_ip.to_string(),
             }
         }
     }
-    if let Some(real_ip) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
-        if !real_ip.trim().is_empty() {
-            return real_ip.trim().to_string();
-        }
-    }
-    "unknown".to_string()
+    hops.iter()
+        .rev()
+        .find(|ip| !trusted_proxies.contains(ip))
+        .or_else(|| hops.first())
+        .unwrap_or(&peer_ip)
+        .to_string()
 }
 
 /// Parse a request body as a JSON object. An empty body defaults to `{}`.
@@ -216,11 +232,48 @@ fn require_caller(caller: Option<AuthenticatedCaller>) -> Result<AuthenticatedCa
 
 /// Rate-limit key: the caller's account id when authenticated, else the
 /// client IP.
-fn rate_key_for(caller: Option<&AuthenticatedCaller>, headers: &HeaderMap) -> String {
+fn rate_key_for(caller: Option<&AuthenticatedCaller>, client_ip: &str) -> String {
     match caller {
         Some(caller) => caller.account.id.clone(),
-        None => client_ip(headers),
+        None => client_ip.to_string(),
     }
+}
+
+/// Slice 9 (H4): auth-throttle keys. Account keys use the lowercased
+/// username as typed, so a failure is counted whether or not the account
+/// exists. IP keys are the resolved client IP.
+fn auth_account_key(username: &str) -> String {
+    format!("acct:{}", username.to_lowercase())
+}
+
+fn auth_ip_key(client_ip: &str) -> String {
+    format!("ip:{client_ip}")
+}
+
+/// Slice 9 (H3): verify `password` against the stored hash off the async
+/// executor. On success, a legacy or outdated hash is replaced with a fresh
+/// Argon2id hash through the existing password-update path.
+async fn verify_and_upgrade_password(
+    state: &ApiState,
+    account_id: &str,
+    password: &str,
+    stored: Option<String>,
+) -> Result<bool, ApiError> {
+    let Some(hash) = stored else {
+        return Ok(false);
+    };
+    if !verify_password_async(password.to_string(), hash.clone()).await? {
+        return Ok(false);
+    }
+    if needs_rehash(&hash) {
+        let fresh = hash_password_async(password.to_string()).await?;
+        state
+            .services
+            .auth
+            .set_password_hash(account_id, &fresh)
+            .map_err(ApiError::from_port_error)?;
+    }
+    Ok(true)
 }
 
 /// Slice 6 (H1): maximum accepted Misskey JSON API body (1 MiB), enforced
@@ -741,10 +794,12 @@ fn miauth_error_page(
 
 async fn miauth_submit(
     State(state): State<ApiState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(session): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
+    let ip = client_ip(peer, &headers, &state.trusted_proxies);
     let content_type = headers
         .get(CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -768,10 +823,12 @@ async fn miauth_submit(
     }
 
     let account = if is_truthy(fields.get("signup").map(String::as_str)) {
-        match state
-            .services
-            .create_account(&username, Some(&hash_password(&password)))
-        {
+        // Slice 9 (H4): every signup attempt from one IP counts.
+        state
+            .rate_limiter
+            .check(&auth_ip_key(&ip), "auth/signup")?;
+        let hash = hash_password_async(password.clone()).await?;
+        match state.services.create_account(&username, Some(&hash)) {
             Ok(account) => account,
             Err(err) => {
                 return Ok(miauth_error_page(
@@ -782,29 +839,37 @@ async fn miauth_submit(
             }
         }
     } else {
+        // Slice 9 (H4): throttle before any lookup or hash check.
+        let acct_key = auth_account_key(&username);
+        let ip_key = auth_ip_key(&ip);
+        state
+            .rate_limiter
+            .check_auth_failures("auth/miauth", &acct_key, &ip_key)?;
         let found = state
             .services
             .accounts
             .find_by_username_and_host(&username, None)
             .map_err(ApiError::from_port_error)?;
-        let found = match found {
-            Some(account) => account,
-            None => {
-                return Ok(miauth_error_page(
-                    &session,
-                    &fields,
-                    "Invalid username or password.",
-                ));
-            }
+        let stored = match &found {
+            Some(account) => state
+                .services
+                .auth
+                .get_password_hash(&account.id)
+                .map_err(ApiError::from_port_error)?,
+            None => None,
         };
-        let stored = state
-            .services
-            .auth
-            .get_password_hash(&found.id)
-            .map_err(ApiError::from_port_error)?;
-        match stored {
-            Some(hash) if verify_password(&password, &hash) => found,
+        let verified = match &found {
+            Some(account) => {
+                verify_and_upgrade_password(&state, &account.id, &password, stored).await?
+            }
+            None => false,
+        };
+        match found {
+            Some(account) if verified => account,
             _ => {
+                state
+                    .rate_limiter
+                    .record_auth_failure("auth/miauth", &acct_key, &ip_key);
                 return Ok(miauth_error_page(
                     &session,
                     &fields,
@@ -933,40 +998,58 @@ async fn miauth_submit(
 /// every other call returns `{ "ok": false }`.
 async fn miauth_check(
     State(state): State<ApiState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Path(session): Path<String>,
 ) -> Result<Response, ApiError> {
+    // Slice 9 (H4): every check counts per client IP. Pending polls
+    // (`ok:false`) are normal client behaviour, so they are not failures.
+    let ip = client_ip(peer, &headers, &state.trusted_proxies);
+    state
+        .rate_limiter
+        .check(&auth_ip_key(&ip), "auth/miauth-check")?;
     let consumed = state
         .services
         .auth
         .consume_miauth_session(&session)
         .map_err(ApiError::from_port_error)?;
-    match consumed {
+    let approved = match consumed {
         Some(sess) => match (sess.token, sess.account_id) {
-            (Some(token), Some(account_id)) => {
-                let account = state
-                    .services
-                    .accounts
-                    .find_by_id(&account_id)
-                    .map_err(ApiError::from_port_error)?
-                    .ok_or_else(ApiError::authentication_failed)?;
-                let user = pack_user_detailed_not_me(&account, None, &state.services)
-                    .map_err(ApiError::from_port_error)?;
-                Ok(Json(serde_json::json!({
-                    "ok": true,
-                    "token": token,
-                    "user": user,
-                }))
-                .into_response())
-            }
-            _ => Ok(Json(serde_json::json!({ "ok": false })).into_response()),
+            (Some(token), Some(account_id)) => Some((token, account_id)),
+            _ => None,
         },
-        None => Ok(Json(serde_json::json!({ "ok": false })).into_response()),
+        None => None,
+    };
+    match approved {
+        Some((token, account_id)) => {
+            let account = state
+                .services
+                .accounts
+                .find_by_id(&account_id)
+                .map_err(ApiError::from_port_error)?
+                .ok_or_else(ApiError::authentication_failed)?;
+            let user = pack_user_detailed_not_me(&account, None, &state.services)
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(serde_json::json!({
+                "ok": true,
+                "token": token,
+                "user": user,
+            }))
+            .into_response())
+        }
+        None => {
+            Ok(Json(serde_json::json!({ "ok": false })).into_response())
+        }
     }
 }
 
 // --- Web signup / signin ---------------------------------------------------
 
-fn do_signup(state: &ApiState, obj: &Map<String, Value>) -> Result<(Account, String), ApiError> {
+async fn do_signup(
+    state: &ApiState,
+    obj: &Map<String, Value>,
+    ip: &str,
+) -> Result<(Account, String), ApiError> {
     let username = match obj.get("username").and_then(Value::as_str) {
         Some(username) if !username.is_empty() => username,
         _ => {
@@ -993,9 +1076,12 @@ fn do_signup(state: &ApiState, obj: &Map<String, Value>) -> Result<(Account, Str
             ));
         }
     }
+    // Slice 9 (H4): every signup attempt from one IP counts.
+    state.rate_limiter.check(&auth_ip_key(ip), "auth/signup")?;
+    let hash = hash_password_async(password.to_string()).await?;
     let account = state
         .services
-        .create_account(username, Some(&hash_password(password)))
+        .create_account(username, Some(&hash))
         .map_err(ApiError::from_port_error)?;
     let raw_token = generate_random_token();
     state
@@ -1015,7 +1101,11 @@ fn do_signup(state: &ApiState, obj: &Map<String, Value>) -> Result<(Account, Str
     Ok((account, raw_token))
 }
 
-fn do_signin(state: &ApiState, obj: &Map<String, Value>) -> Result<(Account, String), ApiError> {
+async fn do_signin(
+    state: &ApiState,
+    obj: &Map<String, Value>,
+    ip: &str,
+) -> Result<(Account, String), ApiError> {
     let username = match obj.get("username").and_then(Value::as_str) {
         Some(username) if !username.is_empty() => username,
         _ => {
@@ -1034,21 +1124,38 @@ fn do_signin(state: &ApiState, obj: &Map<String, Value>) -> Result<(Account, Str
             ));
         }
     };
-    let account = state
+    // Slice 9 (H4): throttle before any lookup or hash check. Failures are
+    // counted for unknown usernames too, so responses do not reveal them.
+    let acct_key = auth_account_key(username);
+    let ip_key = auth_ip_key(ip);
+    state
+        .rate_limiter
+        .check_auth_failures("auth/signin", &acct_key, &ip_key)?;
+    let found = state
         .services
         .accounts
         .find_by_username_and_host(username, None)
-        .map_err(ApiError::from_port_error)?
-        .ok_or_else(ApiError::authentication_failed)?;
-    let stored = state
-        .services
-        .auth
-        .get_password_hash(&account.id)
         .map_err(ApiError::from_port_error)?;
-    match stored {
-        Some(hash) if verify_password(password, &hash) => {}
-        _ => return Err(ApiError::authentication_failed()),
-    }
+    let verified = match &found {
+        Some(account) => {
+            let stored = state
+                .services
+                .auth
+                .get_password_hash(&account.id)
+                .map_err(ApiError::from_port_error)?;
+            verify_and_upgrade_password(state, &account.id, password, stored).await?
+        }
+        None => false,
+    };
+    let account = match found {
+        Some(account) if verified => account,
+        _ => {
+            state
+                .rate_limiter
+                .record_auth_failure("auth/signin", &acct_key, &ip_key);
+            return Err(ApiError::authentication_failed());
+        }
+    };
     let raw_token = generate_random_token();
     state
         .services
@@ -1078,12 +1185,14 @@ const SIGNUP_FIELDS: &[&str] = &[
 
 async fn signup(
     State(state): State<ApiState>,
-    _headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let obj = parse_json_body(&body)?;
     check_allowed_fields(&obj, SIGNUP_FIELDS)?;
-    let (account, raw_token) = do_signup(&state, &obj)?;
+    let ip = client_ip(peer, &headers, &state.trusted_proxies);
+    let (account, raw_token) = do_signup(&state, &obj, &ip).await?;
     let mut packed = pack_me_detailed(&account, true, &state.services)
         .map_err(ApiError::from_port_error)?;
     if let Some(obj) = packed.as_object_mut() {
@@ -1099,12 +1208,14 @@ async fn signup(
 
 async fn signin(
     State(state): State<ApiState>,
-    _headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let obj = parse_json_body(&body)?;
     check_allowed_fields(&obj, &["username", "password"])?;
-    let (account, raw_token) = do_signin(&state, &obj)?;
+    let ip = client_ip(peer, &headers, &state.trusted_proxies);
+    let (account, raw_token) = do_signin(&state, &obj, &ip).await?;
     let user = pack_me_detailed(&account, true, &state.services)
         .map_err(ApiError::from_port_error)?;
     let mut response = Json(serde_json::json!({
@@ -1179,7 +1290,11 @@ fn is_truthy_value(value: Option<&Value>) -> bool {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn drive_files_create(State(state): State<ApiState>, req: Request) -> Result<Response, ApiError> {
+async fn drive_files_create(
+    State(state): State<ApiState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request,
+) -> Result<Response, ApiError> {
     let (parts, body) = req.into_parts();
     let headers = parts.headers.clone();
     let content_type = headers
@@ -1208,7 +1323,9 @@ async fn drive_files_create(State(state): State<ApiState>, req: Request) -> Resu
     };
     // Slice 6 (H1, decision D-c): bound concurrent uploads per client IP
     // (plus a global cap). Held for the whole handler.
-    let _upload_permit = state.upload_slots.acquire(&client_ip(&headers))?;
+    let _upload_permit = state
+        .upload_slots
+        .acquire(&client_ip(peer, &headers, &state.trusted_proxies))?;
     // Slice 6 (H1): streaming running cap — 413 as soon as the cap is
     // crossed, without ever holding more than ~cap bytes. When the token
     // is the multipart `i` field (as misskey-js sends it), this bounded
@@ -1343,21 +1460,27 @@ async fn drive_files_create(State(state): State<ApiState>, req: Request) -> Resu
 /// dispatch runs on the blocking pool rather than an async worker thread.
 async fn api_dispatch(
     State(state): State<ApiState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(endpoint): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    tokio::task::spawn_blocking(move || api_dispatch_blocking(state, endpoint, headers, body))
+    let ip = client_ip(peer, &headers, &state.trusted_proxies);
+    tokio::task::spawn_blocking(move || api_dispatch_blocking(state, endpoint, headers, body, ip))
         .await
         .map_err(|_| ApiError::from_port_error(PortError::StorageUnavailable("dispatch task failed".into())))?
 }
 
+/// `client_ip` is the resolved client address (see [`client_ip`]). The
+/// signin and signup arms block on the async password helpers; this runs on
+/// the blocking pool, so `block_on` is safe here.
 #[allow(clippy::too_many_lines)]
 fn api_dispatch_blocking(
     state: ApiState,
     endpoint: String,
     headers: HeaderMap,
     body: Bytes,
+    client_ip: String,
 ) -> Result<Response, ApiError> {
     // Slice 6 (H1): 1 MiB default JSON body limit, enforced here (not in a
     // router layer) so direct dispatch calls are covered too. Oversized
@@ -1369,7 +1492,7 @@ fn api_dispatch_blocking(
     let obj = parse_json_body(&body)?;
     let body_value = Value::Object(obj.clone());
     let caller = resolve_caller(&state.services, &headers, Some(&body_value))?;
-    let rate_key = rate_key_for(caller.as_ref(), &headers);
+    let rate_key = rate_key_for(caller.as_ref(), &client_ip);
 
     match endpoint.as_str() {
         "meta" => {
@@ -1576,7 +1699,8 @@ fn api_dispatch_blocking(
 
         "signup" | "admin/accounts/create" => {
             check_allowed_fields(&obj, SIGNUP_FIELDS)?;
-            let (account, raw_token) = do_signup(&state, &obj)?;
+            let (account, raw_token) =
+                tokio::runtime::Handle::current().block_on(do_signup(&state, &obj, &client_ip))?;
             let mut packed = pack_me_detailed(&account, true, &state.services)
                 .map_err(ApiError::from_port_error)?;
             if let Some(map) = packed.as_object_mut() {
@@ -1587,7 +1711,8 @@ fn api_dispatch_blocking(
 
         "signin" => {
             check_allowed_fields(&obj, &["username", "password"])?;
-            let (account, raw_token) = do_signin(&state, &obj)?;
+            let (account, raw_token) =
+                tokio::runtime::Handle::current().block_on(do_signin(&state, &obj, &client_ip))?;
             let user = pack_me_detailed(&account, true, &state.services)
                 .map_err(ApiError::from_port_error)?;
             Ok(Json(serde_json::json!({
@@ -2368,6 +2493,8 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
 
+    use crate::api::misskey::auth::verify_password;
+
     use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE};
 
     use crate::application::ports::{
@@ -2456,6 +2583,7 @@ mod tests {
                 worker,
                 rate_limiter,
                 upload_slots,
+                trusted_proxies: Arc::new(Vec::new()),
             },
             clock,
         )
@@ -2475,11 +2603,30 @@ mod tests {
         (status, value, headers)
     }
 
+    /// Direct-call peer used by every handler test unless a test says otherwise.
+    fn test_peer() -> ConnectInfo<SocketAddr> {
+        ConnectInfo("127.0.0.1:9".parse().unwrap())
+    }
+
+    fn peer_at(ip: &str) -> ConnectInfo<SocketAddr> {
+        ConnectInfo(format!("{ip}:9").parse().unwrap())
+    }
+
     async fn call(
         state: &ApiState,
         endpoint: &str,
         body: Value,
         token: Option<&str>,
+    ) -> (StatusCode, Value) {
+        call_from(state, endpoint, body, token, test_peer()).await
+    }
+
+    async fn call_from(
+        state: &ApiState,
+        endpoint: &str,
+        body: Value,
+        token: Option<&str>,
+        peer: ConnectInfo<SocketAddr>,
     ) -> (StatusCode, Value) {
         let mut headers = HeaderMap::new();
         if let Some(token) = token {
@@ -2491,6 +2638,7 @@ mod tests {
         let bytes = Bytes::from(serde_json::to_vec(&body).unwrap());
         let response = match api_dispatch(
             State(state.clone()),
+            peer,
             Path(endpoint.to_string()),
             headers,
             bytes,
@@ -2563,6 +2711,7 @@ mod tests {
         // Web signin route returns id/token/i/user + cookie.
         let response = signin(
             State(state.clone()),
+            test_peer(),
             HeaderMap::new(),
             Bytes::from(serde_json::to_vec(&serde_json::json!({
                 "username": "alice", "password": "s3cret-pw",
@@ -2587,6 +2736,189 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// Pre-slice-9 `salt:sha256` hash, built the way the legacy hasher did.
+    fn legacy_password_hash(salt_hex: &str, password: &str) -> String {
+        let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+        sha2::Digest::update(&mut hasher, salt_hex.as_bytes());
+        sha2::Digest::update(&mut hasher, b":");
+        sha2::Digest::update(&mut hasher, password.as_bytes());
+        format!("{salt_hex}:{}", hex::encode(sha2::Digest::finalize(hasher)))
+    }
+
+    #[tokio::test]
+    async fn slice9_legacy_hash_verifies_then_upgrades_to_argon2id_on_signin() {
+        let (state, _) = test_state();
+        let legacy = legacy_password_hash("00112233445566778899aabbccddeeff", "legacy-pw");
+        let account = state
+            .services
+            .create_account("legacy_user", Some(&legacy))
+            .expect("create legacy account");
+        let response = signin(
+            State(state.clone()),
+            test_peer(),
+            HeaderMap::new(),
+            Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "username": "legacy_user", "password": "legacy-pw",
+                }))
+                .unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+        let (status, value, _) = read_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value["id"], account.id);
+        let stored = state
+            .services
+            .auth
+            .get_password_hash(&account.id)
+            .unwrap()
+            .expect("stored hash");
+        assert!(stored.starts_with("$argon2id$"), "{stored}");
+        assert!(verify_password("legacy-pw", &stored));
+        assert!(!verify_password("wrong", &stored));
+    }
+
+    #[tokio::test]
+    async fn slice9_signup_stores_argon2id_and_rejects_wrong_password() {
+        let (state, _) = test_state();
+        let (account_id, _) = signup_user(&state, "slice9_new").await;
+        let stored = state
+            .services
+            .auth
+            .get_password_hash(&account_id)
+            .unwrap()
+            .expect("stored hash");
+        assert!(stored.starts_with("$argon2id$"), "{stored}");
+        let (status, _) = call(
+            &state,
+            "signin",
+            serde_json::json!({ "username": "slice9_new", "password": "wrong" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn slice9_signin_brute_force_returns_rate_limit_exceeded() {
+        let (mut state, clock) = test_state();
+        signup_user(&state, "victim").await;
+        // Three failures per account trip the cap; the per-IP cap is generous here.
+        state.rate_limiter = Arc::new(
+            RateLimiter::new(clock.clone()).with_auth_limit("auth/signin", 3, 30, 60_000),
+        );
+        let bad = serde_json::json!({ "username": "victim", "password": "guess" });
+        let good = serde_json::json!({ "username": "victim", "password": "s3cret-pw" });
+
+        let (status, _) = call(&state, "signin", bad.clone(), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        // Right after a failure the progressive delay refuses every attempt.
+        let (status, value) = call(&state, "signin", good.clone(), None).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{value}");
+        assert_eq!(value["code"], "RATE_LIMIT_EXCEEDED");
+
+        clock.advance_ms(1_000);
+        let (status, _) = call(&state, "signin", bad.clone(), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        clock.advance_ms(2_000);
+        let (status, _) = call(&state, "signin", bad, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        // Account cap reached: even the right password waits for the window.
+        let (status, value) = call(&state, "signin", good.clone(), None).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{value}");
+        clock.advance_ms(60_000);
+        let (status, value) = call(&state, "signin", good, None).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+    }
+
+    #[tokio::test]
+    async fn slice9_signin_per_ip_bucket_trips_across_accounts() {
+        let (mut state, clock) = test_state();
+        signup_user(&state, "ipa").await;
+        signup_user(&state, "ipb").await;
+        // One failure per IP is enough; the per-account cap is generous.
+        state.rate_limiter = Arc::new(
+            RateLimiter::new(clock.clone()).with_auth_limit("auth/signin", 100, 1, 60_000),
+        );
+        let (status, _) = call_from(
+            &state,
+            "signin",
+            serde_json::json!({ "username": "ipa", "password": "x" }),
+            None,
+            peer_at("198.51.100.20"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        // A different account from the same IP is refused by the IP bucket.
+        let (status, value) = call_from(
+            &state,
+            "signin",
+            serde_json::json!({ "username": "ipb", "password": "x" }),
+            None,
+            peer_at("198.51.100.20"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{value}");
+        assert_eq!(value["code"], "RATE_LIMIT_EXCEEDED");
+        // Another IP still signs in.
+        let (status, value) = call_from(
+            &state,
+            "signin",
+            serde_json::json!({ "username": "ipb", "password": "s3cret-pw" }),
+            None,
+            peer_at("198.51.100.21"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+    }
+
+    #[test]
+    fn slice9_spoofed_xff_from_untrusted_peer_is_ignored() {
+        let peer: SocketAddr = "203.0.113.9:4000".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_static("192.0.2.77"));
+        headers.insert("x-real-ip", HeaderValue::from_static("192.0.2.78"));
+        assert_eq!(client_ip(peer, &headers, &[]), "203.0.113.9");
+        // Another proxy being trusted does not make this untrusted peer's header count.
+        let trusted = ["10.0.0.1".parse::<IpAddr>().unwrap()];
+        assert_eq!(client_ip(peer, &headers, &trusted), "203.0.113.9");
+    }
+
+    #[test]
+    fn slice9_xff_honored_only_from_trusted_proxy() {
+        let proxy: SocketAddr = "10.0.0.1:4000".parse().unwrap();
+        let trusted = ["10.0.0.1".parse::<IpAddr>().unwrap()];
+        let mut headers = HeaderMap::new();
+        // The client prepended a fake hop; the trusted proxy appended the real client.
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("198.51.100.1, 192.0.2.77"),
+        );
+        assert_eq!(client_ip(proxy, &headers, &trusted), "192.0.2.77");
+        // A trusted hop on the right is skipped.
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("192.0.2.77, 10.0.0.1"),
+        );
+        assert_eq!(client_ip(proxy, &headers, &trusted), "192.0.2.77");
+        // All hops trusted: the leftmost entry is used.
+        let both = ["10.0.0.1".parse::<IpAddr>().unwrap(), "10.0.0.2".parse().unwrap()];
+        let second: SocketAddr = "10.0.0.2:4000".parse().unwrap();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("10.0.0.1, 10.0.0.2"),
+        );
+        assert_eq!(client_ip(second, &headers, &both), "10.0.0.1");
+        // An unparseable hop makes the header untrustworthy: use the peer.
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("203.0.113.5, garbage"),
+        );
+        assert_eq!(client_ip(second, &headers, &both), "10.0.0.2");
     }
 
     #[tokio::test]
@@ -2670,9 +3002,14 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
 
         // First check consumes the session.
-        let response = miauth_check(State(state.clone()), Path("sess-001".to_string()))
-            .await
-            .unwrap();
+        let response = miauth_check(
+            State(state.clone()),
+            test_peer(),
+            HeaderMap::new(),
+            Path("sess-001".to_string()),
+        )
+        .await
+        .unwrap();
         let (status, value, _) = read_json(response).await;
         assert_eq!(status, StatusCode::OK, "{value}");
         assert_eq!(value["ok"], true);
@@ -2680,7 +3017,12 @@ mod tests {
         assert_eq!(value["user"]["username"], "dave");
 
         // Second check is spent.
-        let response = miauth_check(State(state.clone()), Path("sess-001".to_string()))
+        let response = miauth_check(
+            State(state.clone()),
+            test_peer(),
+            HeaderMap::new(),
+            Path("sess-001".to_string()),
+        )
             .await
             .unwrap();
         let (status, value, _) = read_json(response).await;
@@ -2717,6 +3059,7 @@ mod tests {
         );
         let response = miauth_submit(
             State(state.clone()),
+            test_peer(),
             Path("websess".to_string()),
             headers,
             Bytes::from("username=erin&password=s3cret-pw"),
@@ -2740,6 +3083,7 @@ mod tests {
         );
         let response = match api_dispatch(
             State(state.clone()),
+            test_peer(),
             Path("i".to_string()),
             cookie_headers,
             Bytes::from("{}"),
@@ -2761,6 +3105,7 @@ mod tests {
         );
         let response = miauth_submit(
             State(state.clone()),
+            test_peer(),
             Path("cbsess".to_string()),
             headers,
             Bytes::from(
@@ -2776,7 +3121,12 @@ mod tests {
         );
 
         // The approved session checks out exactly once.
-        let response = miauth_check(State(state.clone()), Path("cbsess".to_string()))
+        let response = miauth_check(
+            State(state.clone()),
+            test_peer(),
+            HeaderMap::new(),
+            Path("cbsess".to_string()),
+        )
             .await
             .unwrap();
         let (status, value, _) = read_json(response).await;
@@ -3191,7 +3541,7 @@ mod tests {
             )
             .body(Body::from(multipart_body))
             .unwrap();
-        let response = drive_files_create(State(state.clone()), request)
+        let response = drive_files_create(State(state.clone()), test_peer(), request)
             .await
             .unwrap();
         let (status, mp_file, _) = read_json(response).await;
@@ -3225,7 +3575,7 @@ mod tests {
                 .unwrap(),
             ))
             .unwrap();
-        let response = drive_files_create(State(state.clone()), request)
+        let response = drive_files_create(State(state.clone()), test_peer(), request)
             .await
             .unwrap();
         let (status, file, _) = read_json(response).await;
@@ -3291,7 +3641,7 @@ mod tests {
                 yielded: yielded.clone(),
             }))
             .unwrap();
-        let err = drive_files_create(State(state.clone()), request)
+        let err = drive_files_create(State(state.clone()), test_peer(), request)
             .await
             .unwrap_err();
         assert_eq!(err.code, "MAX_FILE_SIZE_EXCEEDED");
@@ -3322,7 +3672,7 @@ mod tests {
                 yielded: yielded.clone(),
             }))
             .unwrap();
-        let err = drive_files_create(State(state.clone()), request)
+        let err = drive_files_create(State(state.clone()), test_peer(), request)
             .await
             .unwrap_err();
         assert_eq!(err.http_status, 401);
@@ -3349,8 +3699,14 @@ mod tests {
         let body = Bytes::from(raw.into_bytes());
         assert!(body.len() > MAX_JSON_BODY_BYTES);
         let err =
-            api_dispatch_blocking(state.clone(), "notes/create".to_string(), headers, body)
-                .unwrap_err();
+            api_dispatch_blocking(
+                state.clone(),
+                "notes/create".to_string(),
+                headers,
+                body,
+                "127.0.0.1".to_string(),
+            )
+            .unwrap_err();
         assert_eq!(err.code, "MAX_FILE_SIZE_EXCEEDED");
         assert_eq!(err.http_status, 413);
     }
@@ -3361,8 +3717,8 @@ mod tests {
         // another upload from the same IP fails Misskey-shaped 429.
         let (state, _) = test_state();
         let (_, token) = signup_user(&state, "uploader_busy").await;
-        let _first = state.upload_slots.acquire("unknown").expect("slot 1");
-        let _second = state.upload_slots.acquire("unknown").expect("slot 2");
+        let _first = state.upload_slots.acquire("127.0.0.1").expect("slot 1");
+        let _second = state.upload_slots.acquire("127.0.0.1").expect("slot 2");
         let boundary = "BUSY123";
         let multipart_body = format!(
             "--{boundary}\r\nContent-Disposition: form-data; name=\"i\"\r\n\r\n{token}\r\n\
@@ -3376,7 +3732,7 @@ mod tests {
             )
             .body(Body::from(multipart_body))
             .unwrap();
-        let err = drive_files_create(State(state.clone()), request)
+        let err = drive_files_create(State(state.clone()), test_peer(), request)
             .await
             .unwrap_err();
         assert_eq!(err.code, "RATE_LIMIT_EXCEEDED");

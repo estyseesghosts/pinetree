@@ -173,10 +173,15 @@ async fn boot_node(tag: &'static str) -> FedNode {
         worker: worker.clone(),
         rate_limiter,
         upload_slots: Arc::new(UploadSlots::with_defaults()),
+        trusted_proxies: Arc::new(Vec::new()),
     };
     let app = federation_router(state.clone());
     let serve_handle = tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await;
     });
     let node = FedNode {
         tag,
@@ -219,7 +224,11 @@ impl FedNode {
         };
         let app = federation_router(self.state.clone());
         self.serve_handle = Some(tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            let _ = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await;
         }));
         let client = test_client();
         let base = self.base_url.clone();

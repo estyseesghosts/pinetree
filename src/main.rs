@@ -1,3 +1,4 @@
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -113,6 +114,14 @@ async fn main() {
             cfg.data_dir = dir.into();
         } else if let Some(listen) = arg.strip_prefix("--listen=") {
             cfg.listen = listen.parse().expect("valid --listen addr");
+        } else if let Some(list) = arg.strip_prefix("--trusted-proxies=") {
+            cfg.trusted_proxies = match parse_trusted_proxies(list) {
+                Ok(proxies) => proxies,
+                Err(err) => {
+                    eprintln!("{err}");
+                    std::process::exit(1);
+                }
+            };
         } else {
             positional.push(arg);
         }
@@ -152,10 +161,30 @@ async fn main() {
         worker,
         rate_limiter,
         upload_slots: Arc::new(UploadSlots::with_defaults()),
+        trusted_proxies: Arc::new(cfg.trusted_proxies.clone()),
     };
     let app = build_router(api_state);
     let listener = tokio::net::TcpListener::bind(cfg.listen)
         .await
         .expect("bind listener");
-    axum::serve(listener, app).await.expect("serve axum");
+    // Client IPs come from the TCP peer (`ConnectInfo`), not from headers.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .expect("serve axum");
+}
+
+/// `--trusted-proxies=ip[,ip...]`: reverse proxies whose `X-Forwarded-For`
+/// is honored for client IPs (slice 9, H4).
+fn parse_trusted_proxies(list: &str) -> Result<Vec<IpAddr>, String> {
+    list.split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            part.parse::<IpAddr>()
+                .map_err(|err| format!("invalid --trusted-proxies address {part}: {err}"))
+        })
+        .collect()
 }

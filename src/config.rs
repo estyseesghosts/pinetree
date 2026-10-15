@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -18,6 +18,9 @@ pub struct Config {
     pub preserved_usernames: Vec<String>,
     pub prohibited_words: Vec<String>,
     pub sensitive_words: Vec<String>,
+    /// Reverse proxies whose `X-Forwarded-For` is honored for client IPs
+    /// (slice 9, H4). Empty by default: the TCP peer is always the client.
+    pub trusted_proxies: Vec<IpAddr>,
 }
 
 impl Default for Config {
@@ -36,6 +39,7 @@ impl Default for Config {
             ],
             prohibited_words: Vec::new(),
             sensitive_words: Vec::new(),
+            trusted_proxies: Vec::new(),
         }
     }
 }
