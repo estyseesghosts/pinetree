@@ -1,4 +1,4 @@
-# Current state (2026-10-14, Phase 2 complete)
+# Current state (2026-10-15, Phase 2.5 cleanup complete; Phase 3 entry gate green)
 
 ## Phase status
 
@@ -7,7 +7,8 @@
 | 0 Contracts | Done | `docs/phase-0-exit-criteria.md`; FDB client verified live (`docs/fdb-verification.md`) |
 | 1 Single-node server | Done | `docs/phase-1-exit-criteria.md`; `state/logs/2026-10-14-phase-1-complete.md` |
 | 2 Minimal federation | **Done** | `docs/phase-2-exit-criteria.md`; `state/logs/2026-10-14-phase-2-complete.md` |
-| 3 Client compatibility + streaming | **Next** | — |
+| 2.5 Cleanup | **Done** | Slices 0–9, one commit each: `state/logs/2026-10-15-phase2-5-*`; clean-clone `cargo test` 150 green; `scripts/smoke-phase2.sh` → `SMOKE_OK` |
+| 3 Client compatibility + streaming | **Next — entry gate green** | — |
 | 4 FoundationDB multi-node | Planned | — |
 | 5 Scale and hardening | Planned | — |
 
@@ -41,14 +42,14 @@ Anything else answers 404 `UNKNOWN_API_ENDPOINT`; unknown fields on listed endpo
 - Outbound: signed delivery from durable `FederateDeliver` jobs, retries with exponential backoff (`MAX_DELIVERY_ATTEMPTS`), shared-inbox dedup.
 - Interop-learned behaviours: Misskey reuses Follow/Undo ids per follower/followee pair, so dedup forgets them after `Undo(Follow)`; legacy HTTP Signatures only.
 
-## Tests (all executed 2026-10-14)
+## Tests (all executed 2026-10-15, after the Phase 2.5 cleanup)
 
-`cargo test --offline`: lib 113, conformance 27 (redb), crash_recovery 2, client_smoke 1 (real `misskey-js`), federation 2 (two in-process nodes), minrepro 1, federation_interop 1 (env-gated). Live four-server interop: `scripts/smoke-phase2.sh` → `SMOKE_OK` (Misskey 2026.10.1-alpha.0, Sharkey 2025.4.7, 2× pinetree).
+`cargo test`: lib 108, conformance 35 (redb), crash_recovery 2, client_smoke 1 (real `misskey-js`), federation 2 (two in-process nodes), minrepro 1, federation_interop 1 (env-gated) — 150 green. Clean-clone `cargo test` is 150 green too (reference checkouts `./misskey`/`./sharkey` re-linked first; packer snapshot tests skip without them). Live four-server interop: `scripts/smoke-phase2.sh` → `SMOKE_OK` (Misskey 2026.10.1-alpha.0, Sharkey 2025.4.7, 2× pinetree).
 
 ## Known gaps / limits
 
 - **No streaming.** `src/streaming/*` are empty stubs; `StreamingSink` is a no-op, so there is no `/streaming` route, no note capture, and live UI timelines stay empty.
-- API subset only (see above): no `users/notes`, `users/followers|following`, `notes/renotes`, `notes/replies`, `notes/global-timeline`, `notes/search`, lists, antennas, clips, channels, pages, drive folders/listing, mute/block, 2FA, webhooks, polls, quotes, custom emoji endpoints.
+- API subset only (see above): no `users/notes`, `users/followers`, `users/following`, `notes/renotes`, `notes/replies`, `notes/global-timeline`, `notes/search`, lists, antennas, clips, channels, pages, drive folders/listing, mute/block, 2FA, webhooks, polls, quotes, custom emoji endpoints. The `users/followers` gap is endpoint-only — the `followers_of` store and the ActivityPub followers collection exist.
 - `i/update` supports a subset of profile fields (no profile `fields[]`, decorations, mutes, …).
 - Federation MVP scope: no polls/`_misskey_votes`, no quote metadata, no `_misskey_content` (never emitted), no Move/Block/Flag, no RFC 9421 message signatures or LD signatures, no public-internet validation (interop was loopback-only).
 - Storage is single-node `redb`; FoundationDB adapter and `src/cluster/*` are Phase 4. `--mode=cluster` is refused.

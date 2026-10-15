@@ -1,6 +1,6 @@
 # Feature matrix: pinetree vs Misskey vs Sharkey
 
-Compared versions: **pinetree** at end of Phase 2 (2026-10-14); **Misskey** `2026.10.1-alpha.0` and **Sharkey** `2025.4.7` (the read-only checkouts `./misskey`, `./sharkey`). Misskey/Sharkey cells reflect what exists in those checkouts (endpoint and module presence was checked by listing the source tree; behaviour depth was not audited). pinetree cells reflect executed tests only.
+Compared versions: **pinetree** after the Phase 2.5 cleanup (2026-10-15); **Misskey** `2026.10.1-alpha.0` and **Sharkey** `2025.4.7` (the read-only checkouts `./misskey`, `./sharkey`). Misskey/Sharkey cells reflect what exists in those checkouts (endpoint and module presence was checked by listing the source tree; behaviour depth was not audited). pinetree cells reflect executed tests only.
 
 Legend: ✅ supported · 🟡 partial/subset · ❌ not supported (yet) · ⛔ deliberate non-goal · 🗓 planned (phase)
 
@@ -68,8 +68,8 @@ Legend: ✅ supported · 🟡 partial/subset · ❌ not supported (yet) · ⛔ d
 | Polls (`Question`, `_misskey_votes`) | ❌ (deferred) | ✅ | ✅ |
 | `_misskey_content` | never emitted | legacy | legacy |
 | Move / Block / Flag | ❌ | ✅ | ✅ |
-| Atomic activity-id dedup | ✅ (same transaction as the state change) | job-level | job-level |
-| Durable outbound delivery + backoff | ✅ (outbox in the same transaction as the post) | ✅ (BullMQ) | ✅ (BullMQ) |
+| Atomic activity-id dedup | ✅ (same transaction as the state change, including Reject) | job-level | job-level |
+| Durable outbound delivery + backoff | ✅ (outbox in the same transaction as the post; terminal quarantine + retry caps) | ✅ (BullMQ) | ✅ (BullMQ) |
 | SSRF / size / redirect / timeout limits | ✅ | ✅ | ✅ |
 | Remote media validation + cache | ✅ | ✅ | ✅ |
 | Verified interop | ✅ vs real Misskey + Sharkey (loopback) | — | — |
