@@ -2,6 +2,7 @@ use super::AppServices;
 
 use crate::application::ports::{InsertMediaInput, PortError};
 use crate::domain::media::{sniff_mime, MediaMeta, MediaProperties};
+use crate::media::ingest::{md5_hex, sha256_hex};
 
 impl AppServices {
     #[allow(clippy::too_many_arguments)]
@@ -20,9 +21,13 @@ impl AppServices {
                 "MAX_FILE_SIZE_EXCEEDED".to_string(),
             ));
         }
-        let hash = md5_hex(bytes);
+        // Slice 8 (D6): both hashes are computed on upload. The MD5 stays
+        // the per-owner dedup key (same bytes → same md5 → existing row)
+        // and the client-visible packer `md5`; the SHA-256 is the blob
+        // content address.
+        let md5 = md5_hex(bytes);
         if !force {
-            if let Some(existing) = self.media.find_by_owner_and_hash(owner_id, &hash)? {
+            if let Some(existing) = self.media.find_by_owner_and_hash(owner_id, &md5)? {
                 return Ok(existing);
             }
         }
@@ -32,14 +37,16 @@ impl AppServices {
         let sniffed = sniff_mime(bytes);
         let media_id = self.ids.generate();
         let url = format!("{}/files/{media_id}", self.public_url.trim_end_matches('/'));
-        self.blobs.put(&hash, bytes)?;
+        let blob_key = sha256_hex(bytes);
+        self.blobs.put(&blob_key, bytes)?;
         self.media.insert_metadata(InsertMediaInput {
             id: Some(media_id),
             owner_id: Some(owner_id.to_string()),
             name,
             mime: sniffed,
             size_bytes: bytes.len() as u64,
-            hash,
+            hash: md5,
+            blob_key,
             blurhash: None,
             properties: MediaProperties::default(),
             is_sensitive,
@@ -63,11 +70,4 @@ impl AppServices {
     ) -> Result<MediaMeta, PortError> {
         self.notes.attach_remote_media(note_id, input, Vec::new())
     }
-}
-
-fn md5_hex(bytes: &[u8]) -> String {
-    use md5::{Digest, Md5};
-    let mut hasher = Md5::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
 }

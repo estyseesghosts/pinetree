@@ -569,6 +569,11 @@ pub struct InsertMediaInput {
     pub mime: String,
     pub size_bytes: u64,
     pub hash: String,
+    /// SHA-256 hex of the stored bytes: the `BlobStore` content address
+    /// (Phase 2.6 slice 8). `hash` stays the MD5 (packer `md5`, per-owner
+    /// dedup key). Both are computed by the caller on upload (local +
+    /// remote paths).
+    pub blob_key: String,
     pub blurhash: Option<String>,
     pub properties: MediaProperties,
     pub is_sensitive: bool,

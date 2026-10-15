@@ -113,6 +113,10 @@ Reads never need transactions spanning writes. Initial read surface (fan-out-on-
 
 `FollowStore` gains `request_follow`, `get_follow_request`, `follow_requests_to`, `accept_follow_request` (request delete + edge + counters + jobs in one txn) and `remove_follow_request` (reject/cancel + jobs in one txn). `ActivityDedup` gains `record_follow_request_activity`. Contract rules: `follow` supersedes a pending request for the same pair; `unfollow` of a pair with only a pending request removes it (and succeeds); `NotFound(NO_FOLLOW_REQUEST)` when accept/remove find none. Conformance cells F1–F5 in `tests/conformance.rs` (FDB inherits them).
 
+## Superseding note — Phase 2.6 slice 8 (2026-10-15)
+
+`InsertMediaInput` gains required `blob_key` (SHA-256 hex of the bytes; the `BlobStore` address). The `hash` input stays the MD5 (packer `md5`, per-owner dedup key). No port *trait* changed: `MediaStore` (`insert_metadata`, `get`, `find_by_owner_and_hash`, `find_by_source_url`, `delete_metadata`) and `BlobStore` (`put`/`get`/`delete`) keep their exact signatures — the length sidecar is internal to `FsBlobStore`. See the `docs/domain-types.md` slice-8 note (wipe) and `state/logs/2026-10-15-phase2-6-slice8-content-addressing.md`.
+
 ## Superseding note — Phase 2.6 slice 7 (2026-10-15)
 
 `JobKind` gains `RemoteMediaFetch` with payload `RemoteMediaFetchPayload { note_id, attachments: Vec<RemoteMediaAttachment> }` (contract-stable mirror of the AP attachment shape; ≤16 entries, `note_id` may be `"__PENDING_NOTE_ID__"` at enqueue time and is substituted in-txn). `ActivityDedup` gains read-only `is_recorded` (advisory replay gate before any remote fetch; `record_*_activity` stays the atomic authority). `MediaStore` gains `find_by_source_url` (worker idempotency pre-check). `NoteStore` gains `attach_remote_media(note_id, input, jobs)` — media-row insert + `file_ids` append in one txn, idempotent per (`source_url`, note), `NotFound(NO_SUCH_NOTE)` when the note is missing/deleted. Conformance cells M1–M2 in `tests/conformance.rs` (FDB inherits them). See `state/logs/2026-10-15-phase2-6-slice7-media-safety.md`.

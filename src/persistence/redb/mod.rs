@@ -1520,6 +1520,7 @@ impl NoteStore for RedbStore {
             mime: input.mime.clone(),
             size_bytes: input.size_bytes,
             hash: input.hash.clone(),
+            blob_key: input.blob_key.clone(),
             blurhash: input.blurhash.clone(),
             properties: input.properties.clone(),
             is_sensitive: input.is_sensitive,
@@ -2446,6 +2447,7 @@ impl MediaStore for RedbStore {
             mime: input.mime,
             size_bytes: input.size_bytes,
             hash: input.hash,
+            blob_key: input.blob_key,
             blurhash: input.blurhash,
             properties: input.properties,
             is_sensitive: input.is_sensitive,
@@ -2483,6 +2485,8 @@ impl MediaStore for RedbStore {
         owner_id: &str,
         hash: &str,
     ) -> Result<Option<MediaMeta>, PortError> {
+        // Slice 8 (D6): the dedup key stays the md5 (`MediaMeta.hash`), not
+        // the SHA-256 blob address — same bytes → same md5 → existing row.
         let read_txn = self.db.begin_read().map_err(map_redb_err)?;
         let table = read_txn.open_table(MEDIA_META).map_err(map_redb_err)?;
         for entry in table.iter().map_err(map_redb_err)? {

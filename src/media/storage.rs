@@ -46,14 +46,25 @@ impl FsBlobStore {
         let pid = std::process::id();
         Ok(self.root.join("tmp").join(format!("{hash}.{pid}.{seq}.tmp")))
     }
-}
 
-impl BlobStore for FsBlobStore {
-    fn put(&self, hash: &str, bytes: &[u8]) -> Result<(), PortError> {
-        let final_path = self.object_path(hash)?;
-        if final_path.exists() {
-            return Ok(());
-        }
+    /// Length sidecar for an object: `{object_path}.len`, holding the
+    /// decimal byte length (Phase 2.6 slice 8). Written via tmp+rename
+    /// alongside the bytes; `get` treats a missing/mismatched sidecar as
+    /// corrupt (`Ok(None)`) so a torn write can never serve short bytes.
+    /// The `BlobStore` trait is unchanged — the sidecar is internal.
+    fn sidecar_path(&self, hash: &str) -> Result<PathBuf, PortError> {
+        let path = self.object_path(hash)?;
+        let mut name = path
+            .file_name()
+            .map(|s| s.to_os_string())
+            .ok_or_else(|| PortError::Validation(format!("invalid blob hash: {hash}")))?;
+        name.push(".len");
+        let mut sidecar = path;
+        sidecar.set_file_name(name);
+        Ok(sidecar)
+    }
+
+    fn write_atomic(&self, hash: &str, final_path: &Path, bytes: &[u8]) -> Result<(), PortError> {
         if let Some(parent) = final_path.parent() {
             fs::create_dir_all(parent).map_err(|e| {
                 PortError::StorageUnavailable(format!("create blob shard dir: {e}"))
@@ -73,17 +84,61 @@ impl BlobStore for FsBlobStore {
                 PortError::StorageUnavailable(format!("sync temp blob file: {e}"))
             })?;
         }
-        fs::rename(&tmp_path, &final_path).map_err(|e| {
+        fs::rename(&tmp_path, final_path).map_err(|e| {
             let _ = fs::remove_file(&tmp_path);
             PortError::StorageUnavailable(format!("rename temp blob to final path: {e}"))
         })?;
         Ok(())
     }
+}
+
+impl BlobStore for FsBlobStore {
+    fn put(&self, hash: &str, bytes: &[u8]) -> Result<(), PortError> {
+        let final_path = self.object_path(hash)?;
+        let sidecar = self.sidecar_path(hash)?;
+        // SHA-256 keys make the skip safe (same key ⇒ same bytes): skip only
+        // when the object length (via stat, no content read) and the sidecar
+        // both record exactly this length, otherwise (re)write both files so
+        // a torn object or a missing/stale sidecar heals instead of lingering.
+        let object_len_ok = fs::metadata(&final_path).map(|m| m.len()).ok()
+            == Some(bytes.len() as u64);
+        let sidecar_ok = fs::read_to_string(&sidecar)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            == Some(bytes.len() as u64);
+        if object_len_ok && sidecar_ok {
+            return Ok(());
+        }
+        self.write_atomic(hash, &final_path, bytes)?;
+        self.write_atomic(hash, &sidecar, bytes.len().to_string().as_bytes())?;
+        Ok(())
+    }
 
     fn get(&self, hash: &str) -> Result<Option<Vec<u8>>, PortError> {
         let final_path = self.object_path(hash)?;
+        let sidecar = self.sidecar_path(hash)?;
+        let expected: u64 = match fs::read_to_string(&sidecar) {
+            // Missing or unparsable sidecar (torn `put`, or a pre-slice-8
+            // MD5-keyed blob) is corruption: `None`, never raw bytes.
+            // Callers already map `None` to 500/404.
+            Ok(s) => match s.trim().parse() {
+                Ok(n) => n,
+                Err(_) => return Ok(None),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(PortError::StorageUnavailable(format!(
+                    "read blob sidecar: {e}"
+                )))
+            }
+        };
         match fs::read(&final_path) {
-            Ok(bytes) => Ok(Some(bytes)),
+            Ok(bytes) => {
+                if bytes.len() as u64 != expected {
+                    return Ok(None);
+                }
+                Ok(Some(bytes))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(PortError::StorageUnavailable(format!(
                 "read blob file: {e}"
@@ -96,8 +151,18 @@ impl BlobStore for FsBlobStore {
         match fs::remove_file(&final_path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => {
+                return Err(PortError::StorageUnavailable(format!(
+                    "delete blob file: {e}"
+                )))
+            }
+        }?;
+        let sidecar = self.sidecar_path(hash)?;
+        match fs::remove_file(&sidecar) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(PortError::StorageUnavailable(format!(
-                "delete blob file: {e}"
+                "delete blob sidecar: {e}"
             ))),
         }
     }
@@ -133,6 +198,46 @@ mod tests {
         assert_eq!(store.get(hash).unwrap().as_deref(), Some(&payload[..]));
 
         store.delete(hash).unwrap();
+        assert_eq!(store.get(hash).unwrap(), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn blob_store_get_verifies_length_sidecar() {
+        // Slice 8 (D6, written before the fix): `get` must never serve
+        // short bytes from a torn write. A length mismatch — or a
+        // missing/corrupt sidecar — reads as `None`, never as truncated
+        // content (callers map `None` to 500/404; the bytes are re-fetched
+        // or re-uploaded).
+        let dir = std::env::temp_dir().join(format!("pinetree-blob-test-{}", uuid::Uuid::new_v4()));
+        let store = FsBlobStore::new(&dir).unwrap();
+        let hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let payload = b"length-checked blob bytes";
+
+        store.put(hash, payload).unwrap();
+        assert_eq!(store.get(hash).unwrap().as_deref(), Some(&payload[..]));
+
+        // Truncate the object file in place: must not serve short bytes.
+        let object = store.object_path(hash).unwrap();
+        std::fs::write(&object, &payload[..4]).unwrap();
+        assert_eq!(
+            store.get(hash).unwrap(),
+            None,
+            "truncated blob must read as corrupt, not short"
+        );
+
+        // A fresh put heals the torn write.
+        store.put(hash, payload).unwrap();
+        assert_eq!(store.get(hash).unwrap().as_deref(), Some(&payload[..]));
+
+        // A corrupt sidecar is corruption too, not a fallback to raw bytes.
+        let sidecar = store.sidecar_path(hash).unwrap();
+        std::fs::write(&sidecar, b"not-a-number").unwrap();
+        assert_eq!(store.get(hash).unwrap(), None);
+
+        // A missing sidecar (e.g. a pre-slice-8 blob) is also `None`.
+        std::fs::remove_file(&sidecar).unwrap();
         assert_eq!(store.get(hash).unwrap(), None);
 
         let _ = std::fs::remove_dir_all(&dir);

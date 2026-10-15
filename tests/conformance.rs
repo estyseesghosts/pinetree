@@ -1779,6 +1779,8 @@ fn valid_media_input(owner: Option<String>) -> InsertMediaInput {
         mime: "image/png".to_string(),
         size_bytes: 512,
         hash: "d41d8cd98f00b204e9800998ecf8427e".to_string(),
+        blob_key: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            .to_string(),
         blurhash: None,
         properties: pinetree::domain::media::MediaProperties::default(),
         is_sensitive: false,
@@ -2288,4 +2290,61 @@ fn m2_attach_remote_media_idempotent() {
     let clock = test_clock();
     let store = factory.open(clock.clone());
     case_m2_attach_remote_media_idempotent(&*store, &clock);
+}
+
+/// M3: SHA-256 blob-key addressing round-trips through the store while the
+/// md5 stays the per-owner dedup key. Two rows for one owner with distinct
+/// (md5, blob_key) pairs coexist; each is found by its own md5 via
+/// `find_by_owner_and_hash`; `get` returns both hashes intact. (Written
+/// before the slice-8 fix; FDB inherits it.)
+fn case_m3_media_blob_key_roundtrip<S: ConformanceStore>(store: &S) {
+    use pinetree::media::ingest::{md5_hex, sha256_hex};
+    let alice = create_user(store, "m3_alice");
+    let payload_a = b"m3 blob A";
+    let payload_b = b"m3 blob B";
+
+    let mut input_a = valid_media_input(Some(alice.id.clone()));
+    input_a.hash = md5_hex(payload_a);
+    input_a.blob_key = sha256_hex(payload_a);
+    input_a.size_bytes = payload_a.len() as u64;
+    let row_a = store.insert_metadata(input_a).expect("row a");
+
+    let mut input_b = valid_media_input(Some(alice.id.clone()));
+    input_b.hash = md5_hex(payload_b);
+    input_b.blob_key = sha256_hex(payload_b);
+    input_b.size_bytes = payload_b.len() as u64;
+    let row_b = store.insert_metadata(input_b).expect("row b");
+
+    assert_ne!(row_a.id, row_b.id);
+    assert_ne!(row_a.blob_key, row_b.blob_key, "distinct bytes → distinct keys");
+    assert_ne!(row_a.hash, row_b.hash);
+
+    // Dedup lookup still keys on the md5: each md5 resolves to its own row.
+    let found_a = store
+        .find_by_owner_and_hash(&alice.id, &row_a.hash)
+        .expect("lookup a")
+        .expect("row a found by md5");
+    assert_eq!(found_a.id, row_a.id);
+    assert_eq!(found_a.blob_key, row_a.blob_key);
+    let found_b = store
+        .find_by_owner_and_hash(&alice.id, &row_b.hash)
+        .expect("lookup b")
+        .expect("row b found by md5");
+    assert_eq!(found_b.id, row_b.id);
+
+    // Unknown md5 finds nothing (no cross-talk between the rows).
+    assert!(
+        store
+            .find_by_owner_and_hash(&alice.id, &sha256_hex(b"m3 blob C"))
+            .expect("unknown lookup")
+            .is_none()
+    );
+}
+
+#[test]
+fn m3_media_blob_key_roundtrip() {
+    let factory = RedbFactory::fresh("m3");
+    let clock = test_clock();
+    let store = factory.open(clock);
+    case_m3_media_blob_key_roundtrip(&*store);
 }

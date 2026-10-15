@@ -1072,6 +1072,8 @@ mod tests {
             mime: "image/png".to_string(),
             size_bytes: 512,
             hash: "d41d8cd98f00b204e9800998ecf8427e".to_string(),
+            blob_key: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .to_string(),
             blurhash: None,
             properties: crate::domain::media::MediaProperties {
                 width: Some(1280),
@@ -1336,6 +1338,21 @@ mod tests {
         assert_eq!(packed["email"], Value::Null);
         assert_eq!(packed["securityKeysList"], Value::Array(Vec::new()));
         assert_eq!(packed["policies"]["driveCapacityMb"], 1024);
+    }
+
+    #[test]
+    fn slice8_pack_drive_file_md5_stable_for_same_bytes() {
+        // Slice 8 (D6, written before the fix): the client-visible `md5` is
+        // the stored md5 field, byte-identical to the pre-slice value for
+        // the same bytes — the blob-key migration must not move it, and the
+        // SHA-256 address must never leak into the packed shape.
+        let (services, _, _) = test_services(1_700_000_000_000);
+        let media = test_media("mid00000000000001", "aid00000000000001");
+        assert_eq!(media.hash, "d41d8cd98f00b204e9800998ecf8427e");
+        let packed = pack_drive_file(&media, &services);
+        assert_eq!(packed["md5"], "d41d8cd98f00b204e9800998ecf8427e");
+        assert!(packed.get("blob_key").is_none());
+        assert!(packed.get("sha256").is_none());
     }
 
     #[test]

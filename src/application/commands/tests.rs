@@ -96,7 +96,89 @@ fn actor_keypair_generation_rotation_and_remote_key_cache() {
     assert_eq!(loaded, cached);
 }
 
+// --- Slice 8 (D6) content-addressing tests (written before the fix) ---
+
 // --- Slice 7 (H2) local-upload sniff tests (written before the fix) ---
+
+#[test]
+fn slice8_distinct_uploads_never_share_blob_storage() {
+    // Two distinct blobs get distinct SHA-256 keys and both stay
+    // retrievable under their own key.
+    let services = test_services("slice8-distinct");
+    let alice = services.create_account("alice", None).unwrap();
+    let a = services
+        .upload_media(&alice.id, "a.txt".to_string(), b"payload A", None, false, true)
+        .unwrap();
+    let b = services
+        .upload_media(&alice.id, "b.txt".to_string(), b"payload B", None, false, true)
+        .unwrap();
+    assert_ne!(a.blob_key, b.blob_key, "distinct bytes → distinct blob keys");
+    assert_ne!(a.hash, b.hash);
+    assert_eq!(
+        services.blobs.get(&a.blob_key).unwrap().as_deref(),
+        Some(b"payload A".as_slice())
+    );
+    assert_eq!(
+        services.blobs.get(&b.blob_key).unwrap().as_deref(),
+        Some(b"payload B".as_slice())
+    );
+}
+
+#[test]
+fn slice8_owner_dedup_still_works_and_force_bypasses() {
+    // Per-owner dedup still keys on the md5: same bytes twice → same row,
+    // single blob write. `force = true` bypasses the dedup but lands on
+    // the same blob key.
+    let services = test_services("slice8-dedup");
+    let alice = services.create_account("alice", None).unwrap();
+    let bytes = b"slice8 dedup payload";
+    let first = services
+        .upload_media(&alice.id, "a.bin".to_string(), bytes, None, false, false)
+        .unwrap();
+    let second = services
+        .upload_media(&alice.id, "a.bin".to_string(), bytes, None, false, false)
+        .unwrap();
+    assert_eq!(first.id, second.id, "same bytes → same row (md5 dedup)");
+    // The blob lives under the SHA-256 key, never under the md5.
+    assert_ne!(first.blob_key, first.hash);
+    assert_eq!(
+        services.blobs.get(&first.blob_key).unwrap().as_deref(),
+        Some(bytes.as_slice())
+    );
+    assert_eq!(
+        services.blobs.get(&first.hash).unwrap(),
+        None,
+        "md5 is not a blob key"
+    );
+    let forced = services
+        .upload_media(&alice.id, "a.bin".to_string(), bytes, None, false, true)
+        .unwrap();
+    assert_ne!(forced.id, first.id, "force bypasses the dedup");
+    assert_eq!(forced.blob_key, first.blob_key, "same bytes → same blob key");
+    assert_eq!(forced.hash, first.hash, "md5 unchanged for the same bytes");
+}
+
+#[test]
+fn slice8_empty_upload_pins_known_md5_and_sha256_vectors() {
+    // The empty input has universally-known digests — md5("") and
+    // sha256("") are also the values the pre-existing fixtures carry, so
+    // no constant here is trusted blindly. Pins the packer `md5` value
+    // absolutely across the blob-key migration.
+    let services = test_services("slice8-vectors");
+    let alice = services.create_account("alice", None).unwrap();
+    let meta = services
+        .upload_media(&alice.id, "empty.bin".to_string(), b"", None, false, true)
+        .unwrap();
+    assert_eq!(meta.hash, "d41d8cd98f00b204e9800998ecf8427e");
+    assert_eq!(
+        meta.blob_key,
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+    assert_eq!(
+        services.blobs.get(&meta.blob_key).unwrap().as_deref(),
+        Some(b"".as_slice())
+    );
+}
 
 #[test]
 fn local_non_utf8_upload_claiming_html_is_not_html() {

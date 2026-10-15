@@ -450,6 +450,7 @@ fn child_c4restart() -> ! {
         "notes": [n1.id, n2.id, n3.id, n4.id, n5.id],
         "media_id": media.id,
         "media_hash": media.hash,
+        "media_blob_key": media.blob_key,
         "reactions": [
             {"user_id": r1.user_id, "note_id": r1.note_id, "reaction": r1.reaction},
             {"user_id": r2.user_id, "note_id": r2.note_id, "reaction": r2.reaction},
@@ -501,6 +502,7 @@ fn c4_restart_preserves_accounts_follows_reactions_and_timelines() {
     let bob_id = str_field("bob_id");
     let media_id = str_field("media_id");
     let media_hash = str_field("media_hash");
+    let media_blob_key = str_field("media_blob_key");
     let note_ids: Vec<String> = manifest["notes"]
         .as_array()
         .expect("manifest notes array")
@@ -564,9 +566,10 @@ fn c4_restart_preserves_accounts_follows_reactions_and_timelines() {
         .expect("get media meta")
         .expect("media metadata survives restart");
     assert_eq!(meta.hash, media_hash);
+    assert_eq!(meta.blob_key, media_blob_key);
     assert_eq!(meta.owner_id.as_deref(), Some(alice_id.as_str()));
     let bytes = blobs
-        .get(&media_hash)
+        .get(&media_blob_key)
         .expect("get blob")
         .expect("media blob survives restart");
     assert_eq!(

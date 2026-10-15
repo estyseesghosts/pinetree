@@ -18,6 +18,14 @@ pub struct MediaMeta {
     pub mime: String,
     pub size_bytes: u64,
     pub hash: String,
+    /// SHA-256 hex of the stored bytes: the `BlobStore` content address
+    /// (Phase 2.6 slice 8). `hash` stays the MD5: it feeds the client-visible
+    /// packer `md5` and the per-owner upload dedup key. `#[serde(default)]`
+    /// so pre-slice-8 rows still decode (they hold MD5-keyed blobs and are
+    /// unsupported — see the domain-types wipe note — but must never crash
+    /// a read).
+    #[serde(default)]
+    pub blob_key: String,
     pub blurhash: Option<String>,
     pub properties: MediaProperties,
     pub is_sensitive: bool,
@@ -60,12 +68,22 @@ impl MediaMeta {
             ));
         }
         // Hashes are hex/alnum text; raw binary blob bytes are rejected here.
+        // `hash` is the client-visible MD5 (packer `md5`, per-owner dedup
+        // key); `blob_key` is the SHA-256 blob-store address (slice 8).
         if self.hash.is_empty()
             || self.hash.len() > 128
             || !self.hash.bytes().all(|b| b.is_ascii_alphanumeric())
         {
             return Err(DomainError::Validation(
                 "hash must be 1..=128 ASCII alphanumeric chars".to_string(),
+            ));
+        }
+        if self.blob_key.is_empty()
+            || self.blob_key.len() > 128
+            || !self.blob_key.bytes().all(|b| b.is_ascii_alphanumeric())
+        {
+            return Err(DomainError::Validation(
+                "blob_key must be 1..=128 ASCII alphanumeric chars".to_string(),
             ));
         }
         if let Some(blurhash) = &self.blurhash {
@@ -232,6 +250,8 @@ mod tests {
             mime: "image/png".to_string(),
             size_bytes: 512,
             hash: "d41d8cd98f00b204e9800998ecf8427e".to_string(),
+            blob_key: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .to_string(),
             blurhash: None,
             properties: MediaProperties::default(),
             is_sensitive: false,
@@ -287,6 +307,22 @@ mod tests {
         m.hash = "\u{0}\u{1}\u{2}binary".to_string();
         assert!(m.validate(MAX_FILE_SIZE).is_err());
         m.hash = "not a hash!".to_string();
+        assert!(m.validate(MAX_FILE_SIZE).is_err());
+    }
+
+    #[test]
+    fn blob_key_rejects_empty_and_binary() {
+        // Slice 8 (D6, written before the fix): the SHA-256 blob address
+        // carries the same alnum bounds as the md5 field.
+        let mut m = valid_media();
+        assert!(m.validate(MAX_FILE_SIZE).is_ok());
+        m.blob_key = String::new();
+        assert!(m.validate(MAX_FILE_SIZE).is_err());
+        m.blob_key = "k".repeat(129);
+        assert!(m.validate(MAX_FILE_SIZE).is_err());
+        m.blob_key = "not a key!".to_string();
+        assert!(m.validate(MAX_FILE_SIZE).is_err());
+        m.blob_key = "\u{0}\u{1}\u{2}binary".to_string();
         assert!(m.validate(MAX_FILE_SIZE).is_err());
     }
 

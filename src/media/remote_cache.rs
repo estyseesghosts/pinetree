@@ -19,7 +19,7 @@ use crate::application::ports::{
 use crate::domain::media::{sniff_mime, MediaMeta, MediaProperties};
 use crate::domain::note::MAX_FILE_IDS;
 use crate::federation::delivery::{SafeHttpClient, parse_http_url, resolve_and_validate_url};
-use crate::media::ingest::{md5_hex, sanitize_filename};
+use crate::media::ingest::{md5_hex, sha256_hex, sanitize_filename};
 
 /// Maximum attachments carried per note (Misskey parity; matches the
 /// `Note::file_ids` domain bound). Longer lists are truncated, keeping
@@ -170,7 +170,7 @@ fn fetch_and_attach_remote_media(
         height: attachment.height,
     };
     let prepared = download_and_sniff(services, &services.federation_http, &parsed)?;
-    services.blobs.put(&prepared.hash, &prepared.bytes)?;
+    services.blobs.put(&prepared.blob_key, &prepared.bytes)?;
     let media_id = services.ids.generate();
     let local_url = format!(
         "{}/files/{media_id}",
@@ -183,6 +183,7 @@ fn fetch_and_attach_remote_media(
         mime: prepared.mime,
         size_bytes: prepared.bytes.len() as u64,
         hash: prepared.hash,
+        blob_key: prepared.blob_key,
         blurhash: prepared.blurhash,
         properties: prepared.properties,
         is_sensitive: prepared.is_sensitive,
@@ -210,7 +211,10 @@ struct PreparedRemoteMedia {
     mime: String,
     name: String,
     comment: Option<String>,
+    /// MD5: stays the client-visible `MediaMeta.hash` (packer `md5`).
     hash: String,
+    /// SHA-256 hex: the `BlobStore` content address (slice 8).
+    blob_key: String,
     blurhash: Option<String>,
     properties: MediaProperties,
     is_sensitive: bool,
@@ -285,12 +289,14 @@ fn download_and_sniff(
         .map(|c| c.chars().take(512).collect());
 
     let hash = md5_hex(&resp.body);
+    let blob_key = sha256_hex(&resp.body);
     Ok(PreparedRemoteMedia {
         bytes: resp.body,
         mime,
         name,
         comment,
         hash,
+        blob_key,
         blurhash: attachment.blurhash.clone(),
         properties: MediaProperties {
             width: attachment.width,
@@ -313,7 +319,7 @@ pub fn fetch_and_cache_remote_media(
     attachment: &ParsedAttachment,
 ) -> Result<MediaMeta, PortError> {
     let prepared = download_and_sniff(services, client, attachment)?;
-    services.blobs.put(&prepared.hash, &prepared.bytes)?;
+    services.blobs.put(&prepared.blob_key, &prepared.bytes)?;
 
     let media_id = services.ids.generate();
     let local_url = format!(
@@ -327,6 +333,7 @@ pub fn fetch_and_cache_remote_media(
         mime: prepared.mime,
         size_bytes: prepared.bytes.len() as u64,
         hash: prepared.hash,
+        blob_key: prepared.blob_key,
         blurhash: prepared.blurhash,
         properties: prepared.properties,
         is_sensitive: prepared.is_sensitive,
@@ -462,7 +469,15 @@ mod tests {
         assert!(meta.is_sensitive);
         assert_eq!(meta.mime, "image/png");
         assert_eq!(meta.size_bytes, png_bytes.len() as u64);
-        assert_eq!(services.blobs.get(&meta.hash).unwrap().unwrap(), png_bytes);
+        // Slice 8 (D6): the blob lives under the SHA-256 key while the
+        // meta keeps the md5; both are the real digests of the fetched bytes.
+        assert_eq!(meta.hash, md5_hex(&png_bytes));
+        assert_eq!(meta.blob_key, sha256_hex(&png_bytes));
+        assert_ne!(meta.blob_key, meta.hash);
+        assert_eq!(
+            services.blobs.get(&meta.blob_key).unwrap().unwrap(),
+            png_bytes
+        );
 
         let big_att = ParsedAttachment {
             url: format!("http://{addr}/big.bin"),

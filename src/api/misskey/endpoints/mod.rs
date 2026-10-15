@@ -474,7 +474,7 @@ async fn serve_file(
     let bytes = state
         .services
         .blobs
-        .get(&meta.hash)
+        .get(&meta.blob_key)
         .map_err(ApiError::from_port_error)?
         .ok_or_else(ApiError::internal)?;
     let mut response = bytes.into_response();

@@ -1122,7 +1122,7 @@ async fn federation_two_node_end_to_end() {
     assert_eq!(meta.owner_id, None, "remote media is ownerless");
     assert!(meta.is_link, "remote media is a link");
     assert_eq!(
-        b.services.blobs.get(&meta.hash).expect("blob").expect("blob bytes"),
+        b.services.blobs.get(&meta.blob_key).expect("blob").expect("blob bytes"),
         png,
         "cached bytes match the source"
     );
@@ -1386,7 +1386,7 @@ fn federation_remote_media_cache() {
     assert!(meta.is_sensitive);
     assert_eq!(meta.mime, "image/png");
     assert_eq!(meta.size_bytes, png.len() as u64);
-    assert_eq!(blobs.get(&meta.hash).expect("blob").expect("bytes"), png);
+    assert_eq!(blobs.get(&meta.blob_key).expect("blob").expect("bytes"), png);
 
     // Missing object rejected (404 from the inline server).
     let missing = ParsedAttachment {
