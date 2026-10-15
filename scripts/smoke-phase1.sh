@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Phase 1 Slice E1 — live binary + misskey-js client smoke suite.
 #
-# Starts the compiled `target/debug/pinetree` binary (building it first when
+# Starts the compiled pinetree binary (resolved via cargo metadata so it
+# honours .cargo/config.toml `target-dir`; building it first when
 # absent) on a temporary `--data-dir` and an ephemeral
 # `--listen=127.0.0.1:<port>` with `--public-url=http://127.0.0.1:<port>`,
 # then drives the full end-to-end flow with the real Misskey
@@ -23,7 +24,17 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BIN="$ROOT/target/debug/pinetree"
+# Binary location honours .cargo/config.toml `target-dir` (and CARGO_TARGET_DIR):
+# resolve via cargo metadata, falling back to the default layout. PINETREE_BIN
+# overrides outright.
+pinetree_bin() {
+  if [[ -n "${PINETREE_BIN:-}" ]]; then echo "$PINETREE_BIN"; return; fi
+  local dir
+  dir="$(cd "$ROOT" && cargo metadata --format-version 1 --offline --no-deps 2>/dev/null \
+    | python3 -c 'import json,sys;print(json.load(sys.stdin).get("target_directory",""))' 2>/dev/null)"
+  if [[ -n "$dir" ]]; then echo "$dir/debug/pinetree"; else echo "$ROOT/target/debug/pinetree"; fi
+}
+BIN="$(pinetree_bin)"
 TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/pinetree-smoke-XXXXXX")"
 DATA_DIR="$TMPDIR/data"
 STATE_FILE="$TMPDIR/smoke-state.json"

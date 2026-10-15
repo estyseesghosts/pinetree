@@ -3,6 +3,7 @@
 /misskey
 /sharkey
 /target/
+MPC68MOKR/
 /data/
 libfdb_c*.so
 repo.zip

@@ -36,12 +36,25 @@ print its first line; it is not hung).
 ## One-time prerequisites
 
 1. docker + compose plugin (images `postgres:16-alpine`, `redis:7-alpine`).
-2. Misskey backend built: `cd misskey && pnpm build-pre && pnpm --filter "backend..." build` (Node 24 is fine).
-3. Sharkey needs **Node 22** (its `engines` field rejects 24). Get one, e.g.
+2. Node 24 (Misskey) **and** Node 22 (Sharkey): `nvm install 24` as default,
+   system Node 22 via `SHARKEY_NODE_BIN=/usr/sbin`. The script hard-checks
+   both majors (Misskey's `re2` is compiled for 24, Sharkey's tree for 22).
+3. Misskey backend built: `cd misskey && pnpm build-pre && pnpm --filter "backend..." build` (Node 24 is fine).
+4. Sharkey needs **Node 22** (its `engines` field rejects 24). Get one, e.g.
    `curl -L https://nodejs.org/dist/latest-v22.x/node-v22.23.3-linux-x64.tar.xz | tar xJ`,
    then with it first on `PATH`:
    `cd sharkey && pnpm install --frozen-lockfile && pnpm build-pre && pnpm --filter "backend..." build`.
-4. `cargo build --offline` (the pinetree binary at `target/debug/pinetree`).
+5. `cargo build --offline` (the pinetree binary lands in the cargo target dir
+   — `./target` by default, `/root/pinetree-target` here via `.cargo/config.toml`;
+   `scripts/smoke-phase2.sh` resolves it via `cargo metadata`).
+
+Filesystem note (WSL): this repo may live on `/mnt/c`, but keep the
+`./misskey` / `./sharkey` checkout targets **and** the cargo target dir on
+the native Linux filesystem — 9P makes boots, migrations, vite and
+compiles several times slower. This machine uses `/root/fedifedifedi/`
+(checkouts; symlinked as `./misskey`, `./sharkey`) and `/root/pinetree-target`
+(via git-ignored `.cargo/config.toml`). `scripts/smoke-phase2.sh` resolves
+everything through the symlinks, so no script changes are needed.
 
 ## Starting the pieces by hand
 
@@ -88,10 +101,10 @@ Why the env vars: `NODE_ENV=development` because both refuse `http://` URLs
 in production; `MISSKEY_WEBFINGER_USE_HTTP=true` makes them WebFinger over
 http; `allowedPrivateNetworks` lets them fetch from loopback.
 
-**pinetree A and B**
+**pinetree A and B** (`<target>` = cargo target dir, `./target` by default)
 ```bash
 for n in 3 4; do
-  PINETREE_ALLOW_PRIVATE_IPS=1 target/debug/pinetree --public-url=http://127.0.1.$n \
+  PINETREE_ALLOW_PRIVATE_IPS=1 <target>/debug/pinetree --public-url=http://127.0.1.$n \
     --data-dir=$W/pt$n --listen=127.0.0.1:310$n &
 done
 ```
@@ -141,11 +154,34 @@ get a Misskey UI on a pinetree node use the temporary rig
 then open `http://localhost:8182` (needs the Misskey vite dev server on 5173).
 Links and avatars will still point at the `127.0.1.x` public URL.
 
+## Sharkey's own web UI (vite dev behind its backend)
+
+Unlike pinetree, Sharkey serves its own client: the backend renders the app
+shell at `/` and reverse-proxies `/vite` to a vite dev server when no
+production frontend manifest exists (`VITE_PORT`, default 5173). To get it:
+
+```bash
+# one-time pre-builds (Node 22), then vite on 5174 (5173 is Misskey's)
+cd sharkey && pnpm --filter frontend-shared build && pnpm --filter misskey-bubble-game build
+cd packages/frontend && PATH=<node22-bin>:$PATH ./node_modules/.bin/vite --port 5174 --strictPort &
+# point the running backend at it (restart with the env var; same DB)
+VITE_PORT=5174 EMBED_VITE_PORT=5175 <same backend command as above> &
+```
+
+Then open `http://localhost:3102` (`sk1` / `password123`). If `/` serves the
+shell but assets 404, the backend's `/vite` proxy is aimed at the wrong port
+— check `VITE_PORT`. First vite boot optimizes deps and is slow on `/mnt/c`.
+
 ## Known gotchas found while bringing this up
 
 * Misskey/Sharkey `federation` defaults to `none` — nothing federates until
   `admin/update-meta {"federation":"all"}`.
 * Misskey/Sharkey reject `http://` actor/note/url fields when `NODE_ENV=production`.
 * Sharkey needs Node 22; cluster mode left the queue worker down (use `MK_DISABLE_CLUSTERING=1`).
+* Misskey's `re2` native module is compiled for its build-time Node major:
+  run Misskey migrate/serve under the same Node 24 it was built with
+  (`NODE_MODULE_VERSION 137`), Sharkey under Node 22 (127) via
+  `SHARKEY_NODE_BIN`. A `was compiled against a different Node.js version`
+  `ERR_DLOPEN_FAILED` means the majors got swapped.
 * Don't `pkill -f built/entry.js` from the same shell command line: it matches itself.
 * A stale previous Misskey on the port makes a new one silently fail to bind.

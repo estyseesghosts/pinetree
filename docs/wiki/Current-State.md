@@ -7,7 +7,8 @@
 | 0 Contracts | Done | `docs/phase-0-exit-criteria.md`; FDB client verified live (`docs/fdb-verification.md`) |
 | 1 Single-node server | Done | `docs/phase-1-exit-criteria.md`; `state/logs/2026-10-14-phase-1-complete.md` |
 | 2 Minimal federation | **Done** | `docs/phase-2-exit-criteria.md`; `state/logs/2026-10-14-phase-2-complete.md` |
-| 2.5 Cleanup | **Done** | Slices 0–9, one commit each: `state/logs/2026-10-15-phase2-5-*`; clean-clone `cargo test` 150 green; `scripts/smoke-phase2.sh` → `SMOKE_OK` |
+| 2.5 Cleanup | **Done** | Slices 0–9, one commit each: `state/logs/2026-10-15-phase2-5-*`; `cargo test` 251 green; `scripts/smoke-phase2.sh` → `SMOKE_OK` |
+| 2.6 Federation hardening | **Done** | Slices 1–12 (`state/logs/2026-10-15-phase2-6-*`): key ownership, inbox URLs, follow requests, reply visibility, request bodies, media safety, content addressing, passwords/throttling, delivery reliability, AP collections, RSA→`ring` signer |
 | 3 Client compatibility + streaming | **Next — entry gate green** | — |
 | 4 FoundationDB multi-node | Planned | — |
 | 5 Scale and hardening | Planned | — |
@@ -23,7 +24,9 @@ src/                     the crate (see About → How it is built)
 tests/                   conformance, crash_recovery, client_smoke, federation, federation_interop, minrepro
 scripts/                 smoke-phase1.sh, smoke-phase2.sh, interop/ (compose + loopback proxy)
 foundationdb/, redb/     upstream reference checkouts (git-ignored, read-only)
-misskey, sharkey         symlinks to reference checkouts (git-ignored, read-only)
+misskey, sharkey         symlinks to reference checkouts (git-ignored, read-only;
+                          keep the targets on the native Linux fs under WSL)
+.cargo/config.toml       git-ignored machine-local settings (cargo target-dir on ext4)
 ```
 
 ## Implemented Misskey API surface
@@ -42,9 +45,9 @@ Anything else answers 404 `UNKNOWN_API_ENDPOINT`; unknown fields on listed endpo
 - Outbound: signed delivery from durable `FederateDeliver` jobs, retries with exponential backoff (`MAX_DELIVERY_ATTEMPTS`), shared-inbox dedup.
 - Interop-learned behaviours: Misskey reuses Follow/Undo ids per follower/followee pair, so dedup forgets them after `Undo(Follow)`; legacy HTTP Signatures only.
 
-## Tests (all executed 2026-10-15, after the Phase 2.5 cleanup)
+## Tests (all executed 2026-10-15, after slices through 2.6)
 
-`cargo test`: lib 108, conformance 35 (redb), crash_recovery 2, client_smoke 1 (real `misskey-js`), federation 2 (two in-process nodes), minrepro 1, federation_interop 1 (env-gated) — 150 green. Clean-clone `cargo test` is 150 green too (reference checkouts `./misskey`/`./sharkey` re-linked first; packer snapshot tests skip without them). Live four-server interop: `scripts/smoke-phase2.sh` → `SMOKE_OK` (Misskey 2026.10.1-alpha.0, Sharkey 2025.4.7, 2× pinetree).
+`cargo test`: lib 193, conformance 51 (redb), crash_recovery 2, client_smoke 1 (real `misskey-js`), federation 2 (two in-process nodes), minrepro 1, federation_interop 1 (env-gated) — 251 green. Clean-clone `cargo test` needs `./misskey`/`./sharkey` re-linked first (packer snapshot tests skip without them). Live four-server interop: `scripts/smoke-phase2.sh` → `SMOKE_OK` (Misskey 2026.10.1-alpha.0, Sharkey 2025.4.7, 2× pinetree). Single-node bench: `scripts/bench-local.py` (~870 notes-create/s, ~430 timeline/s, ~1200 users-show/s on a debug build).
 
 ## Known gaps / limits
 

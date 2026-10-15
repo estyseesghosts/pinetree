@@ -99,9 +99,24 @@ wait_http() { # url what
 # --- prerequisites ---------------------------------------------------------
 [[ -f "$ROOT/misskey/packages/backend/built/entry.js" ]] || { echo "SMOKE_FAIL: ./misskey backend not built" >&2; exit 1; }
 [[ -f "$ROOT/sharkey/packages/backend/built/boot/entry.js" ]] || { echo "SMOKE_FAIL: ./sharkey backend not built" >&2; exit 1; }
+# Misskey's `re2` native module is compiled for Node 24 (NODE_MODULE_VERSION
+# 137); running it under another major fails with ERR_DLOPEN_FAILED.
+[[ "$(node --version)" == v24.* ]] || { echo "SMOKE_FAIL: Misskey needs Node 24 on PATH (nvm use 24)" >&2; exit 1; }
 SK_PATH="${SHARKEY_NODE_BIN:+$SHARKEY_NODE_BIN:}$PATH"
 [[ "$(PATH="$SK_PATH" node --version)" == v22.* ]] || { echo "SMOKE_FAIL: Sharkey needs Node 22 (set SHARKEY_NODE_BIN)" >&2; exit 1; }
-[[ -x "$ROOT/target/debug/pinetree" ]] || (cd "$ROOT" && cargo build --offline)
+# Binary location honours .cargo/config.toml `target-dir` (and
+# CARGO_TARGET_DIR): resolve via cargo metadata, falling back to the default
+# layout. PINETREE_BIN overrides outright.
+pinetree_bin() {
+  if [[ -n "${PINETREE_BIN:-}" ]]; then echo "$PINETREE_BIN"; return; fi
+  local dir
+  dir="$(cd "$ROOT" && cargo metadata --format-version 1 --offline --no-deps 2>/dev/null \
+    | python3 -c 'import json,sys;print(json.load(sys.stdin).get("target_directory",""))' 2>/dev/null)"
+  if [[ -n "$dir" ]]; then echo "$dir/debug/pinetree"; else echo "$ROOT/target/debug/pinetree"; fi
+}
+BIN="$(pinetree_bin)"
+[[ -x "$BIN" ]] || (cd "$ROOT" && cargo build --offline)
+[[ -x "$BIN" ]] || { echo "SMOKE_FAIL: pinetree binary missing at $BIN" >&2; exit 1; }
 
 # --- backing services ------------------------------------------------------
 "${COMPOSE[@]}" up -d >/dev/null
@@ -144,11 +159,11 @@ start_bg sharkey "$ROOT/sharkey/packages/backend" \
 for n in 3 4; do
   rm -rf "$WORK/pt$n"; mkdir -p "$WORK/pt$n"
   start_bg "pt$n" "$ROOT" PINETREE_ALLOW_PRIVATE_IPS=1 -- \
-    "$ROOT/target/debug/pinetree" --public-url="http://127.0.1.$n" --data-dir="$WORK/pt$n" --listen="127.0.0.1:310$n"
+    "$BIN" --public-url="http://127.0.1.$n" --data-dir="$WORK/pt$n" --listen="127.0.0.1:310$n"
 done
 start_bg proxy "$ROOT" -- node scripts/interop/proxy.mjs 127.0.1.1=3101 127.0.1.2=3102 127.0.1.3=3103 127.0.1.4=3104
 
-echo "[interop] waiting for servers (Sharkey/Misskey are slow to boot from /mnt/c)..."
+echo "[interop] waiting for servers (Sharkey/Misskey boots are slow)..."
 wait_http http://127.0.1.3 pinetree-a
 wait_http http://127.0.1.4 pinetree-b
 wait_http http://127.0.0.1:3101 misskey

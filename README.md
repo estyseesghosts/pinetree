@@ -49,18 +49,32 @@ foundationdb/, redb/     upstream reference checkouts (read-only, git-ignored)
   client smoke test and packer snapshot tests), and for the interop rig:
   `docker` with the compose plugin, Node 24 (Misskey) **and** Node 22 (Sharkey
   rejects Node 24 via its `engines` field — pass
-  `SHARKEY_NODE_BIN=<dir containing a Node 22 binary>`).
+  `SHARKEY_NODE_BIN=<dir containing a Node 22 binary>`). `nvm` handles this:
+  `nvm install 24` (default) plus system Node 22, then
+  `SHARKEY_NODE_BIN=/usr/sbin scripts/smoke-phase2.sh`.
+- The pinetree binary lands in the cargo target dir (default `./target`,
+  this machine `/root/pinetree-target` via git-ignored `.cargo/config.toml`).
+  `scripts/smoke-*.sh` resolve it via `cargo metadata` (`PINETREE_BIN`
+  overrides).
 - Reference checkouts are git-ignored: after cloning, symlink (or clone) them as
   `./misskey` and `./sharkey` next to the repo, matching Misskey
   `2026.10.1-alpha.0` and Sharkey `2025.4.7`.
+- Under WSL, keep heavy trees off `/mnt/c` (9P is several times slower for
+  Node/Rust workloads): put the checkouts on the Linux filesystem
+  (e.g. `/root/fedifedifedi/...`) and symlink to them, and build artifacts
+  go to ext4 via the git-ignored `.cargo/config.toml` (`target-dir`;
+  adjust the path if your checkout lives elsewhere).
 
 ## Quickstart
 
 ```bash
 cargo build
-target/debug/pinetree --public-url=http://127.0.0.1:3000 --data-dir=./data --listen=127.0.0.1:3000
-target/debug/pinetree create-account --username=alice --password=secret --data-dir=./data
+<target>/debug/pinetree --public-url=http://127.0.0.1:3000 --data-dir=./data --listen=127.0.0.1:3000
+<target>/debug/pinetree create-account --username=alice --password=secret --data-dir=./data
 ```
+
+(`<target>` is `./target` by default, `/root/pinetree-target` on this
+machine — see Prerequisites.)
 
 `--mode=cluster` deliberately refuses ("not implemented (Phase 4)").
 `PINETREE_ALLOW_PRIVATE_IPS=1` is an SSRF *testing* exemption for loopback
@@ -70,9 +84,19 @@ always on.
 ## Testing
 
 ```bash
-cargo test                                        # full suite (150 green at Phase 2.5)
+cargo test                                        # full suite (251 green: lib 193 + conformance 51 + the rest)
 scripts/smoke-phase1.sh                           # live binary + real misskey-js client (needs bun + ./misskey)
 SHARKEY_NODE_BIN=<node22/bin> scripts/smoke-phase2.sh   # four-server interop: Misskey + Sharkey + 2x pinetree
+```
+
+Benching a single node (stays under the per-account rate limits by rotating
+users; numbers are debug-build lower bounds):
+
+```bash
+PINETREE_ALLOW_PRIVATE_IPS=1 <target>/debug/pinetree --public-url=http://127.0.0.1:3210 \
+  --data-dir=/tmp/pinetree-bench --listen=127.0.0.1:3210 &
+python3 scripts/bench-local.py --base http://127.0.0.1:3210 --creates 400 --reads 1000
+# notes/create ~870/s p50 ~1ms, notes/timeline ~430/s, users/show ~1200/s
 ```
 
 Clean-clone procedure: clone, re-link `./misskey`/`./sharkey`, run `cargo test`.

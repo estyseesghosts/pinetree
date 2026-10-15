@@ -1,0 +1,6 @@
+# Machine-local cargo settings (git-ignored). Keep build artifacts on the
+# native Linux filesystem: under WSL, a repo checked out on /mnt/c pays the
+# 9P tax on every file access, which makes builds and test runs several times
+# slower. Override the path below if your checkout lives elsewhere.
+[build]
+target-dir = "/root/pinetree-target"

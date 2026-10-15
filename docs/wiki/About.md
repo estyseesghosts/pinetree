@@ -41,10 +41,14 @@ Identity is stable and independent of placement: actor URLs are `https://{domain
 
 ```bash
 cargo build --offline
-target/debug/pinetree --public-url=http://127.0.0.1:3000 --data-dir=./data --listen=127.0.0.1:3000
-target/debug/pinetree create-account --username=alice --password=secret --data-dir=./data
+<target>/debug/pinetree --public-url=http://127.0.0.1:3000 --data-dir=./data --listen=127.0.0.1:3000
+<target>/debug/pinetree create-account --username=alice --password=secret --data-dir=./data
 PINETREE_ALLOW_PRIVATE_IPS=1 ...   # only for loopback federation tests; default blocks private addresses
 ```
+
+(`<target>` is `./target`, or wherever `.cargo/config.toml` points it —
+this machine uses `/root/pinetree-target`. Keep checkouts and the target dir
+on the native Linux filesystem under WSL; 9P is several times slower.)
 
 Cluster mode (`--mode=cluster`) deliberately exits with "not implemented (Phase 4)". For a full local federation lab (real Misskey, real Sharkey, two pinetrees) see `docs/phase-2-interop-howto.md` and `scripts/smoke-phase2.sh`.
 
