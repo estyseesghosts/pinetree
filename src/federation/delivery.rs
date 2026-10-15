@@ -9,7 +9,11 @@
 //!   or `allow_private_ips` flag for local federation testing.
 //!   `allow_private_ips` is an SSRF exemption ONLY: it never affects TLS
 //!   certificate verification, which is always enforced on HTTPS requests.
-//! - Connect and read timeouts (default 10s)
+//! - Connect and read timeouts (default 10s), an overall deadline for the
+//!   plain-HTTP path (default 20s), and a bounded DNS lookup (default 5s)
+//! - Typed [`SendError`]s: permanent kinds (SSRF, invalid URL, NXDOMAIN) are
+//!   never retried; transient kinds (timeouts, 5xx/429 at the retry layer)
+//!   are retried with backoff by the delivery worker
 //! - Redirect limit (default ≤ 3 hops, rejecting `https` → `http` downgrades
 //!   and re-validating every redirect target against SSRF rules)
 //! - Response size limit (default 64 KiB for ActivityPub JSON, configurable
@@ -18,7 +22,8 @@
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::sync::mpsc::RecvTimeoutError;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use serde_json::Value;
@@ -34,13 +39,101 @@ use crate::domain::account::Account;
 pub const MAX_AP_JSON_BYTES: usize = 65_536;
 /// Default connect/read timeout for federation HTTP calls (10s).
 pub const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default overall deadline for one plain-HTTP request: connect, write and
+/// read together (20s).
+pub const DEFAULT_TOTAL_TIMEOUT: Duration = Duration::from_secs(20);
+/// Default bound on one DNS lookup (5s).
+pub const DEFAULT_DNS_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum HTTP redirects followed on outbound federation requests.
 pub const MAX_REDIRECTS: usize = 3;
+
+/// Why a federation send failed. The kind drives the retry decision: see
+/// [`SendErrorKind::is_transient`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendErrorKind {
+    /// Destination resolved to a private/reserved address (SSRF guard). Permanent.
+    SsrfBlocked,
+    /// Not an `http(s)` URL, or an unparseable authority. Permanent.
+    InvalidUrl,
+    /// DNS reports that the name does not exist (NXDOMAIN). Permanent.
+    DnsNotFound,
+    /// Redirect refused (HTTPS downgrade, loop, unsupported target). Permanent.
+    Redirect,
+    /// Response or request exceeded its size cap. Permanent.
+    TooLarge,
+    /// DNS lookup failed for a reason other than NXDOMAIN. Transient.
+    Dns,
+    /// DNS lookup, connect, or the overall request deadline elapsed. Transient.
+    Timeout,
+    /// TCP connect refused or unreachable. Transient.
+    Connect,
+    /// Socket read or write failed mid-request. Transient.
+    Io,
+    /// TLS handshake or certificate failure. Transient.
+    Tls,
+    /// Malformed or truncated HTTP response from the peer. Transient.
+    Protocol,
+    /// Local failure (signing, key lookup, spawning curl). Transient.
+    Internal,
+}
+
+impl SendErrorKind {
+    /// `true` when retrying later may succeed.
+    pub fn is_transient(self) -> bool {
+        matches!(
+            self,
+            Self::Dns
+                | Self::Timeout
+                | Self::Connect
+                | Self::Io
+                | Self::Tls
+                | Self::Protocol
+                | Self::Internal
+        )
+    }
+}
+
+/// Typed failure from [`SafeHttpClient::send`] and the resolver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendError {
+    pub kind: SendErrorKind,
+    pub message: String,
+}
+
+impl SendError {
+    pub fn new(kind: SendErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SendError {}
+
+/// Callers that only need text (media and actor fetches) keep their
+/// `Result<_, String>` signatures through `?`.
+impl From<SendError> for String {
+    fn from(err: SendError) -> String {
+        err.message
+    }
+}
 
 /// Configuration for the untrusted-peer federation HTTP client.
 #[derive(Debug, Clone)]
 pub struct SafeHttpConfig {
+    /// Per-operation socket timeout (connect, and each read/write).
     pub timeout: Duration,
+    /// Overall deadline for one plain-HTTP request (connect + write + read).
+    pub total_timeout: Duration,
+    /// Bound on one DNS lookup.
+    pub dns_timeout: Duration,
     pub max_redirects: usize,
     /// SSRF exemption ONLY for local federation testing (env
     /// `PINETREE_ALLOW_PRIVATE_IPS`): skips private/reserved-IP rejection.
@@ -57,6 +150,8 @@ impl Default for SafeHttpConfig {
             .unwrap_or(false);
         Self {
             timeout: DEFAULT_HTTP_TIMEOUT,
+            total_timeout: DEFAULT_TOTAL_TIMEOUT,
+            dns_timeout: DEFAULT_DNS_TIMEOUT,
             max_redirects: MAX_REDIRECTS,
             allow_private_ips: allow_private,
             allowed_hosts: Vec::new(),
@@ -204,13 +299,70 @@ fn is_ip_literal_host(host: &str) -> bool {
     bare.parse::<std::net::IpAddr>().is_ok()
 }
 
+/// Resolve a host on a helper thread and wait at most `timeout`. A lookup
+/// that outlives the deadline is abandoned; its thread ends on its own when
+/// the system resolver returns.
+fn resolve_host_with_timeout(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+) -> Result<Vec<SocketAddr>, SendError> {
+    let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<Vec<SocketAddr>>>();
+    let lookup = format!("{host}:{port}");
+    let _lookup_thread = std::thread::Builder::new()
+        .name("pinetree-dns".to_string())
+        .spawn(move || {
+            let result = lookup
+                .to_socket_addrs()
+                .map(|addrs| addrs.collect::<Vec<SocketAddr>>());
+            let _ = tx.send(result);
+        })
+        .map_err(|e| {
+            SendError::new(
+                SendErrorKind::Internal,
+                format!("spawn DNS lookup for {host}: {e}"),
+            )
+        })?;
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(addrs)) => Ok(addrs),
+        Ok(Err(err)) => Err(classify_dns_error(host, &err)),
+        Err(RecvTimeoutError::Timeout) => Err(SendError::new(
+            SendErrorKind::Timeout,
+            format!("DNS resolution timed out for {host} after {timeout:?}"),
+        )),
+        Err(RecvTimeoutError::Disconnected) => Err(SendError::new(
+            SendErrorKind::Dns,
+            format!("DNS resolution failed for {host}"),
+        )),
+    }
+}
+
+/// Map a resolver failure to a kind. NXDOMAIN is permanent; every other
+/// resolver failure (temporary failure, server unreachable) is transient.
+fn classify_dns_error(host: &str, err: &std::io::Error) -> SendError {
+    const NXDOMAIN_MARKERS: [&str; 5] = [
+        "name or service not known",
+        "nodename nor servname",
+        "no such host",
+        "host not found",
+        "unknown host",
+    ];
+    let text = err.to_string().to_ascii_lowercase();
+    let kind = if NXDOMAIN_MARKERS.iter().any(|m| text.contains(m)) {
+        SendErrorKind::DnsNotFound
+    } else {
+        SendErrorKind::Dns
+    };
+    SendError::new(kind, format!("DNS resolution failed for {host}: {err}"))
+}
+
 /// Resolve a URL's host and validate that none of its resolved socket
 /// addresses violate SSRF rules.
 pub fn resolve_and_validate_url(
     url: &str,
     cfg: &SafeHttpConfig,
-) -> Result<(ParsedUrl, Vec<SocketAddr>), String> {
-    let parsed = parse_http_url(url)?;
+) -> Result<(ParsedUrl, Vec<SocketAddr>), SendError> {
+    let parsed = parse_http_url(url).map_err(|e| SendError::new(SendErrorKind::InvalidUrl, e))?;
     let host_allowed = cfg.allow_private_ips
         || cfg
             .allowed_hosts
@@ -220,26 +372,31 @@ pub fn resolve_and_validate_url(
     // Check literal IP first so we reject private literals before touching DNS.
     if let Ok(ip) = parsed.host.parse::<IpAddr>() {
         if !host_allowed && is_private_or_reserved_ip(ip) {
-            return Err(format!("SSRF blocked private/reserved IP {ip} for {url}"));
+            return Err(SendError::new(
+                SendErrorKind::SsrfBlocked,
+                format!("SSRF blocked private/reserved IP {ip} for {url}"),
+            ));
         }
         return Ok((parsed.clone(), vec![SocketAddr::new(ip, parsed.port)]));
     }
 
-    let lookup_host = format!("{}:{}", parsed.host, parsed.port);
-    let addrs: Vec<SocketAddr> = lookup_host
-        .to_socket_addrs()
-        .map_err(|e| format!("DNS resolution failed for {}: {e}", parsed.host))?
-        .collect();
+    let addrs = resolve_host_with_timeout(&parsed.host, parsed.port, cfg.dns_timeout)?;
     if addrs.is_empty() {
-        return Err(format!("DNS resolution returned no addresses for {}", parsed.host));
+        return Err(SendError::new(
+            SendErrorKind::Dns,
+            format!("DNS resolution returned no addresses for {}", parsed.host),
+        ));
     }
     if !host_allowed {
         for addr in &addrs {
             if is_private_or_reserved_ip(addr.ip()) {
-                return Err(format!(
-                    "SSRF blocked resolved private/reserved IP {} for {}",
-                    addr.ip(),
-                    url
+                return Err(SendError::new(
+                    SendErrorKind::SsrfBlocked,
+                    format!(
+                        "SSRF blocked resolved private/reserved IP {} for {}",
+                        addr.ip(),
+                        url
+                    ),
                 ));
             }
         }
@@ -342,7 +499,7 @@ impl SafeHttpClient {
         extra_headers: &[(&str, &str)],
         body: Option<&[u8]>,
         max_response_bytes: usize,
-    ) -> Result<SafeHttpResponse, String> {
+    ) -> Result<SafeHttpResponse, SendError> {
         let mut current_url = url.to_string();
         let mut hops = 0usize;
 
@@ -362,19 +519,30 @@ impl SafeHttpClient {
                 && method.eq_ignore_ascii_case("GET")
             {
                 if hops >= self.config.max_redirects {
-                    return Err(format!(
-                        "exceeded max redirects ({}) for {url}",
-                        self.config.max_redirects
+                    return Err(SendError::new(
+                        SendErrorKind::Redirect,
+                        format!(
+                            "exceeded max redirects ({}) for {url}",
+                            self.config.max_redirects
+                        ),
                     ));
                 }
-                let loc = resp
-                    .header("location")
-                    .ok_or_else(|| "redirect response missing Location header".to_string())?;
-                let next_url = resolve_redirect_url(&parsed, loc)?;
-                let next_parsed = parse_http_url(&next_url)?;
+                let loc = resp.header("location").ok_or_else(|| {
+                    SendError::new(
+                        SendErrorKind::Protocol,
+                        "redirect response missing Location header",
+                    )
+                })?;
+                let next_url = resolve_redirect_url(&parsed, loc)
+                    .map_err(|e| SendError::new(SendErrorKind::Redirect, e))?;
+                let next_parsed = parse_http_url(&next_url)
+                    .map_err(|e| SendError::new(SendErrorKind::InvalidUrl, e))?;
                 if parsed.scheme == "https" && next_parsed.scheme == "http" {
-                    return Err(format!(
-                        "refusing HTTPS to HTTP redirect downgrade: {current_url} -> {next_url}"
+                    return Err(SendError::new(
+                        SendErrorKind::Redirect,
+                        format!(
+                            "refusing HTTPS to HTTP redirect downgrade: {current_url} -> {next_url}"
+                        ),
                     ));
                 }
                 current_url = next_url;
@@ -395,7 +563,7 @@ impl SafeHttpClient {
         extra_headers: &[(&str, &str)],
         body: Option<&[u8]>,
         max_response_bytes: usize,
-    ) -> Result<SafeHttpResponse, String> {
+    ) -> Result<SafeHttpResponse, SendError> {
         if parsed.scheme == "https" {
             return self.send_https_via_curl(
                 method,
@@ -408,11 +576,33 @@ impl SafeHttpClient {
             );
         }
 
-        let addr = addrs[0];
-        let mut stream = TcpStream::connect_timeout(&addr, self.config.timeout)
-            .map_err(|e| format!("connect {addr}: {e}"))?;
-        let _ = stream.set_read_timeout(Some(self.config.timeout));
-        let _ = stream.set_write_timeout(Some(self.config.timeout));
+        // One deadline spans connect, write and read (`total_timeout`).
+        let deadline = Instant::now() + self.config.total_timeout;
+        let addr = addrs
+            .first()
+            .copied()
+            .ok_or_else(|| SendError::new(SendErrorKind::Dns, "no addresses to connect to"))?;
+        let connect_budget = remaining_budget(deadline).ok_or_else(|| {
+            SendError::new(
+                SendErrorKind::Timeout,
+                format!("connect {addr}: deadline exceeded"),
+            )
+        })?;
+        let stream = TcpStream::connect_timeout(&addr, connect_budget.min(self.config.timeout))
+            .map_err(|e| {
+                let kind = if is_timeout_kind(e.kind()) {
+                    SendErrorKind::Timeout
+                } else {
+                    SendErrorKind::Connect
+                };
+                SendError::new(kind, format!("connect {addr}: {e}"))
+            })?;
+        let mut conn = DeadlineStream {
+            stream,
+            deadline,
+            per_op: self.config.timeout,
+            timed_out: false,
+        };
 
         let mut req_buf = Vec::with_capacity(512 + body.map(|b| b.len()).unwrap_or(0));
         write!(
@@ -457,14 +647,21 @@ impl SafeHttpClient {
             req_buf.extend_from_slice(b);
         }
 
-        stream
-            .write_all(&req_buf)
-            .map_err(|e| format!("write request to {addr}: {e}"))?;
-        stream
+        let written = conn.write_all_deadline(&req_buf);
+        if let Err(e) = written {
+            return Err(io_send_error(
+                format!("write request to {addr}"),
+                &e,
+                conn.timed_out,
+            ));
+        }
+        conn.stream
             .flush()
-            .map_err(|e| format!("flush request to {addr}: {e}"))?;
+            .map_err(|e| io_send_error(format!("flush request to {addr}"), &e, conn.timed_out))?;
 
-        read_http_response(&mut stream, max_response_bytes, full_url)
+        let parsed_response = read_http_response(&mut conn, max_response_bytes, full_url);
+        let timed_out = conn.timed_out;
+        parsed_response.map_err(|msg| response_error(msg, timed_out))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -477,7 +674,7 @@ impl SafeHttpClient {
         extra_headers: &[(&str, &str)],
         body: Option<&[u8]>,
         max_response_bytes: usize,
-    ) -> Result<SafeHttpResponse, String> {
+    ) -> Result<SafeHttpResponse, SendError> {
         let addr = addrs[0];
         let timeout_secs = self.config.timeout.as_secs().max(1);
         let args = curl_args(
@@ -500,7 +697,9 @@ impl SafeHttpClient {
         }
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-        let mut child = cmd.spawn().map_err(|e| format!("spawn curl: {e}"))?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| SendError::new(SendErrorKind::Internal, format!("spawn curl: {e}")))?;
         if let Some(b) = body {
             if let Some(mut stdin) = child.stdin.take() {
                 let _ = stdin.write_all(b);
@@ -508,17 +707,118 @@ impl SafeHttpClient {
         }
         let output = child
             .wait_with_output()
-            .map_err(|e| format!("wait curl: {e}"))?;
+            .map_err(|e| SendError::new(SendErrorKind::Io, format!("wait curl: {e}")))?;
         if !output.status.success() {
-            return Err(format!(
-                "curl failed ({}): {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(curl_error(
+                output.status.code(),
+                &format!("{}: {stderr}", output.status),
             ));
         }
         let mut cursor = std::io::Cursor::new(output.stdout);
         read_http_response(&mut cursor, max_response_bytes, full_url)
+            .map_err(|msg| response_error(msg, false))
     }
+}
+
+/// Plain-HTTP stream bounded by one overall deadline. Each read and write
+/// re-arms its socket timeout with the time left, so a peer that trickles
+/// bytes cannot stretch a request past `SafeHttpConfig::total_timeout`.
+struct DeadlineStream {
+    stream: TcpStream,
+    deadline: Instant,
+    per_op: Duration,
+    /// Set when the deadline or a socket timeout fired, so the caller reports
+    /// `Timeout` rather than a generic protocol error.
+    timed_out: bool,
+}
+
+impl DeadlineStream {
+    fn time_left(&mut self) -> std::io::Result<Duration> {
+        match remaining_budget(self.deadline) {
+            Some(left) => Ok(left.min(self.per_op)),
+            None => {
+                self.timed_out = true;
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "federation request deadline exceeded",
+                ))
+            }
+        }
+    }
+
+    fn write_all_deadline(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        for chunk in buf.chunks(16 * 1024) {
+            let left = self.time_left()?;
+            self.stream.set_write_timeout(Some(left))?;
+            let res = self.stream.write_all(chunk);
+            if let Err(e) = &res {
+                self.timed_out |= is_timeout_kind(e.kind());
+            }
+            res?;
+        }
+        Ok(())
+    }
+}
+
+impl Read for DeadlineStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self.time_left()?;
+        self.stream.set_read_timeout(Some(left))?;
+        let res = self.stream.read(buf);
+        if let Err(e) = &res {
+            self.timed_out |= is_timeout_kind(e.kind());
+        }
+        res
+    }
+}
+
+/// Time left before `deadline`, or `None` once it has passed.
+fn remaining_budget(deadline: Instant) -> Option<Duration> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    (!left.is_zero()).then_some(left)
+}
+
+fn is_timeout_kind(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    )
+}
+
+fn io_send_error(context: String, err: &std::io::Error, timed_out: bool) -> SendError {
+    let kind = if timed_out || is_timeout_kind(err.kind()) {
+        SendErrorKind::Timeout
+    } else {
+        SendErrorKind::Io
+    };
+    SendError::new(kind, format!("{context}: {err}"))
+}
+
+/// Classify a failed response read. Size-cap messages are permanent; anything
+/// else from the peer's bytes is a protocol fault and transient.
+fn response_error(message: String, timed_out: bool) -> SendError {
+    if timed_out {
+        SendError::new(SendErrorKind::Timeout, message)
+    } else if message.contains("exceeded") || message.contains("exceeds") {
+        SendError::new(SendErrorKind::TooLarge, message)
+    } else {
+        SendError::new(SendErrorKind::Protocol, message)
+    }
+}
+
+/// Map a curl exit code to a kind (see curl's exit-code table).
+fn curl_error(code: Option<i32>, detail: &str) -> SendError {
+    let kind = match code {
+        Some(28) => SendErrorKind::Timeout,
+        Some(6) => SendErrorKind::Dns,
+        Some(7) => SendErrorKind::Connect,
+        Some(35 | 51 | 58 | 60 | 77) => SendErrorKind::Tls,
+        Some(63) => SendErrorKind::TooLarge,
+        _ => SendErrorKind::Io,
+    };
+    let code_text = code.map_or_else(|| "signal".to_string(), |c| c.to_string());
+    SendError::new(kind, format!("curl failed (exit {code_text}): {detail}"))
 }
 
 fn resolve_redirect_url(base: &ParsedUrl, location: &str) -> Result<String, String> {
@@ -844,11 +1144,17 @@ pub fn signed_post_activity(
     sender_account_id: &str,
     inbox_url: &str,
     body_bytes: &[u8],
-) -> Result<SafeHttpResponse, String> {
-    let parsed = parse_http_url(inbox_url)?;
+) -> Result<SafeHttpResponse, SendError> {
+    let parsed = parse_http_url(inbox_url)
+        .map_err(|e| SendError::new(SendErrorKind::InvalidUrl, e))?;
     let kp = services
         .ensure_actor_keypair(sender_account_id)
-        .map_err(|e| format!("ensure_actor_keypair: {e}"))?;
+        .map_err(|e| {
+            SendError::new(
+                SendErrorKind::Internal,
+                format!("ensure_actor_keypair: {e}"),
+            )
+        })?;
     let base = services.public_url.trim_end_matches('/');
     let key_id = format!("{base}/users/{sender_account_id}#main-key");
     let date = format_http_date(services.clock.now_ms());
@@ -860,7 +1166,8 @@ pub fn signed_post_activity(
         Some(body_bytes),
         &key_id,
         &kp.private_key_pem,
-    )?;
+    )
+    .map_err(|e| SendError::new(SendErrorKind::Internal, e))?;
     let digest = sig.digest.unwrap_or_default();
     let headers = [
         ("Host", parsed.host_header.as_str()),
@@ -924,7 +1231,7 @@ pub fn webfinger_discover_actor_uri(
                 last_err = format!("WebFinger {wf_url} returned HTTP {}", resp.status);
             }
             Err(e) => {
-                last_err = e;
+                last_err = e.to_string();
             }
         }
     }
@@ -1189,14 +1496,16 @@ mod tests {
             .send("GET", &format!("http://{addr}/loop"), &[], None, 1024)
             .unwrap_err();
         assert!(
-            loop_err.contains("exceeded max redirects"),
+            loop_err.to_string().contains("exceeded max redirects"),
             "got {loop_err}"
         );
+        assert_eq!(loop_err.kind, SendErrorKind::Redirect);
 
         let size_err = client
             .send("GET", &format!("http://{addr}/huge"), &[], None, 512)
             .unwrap_err();
-        assert!(size_err.contains("exceeds limit"), "got {size_err}");
+        assert!(size_err.to_string().contains("exceeds limit"), "got {size_err}");
+        assert_eq!(size_err.kind, SendErrorKind::TooLarge);
 
         drop(handle);
     }
@@ -1311,5 +1620,156 @@ mod tests {
             .expect("proxy CONNECT block must be skipped");
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body, b"hello");
+    }
+}
+
+#[cfg(test)]
+mod slice10_transport_tests {
+    use super::*;
+    use std::io::{self, ErrorKind};
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    fn strict_cfg() -> SafeHttpConfig {
+        SafeHttpConfig {
+            allow_private_ips: false,
+            allowed_hosts: Vec::new(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn slice10_ssrf_and_invalid_url_are_permanent() {
+        let ssrf = resolve_and_validate_url("http://127.0.0.1:3000/inbox", &strict_cfg())
+            .unwrap_err();
+        assert_eq!(ssrf.kind, SendErrorKind::SsrfBlocked);
+        assert!(!ssrf.kind.is_transient());
+
+        let metadata =
+            resolve_and_validate_url("http://169.254.169.254/latest", &strict_cfg()).unwrap_err();
+        assert_eq!(metadata.kind, SendErrorKind::SsrfBlocked);
+
+        let bad_scheme =
+            resolve_and_validate_url("ftp://93.184.216.34/file", &strict_cfg()).unwrap_err();
+        assert_eq!(bad_scheme.kind, SendErrorKind::InvalidUrl);
+        assert!(!bad_scheme.kind.is_transient());
+    }
+
+    #[test]
+    fn slice10_dns_nxdomain_is_permanent_other_dns_failures_transient() {
+        let nxdomain = io::Error::new(
+            ErrorKind::Other,
+            "failed to lookup address information: Name or service not known",
+        );
+        let nx = classify_dns_error("gone.example", &nxdomain);
+        assert_eq!(nx.kind, SendErrorKind::DnsNotFound);
+        assert!(!nx.kind.is_transient());
+
+        let macos = io::Error::new(
+            ErrorKind::Other,
+            "nodename nor servname provided, or not known",
+        );
+        assert_eq!(
+            classify_dns_error("gone.example", &macos).kind,
+            SendErrorKind::DnsNotFound
+        );
+
+        let temporary = io::Error::new(
+            ErrorKind::Other,
+            "failed to lookup address information: Temporary failure in name resolution",
+        );
+        let flaky = classify_dns_error("flaky.example", &temporary);
+        assert_eq!(flaky.kind, SendErrorKind::Dns);
+        assert!(flaky.kind.is_transient());
+    }
+
+    #[test]
+    fn slice10_transient_and_permanent_kinds_partition() {
+        for kind in [
+            SendErrorKind::Dns,
+            SendErrorKind::Timeout,
+            SendErrorKind::Connect,
+            SendErrorKind::Io,
+            SendErrorKind::Tls,
+            SendErrorKind::Protocol,
+            SendErrorKind::Internal,
+        ] {
+            assert!(kind.is_transient(), "{kind:?} must be transient");
+        }
+        for kind in [
+            SendErrorKind::SsrfBlocked,
+            SendErrorKind::InvalidUrl,
+            SendErrorKind::DnsNotFound,
+            SendErrorKind::Redirect,
+            SendErrorKind::TooLarge,
+        ] {
+            assert!(!kind.is_transient(), "{kind:?} must be permanent");
+        }
+    }
+
+    #[test]
+    fn slice10_curl_exit_codes_map_to_kinds() {
+        assert_eq!(curl_error(Some(28), "timed out").kind, SendErrorKind::Timeout);
+        assert_eq!(curl_error(Some(7), "refused").kind, SendErrorKind::Connect);
+        assert_eq!(curl_error(Some(60), "cert").kind, SendErrorKind::Tls);
+        let too_big = curl_error(Some(63), "max-filesize");
+        assert_eq!(too_big.kind, SendErrorKind::TooLarge);
+        assert!(!too_big.kind.is_transient());
+        assert!(curl_error(Some(28), "x").kind.is_transient());
+        assert_eq!(curl_error(None, "killed").kind, SendErrorKind::Io);
+    }
+
+    #[test]
+    fn slice10_response_errors_classify_size_timeout_and_protocol() {
+        assert_eq!(
+            response_error("response body exceeded max size of 5 bytes".into(), false).kind,
+            SendErrorKind::TooLarge
+        );
+        assert_eq!(
+            response_error("truncated chunked body".into(), false).kind,
+            SendErrorKind::Protocol
+        );
+        assert_eq!(
+            response_error("read response body: x".into(), true).kind,
+            SendErrorKind::Timeout
+        );
+    }
+
+    #[test]
+    fn slice10_send_error_text_is_unchanged_for_string_callers() {
+        let err = SendError::new(SendErrorKind::Timeout, "connect x: timed out");
+        assert_eq!(err.to_string(), "connect x: timed out");
+        let as_text: String = err.into();
+        assert_eq!(as_text, "connect x: timed out");
+    }
+
+    #[test]
+    fn slice10_total_deadline_bounds_a_silent_peer() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind silent peer");
+        let addr = listener.local_addr().expect("silent addr");
+        // Accept, then stay silent far longer than the deadline.
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_secs(3));
+                drop(stream);
+            }
+        });
+        let client = SafeHttpClient::new(SafeHttpConfig {
+            allow_private_ips: true,
+            timeout: Duration::from_secs(10),
+            total_timeout: Duration::from_millis(300),
+            ..Default::default()
+        });
+        let started = Instant::now();
+        let err = client
+            .send("GET", &format!("http://{addr}/silent"), &[], None, 1024)
+            .unwrap_err();
+        assert_eq!(err.kind, SendErrorKind::Timeout, "got {err}");
+        assert!(err.kind.is_transient());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "overall deadline not enforced: {:?}",
+            started.elapsed()
+        );
     }
 }

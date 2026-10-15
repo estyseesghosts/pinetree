@@ -625,7 +625,7 @@ async fn federation_two_node_end_to_end() {
     let ssrf_err = strict
         .send("GET", "http://127.0.0.1:9/.well-known/webfinger", &[], None, 1024)
         .unwrap_err();
-    assert!(ssrf_err.contains("SSRF"), "unexpected: {ssrf_err}");
+    assert!(ssrf_err.to_string().contains("SSRF"), "unexpected: {ssrf_err}");
 
     // --- inbox auth negatives (raw signed POSTs to B) ----------------------
     let b_inbox = format!("{}/inbox", b.base_url);

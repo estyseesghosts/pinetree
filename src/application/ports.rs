@@ -220,10 +220,15 @@ pub enum JobKind {
 }
 
 /// Maximum `fail()` retries before a job is auto-quarantined as
-/// terminally failed (see `JobQueue::fail_permanent`). Mirrors the
-/// `MAX_DELIVERY_ATTEMPTS` delivery budget so every job kind shares one
-/// exhaustion bound.
+/// terminally failed (see `JobQueue::fail_permanent`). Every job kind,
+/// including per-inbox federation delivery, shares this one exhaustion bound.
 pub const MAX_JOB_ATTEMPTS: u32 = 8;
+
+/// Maximum number of jobs one `JobQueue::enqueue_jobs` call (or the follow-up
+/// batch of `complete_with_followups`) may insert in a single write
+/// transaction. Keeps fan-out writes well under the FoundationDB ~10 MB
+/// transaction cap; larger fan-outs are split across calls by the caller.
+pub const MAX_JOBS_PER_TXN: usize = 500;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewJob {
@@ -318,6 +323,24 @@ pub trait JobQueue: Send + Sync {
         let _ = (job_id, reason);
         Ok(())
     }
+    /// Settle `job_id` as done AND insert `followups` in ONE write
+    /// transaction: either both happen or neither does. Followups are
+    /// validated before any write; at most [`MAX_JOBS_PER_TXN`] per call.
+    fn complete_with_followups(
+        &self,
+        job_id: &str,
+        followups: Vec<NewJob>,
+    ) -> Result<(), PortError>;
+    /// Insert `jobs` in ONE write transaction (all or nothing), at most
+    /// [`MAX_JOBS_PER_TXN`] per call. No de-duplication on idempotency key:
+    /// a re-run of the producing job can enqueue duplicates, so every
+    /// receiver of a re-enqueued federation delivery must dedupe by activity id.
+    fn enqueue_jobs(&self, jobs: Vec<NewJob>) -> Result<(), PortError>;
+    /// Release the lease on a claimed `job_id` and reschedule it at
+    /// `not_before_ms` WITHOUT counting an attempt (used when a destination is
+    /// in cooldown, which is not a failed delivery). Missing or quarantined
+    /// jobs are a no-op success.
+    fn defer(&self, job_id: &str, not_before_ms: i64) -> Result<(), PortError>;
     fn get_job(&self, job_id: &str) -> Result<Option<Job>, PortError>;
     fn pending_count(&self) -> Result<usize, PortError>;
 }

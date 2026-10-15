@@ -3,8 +3,8 @@ use std::sync::Arc;
 use crate::application::commands::AppServices;
 use crate::application::events::NotifyJobPayload;
 use crate::application::ports::{
-    Clock, IdGenerator, Job, JobKind, JobQueue, NotificationStore, PortError, RemoteMediaFetchPayload,
-    StreamingSink, MAX_JOB_ATTEMPTS,
+    Clock, IdGenerator, Job, JobKind, JobQueue, NewJob, NotificationStore, PortError,
+    RemoteMediaFetchPayload, StreamingSink, MAX_JOBS_PER_TXN, MAX_JOB_ATTEMPTS,
 };
 use crate::domain::notification::Notification;
 use crate::federation::retry::{DeliveryOutcome, DestinationTracker};
@@ -27,10 +27,31 @@ enum Disposition {
     /// Handler succeeded: remove the row.
     Done,
     /// Handler failed retryably: reschedule with backoff, quarantining when
-    /// the retry budget (`MAX_JOB_ATTEMPTS`) is exhausted.
-    Retry,
+    /// the retry budget (`MAX_JOB_ATTEMPTS`) is exhausted. When
+    /// `retry_after_ms` is set (a server's `Retry-After`), the job is not
+    /// rescheduled earlier than that.
+    Retry { retry_after_ms: Option<i64> },
+    /// Fan-out finished: complete the job and enqueue these per-inbox
+    /// follow-ups. The last batch commits atomically with the completion.
+    Fanout(Vec<NewJob>),
+    /// Destination in cooldown: reschedule at this time WITHOUT counting an
+    /// attempt.
+    Defer(i64),
     /// Handler failed terminally: quarantine with the recorded reason.
     Quarantine(String),
+}
+
+/// Split follow-up jobs into full batches (each at most `MAX_JOBS_PER_TXN`)
+/// that are enqueued on their own, plus the final batch that is committed
+/// atomically with the completion of the activity job. The final batch is
+/// never empty when the input is not.
+pub fn split_followup_batches(mut followups: Vec<NewJob>) -> (Vec<Vec<NewJob>>, Vec<NewJob>) {
+    let mut batches = Vec::new();
+    while followups.len() > MAX_JOBS_PER_TXN {
+        let rest = followups.split_off(MAX_JOBS_PER_TXN);
+        batches.push(std::mem::replace(&mut followups, rest));
+    }
+    (batches, followups)
 }
 
 impl JobWorker {
@@ -59,7 +80,7 @@ impl JobWorker {
             Disposition::Done => {
                 self.jobs.complete(&job.id)?;
             }
-            Disposition::Retry => {
+            Disposition::Retry { retry_after_ms } => {
                 if job.attempts + 1 >= MAX_JOB_ATTEMPTS {
                     // Retry budget exhausted for any kind: quarantine with a
                     // recorded reason instead of retrying forever.
@@ -67,9 +88,22 @@ impl JobWorker {
                 } else {
                     let shift = job.attempts.min(10);
                     let backoff = self.base_backoff_ms.saturating_mul(1_i64 << shift);
-                    let retry_at = self.clock.now_ms().saturating_add(backoff);
+                    let mut retry_at = self.clock.now_ms().saturating_add(backoff);
+                    if let Some(earliest) = retry_after_ms {
+                        retry_at = retry_at.max(earliest);
+                    }
                     self.jobs.fail(&job.id, retry_at)?;
                 }
+            }
+            Disposition::Fanout(followups) => {
+                let (batches, last) = split_followup_batches(followups);
+                for batch in batches {
+                    self.jobs.enqueue_jobs(batch)?;
+                }
+                self.jobs.complete_with_followups(&job.id, last)?;
+            }
+            Disposition::Defer(until) => {
+                self.jobs.defer(&job.id, until)?;
             }
             Disposition::Quarantine(reason) => {
                 self.quarantine(&job, &reason)?;
@@ -86,7 +120,7 @@ impl JobWorker {
                 Err(PortError::Validation(reason)) => {
                     Ok(Disposition::Quarantine(format!("bad-payload: {reason}")))
                 }
-                Err(_) => Ok(Disposition::Retry),
+                Err(_) => Ok(Disposition::Retry { retry_after_ms: None }),
             },
             JobKind::StreamingPublish => match self.streaming.publish("streaming", &job.payload)
             {
@@ -94,9 +128,9 @@ impl JobWorker {
                 Err(PortError::Validation(reason)) => {
                     Ok(Disposition::Quarantine(format!("bad-payload: {reason}")))
                 }
-                Err(_) => Ok(Disposition::Retry),
+                Err(_) => Ok(Disposition::Retry { retry_after_ms: None }),
             },
-            JobKind::FederateDeliver => self.dispatch_federate(&job),
+            JobKind::FederateDeliver => self.dispatch_federate(job),
             JobKind::TimelineMaterialize => Ok(Disposition::Done),
             // Slice 7 (H2+C3, decision D-d): remote media fetched
             // off-request. Bad payloads quarantine; per-attachment fetch
@@ -108,7 +142,7 @@ impl JobWorker {
                 Err(PortError::Validation(reason)) => {
                     Ok(Disposition::Quarantine(format!("bad-payload: {reason}")))
                 }
-                Err(_) => Ok(Disposition::Retry),
+                Err(_) => Ok(Disposition::Retry { retry_after_ms: None }),
             },
         }
     }
@@ -164,6 +198,7 @@ impl JobWorker {
             &self.services,
             &self.services.federation_http,
             &self.delivery_tracker,
+            &job.idempotency_key,
             &job.payload,
         ) {
             Ok(outcome) => outcome,
@@ -173,15 +208,19 @@ impl JobWorker {
             }
             Err(e) => return Err(e),
         };
-        match outcome {
-            DeliveryOutcome::Delivered => Ok(Disposition::Done),
-            DeliveryOutcome::PermanentFailure(reason) => Ok(Disposition::Quarantine(format!(
-                "permanent-failure: {reason}"
-            ))),
+        Ok(match outcome {
+            DeliveryOutcome::Delivered => Disposition::Done,
+            DeliveryOutcome::PermanentFailure(reason) => {
+                Disposition::Quarantine(format!("permanent-failure: {reason}"))
+            }
             // `fail()` reschedules with backoff via `process_one`, which
             // quarantines once the retry budget is exhausted.
-            DeliveryOutcome::TransientFailure(_) => Ok(Disposition::Retry),
-        }
+            DeliveryOutcome::TransientFailure { retry_after_ms, .. } => {
+                Disposition::Retry { retry_after_ms }
+            }
+            DeliveryOutcome::Deferred { until_ms } => Disposition::Defer(until_ms),
+            DeliveryOutcome::Split { followups } => Disposition::Fanout(followups),
+        })
     }
 
     pub fn drain(&self, max_steps: usize) -> Result<usize, PortError> {
@@ -243,5 +282,48 @@ fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> String {
         s.clone()
     } else {
         "unknown panic".to_string()
+    }
+}
+
+#[cfg(test)]
+mod slice10_tests {
+    use super::*;
+
+    fn follow_up(n: usize) -> NewJob {
+        NewJob {
+            kind: JobKind::FederateDeliver,
+            payload: Vec::new(),
+            idempotency_key: format!("k:{n}"),
+            not_before: 0,
+        }
+    }
+
+    #[test]
+    fn slice10_followup_batches_respect_the_per_txn_cap() {
+        let (batches, last) = split_followup_batches((0..1_200).map(follow_up).collect());
+        assert_eq!(batches.iter().map(Vec::len).collect::<Vec<_>>(), vec![500, 500]);
+        assert_eq!(last.len(), 200);
+        assert_eq!(last[0].idempotency_key, "k:1000", "order is preserved");
+
+        let (batches, last) = split_followup_batches((0..500).map(follow_up).collect());
+        assert!(batches.is_empty(), "exactly one full batch commits with completion");
+        assert_eq!(last.len(), 500);
+
+        let (batches, last) = split_followup_batches((0..501).map(follow_up).collect());
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].len(), 500);
+        assert_eq!(last.len(), 1);
+
+        let (batches, last) = split_followup_batches(Vec::new());
+        assert!(batches.is_empty() && last.is_empty());
+    }
+
+    #[test]
+    fn slice10_every_batch_is_within_the_cap() {
+        let (batches, last) = split_followup_batches((0..2_500).map(follow_up).collect());
+        assert!(batches.iter().all(|b| b.len() <= MAX_JOBS_PER_TXN));
+        assert!(last.len() <= MAX_JOBS_PER_TXN);
+        let total: usize = batches.iter().map(Vec::len).sum::<usize>() + last.len();
+        assert_eq!(total, 2_500, "no follow-up dropped or duplicated");
     }
 }

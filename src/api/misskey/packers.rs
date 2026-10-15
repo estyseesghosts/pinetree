@@ -856,6 +856,19 @@ mod tests {
         fn fail(&self, _job_id: &str, _retry_at_ms: i64) -> Result<(), PortError> {
             Ok(())
         }
+        fn complete_with_followups(
+            &self,
+            _job_id: &str,
+            _followups: Vec<NewJob>,
+        ) -> Result<(), PortError> {
+            Ok(())
+        }
+        fn enqueue_jobs(&self, _jobs: Vec<NewJob>) -> Result<(), PortError> {
+            Ok(())
+        }
+        fn defer(&self, _job_id: &str, _not_before_ms: i64) -> Result<(), PortError> {
+            Ok(())
+        }
         fn get_job(&self, _job_id: &str) -> Result<Option<crate::application::ports::Job>, PortError> {
             Ok(None)
         }

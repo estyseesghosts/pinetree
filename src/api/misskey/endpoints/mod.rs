@@ -1769,10 +1769,6 @@ fn api_dispatch_blocking(
                 .services
                 .update_profile(&caller.account.id, patch)
                 .map_err(ApiError::from_port_error)?;
-            state
-                .worker
-                .drain(64)
-                .map_err(ApiError::from_port_error)?;
             let packed = pack_me_detailed(&account, caller.is_first_party, &state.services)
                 .map_err(ApiError::from_port_error)?;
             Ok(Json(packed).into_response())
@@ -1970,10 +1966,6 @@ fn api_dispatch_blocking(
                 .services
                 .create_note(input)
                 .map_err(ApiError::from_port_error)?;
-            state
-                .worker
-                .drain(64)
-                .map_err(ApiError::from_port_error)?;
             let packed = pack_note(&note, Some(&caller.account.id), &state.services, 0)
                 .map_err(ApiError::from_port_error)?;
             Ok(Json(serde_json::json!({ "createdNote": packed })).into_response())
@@ -2002,10 +1994,6 @@ fn api_dispatch_blocking(
                 .services
                 .delete_note(&caller.account.id, &note_id)
                 .map_err(ApiError::from_port_error)?;
-            state
-                .worker
-                .drain(64)
-                .map_err(ApiError::from_port_error)?;
             Ok(StatusCode::NO_CONTENT.into_response())
         }
 
@@ -2019,10 +2007,6 @@ fn api_dispatch_blocking(
             state
                 .services
                 .follow(&caller.account.id, &user_id, with_replies)
-                .map_err(ApiError::from_port_error)?;
-            state
-                .worker
-                .drain(64)
                 .map_err(ApiError::from_port_error)?;
             let followee = state
                 .services
@@ -2045,10 +2029,6 @@ fn api_dispatch_blocking(
             state
                 .services
                 .unfollow(&caller.account.id, &user_id)
-                .map_err(ApiError::from_port_error)?;
-            state
-                .worker
-                .drain(64)
                 .map_err(ApiError::from_port_error)?;
             let followee = state
                 .services
@@ -2102,7 +2082,6 @@ fn api_dispatch_blocking(
                 _ => state.services.cancel_follow_request(&me, &user_id),
             }
             .map_err(ApiError::from_port_error)?;
-            state.worker.drain(64).map_err(ApiError::from_port_error)?;
             if endpoint.as_str() == "following/requests/cancel" {
                 let followee = state
                     .services
@@ -2223,10 +2202,6 @@ fn api_dispatch_blocking(
                 .services
                 .react(&caller.account.id, &note_id, &reaction, false)
                 .map_err(ApiError::from_port_error)?;
-            state
-                .worker
-                .drain(64)
-                .map_err(ApiError::from_port_error)?;
             Ok(StatusCode::NO_CONTENT.into_response())
         }
 
@@ -2239,10 +2214,6 @@ fn api_dispatch_blocking(
             state
                 .services
                 .unreact(&caller.account.id, &note_id)
-                .map_err(ApiError::from_port_error)?;
-            state
-                .worker
-                .drain(64)
                 .map_err(ApiError::from_port_error)?;
             Ok(StatusCode::NO_CONTENT.into_response())
         }
@@ -2664,6 +2635,73 @@ mod tests {
         let token = value["token"].as_str().unwrap().to_string();
         let id = value["id"].as_str().unwrap().to_string();
         (id, token)
+    }
+
+    /// Slice 10: API writes do not wait for peers. The follower's inbox
+    /// accepts the connection, reads the request and then stalls; the worker
+    /// is busy with it in the background while `notes/create` returns fast.
+    #[tokio::test]
+    async fn slice10_api_latency_independent_of_slow_peer() {
+        use std::io::Read;
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        use crate::application::ports::{AccountStore, CreateAccountInput, FollowStore};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind slow peer");
+        let addr = listener.local_addr().expect("slow peer addr");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                std::thread::sleep(Duration::from_secs(3));
+            }
+        });
+
+        let (state, _) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let remote = state
+            .services
+            .accounts
+            .create_account(CreateAccountInput {
+                handle: "slowpoke".to_string(),
+                host: Some("slow.example".to_string()),
+                display_name: None,
+                description: None,
+                location: None,
+                birthday: None,
+                uri: Some("https://slow.example/users/slowpoke".to_string()),
+                inbox: Some(format!("http://{addr}/inbox")),
+                shared_inbox: None,
+                is_bot: false,
+                is_cat: false,
+                is_locked: false,
+                preserved_usernames: Vec::new(),
+            })
+            .expect("remote follower");
+        state
+            .services
+            .follows
+            .follow(&remote.id, &alice_id, false, None, Vec::new())
+            .expect("remote account follows alice");
+
+        // Production runs the worker on a background loop; do the same here.
+        let _worker = state.worker.clone().spawn(Duration::from_millis(10));
+
+        let started = Instant::now();
+        let (status, value) = call(
+            &state,
+            "notes/create",
+            serde_json::json!({ "text": "hello slow peers" }),
+            Some(&alice_token),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "notes/create waited on a federation peer: {elapsed:?}"
+        );
     }
 
     #[tokio::test]
@@ -3287,7 +3325,13 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{lite}");
         assert_eq!(lite["id"], bob_id);
 
-        // Bob sees a follow notification (worker drained by the endpoint).
+        // Bob sees a follow notification. The endpoint no longer drains the
+        // worker: delivery and notify jobs run in the background, so this
+        // test drains explicitly to stay deterministic.
+        state
+            .worker
+            .drain(64)
+            .expect("drain follow notification job");
         let (status, notifications) = call(
             &state,
             "i/notifications",

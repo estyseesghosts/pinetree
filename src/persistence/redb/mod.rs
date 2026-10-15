@@ -10,7 +10,7 @@ use crate::application::ports::{
     CreateAccountInput, CreateNoteInput, FollowStore, IdGenerator, InsertMediaInput, Job,
     JobQueue, LegacyAuthSessionRecord, MediaStore, MiAuthSessionRecord, NewJob, NoteStore,
     NotificationStore, PortError, ReactionStore, RemotePublicKeyRecord, TimelineCursor,
-    UpdateAccountPatch, MAX_JOB_ATTEMPTS,
+    UpdateAccountPatch, MAX_JOBS_PER_TXN, MAX_JOB_ATTEMPTS,
 };
 use crate::domain::account::{validate_local_username, Account};
 use crate::domain::follow::{Follow, FollowNotify, FollowRequest};
@@ -213,6 +213,26 @@ impl RedbStore {
             out.push(job);
         }
         Ok(out)
+    }
+
+    /// Mark `job_id` done inside an open write transaction (no-op when the
+    /// job is missing). Table guards are scoped to this call so the caller
+    /// can open the same tables again later in the transaction.
+    fn complete_in_txn(&self, write_txn: &WriteTransaction, job_id: &str) -> Result<(), PortError> {
+        let mut jobs_table = write_txn.open_table(JOBS).map_err(map_redb_err)?;
+        let mut due_table = write_txn.open_table(JOBS_DUE_INDEX).map_err(map_redb_err)?;
+        let job_opt: Option<Job> = match jobs_table.get(job_id).map_err(map_redb_err)? {
+            Some(jg) => Some(decode_json(jg.value())?),
+            None => None,
+        };
+        if let Some(job) = job_opt {
+            jobs_table.remove(job_id).map_err(map_redb_err)?;
+            let _ = due_table.remove((job.not_before, job_id));
+            if let Some(exp) = job.lease_expires {
+                let _ = due_table.remove((exp, job_id));
+            }
+        }
+        Ok(())
     }
 
     fn create_note_in_txn(
@@ -1734,20 +1754,78 @@ impl JobQueue for RedbStore {
 
     fn complete(&self, job_id: &str) -> Result<(), PortError> {
         let write_txn = self.begin_write()?;
+        self.complete_in_txn(&write_txn, job_id)?;
+        self.commit_write(write_txn)
+    }
+
+    fn complete_with_followups(
+        &self,
+        job_id: &str,
+        followups: Vec<NewJob>,
+    ) -> Result<(), PortError> {
+        if followups.len() > MAX_JOBS_PER_TXN {
+            return Err(PortError::Validation(format!(
+                "complete_with_followups: {} followups exceed the {MAX_JOBS_PER_TXN} per-txn cap",
+                followups.len()
+            )));
+        }
+        // Validate before opening the transaction so a bad followup never
+        // leaves a half-applied completion behind.
+        for job in &followups {
+            job.validate()?;
+        }
+        let write_txn = self.begin_write()?;
+        // `complete_in_txn` opens and drops its own table guards before the
+        // followups open theirs (redb rejects opening a table twice).
+        self.complete_in_txn(&write_txn, job_id)?;
+        self.enqueue_jobs_in_txn(&write_txn, followups, None)?;
+        self.commit_write(write_txn)
+    }
+
+    fn enqueue_jobs(&self, jobs: Vec<NewJob>) -> Result<(), PortError> {
+        if jobs.len() > MAX_JOBS_PER_TXN {
+            return Err(PortError::Validation(format!(
+                "enqueue_jobs: {} jobs exceed the {MAX_JOBS_PER_TXN} per-txn cap",
+                jobs.len()
+            )));
+        }
+        for job in &jobs {
+            job.validate()?;
+        }
+        let write_txn = self.begin_write()?;
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)
+    }
+
+    fn defer(&self, job_id: &str, not_before_ms: i64) -> Result<(), PortError> {
+        let write_txn = self.begin_write()?;
         {
             let mut jobs_table = write_txn.open_table(JOBS).map_err(map_redb_err)?;
             let mut due_table = write_txn.open_table(JOBS_DUE_INDEX).map_err(map_redb_err)?;
-            let job_opt: Option<Job> = match jobs_table.get(job_id).map_err(map_redb_err)? {
-                Some(jg) => Some(decode_json(jg.value())?),
-                None => None,
+            let mut job: Job = match jobs_table.get(job_id).map_err(map_redb_err)? {
+                Some(jg) => decode_json(jg.value())?,
+                // Missing jobs are a no-op success, like `complete`.
+                None => return Ok(()),
             };
-            if let Some(job) = job_opt {
-                jobs_table.remove(job_id).map_err(map_redb_err)?;
-                let _ = due_table.remove((job.not_before, job_id));
-                if let Some(exp) = job.lease_expires {
-                    let _ = due_table.remove((exp, job_id));
-                }
+            // Terminal state is sticky: a quarantined job is never rescheduled.
+            if job.failed {
+                return Ok(());
             }
+            let _ = due_table.remove((job.not_before, job_id));
+            if let Some(exp) = job.lease_expires {
+                let _ = due_table.remove((exp, job_id));
+            }
+            // Release the lease without touching `attempts`: a deferral is
+            // not a failed delivery and must not burn retry budget.
+            job.lease_expires = None;
+            job.not_before = not_before_ms;
+            let encoded = encode_json(&job)?;
+            jobs_table
+                .insert(job_id, encoded.as_slice())
+                .map_err(map_redb_err)?;
+            due_table
+                .insert((not_before_ms, job_id), &1u8)
+                .map_err(map_redb_err)?;
         }
         self.commit_write(write_txn)
     }

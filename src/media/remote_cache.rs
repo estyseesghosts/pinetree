@@ -51,7 +51,8 @@ pub fn validate_remote_media_url(
             "remote media URL exceeds 1024 chars".to_string(),
         ));
     }
-    resolve_and_validate_url(url, &client.config).map_err(PortError::Validation)?;
+    resolve_and_validate_url(url, &client.config)
+        .map_err(|e| PortError::Validation(e.to_string()))?;
     Ok(())
 }
 
@@ -234,7 +235,7 @@ fn download_and_sniff(
     let max_bytes = usize::try_from(services.max_file_size).unwrap_or(16 * 1024 * 1024);
     let resp = client
         .send("GET", &attachment.url, &[], None, max_bytes)
-        .map_err(PortError::Validation)?;
+        .map_err(|e| PortError::Validation(e.to_string()))?;
     if !(200..300).contains(&resp.status) {
         return Err(PortError::Validation(format!(
             "remote media GET {} returned HTTP {}",

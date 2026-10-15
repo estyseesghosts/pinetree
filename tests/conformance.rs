@@ -30,8 +30,8 @@ use pinetree::application::commands::AppServices;
 use pinetree::application::ports::{
     AccountStore, ActivityDedup, BlobStore, CreateAccountInput, CreateNoteInput, FollowStore,
     InsertMediaInput, JobKind, JobQueue, MediaStore, NewJob, NoopStreamingSink, NoteStore,
-    NotificationStore, PortError, StreamingSink, TimelineCursor, MAX_JOB_ATTEMPTS,
-    MAX_JOB_PAYLOAD_BYTES,
+    NotificationStore, PortError, StreamingSink, TimelineCursor, MAX_JOBS_PER_TXN,
+    MAX_JOB_ATTEMPTS, MAX_JOB_PAYLOAD_BYTES,
 };
 use pinetree::domain::id::{Clock, ManualClock};
 use pinetree::domain::note::{Note, Visibility};
@@ -1174,6 +1174,331 @@ fn b12_worker_retry_exhaustion_quarantines() {
         0,
         "quarantined jobs are not pending work"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Slice 10 — delivery reliability (Phase 2.6). Job-queue primitives are
+// generic cases (FDB inherits them); worker scenarios run over redb.
+// ---------------------------------------------------------------------------
+
+fn slice10_job(clock: &ManualClock, key: &str) -> NewJob {
+    NewJob {
+        kind: JobKind::StreamingPublish,
+        payload: br#"{"note_id":"x"}"#.to_vec(),
+        idempotency_key: key.to_string(),
+        not_before: clock.now_ms(),
+    }
+}
+
+/// `complete_with_followups` settles the parent and inserts its followups in
+/// one write; a call with any invalid followup changes nothing.
+fn case_slice10_complete_with_followups<S: ConformanceStore>(store: &S, clock: &ManualClock) {
+    let alice = create_user(store, "alice");
+    note_with_job(store, clock, &alice.id, "fan-out parent", "s10:parent");
+    let parent = store.claim_next(60_000).expect("claim").expect("parent job");
+    let parent_id = parent.id.clone();
+
+    let bad = NewJob {
+        idempotency_key: String::new(),
+        ..slice10_job(clock, "s10:bad")
+    };
+    assert!(
+        store
+            .complete_with_followups(
+                &parent_id,
+                vec![slice10_job(clock, "s10:ok-1"), bad],
+            )
+            .is_err(),
+        "an invalid followup rejects the whole call"
+    );
+    assert!(
+        store.get_job(&parent_id).expect("get_job").is_some(),
+        "a rejected completion leaves the parent row in place"
+    );
+    assert_eq!(
+        store.pending_count().expect("count"),
+        1,
+        "no followup from the rejected call"
+    );
+
+    store
+        .complete_with_followups(
+            &parent_id,
+            vec![slice10_job(clock, "s10:ok-1"), slice10_job(clock, "s10:ok-2")],
+        )
+        .expect("valid completion with followups");
+    assert!(
+        store.get_job(&parent_id).expect("get_job").is_none(),
+        "parent completed"
+    );
+    let mut keys = HashSet::new();
+    while let Some(job) = store.claim_next(60_000).expect("claim") {
+        keys.insert(job.idempotency_key.clone());
+    }
+    assert_eq!(
+        keys,
+        HashSet::from(["s10:ok-1".to_string(), "s10:ok-2".to_string()]),
+        "both followups committed with the completion"
+    );
+}
+
+#[test]
+fn slice10_complete_with_followups() {
+    let factory = RedbFactory::fresh("s10-cwf");
+    let clock = test_clock();
+    let store = factory.open(clock.clone());
+    case_slice10_complete_with_followups(&*store, &clock);
+}
+
+/// `defer` releases the lease and reschedules without counting an attempt.
+fn case_slice10_defer_keeps_attempts<S: ConformanceStore>(store: &S, clock: &ManualClock) {
+    let alice = create_user(store, "alice");
+    note_with_job(store, clock, &alice.id, "defer me", "s10:defer");
+    let claimed = store.claim_next(60_000).expect("claim").expect("job");
+    let until = clock.now_ms() + 5_000;
+    store.defer(&claimed.id, until).expect("defer");
+
+    let stored = store
+        .get_job(&claimed.id)
+        .expect("get_job")
+        .expect("deferred row kept");
+    assert_eq!(stored.attempts, 0, "a deferral is not an attempt");
+    assert_eq!(stored.not_before, until, "rescheduled at the requested time");
+    assert!(stored.lease_expires.is_none(), "lease released");
+    assert!(
+        store.claim_next(60_000).expect("claim").is_none(),
+        "not claimable before the deferral ends"
+    );
+
+    clock.advance_ms(5_000);
+    let again = store
+        .claim_next(60_000)
+        .expect("claim")
+        .expect("claimable once the deferral ends");
+    assert_eq!(again.id, claimed.id);
+    assert_eq!(again.attempts, 0, "reclaiming a deferred job counts nothing");
+
+    // Missing jobs are a no-op success, like the other terminal operations.
+    store
+        .defer("job:missing", until)
+        .expect("defer on a missing job is a no-op success");
+}
+
+#[test]
+fn slice10_defer_keeps_attempts() {
+    let factory = RedbFactory::fresh("s10-defer");
+    let clock = test_clock();
+    let store = factory.open(clock.clone());
+    case_slice10_defer_keeps_attempts(&*store, &clock);
+}
+
+/// `enqueue_jobs` inserts a batch atomically and enforces the per-call cap.
+fn case_slice10_enqueue_jobs<S: ConformanceStore>(store: &S, clock: &ManualClock) {
+    let batch: Vec<NewJob> = (0..3)
+        .map(|i| slice10_job(clock, &format!("s10:batch-{i}")))
+        .collect();
+    store.enqueue_jobs(batch).expect("batch enqueue");
+    assert_eq!(store.pending_count().expect("count"), 3);
+
+    let too_many: Vec<NewJob> = (0..MAX_JOBS_PER_TXN + 1)
+        .map(|i| slice10_job(clock, &format!("s10:big-{i}")))
+        .collect();
+    assert!(store.enqueue_jobs(too_many).is_err(), "over the per-call cap");
+    assert_eq!(
+        store.pending_count().expect("count"),
+        3,
+        "a rejected batch writes nothing"
+    );
+
+    let mixed = vec![
+        slice10_job(clock, "s10:mixed-ok"),
+        NewJob {
+            idempotency_key: " ".to_string(),
+            ..slice10_job(clock, "s10:unused")
+        },
+    ];
+    assert!(store.enqueue_jobs(mixed).is_err(), "one invalid job rejects the batch");
+    assert_eq!(store.pending_count().expect("count"), 3);
+
+    let full: Vec<NewJob> = (0..MAX_JOBS_PER_TXN)
+        .map(|i| slice10_job(clock, &format!("s10:full-{i}")))
+        .collect();
+    store.enqueue_jobs(full).expect("a full-size batch is accepted");
+    assert_eq!(
+        store.pending_count().expect("count"),
+        3 + MAX_JOBS_PER_TXN
+    );
+}
+
+#[test]
+fn slice10_enqueue_jobs() {
+    let factory = RedbFactory::fresh("s10-enq");
+    let clock = test_clock();
+    let store = factory.open(clock.clone());
+    case_slice10_enqueue_jobs(&*store, &clock);
+}
+
+/// Remote account whose preferred inbox is `inbox`.
+fn slice10_remote_account<S: AccountStore>(
+    store: &S,
+    handle: &str,
+    inbox: &str,
+) -> pinetree::domain::account::Account {
+    store
+        .create_account(CreateAccountInput {
+            handle: handle.to_string(),
+            host: Some("remote.example".to_string()),
+            display_name: None,
+            description: None,
+            location: None,
+            birthday: None,
+            uri: Some(format!("https://remote.example/users/{handle}")),
+            inbox: Some(inbox.to_string()),
+            shared_inbox: None,
+            is_bot: false,
+            is_cat: false,
+            is_locked: false,
+            preserved_usernames: Vec::new(),
+        })
+        .unwrap_or_else(|e| panic!("remote account {handle}: {e:?}"))
+}
+
+/// Stub inbox on 127.0.0.1: answers each request with `status_line` and counts
+/// the requests it receives. Serves at most `max_requests` connections.
+fn slice10_stub_inbox(status_line: &'static str, max_requests: usize) -> (String, Arc<AtomicU64>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub inbox");
+    let addr = listener.local_addr().expect("stub addr");
+    let hits = Arc::new(AtomicU64::new(0));
+    let counter = hits.clone();
+    std::thread::spawn(move || {
+        for _ in 0..max_requests {
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            counter.fetch_add(1, Ordering::SeqCst);
+            let resp = format!("{status_line}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    (format!("http://{addr}/inbox"), hits)
+}
+
+/// A fan-out over three inboxes where one answers 503: the activity job
+/// completes, the two healthy inboxes are never sent to again, and exactly
+/// one follow-up job (for the failed inbox) is retried.
+#[test]
+fn slice10_one_failing_inbox_retries_only_that_inbox() {
+    let (ok1, hits1) = slice10_stub_inbox("HTTP/1.1 202 Accepted", 16);
+    let (ok2, hits2) = slice10_stub_inbox("HTTP/1.1 202 Accepted", 16);
+    let (bad, bad_hits) = slice10_stub_inbox("HTTP/1.1 503 Service Unavailable", 16);
+
+    let factory = RedbFactory::fresh("s10-fan");
+    let clock = test_clock();
+    let streaming: Arc<dyn StreamingSink> = Arc::new(NoopStreamingSink);
+    let (store, services, worker) = open_worker_stack(&factory, clock.clone(), streaming);
+    let alice = create_user(&*store, "alice");
+    let r1 = slice10_remote_account(&*store, "r1", &ok1);
+    let r2 = slice10_remote_account(&*store, "r2", &ok2);
+    let r3 = slice10_remote_account(&*store, "r3", &bad);
+
+    let mut input = CreateNoteInput::simple_public(&alice.id, "one of three fails");
+    input.extra_mentions = vec![r1.id.clone(), r2.id.clone(), r3.id.clone()];
+    services.create_note(input).expect("note with fan-out");
+
+    // First pass: the activity job fans out inline and settles.
+    worker.drain(16).expect("drain fan-out");
+    assert_eq!(hits1.load(Ordering::SeqCst), 1, "healthy inbox 1 sent once");
+    assert_eq!(hits2.load(Ordering::SeqCst), 1, "healthy inbox 2 sent once");
+    assert_eq!(bad_hits.load(Ordering::SeqCst), 1, "failing inbox sent once");
+    assert_eq!(
+        store.pending_count().expect("count"),
+        1,
+        "only the failed inbox remains queued"
+    );
+
+    // The follow-up waits out the destination cooldown, then retries alone.
+    clock.advance_ms(2_000);
+    worker.drain(16).expect("drain follow-up");
+    assert_eq!(hits1.load(Ordering::SeqCst), 1, "healthy inbox 1 not re-sent");
+    assert_eq!(hits2.load(Ordering::SeqCst), 1, "healthy inbox 2 not re-sent");
+    assert_eq!(
+        bad_hits.load(Ordering::SeqCst),
+        2,
+        "only the failed inbox is retried"
+    );
+
+    // The follow-up is a one-inbox job with the job-level retry budget.
+    clock.advance_ms(3_600_000);
+    let retry = store
+        .claim_next(60_000)
+        .expect("claim")
+        .expect("follow-up still queued for retry");
+    assert_eq!(retry.kind, JobKind::FederateDeliver);
+    assert_eq!(retry.attempts, 1, "the retried send counted one attempt");
+    match serde_json::from_slice::<FederateDeliverPayload>(&retry.payload).expect("payload") {
+        FederateDeliverPayload::NoteCreated {
+            inbox_override, ..
+        } => assert_eq!(inbox_override.as_deref(), Some(bad.as_str())),
+        other => panic!("follow-up must be a per-inbox job, got {other:?}"),
+    }
+}
+
+/// A destination in cooldown is deferred, not sent to and not counted as an
+/// attempt; once the cooldown ends the same job delivers normally.
+#[test]
+fn slice10_cooldown_host_is_deferred_not_attempted() {
+    let (inbox, hits) = slice10_stub_inbox("HTTP/1.1 202 Accepted", 4);
+
+    let factory = RedbFactory::fresh("s10-cool");
+    let clock = test_clock();
+    let streaming: Arc<dyn StreamingSink> = Arc::new(NoopStreamingSink);
+    let (store, _services, worker) = open_worker_stack(&factory, clock.clone(), streaming);
+    let alice = create_user(&*store, "alice");
+    let bob = slice10_remote_account(&*store, "bob", &inbox);
+
+    // An earlier failure put this host in cooldown.
+    let until = worker
+        .delivery_tracker
+        .record_failure(&inbox, clock.now_ms(), 1_000);
+
+    let payload = FederateDeliverPayload::Follow {
+        follow_id: "s10-cool:follow".to_string(),
+        follower_id: alice.id.clone(),
+        followee_id: bob.id.clone(),
+        inbox_url: inbox.clone(),
+    };
+    let job = NewJob::new_json(JobKind::FederateDeliver, &payload, "s10-cool:deliver", clock.now_ms())
+        .expect("follow payload");
+    store
+        .follow(&alice.id, &bob.id, false, None, vec![job])
+        .expect("follow with deliver job");
+
+    assert!(worker.process_one().expect("process"), "job claimed and settled");
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "no send into a cooling host");
+    assert_eq!(
+        store.pending_count().expect("count"),
+        1,
+        "the deferred job stays queued"
+    );
+    assert!(
+        store.claim_next(60_000).expect("claim").is_none(),
+        "not claimable before the cooldown ends"
+    );
+
+    clock.advance_ms((until - clock.now_ms()).max(0));
+    let due = store
+        .claim_next(60_000)
+        .expect("claim")
+        .expect("due when the cooldown ends");
+    assert_eq!(due.attempts, 0, "deferral never counted an attempt");
+    store.complete(&due.id).expect("settle probe claim");
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "still no send");
 }
 
 // ---------------------------------------------------------------------------
