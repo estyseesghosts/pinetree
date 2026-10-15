@@ -90,3 +90,7 @@ Changing deployment modes (redb ↔ FoundationDB) uses explicit export/import wi
 - Both references default to `aidx`; `aid` is legacy. We fix `aidx` only and do not implement the method switch.
 - Sharkey extras treated as **out of scope** for identity: redacted-person authorized-fetch variant, `_misskey_*` privacy fields, `alsoKnownAs`/`movedTo` passthrough (S `ApRendererService.ts:624-626,645-651,669-698`).
 - Misskey quote metadata / polls / `_misskey_content` are deferred per proposal §7 and unaffected by this contract.
+
+## Superseding note — Phase 2.6 slice 11 (2026-10-15)
+
+The collection endpoints in §4 (`/outbox`, `/followers`, `/following`) are now paged with opaque cursors and `next` links, and their `totalItems` rules changed (outbox `totalItems` omitted; followers/following from counters). The full contract is `docs/activitypub-collections.md`. The URL shapes in §4 are unchanged.

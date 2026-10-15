@@ -11,6 +11,7 @@ Each contract file carries a `Status:` line at the top: `Draft` or `Frozen`.
 | Endpoint + streaming manifest | Frozen (`docs/endpoint-manifest.md`) | §6 |
 | Core domain types | Frozen (`docs/domain-types.md`) | §4 |
 | Identity rules | Frozen (`docs/identity-rules.md`) | §3 |
+| ActivityPub collections (outbox, followers, following paging) | Frozen (`docs/activitypub-collections.md`; Phase 2.6 slice 11) | §7 |
 | Visibility policy | Frozen (`docs/visibility-policy.md`) | §4 (`policy.rs`) |
 | Application ports | Frozen (`docs/application-ports.md`) | §4 (`ports.rs`) |
 | Persistence conformance tests | Frozen, redb green (`docs/persistence-conformance.md`; 26/26 green on redb in `tests/conformance.rs`) | §2 |
