@@ -1095,6 +1095,17 @@ async fn federation_two_node_end_to_end() {
         b.services.notes.find_by_uri(&media_note_uri).expect("find").is_some()
     })
     .await;
+    // Slice 7 (D-d): the attachment is fetched by the durable
+    // `RemoteMediaFetch` worker job, not inline on the inbox request, so
+    // drain until the note carries the file.
+    pump_until(&a, &b, "B attaches remote media via worker", phase_deadline, &mut || {
+        b.services
+            .notes
+            .find_by_uri(&media_note_uri)
+            .expect("find")
+            .is_some_and(|n| n.file_ids.len() == 1)
+    })
+    .await;
     let media_cached = b
         .services
         .notes

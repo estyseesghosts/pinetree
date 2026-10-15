@@ -106,3 +106,7 @@ Must-carry subset of `MiDriveFile` (M `models/DriveFile.ts`). Bytes are never he
 ## Superseding note — Phase 2.6 slice 4 (2026-10-15)
 
 Added `FollowRequest { id, follower_id, followee_id, with_replies, notify }` (decision D-a: a separate record mirroring Misskey's `FollowRequest`, not a state field on `Follow`). A request is **not** an edge: it never feeds `follows_author`, `followers_of` fan-out, counters or AP collections. `NotificationKind` gains `ReceiveFollowRequest` (wire type `receiveFollowRequest`). See `state/logs/2026-10-15-phase2-6-slice4-follow-requests.md`.
+
+## Superseding note — Phase 2.6 slice 7 (2026-10-15)
+
+`MediaMeta` gains nullable `source_url` (remote origin URL for cache rows; `None` for local uploads). With the owning note's `file_ids` it is the idempotent-insert key that keeps inbox replays and job retries from orphaning rows. MIME rule tightened: the stored `mime` comes from magic-byte sniffing only (allowlist `image/png|jpeg|gif|webp|avif`, `video/mp4|webm|mpeg`, `audio/mpeg|ogg|wav`, `text/plain` for non-markup UTF-8 only, else `application/octet-stream`); declared `mediaType` and response `Content-Type` never influence it. Never `text/html`, `image/svg+xml`, `application/xhtml+xml`, `text/xml`. See `state/logs/2026-10-15-phase2-6-slice7-media-safety.md`.

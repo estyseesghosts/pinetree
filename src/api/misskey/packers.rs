@@ -767,6 +767,14 @@ mod tests {
         ) -> Result<Vec<Note>, PortError> {
             Ok(Vec::new())
         }
+        fn attach_remote_media(
+            &self,
+            _note_id: &str,
+            _input: InsertMediaInput,
+            _jobs: Vec<NewJob>,
+        ) -> Result<MediaMeta, PortError> {
+            unavailable("attach_remote_media")
+        }
     }
 
     impl FollowStore for Mem {
@@ -860,6 +868,9 @@ mod tests {
         fn check_and_record(&self, _activity_id: &str) -> Result<bool, PortError> {
             Ok(false)
         }
+        fn is_recorded(&self, _activity_id: &str) -> Result<bool, PortError> {
+            Ok(false)
+        }
         fn record_note_activity(
             &self,
             _activity_id: &str,
@@ -892,6 +903,20 @@ mod tests {
             _hash: &str,
         ) -> Result<Option<MediaMeta>, PortError> {
             Ok(None)
+        }
+        fn find_by_source_url(&self, source_url: &str) -> Result<Vec<MediaMeta>, PortError> {
+            let target = source_url.trim();
+            if target.is_empty() {
+                return Ok(Vec::new());
+            }
+            Ok(self
+                .media
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|m| m.source_url.as_deref().map(str::trim) == Some(target))
+                .cloned()
+                .collect())
         }
         fn delete_metadata(&self, _id: &str) -> Result<(), PortError> {
             unavailable("delete_metadata")
@@ -1059,6 +1084,7 @@ mod tests {
             url: format!("https://example.local/files/{id}"),
             thumbnail_url: None,
             comment: None,
+            source_url: None,
         }
     }
 

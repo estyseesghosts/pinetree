@@ -414,7 +414,6 @@ fn child_c4restart() -> ! {
         .upload_media(
             &alice.id,
             "avatar.png".to_string(),
-            Some("image/png".to_string()),
             C4_RESTART_MEDIA_BYTES,
             Some("restart test file".to_string()),
             false,

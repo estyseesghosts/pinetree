@@ -16,7 +16,7 @@ use crate::domain::account::{validate_local_username, Account};
 use crate::domain::follow::{Follow, FollowNotify, FollowRequest};
 use crate::domain::id::{parse_aidx_time, AidxGenerator};
 use crate::domain::media::MediaMeta;
-use crate::domain::note::{extract_hashtags, extract_mentions, Note};
+use crate::domain::note::{extract_hashtags, extract_mentions, Note, MAX_FILE_IDS};
 use crate::domain::notification::Notification;
 use crate::domain::policy::{narrow_on_create, NarrowingInput};
 use crate::domain::reaction::Reaction;
@@ -1500,6 +1500,151 @@ impl NoteStore for RedbStore {
         }
         Ok(None)
     }
+
+    fn attach_remote_media(
+        &self,
+        note_id: &str,
+        input: InsertMediaInput,
+        jobs: Vec<NewJob>,
+    ) -> Result<MediaMeta, PortError> {
+        for job in &jobs {
+            job.validate()?;
+        }
+        // Build and validate the row before opening the transaction (so a
+        // validation failure never touches storage).
+        let id = input.id.clone().unwrap_or_else(|| self.ids.generate());
+        let meta = MediaMeta {
+            id: id.clone(),
+            owner_id: input.owner_id.clone(),
+            name: input.name.clone(),
+            mime: input.mime.clone(),
+            size_bytes: input.size_bytes,
+            hash: input.hash.clone(),
+            blurhash: input.blurhash.clone(),
+            properties: input.properties.clone(),
+            is_sensitive: input.is_sensitive,
+            is_link: input.is_link,
+            url: input.url.clone(),
+            thumbnail_url: input.thumbnail_url.clone(),
+            comment: input.comment.clone(),
+            source_url: input.source_url.clone(),
+        };
+        meta.validate(input.max_file_size)?;
+        let write_txn = self.begin_write()?;
+        // NOTES and MEDIA_META are each opened exactly once: opening the
+        // same table twice in one write txn errors.
+        let mut notes_table = write_txn.open_table(NOTES).map_err(map_redb_err)?;
+        let mut media_table = write_txn.open_table(MEDIA_META).map_err(map_redb_err)?;
+        // Read the note into an owned value first: the access guard borrows
+        // the table, so it must be dropped before any early `abort()`.
+        let note_opt: Option<Note> = {
+            let guard = notes_table.get(note_id).map_err(map_redb_err)?;
+            guard
+                .map(|g| decode_json(g.value()))
+                .transpose()?
+        };
+        let mut note: Note = match note_opt {
+            Some(n) => n,
+            None => {
+                drop(notes_table);
+                drop(media_table);
+                let _ = write_txn.abort();
+                return Err(PortError::NotFound("NO_SUCH_NOTE".to_string()));
+            }
+        };
+        if note.is_deleted {
+            drop(notes_table);
+            drop(media_table);
+            let _ = write_txn.abort();
+            return Err(PortError::NotFound("NO_SUCH_NOTE".to_string()));
+        }
+        // Idempotency per (source_url, note): a row for this URL that the
+        // note already references is returned as-is — no second insert, so
+        // job retries and inbox replays never orphan rows. The scan collects
+        // the hit first so the iterator is dropped before any `abort()`.
+        let mut idempotent_hit: Option<MediaMeta> = None;
+        if let Some(url) = meta.source_url.as_deref() {
+            let target = url.trim();
+            if !target.is_empty() {
+                let attached: std::collections::HashSet<&str> =
+                    note.file_ids.iter().map(String::as_str).collect();
+                for entry in media_table.iter().map_err(map_redb_err)? {
+                    let (_, v) = entry.map_err(map_redb_err)?;
+                    let existing: MediaMeta = decode_json(v.value())?;
+                    if existing.source_url.as_deref().map(str::trim) == Some(target)
+                        && attached.contains(existing.id.as_str())
+                    {
+                        idempotent_hit = Some(existing);
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(existing) = idempotent_hit {
+            drop(notes_table);
+            drop(media_table);
+            let _ = write_txn.abort();
+            return Ok(existing);
+        }
+        let author: Account = {
+            let accounts_table = write_txn.open_table(ACCOUNTS).map_err(map_redb_err)?;
+            let author_opt: Option<Account> = {
+                let guard = accounts_table
+                    .get(note.author_id.as_str())
+                    .map_err(map_redb_err)?;
+                guard
+                    .map(|g| decode_json(g.value()))
+                    .transpose()?
+            };
+            drop(accounts_table);
+            match author_opt {
+                Some(a) => a,
+                None => {
+                    drop(notes_table);
+                    drop(media_table);
+                    let _ = write_txn.abort();
+                    return Err(PortError::NotFound("NO_SUCH_USER".to_string()));
+                }
+            }
+        };
+        // Same ownership rule as `create_note_in_txn`: the row must belong
+        // to the author, or be an unowned remote-cache row for a remote
+        // author.
+        let owner_ok = input.owner_id.as_deref() == Some(note.author_id.as_str())
+            || (author.host.is_some() && input.owner_id.is_none());
+        if !owner_ok {
+            drop(notes_table);
+            drop(media_table);
+            let _ = write_txn.abort();
+            return Err(PortError::Validation("NO_SUCH_FILE".to_string()));
+        }
+        if note.file_ids.len() >= MAX_FILE_IDS {
+            drop(notes_table);
+            drop(media_table);
+            let _ = write_txn.abort();
+            return Err(PortError::Validation(
+                "TOO_MANY_ATTACHMENTS".to_string(),
+            ));
+        }
+        // `note.file_ids` uniqueness is a domain invariant; skip ids the
+        // note already references (defensive: same outcome as idempotent).
+        if !note.file_ids.contains(&id) {
+            note.file_ids.push(id);
+        }
+        let note_bytes = encode_json(&note)?;
+        notes_table
+            .insert(note.id.as_str(), note_bytes.as_slice())
+            .map_err(map_redb_err)?;
+        let meta_bytes = encode_json(&meta)?;
+        media_table
+            .insert(meta.id.as_str(), meta_bytes.as_slice())
+            .map_err(map_redb_err)?;
+        drop(notes_table);
+        drop(media_table);
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)?;
+        Ok(meta)
+    }
 }
 
 impl JobQueue for RedbStore {
@@ -2066,6 +2211,15 @@ impl ReactionStore for RedbStore {
 }
 
 impl ActivityDedup for RedbStore {
+    fn is_recorded(&self, activity_id: &str) -> Result<bool, PortError> {
+        if activity_id.trim().is_empty() {
+            return Err(PortError::Validation("empty activity_id".to_string()));
+        }
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(ACTIVITY_DEDUP).map_err(map_redb_err)?;
+        Ok(table.get(activity_id).map_err(map_redb_err)?.is_some())
+    }
+
     fn forget_activity(&self, activity_id: &str) -> Result<(), PortError> {
         if activity_id.trim().is_empty() {
             return Ok(());
@@ -2299,6 +2453,7 @@ impl MediaStore for RedbStore {
             url: input.url,
             thumbnail_url: input.thumbnail_url,
             comment: input.comment,
+            source_url: input.source_url,
         };
         meta.validate(input.max_file_size)?;
 
@@ -2338,6 +2493,24 @@ impl MediaStore for RedbStore {
             }
         }
         Ok(None)
+    }
+
+    fn find_by_source_url(&self, source_url: &str) -> Result<Vec<MediaMeta>, PortError> {
+        let target = source_url.trim();
+        if target.is_empty() {
+            return Ok(Vec::new());
+        }
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(MEDIA_META).map_err(map_redb_err)?;
+        let mut out = Vec::new();
+        for entry in table.iter().map_err(map_redb_err)? {
+            let (_, v) = entry.map_err(map_redb_err)?;
+            let meta: MediaMeta = decode_json(v.value())?;
+            if meta.source_url.as_deref().map(str::trim) == Some(target) {
+                out.push(meta);
+            }
+        }
+        Ok(out)
     }
 
     fn delete_metadata(&self, id: &str) -> Result<(), PortError> {

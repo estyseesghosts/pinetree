@@ -14,8 +14,8 @@ use axum::{
     body::{Body, Bytes},
     extract::{FromRequest, Multipart, Path, Query, Request, State},
     http::{
-        header::{AUTHORIZATION, CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE},
-        HeaderMap, HeaderValue, StatusCode,
+        header::{AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE},
+        HeaderMap, HeaderName, HeaderValue, StatusCode,
     },
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -131,6 +131,20 @@ pub fn build_router(state: ApiState) -> Router {
         // 2 MiB default extraction limit.
         .with_state(state)
         .merge(federation_routes)
+        // Slice 7 (H2): every response carries `nosniff`, including error
+        // bodies and redirects.
+        .layer(axum::middleware::from_fn(nosniff_middleware))
+}
+
+/// Slice 7 (H2): global `X-Content-Type-Options: nosniff` for all
+/// responses, so a stored file can never be sniffed into active content.
+async fn nosniff_middleware(req: Request, next: axum::middleware::Next) -> Response {
+    let mut response = next.run(req).await;
+    response.headers_mut().insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    response
 }
 
 // --- Small helpers ---------------------------------------------------------
@@ -470,7 +484,40 @@ async fn serve_file(
             .parse::<HeaderValue>()
             .unwrap_or(HeaderValue::from_static("application/octet-stream")),
     );
+    apply_media_security_headers(&mut response, &meta.mime);
     Ok(response)
+}
+
+/// Inline-safe MIME set (slice 7, H2): sniffed `image/*` (except SVG —
+/// the sniffer never emits it, and legacy `image/svg+xml` rows must not
+/// render inline), `audio/*` and `video/*` render inline. Everything else —
+/// `application/octet-stream`, `text/plain`, and any legacy row outside the
+/// allowlist (e.g. stored `application/pdf`) — is served as an attachment
+/// so it can never become active content in the site origin.
+fn is_inline_safe_mime(mime: &str) -> bool {
+    (mime.starts_with("image/") && mime != "image/svg+xml" && !mime.ends_with("+xml"))
+        || mime.starts_with("audio/")
+        || mime.starts_with("video/")
+}
+
+/// Slice 7 (H2): every served file carries `nosniff` plus a
+/// `default-src 'none'; sandbox` CSP, and non-inline-safe files carry
+/// `Content-Disposition: attachment`.
+fn apply_media_security_headers(response: &mut Response, mime: &str) {
+    response.headers_mut().insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("content-security-policy"),
+        HeaderValue::from_static("default-src 'none'; sandbox"),
+    );
+    if !is_inline_safe_mime(mime) {
+        response.headers_mut().insert(
+            CONTENT_DISPOSITION,
+            HeaderValue::from_static("attachment"),
+        );
+    }
 }
 
 /// Misskey `FileServerService.ts:93-99` redirects `/files/{id}/{name}` to
@@ -484,12 +531,24 @@ async fn serve_file_named(Path((id, _name)): Path<(String, String)>) -> Response
         .into_response()
 }
 
-/// Tiny deterministic SVG identicon so avatar URLs always resolve.
+/// Tiny deterministic SVG identicon so avatar URLs always resolve. The
+/// bytes are fully server-generated (SHA-256-derived hex colors and
+/// coordinates; no user input, no script elements), and the response carries
+/// the same sandboxed CSP as served files, so even a direct navigation
+/// cannot execute script.
 async fn identicon(Path(id): Path<String>) -> Response {
     let mut response = identicon_svg(&id).into_response();
     response.headers_mut().insert(
         CONTENT_TYPE,
         HeaderValue::from_static("image/svg+xml"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("content-security-policy"),
+        HeaderValue::from_static("default-src 'none'; sandbox"),
     );
     response
 }
@@ -1157,9 +1216,10 @@ async fn drive_files_create(State(state): State<ApiState>, req: Request) -> Resu
     let raw = read_capped_body(body, upload_cap_bytes(&state.services)).await?;
 
     // Collected upload fields, from multipart or JSON.
+    // (No content-type is collected: the stored MIME comes from the shared
+    // sniffer only — slice 7, H2 — so a caller MIME can never be stored.)
     let mut name: Option<String> = None;
     let mut filename: Option<String> = None;
-    let mut mime: Option<String> = None;
     let mut data: Option<Vec<u8>> = None;
     let mut comment: Option<String> = None;
     let mut is_sensitive = false;
@@ -1178,7 +1238,6 @@ async fn drive_files_create(State(state): State<ApiState>, req: Request) -> Resu
         {
             let field_name = field.name().unwrap_or("").to_string();
             let field_filename = field.file_name().map(|s| s.to_string());
-            let field_mime = field.content_type().map(|s| s.to_string());
             let field_bytes = field
                 .bytes()
                 .await
@@ -1186,7 +1245,6 @@ async fn drive_files_create(State(state): State<ApiState>, req: Request) -> Resu
             match field_name.as_str() {
                 "file" => {
                     filename = field_filename;
-                    mime = field_mime;
                     data = Some(field_bytes.to_vec());
                 }
                 "name" => name = Some(String::from_utf8_lossy(&field_bytes).into_owned()),
@@ -1270,7 +1328,6 @@ async fn drive_files_create(State(state): State<ApiState>, req: Request) -> Resu
         .upload_media(
             &caller.account.id,
             file_name,
-            mime,
             &bytes,
             comment,
             is_sensitive,
@@ -2230,7 +2287,7 @@ fn api_dispatch_blocking(
                     // fetches converge.
                     match state
                         .services
-                        .handle_inbound_create_note(&parsed.uri, input)
+                        .handle_inbound_create_note(&parsed.uri, input, Vec::new())
                     {
                         Ok(Some(note)) => {
                             let packed = pack_note(&note, viewer_id, &state.services, 0)
@@ -3332,6 +3389,109 @@ mod tests {
         let (status, value) = call(&state, "nope/not-real", serde_json::json!({}), None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(value["code"], "UNKNOWN_API_ENDPOINT");
+    }
+
+    #[tokio::test]
+    async fn serve_file_sets_security_headers() {
+        // Slice 7 (H2, written before the fix): every served file carries
+        // nosniff + CSP; octet-stream/text/plain (and anything outside the
+        // inline-safe set) serve as attachments; sniffed images stay inline.
+        let (state, _) = test_state();
+        let (account_id, _) = signup_user(&state, "serena").await;
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        png.extend_from_slice(&[1, 2, 3, 4]);
+        let png_id = state
+            .services
+            .upload_media(&account_id, "pic.png".to_string(), &png, None, false, true)
+            .unwrap()
+            .id;
+        let txt_id = state
+            .services
+            .upload_media(
+                &account_id,
+                "hi.txt".to_string(),
+                b"hello world",
+                None,
+                false,
+                true,
+            )
+            .unwrap()
+            .id;
+        // Non-UTF-8 bytes named `.html`: stored (and served) as
+        // octet-stream, never as HTML.
+        let bin_id = state
+            .services
+            .upload_media(
+                &account_id,
+                "evil.html".to_string(),
+                &[0xFF, 0xFE, 0x00, 0x01],
+                None,
+                false,
+                true,
+            )
+            .unwrap()
+            .id;
+
+        let response = serve_file(State(state.clone()), Path(png_id))
+            .await
+            .unwrap();
+        assert_eq!(response.headers()[CONTENT_TYPE], "image/png");
+        assert_eq!(
+            response.headers()["x-content-type-options"],
+            "nosniff"
+        );
+        assert_eq!(
+            response.headers()["content-security-policy"],
+            "default-src 'none'; sandbox"
+        );
+        assert!(
+            response.headers().get(CONTENT_DISPOSITION).is_none(),
+            "sniffed images stay inline"
+        );
+
+        let response = serve_file(State(state.clone()), Path(txt_id))
+            .await
+            .unwrap();
+        assert_eq!(response.headers()[CONTENT_TYPE], "text/plain");
+        assert_eq!(
+            response.headers()["x-content-type-options"],
+            "nosniff"
+        );
+        assert_eq!(
+            response.headers()["content-security-policy"],
+            "default-src 'none'; sandbox"
+        );
+        assert_eq!(
+            response.headers()[CONTENT_DISPOSITION],
+            "attachment"
+        );
+
+        let response = serve_file(State(state.clone()), Path(bin_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.headers()[CONTENT_TYPE],
+            "application/octet-stream"
+        );
+        assert_eq!(
+            response.headers()[CONTENT_DISPOSITION],
+            "attachment"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), &[0xFF, 0xFE, 0x00, 0x01]);
+    }
+
+    #[test]
+    fn inline_safe_mime_set() {
+        assert!(is_inline_safe_mime("image/png"));
+        assert!(is_inline_safe_mime("audio/mpeg"));
+        assert!(is_inline_safe_mime("video/webm"));
+        assert!(!is_inline_safe_mime("application/octet-stream"));
+        assert!(!is_inline_safe_mime("text/plain"));
+        assert!(!is_inline_safe_mime("application/pdf"));
+        assert!(!is_inline_safe_mime("image/svg+xml"));
     }
 
     #[tokio::test]

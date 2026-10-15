@@ -1,7 +1,7 @@
 use super::AppServices;
 
 use crate::application::ports::{InsertMediaInput, PortError};
-use crate::domain::media::{MediaMeta, MediaProperties};
+use crate::domain::media::{sniff_mime, MediaMeta, MediaProperties};
 
 impl AppServices {
     #[allow(clippy::too_many_arguments)]
@@ -9,7 +9,6 @@ impl AppServices {
         &self,
         owner_id: &str,
         name: String,
-        mime: Option<String>,
         bytes: &[u8],
         comment: Option<String>,
         is_sensitive: bool,
@@ -27,7 +26,10 @@ impl AppServices {
                 return Ok(existing);
             }
         }
-        let sniffed = sniff_mime(bytes, mime.as_deref());
+        // Slice 7 (H2): the stored MIME comes from the shared sniffer only.
+        // The caller-supplied content type is deliberately ignored so a
+        // local upload can never store `text/html` (or svg/xml).
+        let sniffed = sniff_mime(bytes);
         let media_id = self.ids.generate();
         let url = format!("{}/files/{media_id}", self.public_url.trim_end_matches('/'));
         self.blobs.put(&hash, bytes)?;
@@ -45,8 +47,21 @@ impl AppServices {
             url,
             thumbnail_url: None,
             comment,
+            source_url: None,
             max_file_size: self.max_file_size,
         })
+    }
+
+    /// Attach one prepared remote-cache row to `note_id` (Phase 2.6 slice 7,
+    /// decision D-d). Thin application op over the atomic
+    /// `NoteStore::attach_remote_media`: insert + `file_ids` append commit
+    /// together, idempotent per (`source_url`, note).
+    pub fn attach_remote_media_to_note(
+        &self,
+        note_id: &str,
+        input: InsertMediaInput,
+    ) -> Result<MediaMeta, PortError> {
+        self.notes.attach_remote_media(note_id, input, Vec::new())
     }
 }
 
@@ -55,34 +70,4 @@ fn md5_hex(bytes: &[u8]) -> String {
     let mut hasher = Md5::new();
     hasher.update(bytes);
     hex::encode(hasher.finalize())
-}
-
-/// Sniff the content type from magic bytes, falling back to the caller
-/// provided `mime` or `application/octet-stream`.
-fn sniff_mime(bytes: &[u8], fallback: Option<&str>) -> String {
-    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
-        return "image/png".to_string();
-    }
-    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
-        return "image/jpeg".to_string();
-    }
-    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        return "image/gif".to_string();
-    }
-    if bytes.len() >= 12
-        && bytes.starts_with(b"RIFF")
-        && bytes.get(8..12) == Some(b"WEBP".as_slice())
-    {
-        return "image/webp".to_string();
-    }
-    if bytes.starts_with(b"%PDF") {
-        return "application/pdf".to_string();
-    }
-    if bytes.len() >= 12 && bytes.get(4..8) == Some(b"ftyp".as_slice()) {
-        return "video/mp4".to_string();
-    }
-    if std::str::from_utf8(bytes).is_ok() {
-        return "text/plain".to_string();
-    }
-    fallback.unwrap_or("application/octet-stream").to_string()
 }

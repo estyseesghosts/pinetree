@@ -672,6 +672,14 @@ mod tests {
         fn list_all_notes(&self, _cursor: &TimelineCursor) -> Result<Vec<Note>, PortError> {
             Ok(self.notes.lock().unwrap().values().cloned().collect())
         }
+        fn attach_remote_media(
+            &self,
+            _note_id: &str,
+            _input: InsertMediaInput,
+            _jobs: Vec<NewJob>,
+        ) -> Result<crate::domain::media::MediaMeta, PortError> {
+            unavailable("attach_remote_media")
+        }
     }
 
     impl FollowStore for Mem {
@@ -759,6 +767,9 @@ mod tests {
         fn check_and_record(&self, _activity_id: &str) -> Result<bool, PortError> {
             Ok(false)
         }
+        fn is_recorded(&self, _activity_id: &str) -> Result<bool, PortError> {
+            Ok(false)
+        }
         fn record_note_activity(
             &self,
             _activity_id: &str,
@@ -791,6 +802,13 @@ mod tests {
             _hash: &str,
         ) -> Result<Option<crate::domain::media::MediaMeta>, PortError> {
             Ok(None)
+        }
+        fn find_by_source_url(
+            &self,
+            _source_url: &str,
+        ) -> Result<Vec<crate::domain::media::MediaMeta>, PortError> {
+            // Test double stores no remote-cache rows.
+            Ok(Vec::new())
         }
         fn delete_metadata(&self, _id: &str) -> Result<(), PortError> {
             unavailable("delete_metadata")

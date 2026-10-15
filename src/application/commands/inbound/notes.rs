@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use super::super::AppServices;
 
 use crate::application::events::StreamingEvent;
-use crate::application::ports::{CreateNoteInput, PortError};
+use crate::application::ports::{CreateNoteInput, NewJob, PortError};
 use crate::domain::note::{Note, extract_mentions};
 use crate::domain::notification::NotificationKind;
 use crate::domain::reaction::{Reaction, coerce_reaction};
@@ -11,10 +11,13 @@ use crate::domain::reaction::{Reaction, coerce_reaction};
 impl AppServices {
     /// Record an inbound `Create(Note)` with best-effort reply/renote/mention
     /// notifications plus a streaming job. Replay returns `Ok(None)`.
+    /// `extra_jobs` (e.g. a `RemoteMediaFetch` job built by the inbox) are
+    /// committed atomically with the note, so a replay enqueues nothing.
     pub fn handle_inbound_create_note(
         &self,
         activity_id: &str,
         input: CreateNoteInput,
+        extra_jobs: Vec<NewJob>,
     ) -> Result<Option<Note>, PortError> {
         let mut jobs = Vec::new();
         if let Some(reply_id) = input.reply_to.as_deref() {
@@ -87,6 +90,7 @@ impl AppServices {
                 self.ids.generate()
             ),
         )?);
+        jobs.extend(extra_jobs);
         let mut input_with_words = input;
         input_with_words.prohibited_words = self.prohibited_words.clone();
         input_with_words.sensitive_words = self.sensitive_words.clone();

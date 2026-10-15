@@ -95,3 +95,44 @@ fn actor_keypair_generation_rotation_and_remote_key_cache() {
         .unwrap();
     assert_eq!(loaded, cached);
 }
+
+// --- Slice 7 (H2) local-upload sniff tests (written before the fix) ---
+
+#[test]
+fn local_non_utf8_upload_claiming_html_is_not_html() {
+    // A local upload of non-UTF-8 bytes must never be stored as the
+    // caller-claimed `text/html` (the old duplicate fell back to the
+    // caller MIME for non-UTF-8 bytes).
+    let services = test_services("slice7-local-sniff");
+    let alice = services.create_account("alice", None).unwrap();
+    let bytes = vec![0xFF, 0xFE, 0x00, 0x01, 0x02, 0x03];
+    let meta = services
+        .upload_media(&alice.id, "evil.html".to_string(), &bytes, None, false, true)
+        .unwrap();
+    assert_eq!(meta.mime, "application/octet-stream");
+    assert_ne!(meta.mime, "text/html");
+}
+
+#[test]
+fn local_upload_sniff_beats_declared_type() {
+    let services = test_services("slice7-local-declared");
+    let alice = services.create_account("alice", None).unwrap();
+    // Real PNG bytes are stored as PNG however they arrive...
+    let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    png.extend_from_slice(&[0x00, 0x01, 0x02, 0x03]);
+    let meta = services
+        .upload_media(&alice.id, "x.bin".to_string(), &png, None, false, true)
+        .unwrap();
+    assert_eq!(meta.mime, "image/png");
+    // ...and markup bytes never become text, even for a `.txt` name.
+    let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>".to_vec();
+    let meta = services
+        .upload_media(&alice.id, "x.txt".to_string(), &svg, None, false, true)
+        .unwrap();
+    assert_eq!(meta.mime, "application/octet-stream");
+    // Plain UTF-8 still stores as text.
+    let meta = services
+        .upload_media(&alice.id, "hi.txt".to_string(), b"hello world", None, false, true)
+        .unwrap();
+    assert_eq!(meta.mime, "text/plain");
+}

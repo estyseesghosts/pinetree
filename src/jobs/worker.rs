@@ -3,8 +3,8 @@ use std::sync::Arc;
 use crate::application::commands::AppServices;
 use crate::application::events::NotifyJobPayload;
 use crate::application::ports::{
-    Clock, IdGenerator, Job, JobKind, JobQueue, NotificationStore, PortError, StreamingSink,
-    MAX_JOB_ATTEMPTS,
+    Clock, IdGenerator, Job, JobKind, JobQueue, NotificationStore, PortError, RemoteMediaFetchPayload,
+    StreamingSink, MAX_JOB_ATTEMPTS,
 };
 use crate::domain::notification::Notification;
 use crate::federation::retry::{DeliveryOutcome, DestinationTracker};
@@ -98,6 +98,18 @@ impl JobWorker {
             },
             JobKind::FederateDeliver => self.dispatch_federate(&job),
             JobKind::TimelineMaterialize => Ok(Disposition::Done),
+            // Slice 7 (H2+C3, decision D-d): remote media fetched
+            // off-request. Bad payloads quarantine; per-attachment fetch
+            // failures are best-effort skips inside the processor, so only
+            // storage faults retry the whole job (already-attached URLs are
+            // re-skipped without network I/O).
+            JobKind::RemoteMediaFetch => match self.handle_remote_media_fetch(&job.payload) {
+                Ok(()) => Ok(Disposition::Done),
+                Err(PortError::Validation(reason)) => {
+                    Ok(Disposition::Quarantine(format!("bad-payload: {reason}")))
+                }
+                Err(_) => Ok(Disposition::Retry),
+            },
         }
     }
 
@@ -131,6 +143,18 @@ impl JobWorker {
             // Already inserted under this idempotency key: treat as success
             // so the job completes instead of retrying forever.
             Err(PortError::Conflict(_)) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Slice 7: run one `RemoteMediaFetch` job. A note deleted between
+    /// enqueue and run maps to success (nothing to attach to).
+    fn handle_remote_media_fetch(&self, payload: &[u8]) -> Result<(), PortError> {
+        let parsed: RemoteMediaFetchPayload = serde_json::from_slice(payload)
+            .map_err(|e| PortError::Validation(format!("remote-media payload invalid: {e}")))?;
+        match crate::media::remote_cache::process_remote_media_fetch(&self.services, &parsed) {
+            Ok(()) => Ok(()),
+            Err(PortError::NotFound(_)) => Ok(()),
             Err(e) => Err(e),
         }
     }

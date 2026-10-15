@@ -174,6 +174,24 @@ pub trait NoteStore: Send + Sync {
     fn get_note(&self, id: &str) -> Result<Option<Note>, PortError>;
     fn get_note_including_deleted(&self, id: &str) -> Result<Option<Note>, PortError>;
     fn delete_note(&self, id: &str, jobs: Vec<NewJob>) -> Result<(), PortError>;
+    /// Atomically insert one remote-cache media row AND append it to the
+    /// note's `file_ids` (Phase 2.6 slice 7, decision D-d). The single
+    /// transaction means a crash can never leave an inserted-but-unattached
+    /// (orphan) row. Idempotent per (`source_url`, note): when
+    /// `input.source_url` is `Some` and the note already references a row
+    /// with that source URL, the existing row is returned and nothing is
+    /// inserted — so job retries and inbox replays never orphan rows.
+    /// `NotFound(NO_SUCH_NOTE)` when the note is missing or deleted;
+    /// `Validation(NO_SUCH_FILE)` for unknown/unowned file rows is N/A
+    /// here (the row is created by this call) but ownership of the new row
+    /// follows the `create_note` rule (owner == author, or unowned rows for
+    /// remote authors); `Validation` when the note would exceed 16 files.
+    fn attach_remote_media(
+        &self,
+        note_id: &str,
+        input: InsertMediaInput,
+        jobs: Vec<NewJob>,
+    ) -> Result<MediaMeta, PortError>;
     fn notes_by_author(
         &self,
         author_id: &str,
@@ -192,6 +210,13 @@ pub enum JobKind {
     Notify,
     FederateDeliver,
     TimelineMaterialize,
+    /// Slice 7 (H2+C3, decision D-d): fetch-and-cache remote note
+    /// attachments off the inbox request. The payload is
+    /// [`RemoteMediaFetchPayload`]; `note_id` may be
+    /// `"__PENDING_NOTE_ID__"` at enqueue time and is substituted with the
+    /// committed note id inside the storage transaction (same mechanism as
+    /// the federated `NoteCreated` payload).
+    RemoteMediaFetch,
 }
 
 /// Maximum `fail()` retries before a job is auto-quarantined as
@@ -414,6 +439,14 @@ pub trait ReactionStore: Send + Sync {
 
 pub trait ActivityDedup: Send + Sync {
     fn check_and_record(&self, activity_id: &str) -> Result<bool, PortError>;
+    /// Read-only replay gate (Phase 2.6 slice 7): report whether
+    /// `activity_id` was already recorded, without writing. The inbox
+    /// calls this BEFORE any remote fetch so replays trigger zero network
+    /// I/O. It is advisory only — `record_*_activity` stays the atomic
+    /// authority, so the check-then-act race is benign (a concurrent
+    /// first delivery simply does the fetch twice; dedup still converges).
+    /// Backends must implement the real read; test doubles return `false`.
+    fn is_recorded(&self, activity_id: &str) -> Result<bool, PortError>;
     /// Forget a recorded activity id so a later delivery with the same id is
     /// processed again. Used when `Undo(Follow)` retracts a Follow whose id
     /// the sender reuses for every re-follow of the same pair (Misskey's
@@ -543,7 +576,32 @@ pub struct InsertMediaInput {
     pub url: String,
     pub thumbnail_url: Option<String>,
     pub comment: Option<String>,
+    /// Remote origin URL for cache rows (`None` for local uploads). With
+    /// the owning note's `file_ids` this is the idempotent-insert key.
+    pub source_url: Option<String>,
     pub max_file_size: u64,
+}
+
+/// One remote attachment carried inside a `RemoteMediaFetch` job payload.
+/// Mirrors the ActivityPub `ParsedAttachment` shape in contract-stable
+/// form so the application layer never imports ActivityPub types.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteMediaAttachment {
+    pub url: String,
+    pub media_type: Option<String>,
+    pub name: Option<String>,
+    pub is_sensitive: bool,
+    pub blurhash: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+}
+
+/// Payload of a `JobKind::RemoteMediaFetch` job: the committed note to
+/// attach to plus the (already count-truncated) remote attachments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteMediaFetchPayload {
+    pub note_id: String,
+    pub attachments: Vec<RemoteMediaAttachment>,
 }
 
 pub trait MediaStore: Send + Sync {
@@ -554,6 +612,10 @@ pub trait MediaStore: Send + Sync {
         owner_id: &str,
         hash: &str,
     ) -> Result<Option<MediaMeta>, PortError>;
+    /// All media rows cached from `source_url` (Phase 2.6 slice 7). The
+    /// worker intersects this with the note's `file_ids` to skip
+    /// already-attached URLs without any network fetch.
+    fn find_by_source_url(&self, source_url: &str) -> Result<Vec<MediaMeta>, PortError>;
     fn delete_metadata(&self, id: &str) -> Result<(), PortError>;
 }
 
@@ -677,6 +739,10 @@ pub struct NoopActivityDedup;
 
 impl ActivityDedup for NoopActivityDedup {
     fn check_and_record(&self, _activity_id: &str) -> Result<bool, PortError> {
+        Ok(false)
+    }
+
+    fn is_recorded(&self, _activity_id: &str) -> Result<bool, PortError> {
         Ok(false)
     }
 
