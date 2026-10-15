@@ -41,7 +41,7 @@ use pinetree::activitypub::objects::{
 use pinetree::activitypub::signatures::{
     compute_digest_header, sign_request_headers, verify_http_signature,
 };
-use pinetree::api::misskey::response::RateLimiter;
+use pinetree::api::misskey::response::{RateLimiter, UploadSlots};
 use pinetree::api::misskey::{ApiState, build_router};
 use pinetree::application::commands::AppServices;
 use pinetree::application::ports::{
@@ -172,6 +172,7 @@ async fn boot_node(tag: &'static str) -> FedNode {
         services: services.clone(),
         worker: worker.clone(),
         rate_limiter,
+        upload_slots: Arc::new(UploadSlots::with_defaults()),
     };
     let app = federation_router(state.clone());
     let serve_handle = tokio::spawn(async move {

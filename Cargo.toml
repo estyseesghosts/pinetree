@@ -20,6 +20,7 @@ regex = "1.13.1"
 rand = "0.10.3"
 uuid = { version = "1.28.0", features = ["v4"] }
 axum = { version = "0.8", features = ["multipart"] }
+http-body-util = "0.1"
 sha2 = "0.10"
 rsa = { version = "0.9", features = ["sha2"] }
 signature = "2"
@@ -31,3 +32,6 @@ hex = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 foundationdb = { version = "0.11.0", features = ["fdb-7_3"], optional = true }
 foundationdb-sys = { version = "0.11.0", features = ["fdb-7_3"], optional = true }
+
+[dev-dependencies]
+futures-core = "0.3"

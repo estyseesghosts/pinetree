@@ -9,6 +9,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
 use super::errors::ApiError;
 use crate::application::ports::Clock;
 
@@ -127,6 +129,74 @@ fn ceil_secs(ms: u64) -> u64 {
     ms.div_ceil(1000).max(1)
 }
 
+/// Slice 6 (H1, decision D-c): concurrent-upload slots for
+/// `drive/files/create`. Uploads buffer up to `max_file_size` + 1 MiB in
+/// memory, so one client must not stack unbounded concurrent uploads: at
+/// most [`MAX_CONCURRENT_UPLOADS_PER_IP`] concurrent uploads per client IP
+/// (keyed by the same [`client_ip`](super::endpoints::client_ip) string the
+/// rate limiter falls back to), plus a [`MAX_CONCURRENT_UPLOADS_GLOBAL`]
+/// global cap bounding worst-case transient memory on a single node. The
+/// permit is held for the whole upload handler; exhaustion answers
+/// Misskey-shaped `RATE_LIMIT_EXCEEDED` (429) with a short `Retry-After`
+/// hint so clients back off instead of hot-looping.
+pub const MAX_CONCURRENT_UPLOADS_PER_IP: usize = 2;
+pub const MAX_CONCURRENT_UPLOADS_GLOBAL: usize = 16;
+pub const UPLOAD_BUSY_RETRY_AFTER_SECS: u64 = 5;
+
+/// Held for the duration of one upload handler; dropping it frees both
+/// the per-IP and the global slot.
+#[derive(Debug)]
+pub struct UploadPermit {
+    _global: OwnedSemaphorePermit,
+    _ip: OwnedSemaphorePermit,
+}
+
+/// Concurrent-upload slots; see [`MAX_CONCURRENT_UPLOADS_PER_IP`].
+pub struct UploadSlots {
+    per_ip: usize,
+    global: Arc<Semaphore>,
+    per_ip_slots: Mutex<HashMap<String, Arc<Semaphore>>>,
+}
+
+impl UploadSlots {
+    pub fn new(per_ip: usize, global: usize) -> Self {
+        Self {
+            per_ip,
+            global: Arc::new(Semaphore::new(global)),
+            per_ip_slots: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Production defaults: 2 concurrent uploads per IP, 16 globally.
+    pub fn with_defaults() -> Self {
+        Self::new(
+            MAX_CONCURRENT_UPLOADS_PER_IP,
+            MAX_CONCURRENT_UPLOADS_GLOBAL,
+        )
+    }
+
+    /// Take one upload slot for `ip`, or fail 429 `RATE_LIMIT_EXCEEDED`.
+    /// Non-blocking: never waits, so a saturated server sheds load fast.
+    pub fn acquire(&self, ip: &str) -> Result<UploadPermit, ApiError> {
+        let busy = || ApiError::rate_limit_exceeded(UPLOAD_BUSY_RETRY_AFTER_SECS);
+        let slot = {
+            let mut slots = self.per_ip_slots.lock().unwrap_or_else(|e| e.into_inner());
+            slots
+                .entry(ip.to_string())
+                .or_insert_with(|| Arc::new(Semaphore::new(self.per_ip)))
+                .clone()
+        };
+        let global = self.global.clone().try_acquire_owned().map_err(|_| busy())?;
+        match slot.try_acquire_owned() {
+            Ok(ip_permit) => Ok(UploadPermit {
+                _global: global,
+                _ip: ip_permit,
+            }),
+            Err(_) => Err(busy()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,5 +233,31 @@ mod tests {
         assert_eq!(err.code, "RATE_LIMIT_EXCEEDED");
         clock.advance_ms(1_000);
         assert!(limiter.check("alice", "notes/delete").is_ok());
+    }
+
+    #[test]
+    fn upload_slots_cap_per_ip_and_release_on_drop() {
+        // Slice 6 (H1, decision D-c): at most `per_ip` concurrent uploads
+        // per client IP; the permit releases when the handler drops it.
+        let slots = UploadSlots::new(1, 10);
+        let first = slots.acquire("1.1.1.1").expect("first slot");
+        let err = slots.acquire("1.1.1.1").unwrap_err();
+        assert_eq!(err.code, "RATE_LIMIT_EXCEEDED");
+        assert_eq!(err.http_status, 429);
+        // A different IP is unaffected by the first IP's usage.
+        let _other = slots.acquire("2.2.2.2").expect("other ip slot");
+        drop(first);
+        let _again = slots.acquire("1.1.1.1").expect("slot after release");
+    }
+
+    #[test]
+    fn upload_slots_global_cap() {
+        // Slice 6 (H1, decision D-c): the global cap binds even when no
+        // single IP is at its own cap.
+        let slots = UploadSlots::new(10, 1);
+        let _first = slots.acquire("1.1.1.1").expect("first slot");
+        let err = slots.acquire("2.2.2.2").unwrap_err();
+        assert_eq!(err.code, "RATE_LIMIT_EXCEEDED");
+        assert_eq!(err.http_status, 429);
     }
 }

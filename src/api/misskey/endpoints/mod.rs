@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use axum::{
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, FromRequest, Multipart, Path, Query, Request, State},
+    extract::{FromRequest, Multipart, Path, Query, Request, State},
     http::{
         header::{AUTHORIZATION, CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE},
         HeaderMap, HeaderValue, StatusCode,
@@ -21,6 +21,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use http_body_util::{BodyExt, Limited};
 use serde_json::{Map, Value};
 
 use crate::activitypub::{actor as ap_actor, objects as ap_objects, webfinger as ap_webfinger};
@@ -49,15 +50,16 @@ use super::packers::{
     pack_user_detailed_not_me, pack_user_lite,
 };
 use super::request::check_allowed_fields;
-use super::response::RateLimiter;
+use super::response::{RateLimiter, UploadSlots};
 
-/// Shared API state: application services, the durable-job worker, and
-/// the Misskey rate limiter.
+/// Shared API state: application services, the durable-job worker, the
+/// Misskey rate limiter, and the concurrent-upload slots.
 #[derive(Clone)]
 pub struct ApiState {
     pub services: Arc<AppServices>,
     pub worker: Arc<JobWorker>,
     pub rate_limiter: Arc<RateLimiter>,
+    pub upload_slots: Arc<UploadSlots>,
 }
 
 /// Build the full Phase 1 Axum router.
@@ -122,8 +124,11 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/api/signin", post(signin))
         .route("/api/drive/files/create", post(drive_files_create))
         .route("/api/{*endpoint}", post(api_dispatch))
-        // Drive uploads carry media bytes; lift axum's 2 MiB default cap.
-        .layer(DefaultBodyLimit::disable())
+        // No `DefaultBodyLimit::disable()`: the Misskey JSON dispatcher
+        // enforces its own 1 MiB cap in `api_dispatch_blocking` (testable
+        // without router layers), `drive/files/create` enforces its own
+        // streaming cap in the handler, and everything else keeps axum's
+        // 2 MiB default extraction limit.
         .with_state(state)
         .merge(federation_routes)
 }
@@ -202,6 +207,34 @@ fn rate_key_for(caller: Option<&AuthenticatedCaller>, headers: &HeaderMap) -> St
         Some(caller) => caller.account.id.clone(),
         None => client_ip(headers),
     }
+}
+
+/// Slice 6 (H1): maximum accepted Misskey JSON API body (1 MiB), enforced
+/// in `api_dispatch_blocking` so oversized JSON answers 413 without
+/// router layers. Multipart uploads are exempt: `drive/files/create`
+/// enforces its own streaming cap instead.
+pub const MAX_JSON_BODY_BYTES: usize = 1_048_576;
+
+/// Multipart/JSON framing overhead allowed on top of `max_file_size` for
+/// `drive/files/create` (1 MiB).
+pub const UPLOAD_OVERHEAD_BYTES: usize = 1_048_576;
+
+/// Upload body cap: `max_file_size` + multipart overhead.
+fn upload_cap_bytes(services: &AppServices) -> usize {
+    usize::try_from(services.max_file_size)
+        .unwrap_or(usize::MAX)
+        .saturating_add(UPLOAD_OVERHEAD_BYTES)
+}
+
+/// Read the whole request body with a streaming running cap: abort with
+/// 413 `MAX_FILE_SIZE_EXCEEDED` as soon as the cap is crossed, without
+/// ever holding more than ~cap bytes.
+async fn read_capped_body(body: Body, cap: usize) -> Result<Bytes, ApiError> {
+    Limited::new(body, cap)
+        .collect()
+        .await
+        .map(|collected| collected.to_bytes())
+        .map_err(|_| ApiError::max_file_size_exceeded())
 }
 
 fn required_str(obj: &Map<String, Value>, key: &str) -> Result<String, ApiError> {
@@ -1095,9 +1128,33 @@ async fn drive_files_create(State(state): State<ApiState>, req: Request) -> Resu
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let raw = axum::body::to_bytes(body, usize::MAX)
-        .await
-        .map_err(|_| ApiError::max_file_size_exceeded())?;
+    // Slice 6 (H1): when the credential travels in the `Authorization`
+    // header, authenticate, check `write:drive`, and rate-limit BEFORE
+    // reading a single body byte.
+    let header_token = extract_raw_token(
+        headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()),
+        None,
+        None,
+    );
+    let early_caller = match header_token {
+        Some(raw) => {
+            let caller = authenticate(&state.services, &raw)?;
+            caller.require_permission("write:drive")?;
+            state
+                .rate_limiter
+                .check(&caller.account.id, "drive/files/create")?;
+            Some(caller)
+        }
+        None => None,
+    };
+    // Slice 6 (H1, decision D-c): bound concurrent uploads per client IP
+    // (plus a global cap). Held for the whole handler.
+    let _upload_permit = state.upload_slots.acquire(&client_ip(&headers))?;
+    // Slice 6 (H1): streaming running cap — 413 as soon as the cap is
+    // crossed, without ever holding more than ~cap bytes. When the token
+    // is the multipart `i` field (as misskey-js sends it), this bounded
+    // read is the guard; auth still happens below before any write.
+    let raw = read_capped_body(body, upload_cap_bytes(&state.services)).await?;
 
     // Collected upload fields, from multipart or JSON.
     let mut name: Option<String> = None;
@@ -1182,17 +1239,25 @@ async fn drive_files_create(State(state): State<ApiState>, req: Request) -> Resu
     let body_value = body_token
         .as_deref()
         .map(|token| serde_json::json!({ "i": token }));
-    let raw_token = extract_raw_token(
-        headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()),
-        body_value.as_ref(),
-        headers.get(COOKIE).and_then(|v| v.to_str().ok()),
-    )
-    .ok_or_else(ApiError::credential_required)?;
-    let caller = authenticate(&state.services, &raw_token)?;
-    caller.require_permission("write:drive")?;
-    state
-        .rate_limiter
-        .check(&caller.account.id, "drive/files/create")?;
+    // The header path already authenticated above; otherwise resolve the
+    // multipart/JSON `i` field (or cookie) exactly as before.
+    let caller = match early_caller {
+        Some(caller) => caller,
+        None => {
+            let raw_token = extract_raw_token(
+                headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()),
+                body_value.as_ref(),
+                headers.get(COOKIE).and_then(|v| v.to_str().ok()),
+            )
+            .ok_or_else(ApiError::credential_required)?;
+            let caller = authenticate(&state.services, &raw_token)?;
+            caller.require_permission("write:drive")?;
+            state
+                .rate_limiter
+                .check(&caller.account.id, "drive/files/create")?;
+            caller
+        }
+    };
 
     let bytes = data
         .ok_or_else(|| ApiError::invalid_param("file", "an upload file is required"))?;
@@ -1237,6 +1302,13 @@ fn api_dispatch_blocking(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
+    // Slice 6 (H1): 1 MiB default JSON body limit, enforced here (not in a
+    // router layer) so direct dispatch calls are covered too. Oversized
+    // bodies answer 413 `MAX_FILE_SIZE_EXCEEDED`, mirroring the inbox
+    // `payload_too_large()` pattern.
+    if body.len() > MAX_JSON_BODY_BYTES {
+        return Err(ApiError::max_file_size_exceeded());
+    }
     let obj = parse_json_body(&body)?;
     let body_value = Value::Object(obj.clone());
     let caller = resolve_caller(&state.services, &headers, Some(&body_value))?;
@@ -2237,6 +2309,7 @@ fn update_bool_field(obj: &Map<String, Value>, key: &str) -> Result<Option<bool>
 mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
 
     use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE};
 
@@ -2319,11 +2392,13 @@ mod tests {
             base_backoff_ms: 1_000,
         });
         let rate_limiter = Arc::new(RateLimiter::with_misskey_defaults(clock.clone()));
+        let upload_slots = Arc::new(UploadSlots::with_defaults());
         (
             ApiState {
                 services,
                 worker,
                 rate_limiter,
+                upload_slots,
             },
             clock,
         )
@@ -3111,6 +3186,144 @@ mod tests {
             .unwrap();
         assert_eq!(body.as_ref(), b"hello world");
         let _ = file_id;
+    }
+
+    /// Streaming chunk source that counts every byte the server pulls.
+    /// Slice 6 (H1): proves an oversized upload aborts early instead of
+    /// buffering the whole body.
+    struct CountingChunks {
+        remaining: usize,
+        chunk: usize,
+        yielded: Arc<AtomicUsize>,
+    }
+
+    impl futures_core::Stream for CountingChunks {
+        type Item = Result<Bytes, std::io::Error>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            if self.remaining == 0 {
+                return std::task::Poll::Ready(None);
+            }
+            let n = self.chunk.min(self.remaining);
+            self.remaining -= n;
+            self.yielded
+                .fetch_add(n, std::sync::atomic::Ordering::SeqCst);
+            std::task::Poll::Ready(Some(Ok(Bytes::from(vec![0x78; n]))))
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_upload_rejected_without_buffering() {
+        // Slice 6 (H1): a streaming body larger than max_file_size + 1 MiB
+        // must fail 413 while pulling only ~cap bytes from the source.
+        let (state, _) = test_state();
+        let (_, token) = signup_user(&state, "uploader_cap").await;
+        let cap = upload_cap_bytes(&state.services);
+        let chunk = 64 * 1024;
+        let total = cap + 5 * 1024 * 1024;
+        let yielded = Arc::new(AtomicUsize::new(0));
+        let request = Request::builder()
+            .header(CONTENT_TYPE, "multipart/form-data; boundary=BOUND123")
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from_stream(CountingChunks {
+                remaining: total,
+                chunk,
+                yielded: yielded.clone(),
+            }))
+            .unwrap();
+        let err = drive_files_create(State(state.clone()), request)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "MAX_FILE_SIZE_EXCEEDED");
+        assert_eq!(err.http_status, 413);
+        let pulled = yielded.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            pulled < total,
+            "must abort before reading the whole body: pulled {pulled} of {total}"
+        );
+        assert!(
+            pulled <= cap + chunk,
+            "must stay bounded by the cap: pulled {pulled}, cap {cap}"
+        );
+    }
+
+    #[tokio::test]
+    async fn drive_upload_header_auth_checked_before_body_read() {
+        // Slice 6 (H1): a bad `Authorization: Bearer` token fails 401
+        // without pulling a single body byte.
+        let (state, _) = test_state();
+        let yielded = Arc::new(AtomicUsize::new(0));
+        let request = Request::builder()
+            .header(CONTENT_TYPE, "multipart/form-data; boundary=BOUND123")
+            .header(AUTHORIZATION, "Bearer wrong-token")
+            .body(Body::from_stream(CountingChunks {
+                remaining: 4 * 1024 * 1024,
+                chunk: 64 * 1024,
+                yielded: yielded.clone(),
+            }))
+            .unwrap();
+        let err = drive_files_create(State(state.clone()), request)
+            .await
+            .unwrap_err();
+        assert_eq!(err.http_status, 401);
+        assert_eq!(
+            yielded.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no body byte may be read before header auth fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_json_body_returns_413() {
+        // Slice 6 (H1): a JSON body over 1 MiB is rejected 413 in the
+        // Misskey dispatch path even when called directly.
+        let (state, _) = test_state();
+        let (_, token) = signup_user(&state, "json_cap").await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            format!("Bearer {token}").parse::<HeaderValue>().unwrap(),
+        );
+        let big = "x".repeat(MAX_JSON_BODY_BYTES + 1);
+        let raw = format!("{{\"text\":{}}}", serde_json::to_string(&big).unwrap());
+        let body = Bytes::from(raw.into_bytes());
+        assert!(body.len() > MAX_JSON_BODY_BYTES);
+        let err =
+            api_dispatch_blocking(state.clone(), "notes/create".to_string(), headers, body)
+                .unwrap_err();
+        assert_eq!(err.code, "MAX_FILE_SIZE_EXCEEDED");
+        assert_eq!(err.http_status, 413);
+    }
+
+    #[tokio::test]
+    async fn drive_upload_concurrency_limit_returns_429() {
+        // Slice 6 (H1, decision D-c): with both per-IP upload slots held,
+        // another upload from the same IP fails Misskey-shaped 429.
+        let (state, _) = test_state();
+        let (_, token) = signup_user(&state, "uploader_busy").await;
+        let _first = state.upload_slots.acquire("unknown").expect("slot 1");
+        let _second = state.upload_slots.acquire("unknown").expect("slot 2");
+        let boundary = "BUSY123";
+        let multipart_body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"i\"\r\n\r\n{token}\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"tiny.txt\"\r\n\
+             Content-Type: text/plain\r\n\r\ntiny\r\n--{boundary}--\r\n"
+        );
+        let request = Request::builder()
+            .header(
+                CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(multipart_body))
+            .unwrap();
+        let err = drive_files_create(State(state.clone()), request)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "RATE_LIMIT_EXCEEDED");
+        assert_eq!(err.http_status, 429);
     }
 
     #[tokio::test]

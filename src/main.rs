@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pinetree::api::misskey::auth::hash_password;
-use pinetree::api::misskey::response::RateLimiter;
+use pinetree::api::misskey::response::{RateLimiter, UploadSlots};
 use pinetree::api::misskey::{ApiState, build_router};
 use pinetree::application::commands::AppServices;
 use pinetree::application::ports::{
@@ -151,6 +151,7 @@ async fn main() {
         services,
         worker,
         rate_limiter,
+        upload_slots: Arc::new(UploadSlots::with_defaults()),
     };
     let app = build_router(api_state);
     let listener = tokio::net::TcpListener::bind(cfg.listen)
