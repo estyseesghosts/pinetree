@@ -97,6 +97,25 @@ impl RateLimiter {
             .with_limit("notes/drafts/create", 300, HOUR_MS, None)
             .with_limit("notes/drafts/update", 300, HOUR_MS, None)
             .with_limit("notes/drafts/delete", 300, HOUR_MS, None)
+            // Profile import/export (§13; Misskey `secure: true` 1/hr
+            // parity — each endpoint gets its own 1/hr bucket. Upstream
+            // durations differ for three exports (`export-notes`,
+            // `export-clips`, `export-favorites` are 1/day and
+            // `export-user-lists` is 1/min); pinetree normalizes all 13 to
+            // 1/hr, documented in the endpoint manifest §20.
+            .with_limit("i/export-following", 1, HOUR_MS, None)
+            .with_limit("i/export-blocking", 1, HOUR_MS, None)
+            .with_limit("i/export-mute", 1, HOUR_MS, None)
+            .with_limit("i/export-notes", 1, HOUR_MS, None)
+            .with_limit("i/export-user-lists", 1, HOUR_MS, None)
+            .with_limit("i/export-antennas", 1, HOUR_MS, None)
+            .with_limit("i/export-clips", 1, HOUR_MS, None)
+            .with_limit("i/export-favorites", 1, HOUR_MS, None)
+            .with_limit("i/import-following", 1, HOUR_MS, None)
+            .with_limit("i/import-blocking", 1, HOUR_MS, None)
+            .with_limit("i/import-muting", 1, HOUR_MS, None)
+            .with_limit("i/import-user-lists", 1, HOUR_MS, None)
+            .with_limit("i/import-antennas", 1, HOUR_MS, None)
             // Every signup attempt from one IP counts (see `check`).
             .with_limit("auth/signup", 20, HOUR_MS, None)
             // MiAuth check polls: every request counts per IP.

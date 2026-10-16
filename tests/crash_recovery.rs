@@ -92,6 +92,7 @@ fn open_stack(dir: &Path) -> (Arc<RedbStore>, Arc<FsBlobStore>, Arc<AppServices>
         blobs: blobs.clone(),
         notifications: store.clone(),
         auth: store.clone(),
+        host_caps: store.clone(),
         streaming: Arc::new(NoopStreamingSink),
         dedup: store.clone() as Arc<dyn ActivityDedup>,
         federation_http: SafeHttpClient::new(SafeHttpConfig {

@@ -78,6 +78,7 @@ impl LiveServer {
             blobs,
             notifications: store.clone(),
             auth: store.clone(),
+            host_caps: store.clone(),
             streaming: streaming.clone(),
             dedup: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {

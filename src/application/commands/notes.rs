@@ -7,7 +7,7 @@ use crate::application::ports::{CreateNoteInput, EditNoteInput, PortError};
 use crate::domain::note::{Note, extract_mentions};
 use crate::domain::notification::NotificationKind;
 use crate::domain::policy::{ViewerContext, is_visible};
-use crate::domain::reaction::{Reaction, coerce_reaction, normalize_reaction};
+use crate::domain::reaction::{FALLBACK_REACTION, Reaction, coerce_reaction, normalize_reaction};
 
 impl AppServices {
     #[allow(clippy::too_many_lines)]
@@ -488,6 +488,36 @@ impl AppServices {
             self.delete_note(actor_id, &renote.id)?;
         }
         Ok(count)
+    }
+
+    /// Heart-click entry point (§6 DIVERGENCE, decided): `None` (absent/null
+    /// `reaction` param) resolves server-side to the reactor's
+    /// `defaultReaction ?? FALLBACK` (bare ❤, U+2764), then runs the exact
+    /// `react` pipeline below — so a stored default goes through
+    /// `normalize_reaction` too (`"❤️"` stored → `"❤"` applied; custom
+    /// `":name:"` defaults pass through) and `coerce_reaction` still wins on
+    /// like-only notes. Explicit reactions behave byte-identically to
+    /// [`AppServices::react`].
+    pub fn react_with_default(
+        &self,
+        user_id: &str,
+        note_id: &str,
+        reaction: Option<&str>,
+        upsert: bool,
+    ) -> Result<Reaction, PortError> {
+        let resolved;
+        let reaction = match reaction {
+            Some(r) => r,
+            None => {
+                resolved = self
+                    .accounts
+                    .find_by_id(user_id)?
+                    .and_then(|a| a.default_reaction)
+                    .unwrap_or_else(|| FALLBACK_REACTION.to_string());
+                &resolved
+            }
+        };
+        self.react(user_id, note_id, reaction, upsert)
     }
 
     pub fn react(

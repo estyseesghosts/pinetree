@@ -91,4 +91,14 @@ pub struct NotifyJobPayload {
     pub kind: NotificationKind,
     pub note_id: Option<String>,
     pub reaction: Option<String>,
+    /// Drive file an `ExportCompleted` notification reports (`fileId`).
+    /// `None` on every other kind. `#[serde(default)]` keeps in-flight
+    /// payloads written before §13 decodable.
+    #[serde(default)]
+    pub file_id: Option<String>,
+    /// Entity an `ExportCompleted` notification reports (`exportedEntity`).
+    /// `None` on every other kind. `#[serde(default)]` keeps in-flight
+    /// payloads written before §13 decodable.
+    #[serde(default)]
+    pub exported_entity: Option<String>,
 }

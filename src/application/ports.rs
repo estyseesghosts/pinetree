@@ -700,6 +700,32 @@ pub enum JobKind {
     /// `ScheduledNotePostFailed`. Reuses the worker's standard
     /// lease/backoff.
     PostScheduledDraft,
+    /// Profile export (`docs/misskey-parity-plan.md` §13; Misskey `db`
+    /// queue `exportFollowing`/`exportBlocking`/`exportMuting`/
+    /// `exportNotes`/`exportUserLists`/`exportAntennas`/`exportClips`/
+    /// `exportFavorites` parity): builds the entity file off-request,
+    /// stores it in the caller's drive, and reports completion with an
+    /// `exportCompleted` notification. The payload is [`ExportJobPayload`]
+    /// (jobs carry ids only — never file content, per the 64KiB cap).
+    /// Idempotent: the export bytes are deterministic for the same state,
+    /// the drive upload dedups on content (`force == false`), and the
+    /// completion `Notify` job carries a deterministic key, so a replay
+    /// overwrites the same notification row instead of duplicating it.
+    /// A gone user converges quietly. Reuses the worker's standard
+    /// lease/backoff.
+    Export,
+    /// Profile import (`docs/misskey-parity-plan.md` §13; Misskey `db`
+    /// queue `importFollowing`/`importBlocking`/`importMuting`/
+    /// `importUserLists`/`importAntennas` parity): reads the caller's drive
+    /// file off-request and applies its rows. The payload is
+    /// [`ImportJobPayload`] (ids only). Idempotent: every row resolves
+    /// through the same application ops as the interactive endpoints, so a
+    /// replay converges on `ALREADY_*` conflicts (skipped, never failed);
+    /// only storage faults retry the job. A gone user or file converges
+    /// quietly. Bounded work per run (one transaction per row, at most the
+    /// 64KiB file the endpoint guards admit). Reuses the worker's standard
+    /// lease/backoff.
+    Import,
 }
 
 /// Maximum `fail()` retries before a job is auto-quarantined as
@@ -933,6 +959,21 @@ pub trait FollowStore: Send + Sync {
     }
 }
 
+/// Cached per-host ActivityPub software name (`docs/misskey-parity-plan.md`
+/// §6; backs the outbound `Like` emoji/plain split). One row per lowercased
+/// host: the `software.name` from the host's NodeInfo document plus the fetch
+/// time. Rows are read off-transaction by the delivery worker; staleness is
+/// decided by the caller against
+/// [`crate::federation::host_caps::HOST_SOFTWARE_TTL_MS`]. Probe failures are
+/// never cached (the caller treats a miss as emoji-aware and retries the
+/// probe on the next delivery).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostSoftware {
+    pub host: String,
+    pub software: Option<String>,
+    pub fetched_at_ms: i64,
+}
+
 /// Directed blocks (`docs/misskey-parity-plan.md` §0A; Misskey
 /// `MiBlocking{blocker,blockee}` unique).
 ///
@@ -975,6 +1016,14 @@ pub trait BlockStore: Send + Sync {
         blocker_id: &str,
         cursor: &TimelineCursor,
     ) -> Result<Vec<Blocking>, PortError>;
+}
+
+/// Per-host capability cache backing [`HostSoftware`]: point lookups and
+/// whole-row upserts only (no fan-out, no jobs — the delivery worker reads
+/// and writes these rows outside any state transaction).
+pub trait HostCapsStore: Send + Sync {
+    fn get_host_software(&self, host: &str) -> Result<Option<HostSoftware>, PortError>;
+    fn put_host_software(&self, entry: HostSoftware) -> Result<(), PortError>;
 }
 
 /// Mutes and renote-mutes (`docs/misskey-parity-plan.md` §0A; Misskey
@@ -1388,6 +1437,110 @@ pub struct PollExpiryPayload {
 pub struct ScheduledDraftPayload {
     pub draft_id: String,
     pub scheduled_at_ms: i64,
+}
+
+/// Exportable profile entity (§13; Misskey `export*` job parity). The wire
+/// filename stem, extension, and `exportedEntity` tag are fixed per entity
+/// (see the `Export*ProcessorService.ts` files).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExportEntity {
+    Following,
+    Blocking,
+    Muting,
+    Notes,
+    UserLists,
+    Antennas,
+    Clips,
+    Favorites,
+}
+
+impl ExportEntity {
+    /// Drive filename stem (`following-…`, `blocking-…`, `mute-…`,
+    /// `notes-…`, `user-lists-…`, `antennas-…`, `clips-…`, `favorites-…`
+    /// — verbatim upstream stems, including the `mute-` singular).
+    pub fn file_stem(&self) -> &'static str {
+        match self {
+            ExportEntity::Following => "following",
+            ExportEntity::Blocking => "blocking",
+            ExportEntity::Muting => "mute",
+            ExportEntity::Notes => "notes",
+            ExportEntity::UserLists => "user-lists",
+            ExportEntity::Antennas => "antennas",
+            ExportEntity::Clips => "clips",
+            ExportEntity::Favorites => "favorites",
+        }
+    }
+
+    /// Drive file extension (CSV for the acct-list entities, JSON for the
+    /// structured ones — verbatim upstream `ext`).
+    pub fn file_ext(&self) -> &'static str {
+        match self {
+            ExportEntity::Following
+            | ExportEntity::Blocking
+            | ExportEntity::Muting
+            | ExportEntity::UserLists => "csv",
+            ExportEntity::Notes
+            | ExportEntity::Antennas
+            | ExportEntity::Clips
+            | ExportEntity::Favorites => "json",
+        }
+    }
+
+    /// Misskey `exportCompleted` `exportedEntity` tag (verbatim upstream
+    /// values, including the `muting`/`note`/`userList` singulars).
+    pub fn exported_entity(&self) -> &'static str {
+        match self {
+            ExportEntity::Following => "following",
+            ExportEntity::Blocking => "blocking",
+            ExportEntity::Muting => "muting",
+            ExportEntity::Notes => "note",
+            ExportEntity::UserLists => "userList",
+            ExportEntity::Antennas => "antenna",
+            ExportEntity::Clips => "clip",
+            ExportEntity::Favorites => "favorite",
+        }
+    }
+}
+
+/// Importable profile entity (§13; Misskey `import*` job parity).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ImportEntity {
+    Following,
+    Blocking,
+    Muting,
+    UserLists,
+    Antennas,
+}
+
+/// Payload of a `JobKind::Export` job: which entity of `user_id` to export
+/// into the caller's drive. `export_id` keys idempotency (deterministic
+/// completion-notification key + content-deduped upload). `exclude_muting`
+/// drops muted followees (`export-following` parity); `exclude_inactive`
+/// is accepted and ignored — pinetree tracks no last-active timestamp
+/// (DIVERGENCE, documented at the call sites).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportJobPayload {
+    pub export_id: String,
+    pub user_id: String,
+    pub entity: ExportEntity,
+    pub exclude_muting: bool,
+    pub exclude_inactive: bool,
+}
+
+/// Payload of a `JobKind::Import` job: apply the caller's drive file
+/// `file_id` as `entity` rows for `user_id`. `import_id` keys idempotency
+/// (replays converge on per-row `ALREADY_*` conflicts). `with_replies`
+/// seeds the follow `withReplies` default when a row carries none
+/// (`import-following` parity).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportJobPayload {
+    pub import_id: String,
+    pub user_id: String,
+    pub entity: ImportEntity,
+    pub file_id: String,
+    pub with_replies: Option<bool>,
 }
 
 /// Polls and poll votes (`docs/misskey-parity-plan.md` §4; Misskey `MiPoll`

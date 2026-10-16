@@ -402,6 +402,7 @@ mod tests {
             auth: store.clone(),
             streaming: Arc::new(NoopStreamingSink),
             dedup: store.clone() as Arc<dyn ActivityDedup>,
+            host_caps: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()

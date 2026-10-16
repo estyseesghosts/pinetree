@@ -214,6 +214,32 @@ impl JobWorker {
                 }
                 Err(_) => Ok(Disposition::Retry { retry_after_ms: None }),
             },
+            // Profile export (§13): build the file, store it in the caller's
+            // drive, and fan out the `exportCompleted` Notify follow-up —
+            // committed atomically with the export job's completion, so the
+            // notification can never be lost or duplicated. Bad payloads
+            // quarantine; a gone user converges quietly (no follow-up);
+            // only storage faults retry.
+            JobKind::Export => match self.handle_export(&job.payload) {
+                Ok(None) => Ok(Disposition::Done),
+                Ok(Some(notify)) => Ok(Disposition::Fanout(vec![notify])),
+                Err(PortError::Validation(reason)) => {
+                    Ok(Disposition::Quarantine(format!("bad-payload: {reason}")))
+                }
+                Err(_) => Ok(Disposition::Retry { retry_after_ms: None }),
+            },
+            // Profile import (§13): apply the caller's drive-file rows
+            // through the interactive application ops. Bad payloads
+            // quarantine; gone users/files converge quietly; per-row
+            // failures skip the row inside the handler. Only storage
+            // faults retry.
+            JobKind::Import => match self.handle_import(&job.payload) {
+                Ok(_) => Ok(Disposition::Done),
+                Err(PortError::Validation(reason)) => {
+                    Ok(Disposition::Quarantine(format!("bad-payload: {reason}")))
+                }
+                Err(_) => Ok(Disposition::Retry { retry_after_ms: None }),
+            },
         }
     }
 
@@ -235,11 +261,25 @@ impl JobWorker {
         // through. Drops converge quietly (job completes, no row, no hints);
         // storage faults still retry. Scheduler-direct inserts bypass this
         // gate like upstream notifier-less notifications do.
-        if !self.services.notification_delivery_allowed(
+        //
+        // §13 `exportCompleted` is notifier-less upstream (no `notifierId`,
+        // so neither the self-notify nor the mute check applies — only a
+        // `never` receive-config drops it). Pinetree rows require a
+        // notifier (the exporter), so this kind takes the dedicated
+        // notifier-less gate instead.
+        let allowed = if notify.kind == NotificationKind::ExportCompleted {
+            self.services
+                .export_completed_allowed(&notify.notifiee_id)?
+        } else if !self.services.notification_delivery_allowed(
             &notify.notifiee_id,
             notify.kind,
             &notify.notifier_id,
         )? {
+            return Ok(());
+        } else {
+            true
+        };
+        if !allowed {
             return Ok(());
         }
         let id = if idempotency_key.trim().is_empty() {
@@ -255,6 +295,8 @@ impl JobWorker {
             note_id: notify.note_id.clone(),
             reaction: notify.reaction.clone(),
             draft_id: None,
+            file_id: notify.file_id.clone(),
+            exported_entity: notify.exported_entity.clone(),
             is_read: false,
         };
         let stored = match self.notifications.insert_notification(notification) {
@@ -358,7 +400,11 @@ impl JobWorker {
             // Scheduling notifications (§5) fan out as the plain
             // `notification` hint above (no note/user side-channel: the
             // posted note / failed draft rides in the packed body).
-            NotificationKind::ScheduledNotePosted | NotificationKind::ScheduledNotePostFailed => {}
+            // `exportCompleted` (§13) likewise: the drive file rides in the
+            // packed body (`fileId`).
+            NotificationKind::ScheduledNotePosted
+            | NotificationKind::ScheduledNotePostFailed
+            | NotificationKind::ExportCompleted => {}
         }
         Ok(())
     }
@@ -435,6 +481,29 @@ impl JobWorker {
         self.services
             .post_scheduled_draft(&parsed.draft_id, parsed.scheduled_at_ms)
             .map(|_| ())
+    }
+
+    /// Run one `Export` job (§13): build the file and store it in the
+    /// caller's drive. Returns the `exportCompleted` `Notify` follow-up for
+    /// the dispatcher to commit atomically with this job's completion, or
+    /// `None` when the user is gone (converges quietly).
+    fn handle_export(
+        &self,
+        payload: &[u8],
+    ) -> Result<Option<crate::application::ports::NewJob>, PortError> {
+        use crate::application::ports::ExportJobPayload;
+        let parsed: ExportJobPayload = serde_json::from_slice(payload)
+            .map_err(|e| PortError::Validation(format!("export payload invalid: {e}")))?;
+        self.services.run_export_job(&parsed)
+    }
+
+    /// Run one `Import` job (§13): apply the caller's drive-file rows.
+    /// Gone users/files converge quietly; only storage faults retry.
+    fn handle_import(&self, payload: &[u8]) -> Result<(), PortError> {
+        use crate::application::ports::ImportJobPayload;
+        let parsed: ImportJobPayload = serde_json::from_slice(payload)
+            .map_err(|e| PortError::Validation(format!("import payload invalid: {e}")))?;
+        self.services.run_import_job(&parsed)
     }
 
     /// Run one `QuoteStampReverify` job: re-dereference the stamp offered by

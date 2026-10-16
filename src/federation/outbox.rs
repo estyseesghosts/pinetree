@@ -20,7 +20,7 @@ use serde_json::Value;
 use crate::activitypub::objects::{
     render_accept_follow_activity, render_block_activity, render_create_or_announce_for_note,
     render_delete_note_activity, render_delete_stamp_activity, render_follow_activity,
-    render_like_activity, render_note_audience, render_note_object, render_note_update_activity,
+    render_like_activity_for, render_note_audience, render_note_object, render_note_update_activity,
     render_quote_request_activity, render_quote_response_activity, render_reject_follow_activity,
     render_undo_activity, render_update_actor_activity, PUBLIC_COLLECTION_URI,
 };
@@ -30,6 +30,7 @@ use crate::domain::account::Account;
 use crate::domain::note::Visibility;
 use crate::domain::policy::is_eligible_for_federation_delivery;
 use crate::federation::delivery::{SafeHttpClient, signed_post_activity};
+use crate::federation::host_caps::{fetch_nodeinfo_software, host_of_url, resolve_emoji_capable};
 use crate::federation::retry::{
     DESTINATION_BACKOFF_BASE_MS, DeliveryOutcome, DestinationTracker, classify_inbox_status,
 };
@@ -632,12 +633,22 @@ pub fn execute_federate_deliver(
                 Some(a) => a,
                 None => return Ok(DeliveryOutcome::Delivered),
             };
-            let activity = render_like_activity(
+            // §6 federation split (decided): the NodeInfo probe runs here,
+            // off-transaction in the delivery worker — never inside a state
+            // transaction. Unknown/failed hosts read as emoji-aware.
+            let emoji_capable = match host_of_url(&inbox_url) {
+                Some(host) => resolve_emoji_capable(services, &host, services.clock.now_ms(), &|h| {
+                    fetch_nodeinfo_software(client, h)
+                }),
+                None => true,
+            };
+            let activity = render_like_activity_for(
                 base,
                 &reaction_id,
                 &actor.actor_url(base),
                 &target_note_uri,
                 &reaction,
+                emoji_capable,
             );
             deliver_single(services, client, tracker, &actor_id, &inbox_url, &activity)
         }
@@ -655,8 +666,22 @@ pub fn execute_federate_deliver(
                 None => return Ok(DeliveryOutcome::Delivered),
             };
             let actor_uri = actor.actor_url(base);
-            let inner =
-                render_like_activity(base, &reaction_id, &actor_uri, &target_note_uri, &reaction);
+            // Same per-host decision as `Like` so the undone activity matches
+            // the form originally delivered (capability is TTL-stable).
+            let emoji_capable = match host_of_url(&inbox_url) {
+                Some(host) => resolve_emoji_capable(services, &host, services.clock.now_ms(), &|h| {
+                    fetch_nodeinfo_software(client, h)
+                }),
+                None => true,
+            };
+            let inner = render_like_activity_for(
+                base,
+                &reaction_id,
+                &actor_uri,
+                &target_note_uri,
+                &reaction,
+                emoji_capable,
+            );
             let activity =
                 render_undo_activity(base, &undo_id, &actor_uri, &inner, None, None);
             deliver_single(services, client, tracker, &actor_id, &inbox_url, &activity)

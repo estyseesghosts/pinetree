@@ -7,7 +7,8 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, WriteTran
 
 use crate::application::ports::{
     AccountStore, ActivityDedup, ActorKeypairRecord, ApiTokenRecord, AuthStore, BlockStore, Clock,
-    CreateAccountInput, CreateNoteInput, EditNoteInput, FollowStore, IdGenerator, InsertMediaInput,
+    CreateAccountInput, CreateNoteInput, EditNoteInput, FollowStore, HostCapsStore, HostSoftware,
+    IdGenerator, InsertMediaInput,
     Job, JobQueue, LegacyAuthSessionRecord, MediaStore, MiAuthSessionRecord, MuteStore, NewJob,
     NoteStore, NotificationStore, PollChoiceCount, PollStore, PortError, ReactionStore,
     RemotePublicKeyRecord, TimelineCursor, UpdateAccountPatch, MAX_JOBS_PER_TXN, MAX_JOB_ATTEMPTS,
@@ -115,6 +116,9 @@ const NOTE_EDITS: TableDefinition<&str, &[u8]> = TableDefinition::new("note_edit
 /// are time-ordered), driving `NoteStore::note_edits`.
 const NOTE_EDITS_BY_NOTE: TableDefinition<(&str, &str), u8> =
     TableDefinition::new("note_edits_by_note");
+/// Cached per-host ActivityPub software names (§6 `docs/misskey-parity-plan.md`;
+/// `HostCapsStore` parity): lowercased host → JSON [`HostSoftware`] row.
+const HOST_SOFTWARE: TableDefinition<&str, &[u8]> = TableDefinition::new("host_software");
 
 /// `NOTES_BY_REPLY` backfill version marker: present with value
 /// [`REPLY_INDEX_DONE_VALUE`] once every stored note has been indexed.
@@ -247,6 +251,7 @@ impl RedbStore {
         let _ = write_txn
             .open_table(NOTE_EDITS_BY_NOTE)
             .map_err(map_redb_err)?;
+        let _ = write_txn.open_table(HOST_SOFTWARE).map_err(map_redb_err)?;
         let _ = write_txn.open_table(META).map_err(map_redb_err)?;
         write_txn.commit().map_err(map_redb_err)?;
         Ok(())
@@ -4178,6 +4183,33 @@ impl FollowStore for RedbStore {
             return Err(PortError::NotFound("NO_FOLLOW_REQUEST".to_string()));
         }
         self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)?;
+        Ok(())
+    }
+}
+
+impl HostCapsStore for RedbStore {
+    fn get_host_software(&self, host: &str) -> Result<Option<HostSoftware>, PortError> {
+        let key = host.to_ascii_lowercase();
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(HOST_SOFTWARE).map_err(map_redb_err)?;
+        match table.get(key.as_str()).map_err(map_redb_err)? {
+            Some(g) => Ok(Some(decode_json(g.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn put_host_software(&self, entry: HostSoftware) -> Result<(), PortError> {
+        let key = entry.host.to_ascii_lowercase();
+        let bytes = encode_json(&HostSoftware {
+            host: key.clone(),
+            ..entry
+        })?;
+        let write_txn = self.begin_write()?;
+        {
+            let mut table = write_txn.open_table(HOST_SOFTWARE).map_err(map_redb_err)?;
+            table.insert(key.as_str(), bytes.as_slice()).map_err(map_redb_err)?;
+        }
         self.commit_write(write_txn)?;
         Ok(())
     }

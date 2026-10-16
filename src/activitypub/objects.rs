@@ -942,7 +942,46 @@ pub fn render_featured_change_activity(
     })
 }
 
-/// Render a `Like` activity with Misskey `_misskey_reaction`.
+/// Render a `Like` activity, choosing the emoji-reaction form or the plain
+/// Mastodon-favourite form per recipient capability (§6
+/// `docs/misskey-parity-plan.md`): emoji-aware servers get `Like` +
+/// `_misskey_reaction`, others get a plain `Like` with neither `content` nor
+/// `_misskey_reaction`. Both variants share [`ap_context`]: its
+/// `_misskey_reaction` entry is an inert namespace declaration (and upstream
+/// Misskey always sends the full context too), so the distinguishing feature
+/// is the absence of the `_misskey_reaction` field.
+pub fn render_like_activity_for(
+    public_url: &str,
+    reaction_id: &str,
+    actor_uri: &str,
+    target_note_uri: &str,
+    reaction: &str,
+    emoji_capable: bool,
+) -> Value {
+    let base = public_url.trim_end_matches('/');
+    if emoji_capable {
+        json!({
+            "@context": ap_context(),
+            "id": format!("{base}/likes/{reaction_id}"),
+            "type": "Like",
+            "actor": actor_uri,
+            "object": target_note_uri,
+            "content": reaction,
+            "_misskey_reaction": reaction,
+        })
+    } else {
+        json!({
+            "@context": ap_context(),
+            "id": format!("{base}/likes/{reaction_id}"),
+            "type": "Like",
+            "actor": actor_uri,
+            "object": target_note_uri,
+        })
+    }
+}
+
+/// Render a `Like` activity with Misskey `_misskey_reaction` (the
+/// emoji-aware form; see [`render_like_activity_for`]).
 pub fn render_like_activity(
     public_url: &str,
     reaction_id: &str,
@@ -950,16 +989,14 @@ pub fn render_like_activity(
     target_note_uri: &str,
     reaction: &str,
 ) -> Value {
-    let base = public_url.trim_end_matches('/');
-    json!({
-        "@context": ap_context(),
-        "id": format!("{base}/likes/{reaction_id}"),
-        "type": "Like",
-        "actor": actor_uri,
-        "object": target_note_uri,
-        "content": reaction,
-        "_misskey_reaction": reaction,
-    })
+    render_like_activity_for(
+        public_url,
+        reaction_id,
+        actor_uri,
+        target_note_uri,
+        reaction,
+        true,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1793,6 +1830,7 @@ mod tests {
             auth: store.clone(),
             streaming: Arc::new(NoopStreamingSink),
             dedup: store.clone() as Arc<dyn ActivityDedup>,
+            host_caps: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()
@@ -1813,6 +1851,51 @@ mod tests {
         let ctx = serde_json::to_string(&ap_context()).unwrap();
         assert!(!ctx.contains("_misskey_content"));
         assert!(ctx.contains("_misskey_reaction"));
+    }
+
+    #[test]
+    fn like_render_splits_emoji_aware_and_plain() {
+        let emoji = render_like_activity_for(
+            "https://pinetree.local",
+            "r1",
+            "https://pinetree.local/users/alice",
+            "https://remote.example/notes/1",
+            "🎉",
+            true,
+        );
+        assert_eq!(emoji["type"], "Like");
+        assert_eq!(emoji["_misskey_reaction"], "🎉");
+        assert_eq!(emoji["content"], "🎉");
+
+        let plain = render_like_activity_for(
+            "https://pinetree.local",
+            "r1",
+            "https://pinetree.local/users/alice",
+            "https://remote.example/notes/1",
+            "🎉",
+            false,
+        );
+        assert_eq!(plain["type"], "Like");
+        assert_eq!(plain["actor"], "https://pinetree.local/users/alice");
+        assert_eq!(plain["object"], "https://remote.example/notes/1");
+        assert!(
+            plain.get("_misskey_reaction").is_none(),
+            "plain Like carries no _misskey_reaction"
+        );
+        assert!(
+            plain.get("content").is_none(),
+            "plain Like carries no content"
+        );
+
+        // The legacy entry point keeps rendering the emoji-aware form.
+        let legacy = render_like_activity(
+            "https://pinetree.local",
+            "r1",
+            "https://pinetree.local/users/alice",
+            "https://remote.example/notes/1",
+            "🎉",
+        );
+        assert_eq!(legacy, emoji);
     }
 
     #[test]
@@ -1955,6 +2038,7 @@ mod quote_render_tests {
             auth: store.clone(),
             streaming: Arc::new(NoopStreamingSink),
             dedup: store.clone() as Arc<dyn ActivityDedup>,
+            host_caps: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()

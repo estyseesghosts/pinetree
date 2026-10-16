@@ -1711,6 +1711,7 @@ mod media_safety_tests {
             auth: store.clone(),
             streaming: Arc::new(NoopStreamingSink),
             dedup: store.clone() as Arc<dyn ActivityDedup>,
+            host_caps: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()
@@ -2118,6 +2119,7 @@ mod key_ownership_tests {
             auth: store.clone(),
             streaming: Arc::new(NoopStreamingSink),
             dedup: store.clone() as Arc<dyn ActivityDedup>,
+            host_caps: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()
@@ -2650,6 +2652,7 @@ mod reply_resolution_tests {
             auth: store.clone(),
             streaming: Arc::new(NoopStreamingSink),
             dedup: store.clone() as Arc<dyn ActivityDedup>,
+            host_caps: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()
@@ -3085,5 +3088,106 @@ mod update_note_tests {
             id.starts_with(&format!("{base}/activities/")),
             "update id lives under the public base URL, got {id}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inbound `Like` reaction extraction (§6; Misskey wire compat)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod like_reaction_tests {
+    use super::*;
+    use serde_json::json;
+
+    use crate::application::ports::{CreateAccountInput, ReactionStore};
+    use crate::domain::reaction::FALLBACK_REACTION;
+
+    const CAROL_URI: &str = "https://remote.example/users/carol";
+
+    fn services() -> AppServices {
+        crate::application::commands::tests::test_services("like-reaction")
+    }
+
+    fn remote_carol(services: &AppServices) -> Account {
+        services
+            .accounts
+            .create_account(CreateAccountInput {
+                handle: "carol".to_string(),
+                host: Some("remote.example".to_string()),
+                display_name: None,
+                description: None,
+                location: None,
+                birthday: None,
+                uri: Some(CAROL_URI.to_string()),
+                inbox: Some("https://remote.example/inbox".to_string()),
+                shared_inbox: None,
+                is_bot: false,
+                is_cat: false,
+                is_locked: false,
+                preserved_usernames: Vec::new(),
+            })
+            .expect("remote liker")
+    }
+
+    fn local_note(services: &AppServices, author_id: &str) -> (Note, String) {
+        let note = services
+            .create_note(CreateNoteInput::simple_public(author_id, "likeable"))
+            .expect("local note");
+        let base = services.public_url.trim_end_matches('/');
+        let uri = format!("{base}/notes/{}", note.id);
+        (note, uri)
+    }
+
+    fn stored_reaction(services: &AppServices, user_id: &str, note_id: &str) -> String {
+        services
+            .reactions
+            .get_reaction(user_id, note_id)
+            .expect("read reaction")
+            .expect("reaction stored")
+            .reaction
+    }
+
+    #[test]
+    fn like_without_misskey_reaction_maps_to_fallback() {
+        let services = services();
+        let alice = services.create_account("alice", None).expect("local author");
+        let carol = remote_carol(&services);
+        let (note, note_uri) = local_note(&services, &alice.id);
+
+        // Plain Mastodon-favourite `Like`: no `_misskey_reaction`, no
+        // `content` → bare-heart FALLBACK.
+        let activity = json!({
+            "id": "https://remote.example/likes/1",
+            "type": "Like",
+            "actor": CAROL_URI,
+            "object": note_uri,
+        });
+        let resp = handle_like(&services, &activity, "like-act-1", CAROL_URI).expect("handle");
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            stored_reaction(&services, &carol.id, &note.id),
+            FALLBACK_REACTION
+        );
+    }
+
+    #[test]
+    fn like_with_misskey_reaction_stores_custom_reaction() {
+        let services = services();
+        let alice = services.create_account("alice", None).expect("local author");
+        let carol = remote_carol(&services);
+        let (note, note_uri) = local_note(&services, &alice.id);
+
+        let activity = json!({
+            "id": "https://remote.example/likes/2",
+            "type": "Like",
+            "actor": CAROL_URI,
+            "object": note_uri,
+            "content": "🎉",
+            "_misskey_reaction": "🎉",
+        });
+        let resp = handle_like(&services, &activity, "like-act-2", CAROL_URI).expect("handle");
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(stored_reaction(&services, &carol.id, &note.id), "🎉");
     }
 }

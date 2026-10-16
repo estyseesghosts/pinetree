@@ -1150,6 +1150,27 @@ pub fn pack_notification(notification: &Notification, services: &AppServices) ->
             };
             map.insert("draft".to_string(), packed_draft);
         }
+        // §13: `exportCompleted` carries the exported entity + the drive
+        // file it landed in (upstream `exportedEntity`/`fileId` shape,
+        // `NotificationEntityService.ts:188-191` parity).
+        if notification.kind == crate::domain::notification::NotificationKind::ExportCompleted {
+            map.insert(
+                "exportedEntity".to_string(),
+                notification
+                    .exported_entity
+                    .clone()
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
+            );
+            map.insert(
+                "fileId".to_string(),
+                notification
+                    .file_id
+                    .clone()
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
+            );
+        }
     }
     obj
 }
@@ -1582,7 +1603,8 @@ mod tests {
 
     use crate::application::ports::{
         AccountStore, ActivityDedup, ApiTokenRecord, AuthStore, BlobStore, BlockStore,
-        CreateAccountInput, CreateNoteInput, FollowStore, InsertMediaInput, JobQueue,
+        CreateAccountInput, CreateNoteInput, FollowStore, HostCapsStore, HostSoftware,
+        InsertMediaInput, JobQueue,
         LegacyAuthSessionRecord, MediaStore, MiAuthSessionRecord, MuteStore, NewJob, NoteStore,
         NotificationStore, PollChoiceCount, PollStore, ReactionStore, StreamingSink, UpdateAccountPatch,
     };
@@ -1773,6 +1795,15 @@ mod tests {
             _cursor: &crate::application::ports::TimelineCursor,
         ) -> Result<Vec<Blocking>, PortError> {
             Ok(Vec::new())
+        }
+    }
+
+    impl HostCapsStore for Mem {
+        fn get_host_software(&self, _host: &str) -> Result<Option<HostSoftware>, PortError> {
+            Ok(None)
+        }
+        fn put_host_software(&self, _entry: HostSoftware) -> Result<(), PortError> {
+            Ok(())
         }
     }
 
@@ -2158,6 +2189,7 @@ mod tests {
             auth: mem.clone(),
             streaming: mem.clone(),
             dedup: mem.clone() as Arc<dyn ActivityDedup>,
+            host_caps: mem.clone(),
             federation_http: crate::federation::delivery::SafeHttpClient::new(
                 crate::federation::delivery::SafeHttpConfig {
                     allow_private_ips: true,

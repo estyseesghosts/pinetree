@@ -103,6 +103,23 @@ pub const CANNOT_REPLY_TO_SPECIFIED_VISIBILITY_NOTE_WITH_EXTENDED_VISIBILITY_ID:
     "ed940410-535c-4d5e-bfa3-af798671e93c";
 pub const MAX_LENGTH_ID: &str = "3ac74a84-8fd5-4bb0-870f-01804f82ce16";
 pub const MAX_CW_LENGTH_ID: &str = "7004c478-bda3-4b4f-acb2-4316398c9d52";
+/// Misskey `i/import-*.ts` file-guard idents (verbatim upstream UUIDs).
+/// Every import endpoint mints its OWN UUID per code (unlike pinetree's
+/// usual one-UUID-per-code convention), so these are keyed per endpoint.
+pub const IMPORT_BLOCKING_NO_SUCH_FILE_ID: &str = "ebb53e5f-6574-9c0c-0b92-7ca6def56d7e";
+pub const IMPORT_BLOCKING_TOO_BIG_FILE_ID: &str = "b7fbf0b1-aeef-3b21-29ef-fadd4cb72ccf";
+pub const IMPORT_BLOCKING_EMPTY_FILE_ID: &str = "6f3a4dcc-f060-a707-4950-806fbdbe60d6";
+pub const IMPORT_FOLLOWING_NO_SUCH_FILE_ID: &str = "b98644cf-a5ac-4277-a502-0b8054a709a3";
+pub const IMPORT_FOLLOWING_TOO_BIG_FILE_ID: &str = "dee9d4ed-ad07-43ed-8b34-b2856398bc60";
+pub const IMPORT_FOLLOWING_EMPTY_FILE_ID: &str = "31a1b42c-06f7-42ae-8a38-a661c5c9f691";
+pub const IMPORT_MUTING_NO_SUCH_FILE_ID: &str = "e674141e-bd2a-ba85-e616-aefb187c9c2a";
+pub const IMPORT_MUTING_TOO_BIG_FILE_ID: &str = "9b4ada6d-d7f7-0472-0713-4f558bd1ec9c";
+pub const IMPORT_MUTING_EMPTY_FILE_ID: &str = "d2f12af1-e7b4-feac-86a3-519548f2728e";
+pub const IMPORT_USER_LISTS_NO_SUCH_FILE_ID: &str = "ea9cc34f-c415-4bc6-a6fe-28ac40357049";
+pub const IMPORT_USER_LISTS_TOO_BIG_FILE_ID: &str = "ae6e7a22-971b-4b52-b2be-fc0b9b121fe9";
+pub const IMPORT_USER_LISTS_EMPTY_FILE_ID: &str = "99efe367-ce6e-4d44-93f8-5fae7b040356";
+pub const IMPORT_ANTENNAS_NO_SUCH_FILE_ID: &str = "3b71d086-c3fa-431c-b01d-ded65a777172";
+pub const IMPORT_ANTENNAS_EMPTY_FILE_ID: &str = "7f60115d-8d93-4b0f-bd0e-3815dcbb389f";
 
 /// Misskey API error: stable `code`/`id` ident, human `message`,
 /// machine `kind` (`client` | `permission` | `server`), optional `info`,
@@ -260,6 +277,51 @@ impl ApiError {
             MAX_FILE_SIZE_EXCEEDED_ID,
             413,
         )
+    }
+
+    /// Misskey `i/import-*.ts:26-50` file-guard errors (verbatim upstream
+    /// code/message/id, keyed per endpoint — upstream mints one UUID per
+    /// endpoint per code). `endpoint` is the Misskey endpoint name
+    /// (`i/import-blocking`, …); unknown names fall back to a deterministic
+    /// pinetree UUID with the same code/message.
+    pub fn import_no_such_file(endpoint: &str) -> Self {
+        let id = match endpoint {
+            "i/import-blocking" => IMPORT_BLOCKING_NO_SUCH_FILE_ID,
+            "i/import-following" => IMPORT_FOLLOWING_NO_SUCH_FILE_ID,
+            "i/import-muting" => IMPORT_MUTING_NO_SUCH_FILE_ID,
+            "i/import-user-lists" => IMPORT_USER_LISTS_NO_SUCH_FILE_ID,
+            "i/import-antennas" => IMPORT_ANTENNAS_NO_SUCH_FILE_ID,
+            _ => NO_SUCH_FILE_ID,
+        };
+        Self::client("No such file.", "NO_SUCH_FILE", id, 400)
+    }
+
+    /// Misskey `i/import-*.ts` `EMPTY_FILE` (`That file is empty.`,
+    /// verbatim per-endpoint UUID).
+    pub fn import_empty_file(endpoint: &str) -> Self {
+        let id: String = match endpoint {
+            "i/import-blocking" => IMPORT_BLOCKING_EMPTY_FILE_ID.to_string(),
+            "i/import-following" => IMPORT_FOLLOWING_EMPTY_FILE_ID.to_string(),
+            "i/import-muting" => IMPORT_MUTING_EMPTY_FILE_ID.to_string(),
+            "i/import-user-lists" => IMPORT_USER_LISTS_EMPTY_FILE_ID.to_string(),
+            "i/import-antennas" => IMPORT_ANTENNAS_EMPTY_FILE_ID.to_string(),
+            _ => new_id_for("EMPTY_FILE"),
+        };
+        Self::client("That file is empty.", "EMPTY_FILE", &id, 400)
+    }
+
+    /// Misskey `i/import-*.ts` `TOO_BIG_FILE` (`That file is too big.`,
+    /// verbatim per-endpoint UUID). `i/import-antennas` has no such error
+    /// upstream (it never size-checks), so it is absent from the match.
+    pub fn import_too_big_file(endpoint: &str) -> Self {
+        let id: String = match endpoint {
+            "i/import-blocking" => IMPORT_BLOCKING_TOO_BIG_FILE_ID.to_string(),
+            "i/import-following" => IMPORT_FOLLOWING_TOO_BIG_FILE_ID.to_string(),
+            "i/import-muting" => IMPORT_MUTING_TOO_BIG_FILE_ID.to_string(),
+            "i/import-user-lists" => IMPORT_USER_LISTS_TOO_BIG_FILE_ID.to_string(),
+            _ => new_id_for("TOO_BIG_FILE"),
+        };
+        Self::client("That file is too big.", "TOO_BIG_FILE", &id, 400)
     }
 
     /// 500 `INTERNAL_ERROR`.

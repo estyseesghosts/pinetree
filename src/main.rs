@@ -48,6 +48,7 @@ fn build_services(cfg: &Config) -> Result<(Arc<AppServices>, pinetree::streaming
         auth: store.clone() as Arc<dyn AuthStore>,
         streaming,
         dedup: store.clone() as Arc<dyn ActivityDedup>,
+        host_caps: store.clone(),
         federation_http: SafeHttpClient::new(SafeHttpConfig::default()),
         public_url: cfg.normalized_public_url(),
         max_file_size: cfg.max_file_size,

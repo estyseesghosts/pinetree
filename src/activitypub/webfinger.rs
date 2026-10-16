@@ -544,7 +544,8 @@ mod tests {
     use super::*;
     use crate::application::ports::{
         AccountStore, ActivityDedup, ApiTokenRecord, AuthStore, BlobStore, BlockStore,
-        CreateAccountInput, CreateNoteInput, FollowStore, InsertMediaInput, JobQueue,
+        CreateAccountInput, CreateNoteInput, FollowStore, HostCapsStore, HostSoftware,
+        InsertMediaInput, JobQueue,
         LegacyAuthSessionRecord, MediaStore, MiAuthSessionRecord, MuteStore, NewJob, NoteStore,
         NotificationStore, PollChoiceCount, PollStore, PortError, ReactionStore, StreamingSink, TimelineCursor,
         UpdateAccountPatch,
@@ -750,6 +751,15 @@ mod tests {
             _cursor: &TimelineCursor,
         ) -> Result<Vec<Blocking>, PortError> {
             Ok(Vec::new())
+        }
+    }
+
+    impl HostCapsStore for Mem {
+        fn get_host_software(&self, _host: &str) -> Result<Option<HostSoftware>, PortError> {
+            Ok(None)
+        }
+        fn put_host_software(&self, _entry: HostSoftware) -> Result<(), PortError> {
+            Ok(())
         }
     }
 
@@ -1065,6 +1075,7 @@ mod tests {
             auth: mem.clone(),
             streaming: mem.clone(),
             dedup: mem.clone() as Arc<dyn ActivityDedup>,
+            host_caps: mem.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()

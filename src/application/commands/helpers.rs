@@ -24,6 +24,8 @@ impl AppServices {
             kind,
             note_id,
             reaction,
+            file_id: None,
+            exported_entity: None,
         };
         NewJob::new_json(
             JobKind::Notify,

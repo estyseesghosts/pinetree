@@ -29,8 +29,9 @@ use crate::activitypub::{actor as ap_actor, objects as ap_objects, webfinger as 
 use crate::application::commands::pins::FeaturedCache;
 use crate::application::commands::AppServices;
 use crate::application::ports::{
-    ApiTokenRecord, CreateDraftInput, CreateNoteInput, EditNoteInput, LegacyAuthSessionRecord,
-    MiAuthSessionRecord, PortError, TimelineCursor, UpdateAccountPatch, UpdateDraftPatch,
+    ApiTokenRecord, CreateDraftInput, CreateNoteInput, EditNoteInput, ExportEntity, ImportEntity,
+    LegacyAuthSessionRecord, MiAuthSessionRecord, PortError, TimelineCursor, UpdateAccountPatch,
+    UpdateDraftPatch,
 };
 use crate::domain::account::{
     Account, AvatarDecoration, ChatScope, FollowVisibility, MutedWord,
@@ -896,6 +897,22 @@ fn parse_cursor(obj: &Map<String, Value>) -> Result<TimelineCursor, ApiError> {
     })
 }
 
+/// Map an `AppServices::check_import_file` failure to the caller's
+/// per-endpoint verbatim upstream error (`i/import-*.ts` parity: each
+/// endpoint mints its own UUID per code).
+fn map_import_file_error(err: PortError, endpoint: &str) -> ApiError {
+    match err {
+        PortError::NotFound(_) => ApiError::import_no_such_file(endpoint),
+        PortError::Validation(code) if code == "EMPTY_FILE" => {
+            ApiError::import_empty_file(endpoint)
+        }
+        PortError::Validation(code) if code == "TOO_BIG_FILE" => {
+            ApiError::import_too_big_file(endpoint)
+        }
+        other => ApiError::from_port_error(other),
+    }
+}
+
 /// Cursor paging for the block/mute list endpoints (Misskey parity: `limit`
 /// defaults to 30, range 1–100).
 fn parse_list_cursor(obj: &Map<String, Value>) -> Result<TimelineCursor, ApiError> {
@@ -923,7 +940,8 @@ fn parse_list_cursor(obj: &Map<String, Value>) -> Result<TimelineCursor, ApiErro
 /// never match a local row. The `reaction:grouped` / `renote:grouped`
 /// pseudo-types are valid entries too (§10): like upstream (whose DB query
 /// only matches stored rows), including only a grouped type matches nothing
-/// and excluding one excludes nothing.
+/// and excluding one excludes nothing. (`exportCompleted` left this list in
+/// §13: exports now emit it.)
 fn is_unemitted_notification_type(name: &str) -> bool {
     matches!(
         name,
@@ -935,7 +953,6 @@ fn is_unemitted_notification_type(name: &str) -> bool {
             | "roleAssigned"
             | "chatRoomInvitationReceived"
             | "achievementEarned"
-            | "exportCompleted"
             | "login"
             | "createToken"
             | "app"
@@ -969,6 +986,8 @@ fn notification_kind_for(field: &str, name: &str) -> Result<Option<NotificationK
         // §5: scheduling notifications are now emitted locally.
         "scheduledNotePosted" => Ok(Some(NotificationKind::ScheduledNotePosted)),
         "scheduledNotePostFailed" => Ok(Some(NotificationKind::ScheduledNotePostFailed)),
+        // §13: export completions are now emitted locally.
+        "exportCompleted" => Ok(Some(NotificationKind::ExportCompleted)),
         _ if is_unemitted_notification_type(name) => Ok(None),
         _ => Err(ApiError::invalid_param(
             field,
@@ -979,7 +998,7 @@ fn notification_kind_for(field: &str, name: &str) -> Result<Option<NotificationK
 
 /// Every [`NotificationKind`] the local store can emit, for the
 /// exclude-everything early return (`i/notifications` Misskey parity).
-const ALL_NOTIFICATION_KINDS: [NotificationKind; 9] = [
+const ALL_NOTIFICATION_KINDS: [NotificationKind; 10] = [
     NotificationKind::Follow,
     NotificationKind::ReceiveFollowRequest,
     NotificationKind::Mention,
@@ -989,6 +1008,7 @@ const ALL_NOTIFICATION_KINDS: [NotificationKind; 9] = [
     NotificationKind::ScheduledNotePosted,
     NotificationKind::ScheduledNotePostFailed,
     NotificationKind::Edited,
+    NotificationKind::ExportCompleted,
 ];
 
 /// Shared query params of `i/notifications` and `i/notifications-grouped`
@@ -2834,6 +2854,246 @@ fn api_dispatch_blocking(
             Ok(Json(packed).into_response())
         }
 
+        // §13 profile import/export (Misskey `i/export-*` + `i/import-*`
+        // parity, backend only — see the endpoint manifest §20 for payload
+        // shapes and DIVERGENCEs). Every endpoint takes a credential
+        // (`secure:true` parity: pinetree has no secure mode, so credential
+        // + its own 1/hr bucket) and answers `204 No Content` immediately
+        // (upstream returns void); the `Export`/`Import` job does the work
+        // off-request and exports report back via `exportCompleted`.
+        // `requiredRolePolicy` (`canImport*`) and `prohibitMoved` have no
+        // pinetree equivalent (no roles/moved infra) and are not gated.
+        "i/export-following" => {
+            check_allowed_fields(&obj, &["excludeMuting", "excludeInactive"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state.rate_limiter.check(&rate_key, "i/export-following")?;
+            let exclude_muting = opt_bool(&obj, "excludeMuting", false)?;
+            let exclude_inactive = opt_bool(&obj, "excludeInactive", false)?;
+            state
+                .services
+                .enqueue_export(
+                    &caller.account.id,
+                    ExportEntity::Following,
+                    exclude_muting,
+                    exclude_inactive,
+                )
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "i/export-blocking" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state.rate_limiter.check(&rate_key, "i/export-blocking")?;
+            state
+                .services
+                .enqueue_export(&caller.account.id, ExportEntity::Blocking, false, false)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "i/export-mute" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state.rate_limiter.check(&rate_key, "i/export-mute")?;
+            state
+                .services
+                .enqueue_export(&caller.account.id, ExportEntity::Muting, false, false)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "i/export-notes" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state.rate_limiter.check(&rate_key, "i/export-notes")?;
+            state
+                .services
+                .enqueue_export(&caller.account.id, ExportEntity::Notes, false, false)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "i/export-user-lists" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state.rate_limiter.check(&rate_key, "i/export-user-lists")?;
+            state
+                .services
+                .enqueue_export(&caller.account.id, ExportEntity::UserLists, false, false)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "i/export-antennas" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state.rate_limiter.check(&rate_key, "i/export-antennas")?;
+            state
+                .services
+                .enqueue_export(&caller.account.id, ExportEntity::Antennas, false, false)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "i/export-clips" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state.rate_limiter.check(&rate_key, "i/export-clips")?;
+            state
+                .services
+                .enqueue_export(&caller.account.id, ExportEntity::Clips, false, false)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "i/export-favorites" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state.rate_limiter.check(&rate_key, "i/export-favorites")?;
+            state
+                .services
+                .enqueue_export(&caller.account.id, ExportEntity::Favorites, false, false)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "i/import-following" => {
+            check_allowed_fields(&obj, &["fileId", "withReplies"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state.rate_limiter.check(&rate_key, "i/import-following")?;
+            let file_id = required_str(&obj, "fileId")?;
+            // DIVERGENCE: upstream `withReplies` is optional with no
+            // default (undefined flows into the relationship job);
+            // pinetree booleans need a default — `true` matches the
+            // `following/create` default. Row-level `withReplies=` still
+            // overrides per row.
+            let with_replies = opt_bool(&obj, "withReplies", true)?;
+            if let Err(err) = state.services.check_import_file(&caller.account.id, &file_id) {
+                return Err(map_import_file_error(err, "i/import-following"));
+            }
+            state
+                .services
+                .enqueue_import(
+                    &caller.account.id,
+                    ImportEntity::Following,
+                    &file_id,
+                    Some(with_replies),
+                )
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "i/import-blocking" => {
+            check_allowed_fields(&obj, &["fileId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state.rate_limiter.check(&rate_key, "i/import-blocking")?;
+            let file_id = required_str(&obj, "fileId")?;
+            if let Err(err) = state.services.check_import_file(&caller.account.id, &file_id) {
+                return Err(map_import_file_error(err, "i/import-blocking"));
+            }
+            state
+                .services
+                .enqueue_import(&caller.account.id, ImportEntity::Blocking, &file_id, None)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "i/import-muting" => {
+            check_allowed_fields(&obj, &["fileId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state.rate_limiter.check(&rate_key, "i/import-muting")?;
+            let file_id = required_str(&obj, "fileId")?;
+            if let Err(err) = state.services.check_import_file(&caller.account.id, &file_id) {
+                return Err(map_import_file_error(err, "i/import-muting"));
+            }
+            state
+                .services
+                .enqueue_import(&caller.account.id, ImportEntity::Muting, &file_id, None)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "i/import-user-lists" => {
+            check_allowed_fields(&obj, &["fileId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state.rate_limiter.check(&rate_key, "i/import-user-lists")?;
+            let file_id = required_str(&obj, "fileId")?;
+            if let Err(err) = state.services.check_import_file(&caller.account.id, &file_id) {
+                return Err(map_import_file_error(err, "i/import-user-lists"));
+            }
+            state
+                .services
+                .enqueue_import(&caller.account.id, ImportEntity::UserLists, &file_id, None)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "i/import-antennas" => {
+            check_allowed_fields(&obj, &["fileId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state.rate_limiter.check(&rate_key, "i/import-antennas")?;
+            let file_id = required_str(&obj, "fileId")?;
+            // Upstream (`import-antennas.ts:77-84`) has no size cap and
+            // reads + parses the file in the endpoint, so this arm does
+            // not use `check_import_file`: missing/foreign → `noSuchFile`,
+            // empty → `emptyFile` (verbatim UUIDs).
+            let meta = match state
+                .services
+                .media
+                .get(&file_id)
+                .map_err(ApiError::from_port_error)?
+            {
+                Some(meta) if meta.owner_id.as_deref() == Some(caller.account.id.as_str()) => meta,
+                _ => return Err(ApiError::import_no_such_file("i/import-antennas")),
+            };
+            if meta.size_bytes == 0 {
+                return Err(ApiError::import_empty_file("i/import-antennas"));
+            }
+            // DIVERGENCE: upstream `JSON.parse`s here (a malformed file
+            // throws → HTTP 500) and enforces the `antennaLimit` role
+            // policy (`TOO_MANY_ANTENNAS`). Pinetree answers malformed JSON
+            // with `INVALID_PARAM` and skips the limit check (no antenna
+            // subsystem or role limits exist); the worker re-validates rows
+            // and applies zero of them.
+            let bytes = match state
+                .services
+                .blobs
+                .get(&meta.blob_key)
+                .map_err(ApiError::from_port_error)?
+            {
+                Some(bytes) => bytes,
+                None => return Err(ApiError::import_no_such_file("i/import-antennas")),
+            };
+            let parsed: Value = serde_json::from_slice(&bytes).map_err(|_| {
+                ApiError::invalid_param("fileId", "file must contain a JSON array of antennas")
+            })?;
+            if !parsed.is_array() {
+                return Err(ApiError::invalid_param(
+                    "fileId",
+                    "file must contain a JSON array of antennas",
+                ));
+            }
+            state
+                .services
+                .enqueue_import(&caller.account.id, ImportEntity::Antennas, &file_id, None)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
         "following/create" => {
             check_allowed_fields(&obj, &["userId", "withReplies"])?;
             let caller = require_caller(caller)?;
@@ -3063,12 +3323,19 @@ fn api_dispatch_blocking(
             let caller = require_caller(caller)?;
             caller.require_permission("write:reactions")?;
             let note_id = required_str(&obj, "noteId")?;
-            let reaction = required_str(&obj, "reaction")?;
+            // §6 DIVERGENCE (decided, `docs/misskey-parity-plan.md` §6):
+            // upstream requires `reaction`; pinetree leaves it optional and
+            // resolves an absent/null param server-side to the reactor's
+            // `defaultReaction ?? FALLBACK` (bare ❤).
+            let reaction = opt_string(&obj, "reaction")?;
+            if matches!(reaction.as_deref(), Some("")) {
+                return Err(ApiError::invalid_param("reaction", "this field is required"));
+            }
             // Misskey rejects a duplicate reaction on the same note with
             // ALREADY_REACTED, so this endpoint must not upsert.
             state
                 .services
-                .react(&caller.account.id, &note_id, &reaction, false)
+                .react_with_default(&caller.account.id, &note_id, reaction.as_deref(), false)
                 .map_err(ApiError::from_port_error)?;
             Ok(StatusCode::NO_CONTENT.into_response())
         }
@@ -4938,7 +5205,7 @@ mod tests {
     use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE};
 
     use crate::application::ports::{
-        ActivityDedup, BlobStore, NoopStreamingSink, StreamingSink,
+        ActivityDedup, BlobStore, NoopStreamingSink, ReactionStore, StreamingSink,
     };
     use crate::domain::id::{AidxGenerator, Clock, ManualClock};
     use crate::federation::delivery::{SafeHttpClient, SafeHttpConfig};
@@ -4997,6 +5264,7 @@ mod tests {
             auth: store.clone(),
             streaming: streaming.clone(),
             dedup: store.clone() as Arc<dyn ActivityDedup>,
+            host_caps: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()
@@ -8568,6 +8836,8 @@ mod tests {
                     note_id: None,
                     reaction: None,
                     draft_id: None,
+                    file_id: None,
+                    exported_entity: None,
                     is_read: false,
                 })
                 .unwrap();
@@ -8693,6 +8963,8 @@ mod tests {
                 note_id: None,
                 reaction: Some("❤".to_string()),
                 draft_id: None,
+                file_id: None,
+                exported_entity: None,
                 is_read: false,
             })
             .unwrap();
@@ -9287,6 +9559,8 @@ mod tests {
                     note_id: note,
                     reaction,
                     draft_id: None,
+                    file_id: None,
+                    exported_entity: None,
                     is_read: false,
                 })
                 .unwrap();
@@ -9466,6 +9740,8 @@ mod tests {
                     note_id: None,
                     reaction: None,
                     draft_id: None,
+                    file_id: None,
+                    exported_entity: None,
                     is_read: false,
                 })
                 .unwrap();
@@ -10634,5 +10910,774 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{quote}");
+    }
+
+    /// §6 per-user `defaultReaction` heart-click (`docs/misskey-parity-plan.md`
+    /// §6 DIVERGENCE: `notes/reactions/create` leaves `reaction` optional and
+    /// resolves an absent param server-side to `defaultReaction ?? FALLBACK`).
+    #[tokio::test]
+    async fn parity_default_reaction_heart_click() {
+        let (state, _) = test_state();
+        let (_, alice_token) = signup_user(&state, "alice").await;
+        let (bob_id, bob_token) = signup_user(&state, "bob").await;
+
+        async fn alice_note(state: &ApiState, alice_token: &str, body: Value) -> String {
+            let (status, note) = call(state, "notes/create", body, Some(alice_token)).await;
+            assert_eq!(status, StatusCode::OK, "{note}");
+            note["createdNote"]["id"].as_str().unwrap().to_string()
+        }
+
+        async fn heart_click(
+            state: &ApiState,
+            bob_token: &str,
+            note_id: &str,
+            reaction: Value,
+        ) {
+            let mut body = serde_json::json!({ "noteId": note_id });
+            if !reaction.is_null() {
+                body["reaction"] = reaction;
+            }
+            let (status, value) =
+                call(state, "notes/reactions/create", body, Some(bob_token)).await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{value}");
+        }
+
+        fn stored(state: &ApiState, user_id: &str, note_id: &str) -> String {
+            state
+                .services
+                .reactions
+                .get_reaction(user_id, note_id)
+                .unwrap()
+                .unwrap()
+                .reaction
+        }
+
+        // No default set: heart-click with no `reaction` param → FALLBACK.
+        let note_id = alice_note(&state, &alice_token, serde_json::json!({ "text": "n1" })).await;
+        heart_click(&state, &bob_token, &note_id, Value::Null).await;
+        assert_eq!(stored(&state, &bob_id, &note_id), "❤");
+
+        // Explicit empty `reaction` is still rejected (upstream parity).
+        let (status, value) = call(
+            &state,
+            "notes/reactions/create",
+            serde_json::json!({ "noteId": note_id, "reaction": "" }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "INVALID_PARAM");
+
+        // Bob sets a per-user default; heart-click resolves to it.
+        let (status, me) = call(
+            &state,
+            "i/update",
+            serde_json::json!({ "defaultReaction": "🎉" }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{me}");
+        let note_id = alice_note(&state, &alice_token, serde_json::json!({ "text": "n2" })).await;
+        heart_click(&state, &bob_token, &note_id, Value::Null).await;
+        assert_eq!(stored(&state, &bob_id, &note_id), "🎉");
+
+        // Explicit reaction wins over the stored default.
+        let note_id = alice_note(&state, &alice_token, serde_json::json!({ "text": "n3" })).await;
+        heart_click(
+            &state,
+            &bob_token,
+            &note_id,
+            serde_json::json!("👍"),
+        )
+        .await;
+        assert_eq!(stored(&state, &bob_id, &note_id), "👍");
+
+        // A VS16-form default normalizes through the standard pipeline.
+        let (status, me) = call(
+            &state,
+            "i/update",
+            serde_json::json!({ "defaultReaction": "❤️" }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{me}");
+        let note_id = alice_note(&state, &alice_token, serde_json::json!({ "text": "n4" })).await;
+        heart_click(&state, &bob_token, &note_id, Value::Null).await;
+        assert_eq!(stored(&state, &bob_id, &note_id), "❤");
+
+        // `likeOnly` coercion still wins over the default.
+        let note_id = alice_note(
+            &state,
+            &alice_token,
+            serde_json::json!({ "text": "n5", "reactionAcceptance": "likeOnly" }),
+        )
+        .await;
+        heart_click(&state, &bob_token, &note_id, Value::Null).await;
+        assert_eq!(stored(&state, &bob_id, &note_id), "❤");
+    }
+
+    /// Read one export result file's bytes through the notification's
+    /// `fileId` (media metadata + blob store, like the import worker does).
+    async fn read_export_bytes(state: &ApiState, file_id: &str) -> Vec<u8> {
+        let meta = state
+            .services
+            .media
+            .get(file_id)
+            .unwrap()
+            .expect("export file metadata");
+        state
+            .services
+            .blobs
+            .get(&meta.blob_key)
+            .unwrap()
+            .expect("export file bytes")
+    }
+
+    /// The newest `exportCompleted` notifications for `token`
+    /// (`markAsRead: false` so repeated reads in one test stay stable).
+    async fn export_completed_notifications(state: &ApiState, token: &str) -> Value {
+        let (status, notes) = call(
+            state,
+            "i/notifications",
+            serde_json::json!({ "markAsRead": false, "includeTypes": ["exportCompleted"] }),
+            Some(token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{notes}");
+        notes
+    }
+
+    /// Create a remote account in the store (§13 import/export fixture).
+    fn remote_account(services: &AppServices, username: &str, host: &str) -> String {
+        use crate::application::ports::CreateAccountInput;
+        services
+            .accounts
+            .create_account(CreateAccountInput {
+                handle: username.to_string(),
+                host: Some(host.to_string()),
+                display_name: None,
+                description: None,
+                location: None,
+                birthday: None,
+                uri: Some(format!("https://{host}/users/{username}")),
+                inbox: Some(format!("https://{host}/inbox")),
+                shared_inbox: None,
+                is_bot: false,
+                is_cat: false,
+                is_locked: false,
+                preserved_usernames: Vec::new(),
+            })
+            .unwrap()
+            .id
+    }
+
+    #[tokio::test]
+    async fn parity_export_following_csv_exact_and_notification() {
+        let (state, clock) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (bob_id, _) = signup_user(&state, "bob").await;
+        let (carol_id, _) = signup_user(&state, "carol").await;
+        let eve_id = remote_account(&state.services, "eve", "remote.example");
+        state.services.follow(&alice_id, &bob_id, true).unwrap();
+        clock.advance_ms(1_000);
+        state.services.follow(&alice_id, &carol_id, false).unwrap();
+        clock.advance_ms(1_000);
+        state.services.follow(&alice_id, &eve_id, true).unwrap();
+
+        let (status, _) = call(
+            &state,
+            "i/export-following",
+            serde_json::json!({}),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        state.worker.drain(100).unwrap();
+
+        // `exportCompleted` carries the drive file id + entity tag.
+        let notes = export_completed_notifications(&state, &alice_token).await;
+        let notes = notes.as_array().unwrap();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(notes[0]["type"], "exportCompleted");
+        assert_eq!(notes[0]["exportedEntity"], "following");
+        let file_id = notes[0]["fileId"].as_str().unwrap().to_string();
+
+        // Exact upstream row shape: `{acct},withReplies={bool}`, one per
+        // line, follow-row-id order, no header row. Locals are bare
+        // usernames (DIVERGENCE), remotes are `user@host`.
+        let bytes = read_export_bytes(&state, &file_id).await;
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            "bob,withReplies=true\ncarol,withReplies=false\neve@remote.example,withReplies=true\n",
+        );
+    }
+
+    #[tokio::test]
+    async fn parity_export_following_exclude_muting_and_inactive() {
+        let (state, clock) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (bob_id, _) = signup_user(&state, "bob").await;
+        let (carol_id, _) = signup_user(&state, "carol").await;
+        state.services.follow(&alice_id, &bob_id, true).unwrap();
+        clock.advance_ms(1_000);
+        state.services.follow(&alice_id, &carol_id, true).unwrap();
+        state.services.mute(&alice_id, &carol_id, None).unwrap();
+
+        // Default export keeps muted followees.
+        let (status, _) = call(
+            &state,
+            "i/export-following",
+            serde_json::json!({}),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        state.worker.drain(100).unwrap();
+        let notes = export_completed_notifications(&state, &alice_token).await;
+        let file_id = notes[0]["fileId"].as_str().unwrap().to_string();
+        let bytes = read_export_bytes(&state, &file_id).await;
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            "bob,withReplies=true\ncarol,withReplies=true\n",
+        );
+
+        // `excludeMuting` drops them (second call needs a fresh hour).
+        clock.advance_ms(3_600_000);
+        let (status, _) = call(
+            &state,
+            "i/export-following",
+            serde_json::json!({ "excludeMuting": true }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        state.worker.drain(100).unwrap();
+        let notes = export_completed_notifications(&state, &alice_token).await;
+        let file_id = notes[0]["fileId"].as_str().unwrap().to_string();
+        let bytes = read_export_bytes(&state, &file_id).await;
+        assert_eq!(String::from_utf8(bytes).unwrap(), "bob,withReplies=true\n");
+
+        // `excludeInactive` is accepted and ignored (DIVERGENCE: no
+        // last-active tracking): same bytes as the default export.
+        clock.advance_ms(3_600_000);
+        let (status, _) = call(
+            &state,
+            "i/export-following",
+            serde_json::json!({ "excludeInactive": true }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        state.worker.drain(100).unwrap();
+        let notes = export_completed_notifications(&state, &alice_token).await;
+        let file_id = notes[0]["fileId"].as_str().unwrap().to_string();
+        let bytes = read_export_bytes(&state, &file_id).await;
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            "bob,withReplies=true\ncarol,withReplies=true\n",
+        );
+    }
+
+    #[tokio::test]
+    async fn parity_export_blocking_and_mute_csv() {
+        let (state, _) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (bob_id, _) = signup_user(&state, "bob").await;
+        let (carol_id, _) = signup_user(&state, "carol").await;
+        let (dave_id, _) = signup_user(&state, "dave").await;
+        state.services.block(&alice_id, &bob_id).unwrap();
+        state.services.mute(&alice_id, &carol_id, None).unwrap();
+        // Expiring mutes are NOT exported (upstream `IsNull()` parity).
+        state
+            .services
+            .mute(
+                &alice_id,
+                &dave_id,
+                Some(state.services.clock.now_ms() + 100_000),
+            )
+            .unwrap();
+
+        let (status, _) = call(
+            &state,
+            "i/export-blocking",
+            serde_json::json!({}),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = call(
+            &state,
+            "i/export-mute",
+            serde_json::json!({}),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        state.worker.drain(100).unwrap();
+
+        let notes = export_completed_notifications(&state, &alice_token).await;
+        let notes = notes.as_array().unwrap();
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        let mut seen = std::collections::HashMap::new();
+        for note in notes {
+            let entity = note["exportedEntity"].as_str().unwrap().to_string();
+            let file_id = note["fileId"].as_str().unwrap().to_string();
+            let bytes = read_export_bytes(&state, &file_id).await;
+            seen.insert(entity, String::from_utf8(bytes).unwrap());
+        }
+        assert_eq!(seen["blocking"], "bob\n");
+        assert_eq!(seen["muting"], "carol\n");
+    }
+
+    #[tokio::test]
+    async fn parity_export_notes_json_roundtrip() {
+        let (state, clock) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let first = state
+            .services
+            .create_note(crate::application::ports::CreateNoteInput::simple_public(
+                &alice_id,
+                "first note",
+            ))
+            .unwrap();
+        clock.advance_ms(1_000);
+        let second = state
+            .services
+            .create_note(crate::application::ports::CreateNoteInput::simple_public(
+                &alice_id,
+                "second note",
+            ))
+            .unwrap();
+
+        let (status, _) = call(
+            &state,
+            "i/export-notes",
+            serde_json::json!({}),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        state.worker.drain(100).unwrap();
+
+        let notes = export_completed_notifications(&state, &alice_token).await;
+        assert_eq!(notes[0]["exportedEntity"], "note");
+        let file_id = notes[0]["fileId"].as_str().unwrap().to_string();
+        let bytes = read_export_bytes(&state, &file_id).await;
+        let items: Vec<Value> = serde_json::from_slice(&bytes).unwrap();
+        // Newest-first, upstream DTO keys.
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["id"], second.id);
+        assert_eq!(items[0]["text"], "second note");
+        assert_eq!(items[1]["id"], first.id);
+        for item in &items {
+            for key in [
+                "id",
+                "text",
+                "createdAt",
+                "fileIds",
+                "files",
+                "replyId",
+                "renoteId",
+                "poll",
+                "cw",
+                "visibility",
+                "visibleUserIds",
+                "localOnly",
+                "reactionAcceptance",
+            ] {
+                assert!(item.get(key).is_some(), "missing {key} in {item}");
+            }
+            assert_eq!(item["visibility"], "public");
+            assert_eq!(item["poll"], Value::Null);
+        }
+    }
+
+    #[tokio::test]
+    async fn parity_import_blocking_guards_use_upstream_errors() {
+        let (state, clock) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (bob_id, _) = signup_user(&state, "bob").await;
+
+        // Unknown id → NO_SUCH_FILE with the import-blocking UUID.
+        let (status, value) = call(
+            &state,
+            "i/import-blocking",
+            serde_json::json!({ "fileId": "mid00000000000999" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_FILE");
+        assert_eq!(
+            value["error"]["id"],
+            "ebb53e5f-6574-9c0c-0b92-7ca6def56d7e"
+        );
+
+        // Foreign (bob's) file → same NO_SUCH_FILE (ownership is hidden).
+        clock.advance_ms(3_600_000);
+        let foreign = state
+            .services
+            .upload_media(&bob_id, "list.csv".to_string(), b"alice\n", None, false, true)
+            .unwrap();
+        let (status, value) = call(
+            &state,
+            "i/import-blocking",
+            serde_json::json!({ "fileId": foreign.id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_FILE");
+        assert_eq!(
+            value["error"]["id"],
+            "ebb53e5f-6574-9c0c-0b92-7ca6def56d7e"
+        );
+
+        // Empty file → EMPTY_FILE.
+        clock.advance_ms(3_600_000);
+        let empty = state
+            .services
+            .upload_media(&alice_id, "empty.csv".to_string(), b"", None, false, true)
+            .unwrap();
+        let (status, value) = call(
+            &state,
+            "i/import-blocking",
+            serde_json::json!({ "fileId": empty.id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "EMPTY_FILE");
+        assert_eq!(
+            value["error"]["id"],
+            "6f3a4dcc-f060-a707-4950-806fbdbe60d6"
+        );
+
+        // Over 64KiB → TOO_BIG_FILE.
+        clock.advance_ms(3_600_000);
+        let big = vec![b'a'; 65_537];
+        let oversized = state
+            .services
+            .upload_media(&alice_id, "big.csv".to_string(), &big, None, false, true)
+            .unwrap();
+        let (status, value) = call(
+            &state,
+            "i/import-blocking",
+            serde_json::json!({ "fileId": oversized.id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "TOO_BIG_FILE");
+        assert_eq!(
+            value["error"]["id"],
+            "b7fbf0b1-aeef-3b21-29ef-fadd4cb72ccf"
+        );
+    }
+
+    #[tokio::test]
+    async fn parity_import_blocking_rows_and_replay() {
+        let (state, clock) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (bob_id, _) = signup_user(&state, "bob").await;
+        let file = state
+            .services
+            .upload_media(
+                &alice_id,
+                "blocking.csv".to_string(),
+                b"bob\nno-such-user-xyz\n",
+                None,
+                false,
+                true,
+            )
+            .unwrap();
+
+        let (status, _) = call(
+            &state,
+            "i/import-blocking",
+            serde_json::json!({ "fileId": file.id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        state.worker.drain(100).unwrap();
+
+        // Valid rows applied, unresolvable rows skipped, batch intact.
+        assert!(state.services.blocks.is_blocking(&alice_id, &bob_id).unwrap());
+        let list = || {
+            state
+                .services
+                .blocks
+                .list_blockings(
+                    &alice_id,
+                    &TimelineCursor {
+                        limit: 100,
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+        };
+        assert_eq!(list().len(), 1);
+
+        // A replay of the same file converges (conflicts skip, no dupes).
+        clock.advance_ms(3_600_000);
+        let (status, _) = call(
+            &state,
+            "i/import-blocking",
+            serde_json::json!({ "fileId": file.id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        state.worker.drain(100).unwrap();
+        assert_eq!(list().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn parity_import_following_acct_and_legacy_rows() {
+        let (state, _) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (bob_id, _) = signup_user(&state, "bob").await;
+        let (carol_id, _) = signup_user(&state, "carol").await;
+        let (dave_id, _) = signup_user(&state, "dave").await;
+        let file = state
+            .services
+            .upload_media(
+                &alice_id,
+                "following.csv".to_string(),
+                b"bob\ncarol,withReplies=false\ndeadbeef,dave,example.local\nghost@unknown.invalid\n",
+                None,
+                false,
+                true,
+            )
+            .unwrap();
+
+        let (status, _) = call(
+            &state,
+            "i/import-following",
+            serde_json::json!({ "fileId": file.id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        state.worker.drain(100).unwrap();
+
+        // Bare acct, acct + row `withReplies=`, and the legacy 3-column
+        // (`id,username,host`) variant all resolve; the unresolvable remote
+        // row skips without failing the batch.
+        let bob = state
+            .services
+            .follows
+            .get_follow(&alice_id, &bob_id)
+            .unwrap()
+            .unwrap();
+        assert!(bob.with_replies, "endpoint default withReplies is true");
+        let carol = state
+            .services
+            .follows
+            .get_follow(&alice_id, &carol_id)
+            .unwrap()
+            .unwrap();
+        assert!(!carol.with_replies, "row withReplies=false wins");
+        assert!(
+            state
+                .services
+                .follows
+                .is_following(&alice_id, &dave_id)
+                .unwrap()
+        );
+        assert_eq!(
+            state
+                .services
+                .follows
+                .following_of(&alice_id, None, 100)
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn parity_import_muting_applies_rows() {
+        let (state, _) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (bob_id, _) = signup_user(&state, "bob").await;
+        let file = state
+            .services
+            .upload_media(&alice_id, "mute.csv".to_string(), b"bob\n", None, false, true)
+            .unwrap();
+
+        let (status, _) = call(
+            &state,
+            "i/import-muting",
+            serde_json::json!({ "fileId": file.id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        state.worker.drain(100).unwrap();
+        assert!(
+            state
+                .services
+                .mutes
+                .is_muting(&alice_id, &bob_id)
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn parity_no_subsystem_exports_are_empty_but_valid() {
+        let (state, _) = test_state();
+        let (_, alice_token) = signup_user(&state, "alice").await;
+
+        for endpoint in [
+            "i/export-user-lists",
+            "i/export-antennas",
+            "i/export-clips",
+            "i/export-favorites",
+        ] {
+            let (status, _) =
+                call(&state, endpoint, serde_json::json!({}), Some(&alice_token)).await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{endpoint}");
+        }
+        state.worker.drain(100).unwrap();
+
+        let notes = export_completed_notifications(&state, &alice_token).await;
+        let notes = notes.as_array().unwrap();
+        assert_eq!(notes.len(), 4, "{notes:?}");
+        let mut seen = std::collections::HashMap::new();
+        for note in notes {
+            let entity = note["exportedEntity"].as_str().unwrap().to_string();
+            let file_id = note["fileId"].as_str().unwrap().to_string();
+            let bytes = read_export_bytes(&state, &file_id).await;
+            seen.insert(entity, String::from_utf8(bytes).unwrap());
+        }
+        // Zero user lists export as zero CSV rows; antennas/clips/favorites
+        // export as empty JSON arrays (what upstream writes when empty).
+        assert_eq!(seen["userList"], "");
+        assert_eq!(seen["antenna"], "[]");
+        assert_eq!(seen["clip"], "[]");
+        assert_eq!(seen["favorite"], "[]");
+    }
+
+    #[tokio::test]
+    async fn parity_export_rate_limit_trips_and_recovers() {
+        let (state, clock) = test_state();
+        let (_, alice_token) = signup_user(&state, "alice").await;
+
+        let (status, _) = call(
+            &state,
+            "i/export-notes",
+            serde_json::json!({}),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        // Second call inside the hour trips the 1/hr bucket.
+        let (status, value) = call(
+            &state,
+            "i/export-notes",
+            serde_json::json!({}),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{value}");
+        assert_eq!(value["code"], "RATE_LIMIT_EXCEEDED");
+        // A fresh hour admits again.
+        clock.advance_ms(3_600_000);
+        let (status, _) = call(
+            &state,
+            "i/export-notes",
+            serde_json::json!({}),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn parity_import_antennas_validates_but_applies_nothing() {
+        let (state, clock) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let valid = serde_json::json!([{
+            "name": "a",
+            "src": "home",
+            "keywords": [["x"]],
+            "excludeKeywords": [],
+            "users": [],
+            "userListAccts": null,
+            "caseSensitive": false,
+            "localOnly": false,
+            "excludeBots": false,
+            "withReplies": false,
+            "withFile": false,
+            "excludeNotesInSensitiveChannel": false,
+        }]);
+        let file = state
+            .services
+            .upload_media(
+                &alice_id,
+                "antennas.json".to_string(),
+                &serde_json::to_vec(&valid).unwrap(),
+                None,
+                false,
+                true,
+            )
+            .unwrap();
+        let (status, _) = call(
+            &state,
+            "i/import-antennas",
+            serde_json::json!({ "fileId": file.id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        // No antenna subsystem exists: the job validates rows, applies zero,
+        // and still completes (imports never notify).
+        state.worker.drain(100).unwrap();
+
+        // Malformed JSON is INVALID_PARAM (DIVERGENCE: upstream throws 500).
+        clock.advance_ms(3_600_000);
+        let bad = state
+            .services
+            .upload_media(&alice_id, "bad.json".to_string(), b"not json", None, false, true)
+            .unwrap();
+        let (status, value) = call(
+            &state,
+            "i/import-antennas",
+            serde_json::json!({ "fileId": bad.id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "INVALID_PARAM");
+    }
+
+    #[tokio::test]
+    async fn parity_import_user_lists_validates_but_applies_nothing() {
+        let (state, _) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (_bob_id, _bob_token) = signup_user(&state, "bob").await;
+        let file = state
+            .services
+            .upload_media(
+                &alice_id,
+                "lists.csv".to_string(),
+                b"Friends,bob\nnot-a-valid-row\n",
+                None,
+                false,
+                true,
+            )
+            .unwrap();
+        let (status, _) = call(
+            &state,
+            "i/import-user-lists",
+            serde_json::json!({ "fileId": file.id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        // No user-list subsystem: validates, applies zero, completes.
+        state.worker.drain(100).unwrap();
     }
 }

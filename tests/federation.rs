@@ -143,6 +143,7 @@ async fn boot_node(tag: &'static str) -> FedNode {
         blobs,
         notifications: store.clone(),
         auth: store.clone(),
+        host_caps: store.clone(),
         streaming: Arc::new(NoopStreamingSink),
         dedup: store.clone() as Arc<dyn ActivityDedup>,
         federation_http: SafeHttpClient::new(SafeHttpConfig {
@@ -1354,6 +1355,7 @@ fn federation_remote_media_cache() {
         blobs: blobs.clone(),
         notifications: store.clone(),
         auth: store.clone(),
+        host_caps: store.clone(),
         streaming: Arc::new(NoopStreamingSink),
         dedup: store.clone() as Arc<dyn ActivityDedup>,
         federation_http: SafeHttpClient::new(SafeHttpConfig {

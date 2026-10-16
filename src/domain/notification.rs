@@ -19,6 +19,14 @@ pub enum NotificationKind {
     /// note; sent to the reply author on `notes/edit`). Wire type `edited`
     /// (a Sharkey addition — Misskey `notificationTypes` has no such entry).
     Edited,
+    /// A profile export finished (Misskey `exportCompleted`: carries
+    /// `exportedEntity` + `fileId`, no notifier — see
+    /// `NotificationEntityService.ts:188-191`). Pinetree rows require a
+    /// notifier, so the exporter's own id is stored (self-notify pack
+    /// shape, same convention as §5 scheduling notifications); the
+    /// `Notify` worker treats this kind as notifier-less (only a `never`
+    /// receive-config drops it, like upstream).
+    ExportCompleted,
 }
 
 impl NotificationKind {
@@ -37,6 +45,7 @@ impl NotificationKind {
             NotificationKind::ScheduledNotePosted => "scheduledNotePosted",
             NotificationKind::ScheduledNotePostFailed => "scheduledNotePostFailed",
             NotificationKind::Edited => "edited",
+            NotificationKind::ExportCompleted => "exportCompleted",
         }
     }
 }
@@ -55,6 +64,17 @@ pub struct Notification {
     /// (migration by default).
     #[serde(default)]
     pub draft_id: Option<String>,
+    /// Drive file produced by a profile export, referenced by
+    /// `ExportCompleted` (Misskey `fileId`). `None` on every other kind.
+    /// `#[serde(default)]` keeps older rows decoding as file-less.
+    #[serde(default)]
+    pub file_id: Option<String>,
+    /// Entity an `ExportCompleted` notification reports on (Misskey
+    /// `exportedEntity`: `following`/`blocking`/`muting`/`note`/
+    /// `userList`/`antenna`/`clip`/`favorite`). `None` on every other kind.
+    /// `#[serde(default)]` keeps older rows decoding as entity-less.
+    #[serde(default)]
+    pub exported_entity: Option<String>,
     pub is_read: bool,
 }
 
@@ -72,6 +92,8 @@ mod tests {
             note_id: Some("oid00000000000001".to_string()),
             reaction: Some("👍".to_string()),
             draft_id: None,
+            file_id: None,
+            exported_entity: None,
             is_read: false,
         };
         let json = serde_json::to_string(&n).expect("serializable");
