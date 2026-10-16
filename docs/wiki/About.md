@@ -6,8 +6,8 @@ pinetree is a lightweight, modular **Misskey-compatible social network server** 
 
 - Small, well-defined modules that can be extended without rewriting unrelated systems.
 - Runs as a simple **single-node** instance (embedded `redb` database, no Postgres/Redis/broker) *or*, in the planned multi-node mode, as one logical instance spread over several servers on **FoundationDB**.
-- Supports Misskey clients via a tested API subset, including streaming (streaming is Phase 3).
-- Federates in a Misskey-compatible way.
+- Supports Misskey clients via a tested API subset, including streaming.
+- Federates in a Misskey-compatible way, quotes and reply threads included.
 
 ## Explicit non-goals
 
@@ -15,11 +15,12 @@ pinetree is a lightweight, modular **Misskey-compatible social network server** 
 - The Mastodon *client* REST API (ActivityPub federation with Mastodon servers stays in scope; Sharkey, by contrast, ships a Mastodon API).
 - Microservices from day one; requiring SQL, Redis or a message broker.
 
-## What it does today (Phase 2.5 cleanup complete, 2026-10-15)
+## What it does today (Phase 3 + quotes + replies, 2026-10-16)
 
 - **Accounts and auth:** signup/signin, MiAuth (web flow and token checks), legacy `auth/session/*`, per-token permissions, rate limits with Misskey-style `429` + `retryAfter`.
-- **Notes:** create (text, CW, visibility `public/home/followers/specified`, reply, renote, files, `localOnly`), show, delete; reactions create/delete; follows create/delete; home/local/hybrid timelines with cursor pagination; notifications list; remote lookup by `username`+`host` and `ap/show`.
-- **Media:** multipart/JSON upload, local filesystem blob store, public file serving; remote attachment validation and caching (scheme, SSRF, size limit, MIME sniff).
+- **Notes:** create (text, CW, visibility `public/home/followers/specified`, reply, renote, files, `localOnly`), show, delete; quote posts (FEP-044f canonical + legacy compat + authorization workflow); branched replies (indexed children, exact counters, pending parents fail-closed); reactions create/delete; follows create/delete + follow requests (list/accept/reject/cancel); home/local/hybrid/global timelines with cursor pagination; `notes/replies|renotes|children|conversation`, search; notifications list; remote lookup by `username`+`host` and `ap/show`.
+- **Streaming:** authenticated WebSocket `/streaming` with `main`, `homeTimeline`, `localTimeline`, `hybridTimeline`, `globalTimeline` channels and note capture.
+- **Media:** multipart/JSON upload, drive listing/show/update/delete, local filesystem blob store, public file serving; remote attachment validation and caching (scheme, SSRF, size limit, MIME sniff).
 - **Federation (ActivityPub):** WebFinger (JRD + XRD), host-meta, NodeInfo 2.0/2.1, actor documents with RSA keys, outbox/followers/following/featured collections, note documents, shared and personal inboxes, legacy HTTP Signatures (`rsa-sha256`, Digest) both ways, Follow/Accept/Reject/Undo/Create(Note)/Update/Delete/Like(`_misskey_reaction`)/Announce, atomic activity-id deduplication (including Reject), durable outbound delivery with retry and backoff. RSA comes from the maintained `rsa` crate (the hand-rolled bigint/DER/PEM code was removed in Phase 2.5); TLS verification is never disabled (the SSRF test exemption no longer touches it).
 - **Durability:** every local state change commits together with its outbox/job record in one storage transaction; workers deliver, notify and fan out; jobs are idempotent and crash-safe (crash-recovery tests). Terminally failed jobs are quarantined with a logged reason (`fail_permanent`: bad payloads, delivery `PermanentFailure`, retry exhaustion) instead of retrying forever.
 - **Security posture:** federation input is untrusted: size limits, timeouts, redirect limits, SSRF protection, signature and authority checks, HTML/MFM sanitization.
@@ -33,7 +34,7 @@ Modular monolith; dependency direction `domain` ← `application` ← adapters.
 - `src/persistence/redb` — the single-node storage adapter (the FoundationDB adapter is Phase 4). Both adapters must pass the same conformance tests.
 - `src/api/misskey` — HTTP API adapter (axum). `src/activitypub`, `src/federation` — protocol and delivery adapters; they depend only on `Arc<AppServices>`, never on the Misskey adapter.
 - `src/jobs`, `src/media` — durable job queue/worker and blob storage.
-- `src/streaming`, `src/cluster` — placeholders for Phase 3 and Phase 4.
+- `src/streaming` — WebSocket server + channel hub (Phase 3, shipped). `src/cluster` — placeholder for Phase 4.
 
 Identity is stable and independent of placement: actor URLs are `https://{domain}/users/{account_id}`; renames and moves preserve the account ID; public IDs and URLs never expose node hostnames. IDs are Misskey-style `aidx`.
 

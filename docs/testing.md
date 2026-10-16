@@ -15,10 +15,10 @@ dirs, ephemeral ports, fresh containers) — never the play/browser rig:
 
 | Step | What | Time |
 |---|---|---|
-| `cargo test --offline` | unit + contract + integration (283 tests) | ~15 s |
-| `scripts/smoke-phase1.sh` | core flows via real `misskey-js` (+ restart durability) | ~1 min |
-| `scripts/smoke-phase3.sh` | profile REST + streaming via real `misskey-js` `Stream` | ~1 min |
-| `scripts/keystone-sweep.sh` | Keystone's exact calls, 41 checks | ~30 s |
+| `cargo test --offline` | unit + contract + integration (351 tests) | ~15 s |
+| `scripts/smoke-phase1.sh` | core flows via real `misskey-js` (+ restart durability) | ~10 s |
+| `scripts/smoke-phase3.sh` | profile REST + streaming via real `misskey-js` `Stream` | ~10 s |
+| `scripts/keystone-sweep.sh` | Keystone's exact calls, 41 checks | ~10 s |
 | `scripts/smoke-phase2.sh` | four-server federation, fresh pg/redis (hermetic: tears down after) | ~15–25 min |
 
 Each step streams its own progress live (`[smoke1]` / `[smoke3]` / `[PASS]`

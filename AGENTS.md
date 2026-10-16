@@ -20,7 +20,7 @@ Phase 1 exit: all boxes checked in `docs/phase-1-exit-criteria.md` — `pinetree
 
 Phase 2 exit: all boxes checked in `docs/phase-2-exit-criteria.md` — WebFinger/NodeInfo, actors + keys, HTTP signatures, shared/personal inboxes, core activities, atomic dedup, durable delivery with retry, remote media; live four-server interop (real Misskey `2026.10.1-alpha.0`, real Sharkey `2025.4.7`, 2× pinetree) green via `scripts/smoke-phase2.sh` (see `state/logs/2026-10-14-phase-2-complete.md`; how to run each server: `docs/phase-2-interop-howto.md`).
 
-Phase 3 scope (proposal §9): client compatibility and streaming. Known gaps carried over: no `users/notes`, `notes/renotes`, Misskey API `users/followers` endpoint (the followers store `FollowStore::followers_of` and the ActivityPub followers collection exist — only the Misskey client endpoint is missing), streaming route.
+Phase 3 scope (proposal §9): client compatibility and streaming. Gaps carried into Phase 3 — `users/notes`, `notes/renotes`, the Misskey `users/followers` endpoint, the streaming route — were all closed by the Phase 3 exit review (`docs/phase-3-exit-criteria.md`).
 
 ## State maintenance (required every work session)
 

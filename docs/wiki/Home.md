@@ -1,6 +1,6 @@
 # pinetree wiki
 
-Status: living documentation, last updated 2026-10-15 (Phase 2.5 cleanup complete, Phase 3 entry gate green).
+Status: living documentation, last updated 2026-10-16 (Phase 3 complete, quote posts + branched replies green, Phase 4 next).
 The authoritative sources are `sns-server-proposal.md` (product/architecture) and the frozen contracts in `docs/`; this wiki is the readable overview. If they disagree, the proposal and contracts win.
 
 | Page | What it covers |

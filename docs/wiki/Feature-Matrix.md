@@ -1,6 +1,6 @@
 # Feature matrix: pinetree vs Misskey vs Sharkey
 
-Compared versions: **pinetree** after the Phase 2.5 cleanup (2026-10-15); **Misskey** `2026.10.1-alpha.0` and **Sharkey** `2025.4.7` (the read-only checkouts `./misskey`, `./sharkey`). Misskey/Sharkey cells reflect what exists in those checkouts (endpoint and module presence was checked by listing the source tree; behaviour depth was not audited). pinetree cells reflect executed tests only.
+Compared versions: **pinetree** after quote posts + branched replies (2026-10-16); **Misskey** `2026.10.1-alpha.0` and **Sharkey** `2025.4.7` (the read-only checkouts `./misskey`, `./sharkey`). Misskey/Sharkey cells reflect what exists in those checkouts (endpoint and module presence was checked by listing the source tree; behaviour depth was not audited). pinetree cells reflect executed tests only.
 
 Legend: ✅ supported · 🟡 partial/subset · ❌ not supported (yet) · ⛔ deliberate non-goal · 🗓 planned (phase)
 
@@ -14,7 +14,7 @@ Legend: ✅ supported · 🟡 partial/subset · ❌ not supported (yet) · ⛔ d
 | Single-user / small-instance footprint | designed for it | heavy (Postgres + Redis) | heavy |
 | Multi-node as one logical instance | 🗓 4 (FoundationDB) | via external DB/Redis | via external DB/Redis |
 | Built-in web client | ❌ (uses existing Misskey clients) | ✅ | ✅ |
-| Public API size | ~28 endpoints | ~440 endpoint modules | ~460 endpoint modules |
+| Public API size | ~50 endpoints | ~440 endpoint modules | ~460 endpoint modules |
 
 ## Client API
 
@@ -25,24 +25,25 @@ Legend: ✅ supported · 🟡 partial/subset · ❌ not supported (yet) · ⛔ d
 | Legacy `auth/session/*` | ✅ | ✅ | ✅ |
 | OAuth / IndieAuth | ❌ (🗓 only if a target client needs it) | ✅ | ✅ |
 | Mastodon client API | ⛔ | ❌ | ✅ |
-| Streaming (`/streaming`, channels, note capture) | ❌ 🗓 3 | ✅ | ✅ |
+| Streaming (`/streaming`, channels, note capture) | ✅ (5 channels + capture) | ✅ | ✅ |
 | Timelines home / local / hybrid | ✅ | ✅ | ✅ |
-| Global timeline | ❌ 🗓 3 | ✅ | ✅ |
+| Global timeline | ✅ | ✅ | ✅ |
 | Other timelines (user lists, hashtag, antenna, role, channel, bubble) | ❌ | ✅ (no bubble) | ✅ (incl. bubble) |
 | Notes: text, CW, visibility, reply, renote, files, localOnly | ✅ | ✅ | ✅ |
-| Quote notes | ❌ 🗓 3+ (only if in profile) | ✅ | ✅ |
+| Quote notes | ✅ (FEP-044f + legacy compat + authorization workflow) | ✅ | ✅ |
+| Branched reply threads | ✅ (indexed children, pending parents fail-closed, durable resolver) | ✅ | ✅ |
 | Polls | ❌ (deferred) | ✅ | ✅ |
 | Note editing | ❌ | ❌ | ✅ |
 | Reactions (unicode) | ✅ | ✅ | ✅ |
 | Custom-emoji reactions / emoji management | ❌ | ✅ | ✅ |
 | Notifications list | ✅ (list) | ✅ | ✅ |
 | Follow / unfollow | ✅ | ✅ | ✅ |
-| Follow requests (locked accounts) | 🟡 locked flag respected; request endpoints ❌ | ✅ | ✅ |
+| Follow requests (locked accounts) | ✅ (list/accept/reject/cancel) | ✅ | ✅ |
 | Mute / block / renote-mute | ❌ | ✅ | ✅ |
 | User lists, antennas, clips, pages, flash, gallery, channels | ❌ | ✅ | ✅ |
 | Drive: upload | ✅ | ✅ | ✅ |
-| Drive: folders, listing, management | ❌ 🗓 3 as needed | ✅ | ✅ |
-| Search (notes/users) | 🟡 `users/search` only | ✅ | ✅ |
+| Drive: folders, listing, management | 🟡 (listing/show/update/delete; no folders) | ✅ | ✅ |
+| Search (notes/users) | 🟡 (notes + tag + user search, substring) | ✅ | ✅ |
 | Profile edit | 🟡 subset (`name`, `description`, `location`, `birthday`, avatar/banner, flags) | ✅ | ✅ |
 | 2FA / passkeys / webhooks | ❌ | ✅ | ✅ |
 | Roles / moderation / admin API | ❌ (admin account creation only) | ✅ | ✅ |
@@ -64,7 +65,7 @@ Legend: ✅ supported · 🟡 partial/subset · ❌ not supported (yet) · ⛔ d
 | Create(Note), Update, Delete (Tombstone) | ✅ | ✅ | ✅ |
 | Like with `_misskey_reaction` | ✅ | ✅ | ✅ |
 | Announce (renote) + Undo | ✅ | ✅ | ✅ |
-| Quote (`_misskey_quote` / `quoteUrl`) | ❌ (follow-up) | ✅ | ✅ |
+| Quote (FEP-044f `quote` + e232 Link + stamp, `_misskey_quote` / `quoteUrl`) | ✅ | ✅ | ✅ |
 | Polls (`Question`, `_misskey_votes`) | ❌ (deferred) | ✅ | ✅ |
 | `_misskey_content` | never emitted | legacy | legacy |
 | Move / Block / Flag | ❌ | ✅ | ✅ |
@@ -77,4 +78,4 @@ Legend: ✅ supported · 🟡 partial/subset · ❌ not supported (yet) · ⛔ d
 
 ## Reading the matrix
 
-pinetree intentionally implements a *subset*: the goal is "existing Misskey clients work against a small, fast, easy-to-run server" rather than feature parity. Phase 3 widens the client API and adds streaming for a declared client profile; Phase 4 adds the multi-node FoundationDB mode that neither Misskey nor Sharkey offer natively; Phase 5 measures and hardens. See [Roadmap](Roadmap.md).
+pinetree intentionally implements a *subset*: the goal is "existing Misskey clients work against a small, fast, easy-to-run server" rather than feature parity. Phase 3 delivered the client API breadth and streaming for the declared profile; quotes and branched replies followed; Phase 4 adds the multi-node FoundationDB mode that neither Misskey nor Sharkey offer natively; Phase 5 measures and hardens. See [Roadmap](Roadmap.md).
