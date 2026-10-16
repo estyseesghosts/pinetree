@@ -3,7 +3,95 @@
 use crate::domain::id::DomainError;
 use crate::domain::note::ReactionAcceptance;
 
-pub const FALLBACK_REACTION: &str = "❤️";
+/// Misskey `ReactionService.ts` `FALLBACK` (`'\u2764'`, bare U+2764, no VS16).
+pub const FALLBACK_REACTION: &str = "❤";
+
+/// Misskey `ReactionService.ts` `legacies`: string-type reactions mapped to
+/// their emoji.
+pub const LEGACY_REACTIONS: &[(&str, &str)] = &[
+    ("like", "👍"),
+    ("love", "❤"),
+    ("laugh", "😆"),
+    ("hmm", "🤔"),
+    ("surprise", "😮"),
+    ("congrats", "🎉"),
+    ("angry", "💢"),
+    ("confused", "😥"),
+    ("rip", "😇"),
+    ("pudding", "🍮"),
+    ("star", "⭐"),
+];
+
+/// Misskey `ReactionService.normalize` parity: map legacy names, keep the
+/// single emoji grapheme of a unicode reaction while stripping variation
+/// selector `FE0F` (unless the emoji contains a `ZWJ` joiner), and fall back
+/// to the bare heart for anything else (including `null`).
+///
+/// Custom-emoji (`:name:` / `:name@host:`) shapes pass through unchanged:
+/// pinetree has no custom-emoji registry, so there is nothing to check
+/// permission/sensitivity against (Misskey checks `localOnly`, reaction
+/// roles, `isSensitive`, and media-silenced hosts in `ReactionService.ts`
+/// there). DIVERGENCE (documented): unknown custom names are stored
+/// verbatim instead of falling back.
+pub fn normalize_reaction(reaction: Option<&str>) -> String {
+    let Some(reaction) = reaction else {
+        return FALLBACK_REACTION.to_string();
+    };
+    if let Some((_, emoji)) = LEGACY_REACTIONS.iter().find(|(name, _)| *name == reaction) {
+        return (*emoji).to_string();
+    }
+    if reaction.starts_with(':') {
+        return reaction.to_string();
+    }
+    let first = first_emoji_grapheme(reaction);
+    match first {
+        Some(grapheme) => {
+            if grapheme.contains('\u{200d}') {
+                grapheme
+            } else {
+                grapheme.replace('\u{fe0f}', "")
+            }
+        }
+        None => FALLBACK_REACTION.to_string(),
+    }
+}
+
+/// Leading emoji grapheme of `s` (base emoji plus any following `FE0F`,
+/// skin-tone modifier, or `ZWJ`-joined sequence), or `None` when `s` does
+/// not start with an emoji. Implemented without an emoji-table dependency:
+/// consumes `FE0F`/`200D`/modifier codepoints greedily after the first
+/// non-ASCII (or symbol) char.
+fn first_emoji_grapheme(s: &str) -> Option<String> {
+    let mut chars = s.chars().peekable();
+    let first = chars.next()?;
+    // Emoji graphemes never start with an ASCII char ( Misskey's
+    // `emojiRegex` likewise never matches pure-ASCII text); this keeps
+    // `#tag`-style input on the FALLBACK path instead of echoing `#`.
+    if first.is_ascii() {
+        return None;
+    }
+    let mut out = String::from(first);
+    for c in chars {
+        // Grapheme continuations: variation selectors, joiners, skin-tone
+        // modifiers, and the emoji char following a joiner.
+        if c == '\u{fe0f}'
+            || c == '\u{200d}'
+            || ('\u{1f3fb}'..='\u{1f3ff}').contains(&c)
+            || out.ends_with('\u{200d}')
+        {
+            out.push(c);
+        } else {
+            break;
+        }
+    }
+    if out.contains('\u{200d}') {
+        // A trailing dangling joiner is not a complete sequence.
+        while out.ends_with('\u{200d}') {
+            out.pop();
+        }
+    }
+    Some(out)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Reaction {
@@ -66,10 +154,12 @@ mod tests {
 
     #[test]
     fn coerce_reaction_cases() {
+        // `likeOnly` forces the bare-heart fallback (U+2764, no VS16).
         assert_eq!(
             coerce_reaction("👍", Some(ReactionAcceptance::LikeOnly), false),
-            FALLBACK_REACTION
+            "❤"
         );
+        assert_eq!(FALLBACK_REACTION, "❤");
         assert_eq!(
             coerce_reaction("👍", Some(ReactionAcceptance::LikeOnly), true),
             FALLBACK_REACTION
@@ -95,5 +185,48 @@ mod tests {
             "👍"
         );
         assert_eq!(coerce_reaction("👍", None, true), "👍");
+    }
+
+    #[test]
+    fn normalize_falls_back_to_bare_heart() {
+        assert_eq!(normalize_reaction(None), "❤");
+        // VS16 form normalizes to the bare fallback.
+        assert_eq!(normalize_reaction(Some("❤️")), "❤");
+        assert_eq!(normalize_reaction(Some("❤")), "❤");
+    }
+
+    #[test]
+    fn normalize_maps_legacies() {
+        assert_eq!(normalize_reaction(Some("like")), "👍");
+        assert_eq!(normalize_reaction(Some("love")), "❤");
+        assert_eq!(normalize_reaction(Some("laugh")), "😆");
+        assert_eq!(normalize_reaction(Some("hmm")), "🤔");
+        assert_eq!(normalize_reaction(Some("surprise")), "😮");
+        assert_eq!(normalize_reaction(Some("congrats")), "🎉");
+        assert_eq!(normalize_reaction(Some("angry")), "💢");
+        assert_eq!(normalize_reaction(Some("confused")), "😥");
+        assert_eq!(normalize_reaction(Some("rip")), "😇");
+        assert_eq!(normalize_reaction(Some("pudding")), "🍮");
+        assert_eq!(normalize_reaction(Some("star")), "⭐");
+    }
+
+    #[test]
+    fn normalize_strips_fe0f_unless_zwj() {
+        // U+2764 U+FE0F → bare heart; ZWJ sequences keep their selectors.
+        assert_eq!(normalize_reaction(Some("❤️")), "❤");
+        assert_eq!(
+            normalize_reaction(Some("👨‍👩‍👧")),
+            "👨‍👩‍👧"
+        );
+        // Plain emoji pass through; trailing text is cut to one grapheme.
+        assert_eq!(normalize_reaction(Some("👍")), "👍");
+        // Non-emoji text falls back.
+        assert_eq!(normalize_reaction(Some("hello")), FALLBACK_REACTION);
+        assert_eq!(normalize_reaction(Some("")), FALLBACK_REACTION);
+        // Custom-emoji shapes pass through (no registry to check against).
+        assert_eq!(
+            normalize_reaction(Some(":custom_emoji@.:")),
+            ":custom_emoji@.:"
+        );
     }
 }

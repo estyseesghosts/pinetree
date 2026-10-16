@@ -11,11 +11,15 @@ use serde_json::{Map, Value};
 
 use crate::application::commands::AppServices;
 use crate::application::ports::PortError;
-use crate::domain::account::Account;
+use crate::domain::account::{Account, FollowVisibility};
+use crate::domain::blocking::Blocking;
+use crate::domain::draft::NoteDraft;
 use crate::domain::follow::Follow;
+use crate::domain::muting::{Muting, RenoteMuting};
 use crate::domain::media::MediaMeta;
 use crate::domain::note::{Note, Visibility};
-use crate::domain::notification::Notification;
+use crate::domain::notification::{Notification, NotificationKind};
+use crate::domain::reaction::Reaction;
 use crate::domain::visibility::{ViewerContext, is_visible};
 
 /// Misskey server version we claim compatibility with.
@@ -47,10 +51,18 @@ fn note_time_ms(note: &Note, services: &AppServices) -> i64 {
         .unwrap_or_else(|_| services.clock.now_ms())
 }
 
+fn opt_string(value: &Option<String>) -> Value {
+    value.clone().map(Value::String).unwrap_or(Value::Null)
+}
+
+fn opt_number(value: Option<i64>) -> Value {
+    value.map(|v| Value::Number(v.into())).unwrap_or(Value::Null)
+}
+
 /// `UserLite` (`user.ts` `packedUserLiteSchema`).
 pub fn pack_user_lite(account: &Account, public_url: &str, clock_ms: i64) -> Value {
     let _ = clock_ms;
-    serde_json::json!({
+    let mut obj = serde_json::json!({
         "id": account.id,
         "name": account.display_name,
         "username": account.username,
@@ -61,8 +73,132 @@ pub fn pack_user_lite(account: &Account, public_url: &str, clock_ms: i64) -> Val
         "isBot": account.is_bot,
         "isCat": account.is_cat,
         "emojis": {},
-        "onlineStatus": "online",
-    })
+        "onlineStatus": if account.hide_online_status { "unknown" } else { "online" },
+    });
+    if let Some(map) = obj.as_object_mut() {
+        // `requireSigninToViewContents === false ? undefined : true`.
+        if account.require_signin_to_view_contents {
+            map.insert(
+                "requireSigninToViewContents".to_string(),
+                Value::Bool(true),
+            );
+        }
+        // `makeNotes*Before ?? undefined`.
+        if let Some(seconds) = account.make_notes_followers_only_before {
+            map.insert(
+                "makeNotesFollowersOnlyBefore".to_string(),
+                Value::Number(seconds.into()),
+            );
+        }
+        if let Some(seconds) = account.make_notes_hidden_before {
+            map.insert(
+                "makeNotesHiddenBefore".to_string(),
+                Value::Number(seconds.into()),
+            );
+        }
+    }
+    obj
+}
+
+/// Resolve stored `alsoKnownAs` actor URIs to account ids
+/// (`UserEntityService.pack` `alsoKnownAs` parity: ids, `null` when empty).
+/// Local actor URLs (`{public_url}/users/{id}`) carry no stored `uri`, so
+/// they resolve by id suffix.
+fn pack_also_known_as(account: &Account, services: &AppServices) -> Value {
+    let Some(uris) = account.also_known_as.as_ref() else {
+        return Value::Null;
+    };
+    let base = services.public_url.trim_end_matches('/');
+    let mut ids = Vec::new();
+    for uri in uris {
+        if let Ok(Some(target)) = services.accounts.find_by_uri(uri) {
+            ids.push(Value::String(target.id));
+            continue;
+        }
+        if let Some(id) = uri.strip_prefix(&format!("{base}/users/")) {
+            if !id.is_empty()
+                && !id.contains('/')
+                && services.accounts.find_by_id(id).ok().flatten().is_some()
+            {
+                ids.push(Value::String(id.to_string()));
+            }
+        }
+    }
+    if ids.is_empty() {
+        Value::Null
+    } else {
+        Value::Array(ids)
+    }
+}
+
+/// Stored avatar decorations in `UserEntityService` shape (`angle`/`flipH`/
+/// offsets omitted when falsy, `... || undefined` parity).
+/// TODO(§0B): upstream also attaches each decoration's `url` from the
+/// avatar-decoration registry; pinetree has no registry yet.
+fn pack_avatar_decorations(account: &Account) -> Value {
+    Value::Array(
+        account
+            .avatar_decorations
+            .iter()
+            .map(|d| {
+                let mut obj = Map::new();
+                obj.insert("id".to_string(), Value::String(d.id.clone()));
+                if let Some(angle) = d.angle {
+                    if angle != 0.0 {
+                        obj.insert(
+                            "angle".to_string(),
+                            serde_json::Number::from_f64(angle)
+                                .map(Value::Number)
+                                .unwrap_or(Value::Null),
+                        );
+                    }
+                }
+                if let Some(flip_h) = d.flip_h {
+                    if flip_h {
+                        obj.insert("flipH".to_string(), Value::Bool(true));
+                    }
+                }
+                for (key, value) in [("offsetX", d.offset_x), ("offsetY", d.offset_y)] {
+                    if let Some(v) = value {
+                        if v != 0.0 {
+                            obj.insert(
+                                key.to_string(),
+                                serde_json::Number::from_f64(v)
+                                    .map(Value::Number)
+                                    .unwrap_or(Value::Null),
+                            );
+                        }
+                    }
+                }
+                Value::Object(obj)
+            })
+            .collect(),
+    )
+}
+
+/// Masked follow counts (`UserEntityService.ts:465-473` parity):
+/// `public` (or self — moderators bypass too, but pinetree has no roles
+/// infrastructure yet, so no viewer is a moderator) shows the count;
+/// `followers` shows it only to a viewer following the account; otherwise
+/// the count packs as `null` (never omitted).
+fn masked_follow_count(
+    visibility: &FollowVisibility,
+    viewer_follows_account: bool,
+    viewer_id: Option<&str>,
+    account_id: &str,
+    count: u64,
+) -> Value {
+    let is_me = viewer_id == Some(account_id);
+    let show = match visibility {
+        FollowVisibility::Public => true,
+        FollowVisibility::Followers => is_me || viewer_follows_account,
+        FollowVisibility::Private => is_me,
+    };
+    if show {
+        Value::Number(count.into())
+    } else {
+        Value::Null
+    }
 }
 
 /// `UserDetailedNotMe` = `UserLite` + `UserDetailedNotMeOnly`, including
@@ -109,6 +245,28 @@ pub fn pack_user_detailed_not_me(
         ),
         _ => (false, false),
     };
+    // §0A: real relation lookups (were hardcoded `false`).
+    let (is_blocking, is_blocked, is_muted, is_renote_muted) = match viewer_id {
+        Some(viewer) if viewer != account.id => (
+            services
+                .blocks
+                .is_blocking(viewer, &account.id)
+                .unwrap_or(false),
+            services
+                .blocks
+                .is_blocking(&account.id, viewer)
+                .unwrap_or(false),
+            services
+                .mutes
+                .is_muting(viewer, &account.id)
+                .unwrap_or(false),
+            services
+                .mutes
+                .is_renote_muting(viewer, &account.id)
+                .unwrap_or(false),
+        ),
+        _ => (false, false, false, false),
+    };
     let mut obj = pack_user_lite(account, &services.public_url, now)
         .as_object()
         .cloned()
@@ -116,7 +274,10 @@ pub fn pack_user_detailed_not_me(
     obj.insert("url".to_string(), Value::String(actor_url.clone()));
     obj.insert("uri".to_string(), Value::String(actor_url));
     obj.insert("movedTo".to_string(), Value::Null);
-    obj.insert("alsoKnownAs".to_string(), Value::Null);
+    obj.insert(
+        "alsoKnownAs".to_string(),
+        pack_also_known_as(account, services),
+    );
     obj.insert("createdAt".to_string(), Value::String(created_at));
     obj.insert("updatedAt".to_string(), Value::Null);
     obj.insert("lastFetchedAt".to_string(), Value::Null);
@@ -152,37 +313,87 @@ pub fn pack_user_detailed_not_me(
             .map(Value::String)
             .unwrap_or(Value::Null),
     );
-    obj.insert("lang".to_string(), Value::Null);
-    obj.insert("fields".to_string(), Value::Array(Vec::new()));
-    obj.insert("verifiedLinks".to_string(), Value::Array(Vec::new()));
+    obj.insert("avatarDecorations".to_string(), pack_avatar_decorations(account));
+    obj.insert("lang".to_string(), opt_string(&account.lang));
+    obj.insert(
+        "fields".to_string(),
+        serde_json::to_value(&account.fields).unwrap_or(Value::Array(Vec::new())),
+    );
+    obj.insert(
+        "verifiedLinks".to_string(),
+        serde_json::to_value(&account.verified_links).unwrap_or(Value::Array(Vec::new())),
+    );
     obj.insert(
         "followersCount".to_string(),
-        Value::Number(account.followers_count.into()),
+        masked_follow_count(
+            &account.followers_visibility,
+            is_following,
+            viewer_id,
+            &account.id,
+            account.followers_count,
+        ),
     );
     obj.insert(
         "followingCount".to_string(),
-        Value::Number(account.following_count.into()),
+        masked_follow_count(
+            &account.following_visibility,
+            is_following,
+            viewer_id,
+            &account.id,
+            account.following_count,
+        ),
     );
     obj.insert(
         "notesCount".to_string(),
         Value::Number(account.notes_count.into()),
     );
-    obj.insert("pinnedNoteIds".to_string(), Value::Array(Vec::new()));
-    obj.insert("pinnedNotes".to_string(), Value::Array(Vec::new()));
-    obj.insert("pinnedPageId".to_string(), Value::Null);
+    // §7: real pin lookups (Misskey `UserEntityService.ts:552-553`
+    // `pinnedNoteIds: pins.map(pin => pin.noteId)` parity). Gone notes
+    // cannot be packed and are skipped, like every other nullable pack.
+    let pinned_ids: Vec<String> = services
+        .pinned_note_ids(&account.id)
+        .unwrap_or_default();
+    let viewer_for_pins = viewer_id;
+    let mut pinned_notes = Vec::new();
+    for note_id in &pinned_ids {
+        if let Ok(Some(note)) = services.notes.get_note(note_id) {
+            if let Ok(packed) = pack_note(&note, viewer_for_pins, services, 0) {
+                pinned_notes.push(packed);
+            }
+        }
+    }
+    obj.insert(
+        "pinnedNoteIds".to_string(),
+        Value::Array(
+            pinned_ids
+                .iter()
+                .map(|id| Value::String(id.clone()))
+                .collect(),
+        ),
+    );
+    obj.insert("pinnedNotes".to_string(), Value::Array(pinned_notes));
+    obj.insert(
+        "pinnedPageId".to_string(),
+        opt_string(&account.pinned_page_id),
+    );
     obj.insert("pinnedPage".to_string(), Value::Null);
-    obj.insert("publicReactions".to_string(), Value::Bool(true));
+    // `publicReactions: isLocal ? profile : false`
+    // (misskey-dev/misskey#12964 parity).
+    obj.insert(
+        "publicReactions".to_string(),
+        Value::Bool(account.host.is_none() && account.public_reactions),
+    );
     obj.insert(
         "followingVisibility".to_string(),
-        Value::String("public".to_string()),
+        Value::String(account.following_visibility.as_str().to_string()),
     );
     obj.insert(
         "followersVisibility".to_string(),
-        Value::String("public".to_string()),
+        Value::String(account.followers_visibility.as_str().to_string()),
     );
     obj.insert(
         "chatScope".to_string(),
-        Value::String("everyone".to_string()),
+        Value::String(account.chat_scope.as_str().to_string()),
     );
     obj.insert("canChat".to_string(), Value::Bool(false));
     obj.insert("roles".to_string(), Value::Array(Vec::new()));
@@ -197,10 +408,13 @@ pub fn pack_user_detailed_not_me(
         "hasPendingFollowRequestToYou".to_string(),
         Value::Bool(pending_to_you),
     );
-    obj.insert("isBlocking".to_string(), Value::Bool(false));
-    obj.insert("isBlocked".to_string(), Value::Bool(false));
-    obj.insert("isMuted".to_string(), Value::Bool(false));
-    obj.insert("isRenoteMuted".to_string(), Value::Bool(false));
+    obj.insert("isBlocking".to_string(), Value::Bool(is_blocking));
+    obj.insert("isBlocked".to_string(), Value::Bool(is_blocked));
+    obj.insert("isMuted".to_string(), Value::Bool(is_muted));
+    obj.insert(
+        "isRenoteMuted".to_string(),
+        Value::Bool(is_renote_muted),
+    );
     Ok(Value::Object(obj))
 }
 
@@ -238,7 +452,146 @@ pub fn pack_following(
     }))
 }
 
-fn default_policies() -> Value {
+/// `NoteReaction` + `Note` (`note-reaction.ts`
+/// `packedNoteReactionWithNoteSchema`):
+/// `{id, createdAt, user: UserLite, type, note: Note}`. `createdAt`
+/// derives from the reaction-row id timestamp (aidx ids are time-ordered).
+/// `type` is the stored reaction string verbatim (legacy-emoji
+/// normalization rides with §6, which owns the reaction path).
+pub fn pack_note_reaction_with_note(
+    reaction: &Reaction,
+    author: &Account,
+    note: &Note,
+    viewer_id: Option<&str>,
+    services: &AppServices,
+) -> Result<Value, PortError> {
+    let created_at = format_millis(
+        services
+            .ids
+            .parse_time(&reaction.id)
+            .unwrap_or_else(|_| services.clock.now_ms()),
+    );
+    let user = pack_user_lite(author, &services.public_url, services.clock.now_ms());
+    let packed_note = pack_note(note, viewer_id, services, 0)?;
+    Ok(serde_json::json!({
+        "id": reaction.id,
+        "createdAt": created_at,
+        "user": user,
+        "type": reaction.reaction,
+        "note": packed_note,
+    }))
+}
+
+/// `Blocking` (`blocking.ts` `packedBlockingSchema`):
+/// `{id, createdAt, blockeeId, blockee}` with the blockee packed as
+/// `UserDetailedNotMe` (`Null` when the account row is gone).
+pub fn pack_blocking(
+    blocking: &Blocking,
+    viewer_id: Option<&str>,
+    services: &AppServices,
+) -> Result<Value, PortError> {
+    let created_at = format_millis(
+        services
+            .ids
+            .parse_time(&blocking.id)
+            .unwrap_or_else(|_| services.clock.now_ms()),
+    );
+    let blockee = match services.accounts.find_by_id(&blocking.blockee_id)? {
+        Some(account) => pack_user_detailed_not_me(&account, viewer_id, services)?,
+        None => Value::Null,
+    };
+    Ok(serde_json::json!({
+        "id": blocking.id,
+        "createdAt": created_at,
+        "blockeeId": blocking.blockee_id,
+        "blockee": blockee,
+    }))
+}
+
+/// `Muting` (`mute.ts` `packedMutingSchema`):
+/// `{id, createdAt, expiresAt, muteeId, mutee}`. `expiresAt` is an ISO-8601
+/// timestamp or `null` for indefinite mutes.
+pub fn pack_muting(
+    muting: &Muting,
+    viewer_id: Option<&str>,
+    services: &AppServices,
+) -> Result<Value, PortError> {
+    let created_at = format_millis(
+        services
+            .ids
+            .parse_time(&muting.id)
+            .unwrap_or_else(|_| services.clock.now_ms()),
+    );
+    let mutee = match services.accounts.find_by_id(&muting.mutee_id)? {
+        Some(account) => pack_user_detailed_not_me(&account, viewer_id, services)?,
+        None => Value::Null,
+    };
+    Ok(serde_json::json!({
+        "id": muting.id,
+        "createdAt": created_at,
+        "expiresAt": muting.expires_at_ms.map(format_millis),
+        "muteeId": muting.mutee_id,
+        "mutee": mutee,
+    }))
+}
+
+/// `RenoteMuting` (`renote-mute.ts`): `{id, createdAt, muteeId, mutee}`.
+pub fn pack_renote_muting(
+    row: &RenoteMuting,
+    viewer_id: Option<&str>,
+    services: &AppServices,
+) -> Result<Value, PortError> {
+    let created_at = format_millis(
+        services
+            .ids
+            .parse_time(&row.id)
+            .unwrap_or_else(|_| services.clock.now_ms()),
+    );
+    let mutee = match services.accounts.find_by_id(&row.mutee_id)? {
+        Some(account) => pack_user_detailed_not_me(&account, viewer_id, services)?,
+        None => Value::Null,
+    };
+    Ok(serde_json::json!({
+        "id": row.id,
+        "createdAt": created_at,
+        "muteeId": row.mutee_id,
+        "mutee": mutee,
+    }))
+}
+
+/// One `users/relation` entry (Misskey `UserEntityService.getRelation`
+/// parity): follow edges + pending requests in both directions + the §0A
+/// block/mute flags.
+pub fn pack_user_relation(
+    me_id: &str,
+    target_id: &str,
+    services: &AppServices,
+) -> Result<Value, PortError> {
+    Ok(serde_json::json!({
+        "id": target_id,
+        "isFollowing": services.follows.is_following(me_id, target_id).unwrap_or(false),
+        "hasPendingFollowRequestFromYou": services
+            .follows
+            .get_follow_request(me_id, target_id)
+            .map(|r| r.is_some())
+            .unwrap_or(false),
+        "hasPendingFollowRequestToYou": services
+            .follows
+            .get_follow_request(target_id, me_id)
+            .map(|r| r.is_some())
+            .unwrap_or(false),
+        "isFollowed": services.follows.is_following(target_id, me_id).unwrap_or(false),
+        "isBlocking": services.blocks.is_blocking(me_id, target_id).unwrap_or(false),
+        "isBlocked": services.blocks.is_blocking(target_id, me_id).unwrap_or(false),
+        "isMuted": services.mutes.is_muting(me_id, target_id).unwrap_or(false),
+        "isRenoteMuted": services
+            .mutes
+            .is_renote_muting(me_id, target_id)
+            .unwrap_or(false),
+    }))
+}
+
+fn default_policies(services: &AppServices) -> Value {
     serde_json::json!({
         "gtlAvailable": true,
         "ltlAvailable": true,
@@ -250,7 +603,7 @@ fn default_policies() -> Value {
         "driveCapacityMb": 1024,
         "alwaysMarkNsfw": false,
         "SkipNsfwDetection": false,
-        "pinLimit": 5,
+        "pinLimit": services.pin_limit,
         "antennaLimit": 5,
         "wordMuteLimit": 200,
         "webhookLimit": 0,
@@ -266,6 +619,8 @@ fn default_policies() -> Value {
         "canImportMuting": false,
         "canImportUserLists": false,
         "chatAvailability": "unavailable",
+        "noteDraftLimit": services.note_draft_limit,
+        "scheduledNoteLimit": services.scheduled_note_limit,
     })
 }
 
@@ -298,17 +653,35 @@ pub fn pack_me_detailed(
             .map(Value::String)
             .unwrap_or(Value::Null),
     );
-    obj.insert("followedMessage".to_string(), Value::Null);
+    obj.insert("followedMessage".to_string(), opt_string(&account.followed_message));
     obj.insert("isModerator".to_string(), Value::Bool(false));
     obj.insert("isAdmin".to_string(), Value::Bool(false));
-    obj.insert("injectFeaturedNote".to_string(), Value::Bool(false));
-    obj.insert("receiveAnnouncementEmail".to_string(), Value::Bool(false));
-    obj.insert("alwaysMarkNsfw".to_string(), Value::Bool(false));
-    obj.insert("autoSensitive".to_string(), Value::Bool(false));
-    obj.insert("carefulBot".to_string(), Value::Bool(false));
-    obj.insert("autoAcceptFollowed".to_string(), Value::Bool(false));
-    obj.insert("noCrawle".to_string(), Value::Bool(false));
-    obj.insert("preventAiLearning".to_string(), Value::Bool(false));
+    obj.insert(
+        "injectFeaturedNote".to_string(),
+        Value::Bool(account.inject_featured_note),
+    );
+    obj.insert(
+        "receiveAnnouncementEmail".to_string(),
+        Value::Bool(account.receive_announcement_email),
+    );
+    obj.insert(
+        "alwaysMarkNsfw".to_string(),
+        Value::Bool(account.always_mark_nsfw),
+    );
+    obj.insert(
+        "autoSensitive".to_string(),
+        Value::Bool(account.auto_sensitive),
+    );
+    obj.insert("carefulBot".to_string(), Value::Bool(account.careful_bot));
+    obj.insert(
+        "autoAcceptFollowed".to_string(),
+        Value::Bool(account.auto_accept_followed),
+    );
+    obj.insert("noCrawle".to_string(), Value::Bool(account.no_crawle));
+    obj.insert(
+        "preventAiLearning".to_string(),
+        Value::Bool(account.prevent_ai_learning),
+    );
     obj.insert(
         "isExplorable".to_string(),
         Value::Bool(account.is_explorable),
@@ -318,7 +691,10 @@ pub fn pack_me_detailed(
         "twoFactorBackupCodesStock".to_string(),
         Value::String("none".to_string()),
     );
-    obj.insert("hideOnlineStatus".to_string(), Value::Bool(false));
+    obj.insert(
+        "hideOnlineStatus".to_string(),
+        Value::Bool(account.hide_online_status),
+    );
     obj.insert(
         "hasUnreadSpecifiedNotes".to_string(),
         Value::Bool(false),
@@ -335,25 +711,51 @@ pub fn pack_me_detailed(
         Value::Bool(false),
     );
     obj.insert("unreadNotificationsCount".to_string(), Value::Number(0.into()));
-    obj.insert("mutedWords".to_string(), Value::Array(Vec::new()));
-    obj.insert("hardMutedWords".to_string(), Value::Array(Vec::new()));
-    obj.insert("mutedInstances".to_string(), Value::Array(Vec::new()));
+    obj.insert(
+        "mutedWords".to_string(),
+        serde_json::to_value(&account.muted_words).unwrap_or(Value::Array(Vec::new())),
+    );
+    obj.insert(
+        "hardMutedWords".to_string(),
+        serde_json::to_value(&account.hard_muted_words)
+            .unwrap_or(Value::Array(Vec::new())),
+    );
+    obj.insert(
+        "mutedInstances".to_string(),
+        serde_json::to_value(&account.muted_instances)
+            .unwrap_or(Value::Array(Vec::new())),
+    );
+    // Kept for wire compat (`UserEntityService` packs `[]`).
+    obj.insert("mutingNotificationTypes".to_string(), Value::Array(Vec::new()));
     obj.insert(
         "notificationRecieveConfig".to_string(),
-        Value::Object(Map::new()),
+        serde_json::to_value(&account.notification_recieve_config)
+            .unwrap_or(Value::Object(Map::new())),
     );
     obj.insert(
         "emailNotificationTypes".to_string(),
-        Value::Array(Vec::new()),
+        serde_json::to_value(&account.email_notification_types)
+            .unwrap_or(Value::Array(Vec::new())),
     );
     obj.insert("achievements".to_string(), Value::Array(Vec::new()));
     obj.insert("loggedInDays".to_string(), Value::Number(1.into()));
-    obj.insert("policies".to_string(), default_policies());
+    obj.insert("policies".to_string(), default_policies(services));
     obj.insert("twoFactorEnabled".to_string(), Value::Bool(false));
     obj.insert("usePasswordLessLogin".to_string(), Value::Bool(false));
     obj.insert("securityKeys".to_string(), Value::Bool(false));
-    obj.insert("followApprovalLocalSeconds".to_string(), Value::Null);
-    obj.insert("followApprovalRemoteSeconds".to_string(), Value::Null);
+    obj.insert("followApprovalLocalSeconds".to_string(), opt_number(account.follow_approval_local_seconds));
+    obj.insert("followApprovalRemoteSeconds".to_string(), opt_number(account.follow_approval_remote_seconds));
+    // DIVERGENCE (§3 Sharkey-style quote rejection; §6 per-user default
+    // reaction): packed on `MeDetailed` so later slices need no packer
+    // changes. `defaultReaction` is `null` until the user sets one.
+    obj.insert(
+        "rejectQuotes".to_string(),
+        Value::Bool(account.reject_quotes),
+    );
+    obj.insert(
+        "defaultReaction".to_string(),
+        opt_string(&account.default_reaction),
+    );
     if include_secrets {
         obj.insert("email".to_string(), Value::Null);
         obj.insert("emailVerified".to_string(), Value::Null);
@@ -485,6 +887,24 @@ pub fn pack_note(
     );
     obj.insert("userId".to_string(), Value::String(note.author_id.clone()));
     obj.insert("user".to_string(), user);
+    // §8: last edit time (Sharkey `updatedAt` parity: ISO string or null).
+    obj.insert(
+        "updatedAt".to_string(),
+        note.updated_at_ms
+            .map(crate::activitypub::format_millis)
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+    // §3: edit/strip diagnostics (Sharkey `processErrors` parity: array or
+    // null; upstream emits it only in detail packs — pinetree packs a single
+    // shape, so it is always present).
+    obj.insert(
+        "processErrors".to_string(),
+        note.process_errors
+            .clone()
+            .map(|errors| Value::Array(errors.into_iter().map(Value::String).collect()))
+            .unwrap_or(Value::Null),
+    );
     obj.insert(
         "text".to_string(),
         note.text.clone().map(Value::String).unwrap_or(Value::Null),
@@ -616,6 +1036,45 @@ pub fn pack_note(
     );
     obj.insert("emojis".to_string(), Value::Object(Map::new()));
     obj.insert("myReaction".to_string(), my_reaction);
+    // §4 polls (Misskey `note.ts` `poll` + `hasPoll` parity): the poll with
+    // per-requester `isVoted` flags (Misskey `populatePoll` parity), or
+    // `poll: null` + `hasPoll: false` when the note carries none.
+    let (has_poll, poll_value) = match services.polls.get_poll(&note.id)? {
+        Some(poll) => {
+            let my_choices: std::collections::HashSet<usize> = match viewer_id {
+                Some(viewer) => services
+                    .polls
+                    .votes_by_user_for_note(viewer, &note.id)?
+                    .into_iter()
+                    .map(|v| v.choice)
+                    .collect(),
+                None => std::collections::HashSet::new(),
+            };
+            let choices: Vec<Value> = poll
+                .choices
+                .iter()
+                .enumerate()
+                .map(|(i, text)| {
+                    serde_json::json!({
+                        "isVoted": my_choices.contains(&i),
+                        "text": text,
+                        "votes": poll.votes.get(i).copied().unwrap_or(0),
+                    })
+                })
+                .collect();
+            (
+                true,
+                serde_json::json!({
+                    "multiple": poll.multiple,
+                    "expiresAt": poll.expires_at_ms.map(format_millis).map(Value::String).unwrap_or(Value::Null),
+                    "choices": choices,
+                }),
+            )
+        }
+        _ => (false, Value::Null),
+    };
+    obj.insert("hasPoll".to_string(), Value::Bool(has_poll));
+    obj.insert("poll".to_string(), poll_value);
     // Optional AP identity fields (Misskey `note.ts` `uri`/`url`); `channel`
     // is always null — channels do not exist here.
     obj.insert(
@@ -660,7 +1119,8 @@ pub fn pack_notification(notification: &Notification, services: &AppServices) ->
         None => Value::Null,
     };
     // Misskey `notification.ts` is a per-type union: `note` exists only on
-    // note-bearing variants, `reaction` only on the reaction variant.
+    // note-bearing variants, `reaction` only on the reaction variant,
+    // `draft` only on `scheduledNotePostFailed`.
     let mut obj = serde_json::json!({
         "id": notification.id,
         "createdAt": created_at,
@@ -676,8 +1136,328 @@ pub fn pack_notification(notification: &Notification, services: &AppServices) ->
         if let Some(reaction) = notification.reaction.clone() {
             map.insert("reaction".to_string(), Value::String(reaction));
         }
+        // §5: `scheduledNotePostFailed` carries the draft that failed to
+        // post (upstream `noteDraftId` shape packs the draft packer here).
+        // A gone draft packs as `null` (same convention as gone notes).
+        if notification.kind == crate::domain::notification::NotificationKind::ScheduledNotePostFailed
+        {
+            let packed_draft = match notification.draft_id.as_deref() {
+                Some(draft_id) => match services.notes.get_draft(draft_id) {
+                    Ok(Some(draft)) => pack_note_draft(&draft, services),
+                    _ => Value::Null,
+                },
+                None => Value::Null,
+            };
+            map.insert("draft".to_string(), packed_draft);
+        }
     }
     obj
+}
+
+/// Grouped notification packing (§10; Misskey
+/// `i/notifications-grouped.ts:106-153` + `packGroupedMany` parity).
+/// Pure pack-layer change: no storage change. Input is the newest-first
+/// flat page (same fetch as `i/notifications`). Consecutive `reaction`
+/// notifications on the same note merge into one `reaction:grouped`
+/// (`reactions` accumulate oldest-last, `id` rolls to the oldest member,
+/// `createdAt` stays the newest member's — upstream `prev.createdAt` +
+/// rolling-`id` parity); consecutive `renote` notifications on the same
+/// *target* merge into one `renote:grouped` (`userIds` accumulate,
+/// `createdAt` is the oldest member's — upstream `notification.createdAt`
+/// parity). Our rows carry no `targetNoteId`, so the target resolves
+/// through the renote note's `renote_id`; an unresolvable side never
+/// merges and passes through as a plain pack.
+pub fn pack_grouped_notifications(
+    notifications: &[Notification],
+    viewer_id: &str,
+    services: &AppServices,
+) -> Vec<Value> {
+    enum Grouped {
+        Plain(Notification),
+        Reaction {
+            id: String,
+            created_at: String,
+            note_id: String,
+            pairs: Vec<(String, String)>,
+        },
+        Renote {
+            id: String,
+            created_at: String,
+            note_id: String,
+            user_ids: Vec<String>,
+        },
+    }
+
+    fn created_at_of(notification: &Notification, services: &AppServices) -> String {
+        services
+            .ids
+            .parse_time(&notification.id)
+            .map(format_millis)
+            .unwrap_or_else(|_| format_millis(services.clock.now_ms()))
+    }
+
+    fn renote_target_of(notification: &Notification, services: &AppServices) -> Option<String> {
+        let note = services
+            .notes
+            .get_note(notification.note_id.as_deref()?)
+            .ok()??;
+        note.renote_id.clone()
+    }
+
+    // Mirror of the upstream index loop: `prev = notifications[i - 1]`
+    // decides the merge, and the last pushed group (which always ends at
+    // `prev`) absorbs the current row.
+    let mut grouped: Vec<Grouped> = Vec::new();
+    for (i, cur) in notifications.iter().enumerate() {
+        if i == 0 {
+            grouped.push(Grouped::Plain(cur.clone()));
+            continue;
+        }
+        let prev = &notifications[i - 1];
+        let reaction_merge = prev.kind == NotificationKind::Reaction
+            && cur.kind == NotificationKind::Reaction
+            && prev.note_id.is_some()
+            && prev.note_id == cur.note_id;
+        if reaction_merge {
+            let seed = (
+                prev.notifier_id.clone(),
+                prev.reaction.clone().unwrap_or_default(),
+            );
+            let next_pair = (
+                cur.notifier_id.clone(),
+                cur.reaction.clone().unwrap_or_default(),
+            );
+            match grouped.pop() {
+                Some(Grouped::Reaction {
+                    created_at,
+                    note_id,
+                    mut pairs,
+                    ..
+                }) => {
+                    pairs.push(next_pair);
+                    grouped.push(Grouped::Reaction {
+                        id: cur.id.clone(),
+                        created_at,
+                        note_id,
+                        pairs,
+                    });
+                }
+                _ => {
+                    // The popped tail was `Plain(prev)`: replace it with a
+                    // group seeded from `prev`, then absorb `cur`.
+                    grouped.push(Grouped::Reaction {
+                        id: cur.id.clone(),
+                        created_at: created_at_of(prev, services),
+                        note_id: prev.note_id.clone().unwrap_or_default(),
+                        pairs: vec![seed, next_pair],
+                    });
+                }
+            }
+            continue;
+        }
+        let renote_merge = prev.kind == NotificationKind::Renote
+            && cur.kind == NotificationKind::Renote
+            && renote_target_of(prev, services).is_some()
+            && renote_target_of(prev, services) == renote_target_of(cur, services);
+        if renote_merge {
+            match grouped.pop() {
+                Some(Grouped::Renote {
+                    note_id,
+                    mut user_ids,
+                    ..
+                }) => {
+                    user_ids.push(cur.notifier_id.clone());
+                    grouped.push(Grouped::Renote {
+                        id: cur.id.clone(),
+                        created_at: created_at_of(cur, services),
+                        note_id,
+                        user_ids,
+                    });
+                }
+                _ => {
+                    grouped.push(Grouped::Renote {
+                        id: cur.id.clone(),
+                        created_at: created_at_of(cur, services),
+                        note_id: prev.note_id.clone().unwrap_or_default(),
+                        user_ids: vec![prev.notifier_id.clone(), cur.notifier_id.clone()],
+                    });
+                }
+            }
+            continue;
+        }
+        grouped.push(Grouped::Plain(cur.clone()));
+    }
+
+    grouped
+        .into_iter()
+        .map(|group| match group {
+            Grouped::Plain(n) => pack_notification(&n, services),
+            Grouped::Reaction {
+                id,
+                created_at,
+                note_id,
+                pairs,
+            } => pack_grouped_notification(
+                &id,
+                &created_at,
+                "reaction:grouped",
+                &note_id,
+                &pairs,
+                &[],
+                viewer_id,
+                services,
+            ),
+            Grouped::Renote {
+                id,
+                created_at,
+                note_id,
+                user_ids,
+            } => pack_grouped_notification(
+                &id,
+                &created_at,
+                "renote:grouped",
+                &note_id,
+                &[],
+                &user_ids,
+                viewer_id,
+                services,
+            ),
+        })
+        .collect()
+}
+/// - `reaction:grouped`: `{id, createdAt, type, note, reactions:
+///   [{user: UserLite, reaction}]}` (no top-level `user`/`userId`);
+/// - `renote:grouped`: `{id, createdAt, type, note, users: [UserLite]}`.
+/// Groups whose note is gone pack `note: null` (upstream returns null for
+/// a deleted note and drops the group only when every *user* is gone).
+pub fn pack_grouped_notification(
+    id: &str,
+    created_at: &str,
+    kind: &str,
+    note_id: &str,
+    reaction_pairs: &[(String, String)],
+    user_ids: &[String],
+    viewer_id: &str,
+    services: &AppServices,
+) -> Value {
+    let packed_note = match services.notes.get_note(note_id) {
+        Ok(Some(note)) => {
+            pack_note(&note, Some(viewer_id), services, 0).unwrap_or(Value::Null)
+        }
+        _ => Value::Null,
+    };
+    let pack_user = |user_id: &str| match services.accounts.find_by_id(user_id) {
+        Ok(Some(account)) => Some(pack_user_lite(
+            &account,
+            &services.public_url,
+            services.clock.now_ms(),
+        )),
+        _ => None,
+    };
+    match kind {
+        "reaction:grouped" => {
+            let mut reactions = Vec::new();
+            for (user_id, reaction) in reaction_pairs {
+                if let Some(user) = pack_user(user_id) {
+                    reactions.push(serde_json::json!({
+                        "user": user,
+                        "reaction": reaction,
+                    }));
+                }
+            }
+            serde_json::json!({
+                "id": id,
+                "createdAt": created_at,
+                "type": "reaction:grouped",
+                "note": packed_note,
+                "reactions": reactions,
+            })
+        }
+        _ => {
+            let users: Vec<Value> = user_ids.iter().filter_map(|id| pack_user(id)).collect();
+            serde_json::json!({
+                "id": id,
+                "createdAt": created_at,
+                "type": "renote:grouped",
+                "note": packed_note,
+                "users": users,
+            })
+        }
+    }
+}
+
+/// `NoteDraft` (Misskey `note-draft.ts` `packedNoteDraftSchema` parity):
+/// every draft column; `user` packed inline as `UserLite`; `files` from
+/// `file_ids`; `reply`/`renote` packed one level when resolvable (else
+/// `null`); `channel`/`channelId` always null (channels do not exist);
+/// `poll` is `{choices, multiple, expiresAt (ISO|null), expiredAfter}` or
+/// `null`; `scheduledAt` is epoch millis or `null`.
+pub fn pack_note_draft(draft: &NoteDraft, services: &AppServices) -> Value {
+    let created_at = format_millis(
+        services
+            .ids
+            .parse_time(&draft.id)
+            .unwrap_or_else(|_| services.clock.now_ms()),
+    );
+    let user = match services.accounts.find_by_id(&draft.user_id) {
+        Ok(Some(account)) => pack_user_lite(&account, &services.public_url, services.clock.now_ms()),
+        _ => Value::Null,
+    };
+    let mut files = Vec::new();
+    for fid in &draft.file_ids {
+        if let Ok(Some(meta)) = services.media.get(fid) {
+            files.push(pack_drive_file(&meta, services));
+        }
+    }
+    let viewer = Some(draft.user_id.as_str());
+    let reply = match draft.reply_id.as_deref() {
+        Some(id) => match services.notes.get_note(id) {
+            Ok(Some(note)) => pack_note(&note, viewer, services, 1).unwrap_or(Value::Null),
+            _ => Value::Null,
+        },
+        None => Value::Null,
+    };
+    let renote = match draft.renote_id.as_deref() {
+        Some(id) => match services.notes.get_note(id) {
+            Ok(Some(note)) => pack_note(&note, viewer, services, 1).unwrap_or(Value::Null),
+            _ => Value::Null,
+        },
+        None => Value::Null,
+    };
+    let poll = if draft.has_poll {
+        serde_json::json!({
+            "choices": draft.poll_choices,
+            "multiple": draft.poll_multiple,
+            "expiresAt": draft.poll_expires_at_ms.map(format_millis).map(Value::String).unwrap_or(Value::Null),
+            "expiredAfter": draft.poll_expired_after_ms.map(|v| Value::Number(v.into())).unwrap_or(Value::Null),
+        })
+    } else {
+        Value::Null
+    };
+    serde_json::json!({
+        "id": draft.id,
+        "createdAt": created_at,
+        "text": draft.text.clone().map(Value::String).unwrap_or(Value::Null),
+        "cw": draft.cw.clone().map(Value::String).unwrap_or(Value::Null),
+        "userId": draft.user_id,
+        "user": user,
+        "replyId": draft.reply_id.clone().map(Value::String).unwrap_or(Value::Null),
+        "renoteId": draft.renote_id.clone().map(Value::String).unwrap_or(Value::Null),
+        "reply": reply,
+        "renote": renote,
+        "visibility": serde_json::to_value(&draft.visibility).unwrap_or(Value::String("public".to_string())),
+        "visibleUserIds": draft.visible_user_ids,
+        "fileIds": draft.file_ids,
+        "files": files,
+        "hashtag": draft.hashtag.clone().map(Value::String).unwrap_or(Value::Null),
+        "poll": poll,
+        "channelId": Value::Null,
+        "channel": Value::Null,
+        "localOnly": draft.local_only,
+        "reactionAcceptance": draft.reaction_acceptance.as_ref().and_then(|a| serde_json::to_value(a).ok()).unwrap_or(Value::Null),
+        "scheduledAt": draft.scheduled_at_ms.map(|v| Value::Number(v.into())).unwrap_or(Value::Null),
+        "isActuallyScheduled": draft.is_actually_scheduled,
+    })
 }
 
 /// Instance metadata: `MetaLite` always, plus `MetaDetailedOnly` when
@@ -754,7 +1534,7 @@ pub fn pack_meta(services: &AppServices, detail: bool) -> Value {    let uri = s
     obj.insert("inquiryUrl".to_string(), Value::Null);
     obj.insert("serverRules".to_string(), Value::Array(Vec::new()));
     obj.insert("themeColor".to_string(), Value::Null);
-    obj.insert("policies".to_string(), default_policies());
+    obj.insert("policies".to_string(), default_policies(services));
     obj.insert(
         "noteSearchableScope".to_string(),
         Value::String("local".to_string()),
@@ -801,12 +1581,15 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use crate::application::ports::{
-        AccountStore, ActivityDedup, ApiTokenRecord, AuthStore, BlobStore, CreateAccountInput,
-        CreateNoteInput, FollowStore, InsertMediaInput, JobQueue, LegacyAuthSessionRecord,
-        MediaStore, MiAuthSessionRecord, NewJob, NoteStore, NotificationStore, ReactionStore,
-        StreamingSink, UpdateAccountPatch,
+        AccountStore, ActivityDedup, ApiTokenRecord, AuthStore, BlobStore, BlockStore,
+        CreateAccountInput, CreateNoteInput, FollowStore, InsertMediaInput, JobQueue,
+        LegacyAuthSessionRecord, MediaStore, MiAuthSessionRecord, MuteStore, NewJob, NoteStore,
+        NotificationStore, PollChoiceCount, PollStore, ReactionStore, StreamingSink, UpdateAccountPatch,
     };
+    use crate::domain::blocking::Blocking;
     use crate::domain::follow::Follow;
+    use crate::domain::poll::{Poll, PollVote};
+    use crate::domain::muting::{Muting, RenoteMuting};
     use crate::domain::id::{AidxGenerator, ManualClock};
     use crate::domain::notification::Notification;
     use crate::domain::reaction::Reaction;
@@ -819,6 +1602,8 @@ mod tests {
         media: Mutex<HashMap<String, MediaMeta>>,
         reactions: Mutex<HashMap<(String, String), Reaction>>,
         follows: Mutex<HashSet<(String, String)>>,
+        polls: Mutex<HashMap<String, Poll>>,
+        poll_votes: Mutex<HashMap<(String, String, usize), PollVote>>,
     }
 
     impl Mem {
@@ -829,6 +1614,8 @@ mod tests {
                 media: Mutex::new(HashMap::new()),
                 reactions: Mutex::new(HashMap::new()),
                 follows: Mutex::new(HashSet::new()),
+                polls: Mutex::new(HashMap::new()),
+                poll_votes: Mutex::new(HashMap::new()),
             }
         }
     }
@@ -961,6 +1748,91 @@ mod tests {
         }
     }
 
+    impl BlockStore for Mem {
+        fn block(&self, _blocking: Blocking, _jobs: Vec<NewJob>) -> Result<Blocking, PortError> {
+            unavailable("block")
+        }
+        fn unblock(&self, _a: &str, _b: &str, _jobs: Vec<NewJob>) -> Result<(), PortError> {
+            unavailable("unblock")
+        }
+        fn get_blocking(&self, _a: &str, _b: &str) -> Result<Option<Blocking>, PortError> {
+            Ok(None)
+        }
+        fn is_blocking(&self, _a: &str, _b: &str) -> Result<bool, PortError> {
+            Ok(false)
+        }
+        fn blocking_ids_for(&self, _id: &str) -> Result<Vec<String>, PortError> {
+            Ok(Vec::new())
+        }
+        fn blocked_by_ids_for(&self, _id: &str) -> Result<Vec<String>, PortError> {
+            Ok(Vec::new())
+        }
+        fn list_blockings(
+            &self,
+            _id: &str,
+            _cursor: &crate::application::ports::TimelineCursor,
+        ) -> Result<Vec<Blocking>, PortError> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl MuteStore for Mem {
+        fn mute(
+            &self,
+            _a: &str,
+            _b: &str,
+            _expires: Option<i64>,
+            _jobs: Vec<NewJob>,
+        ) -> Result<Option<Muting>, PortError> {
+            unavailable("mute")
+        }
+        fn unmute(&self, _a: &str, _b: &str, _jobs: Vec<NewJob>) -> Result<(), PortError> {
+            unavailable("unmute")
+        }
+        fn get_muting(&self, _a: &str, _b: &str) -> Result<Option<Muting>, PortError> {
+            Ok(None)
+        }
+        fn is_muting(&self, _a: &str, _b: &str) -> Result<bool, PortError> {
+            Ok(false)
+        }
+        fn muted_ids_for(&self, _id: &str) -> Result<Vec<String>, PortError> {
+            Ok(Vec::new())
+        }
+        fn list_mutings(
+            &self,
+            _id: &str,
+            _cursor: &crate::application::ports::TimelineCursor,
+        ) -> Result<Vec<Muting>, PortError> {
+            Ok(Vec::new())
+        }
+        fn renote_mute(&self, _a: &str, _b: &str, _jobs: Vec<NewJob>) -> Result<RenoteMuting, PortError> {
+            unavailable("renote_mute")
+        }
+        fn renote_unmute(&self, _a: &str, _b: &str, _jobs: Vec<NewJob>) -> Result<(), PortError> {
+            unavailable("renote_unmute")
+        }
+        fn get_renote_muting(
+            &self,
+            _a: &str,
+            _b: &str,
+        ) -> Result<Option<RenoteMuting>, PortError> {
+            Ok(None)
+        }
+        fn is_renote_muting(&self, _a: &str, _b: &str) -> Result<bool, PortError> {
+            Ok(false)
+        }
+        fn renote_muted_ids_for(&self, _id: &str) -> Result<Vec<String>, PortError> {
+            Ok(Vec::new())
+        }
+        fn list_renote_mutings(
+            &self,
+            _id: &str,
+            _cursor: &crate::application::ports::TimelineCursor,
+        ) -> Result<Vec<RenoteMuting>, PortError> {
+            Ok(Vec::new())
+        }
+    }
+
     impl ReactionStore for Mem {
         fn react(
             &self,
@@ -982,6 +1854,16 @@ mod tests {
                 .unwrap()
                 .get(&(user.to_string(), note.to_string()))
                 .cloned())
+        }
+        fn reactions_by_user(&self, user: &str) -> Result<Vec<Reaction>, PortError> {
+            Ok(self
+                .reactions
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|r| r.user_id == user)
+                .cloned()
+                .collect())
         }
     }
 
@@ -1016,6 +1898,87 @@ mod tests {
         }
         fn pending_count(&self) -> Result<usize, PortError> {
             Ok(0)
+        }
+    }
+
+    impl PollStore for Mem {
+        fn get_poll(&self, note_id: &str) -> Result<Option<Poll>, PortError> {
+            Ok(self.polls.lock().unwrap().get(note_id).cloned())
+        }
+        fn votes_by_user_for_note(
+            &self,
+            user_id: &str,
+            note_id: &str,
+        ) -> Result<Vec<PollVote>, PortError> {
+            let mut out: Vec<PollVote> = self
+                .poll_votes
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|((u, n, _), _)| u == user_id && n == note_id)
+                .map(|(_, v)| v.clone())
+                .collect();
+            out.sort_by_key(|v| v.choice);
+            Ok(out)
+        }
+        fn cast_vote(&self, vote: PollVote, _jobs: Vec<NewJob>) -> Result<PollVote, PortError> {
+            let note = self
+                .notes
+                .lock()
+                .unwrap()
+                .get(&vote.note_id)
+                .cloned()
+                .ok_or_else(|| PortError::NotFound("NO_SUCH_NOTE".to_string()))?;
+            if note.is_deleted {
+                return Err(PortError::NotFound("NO_SUCH_NOTE".to_string()));
+            }
+            let mut polls = self.polls.lock().unwrap();
+            let poll = polls
+                .get_mut(&vote.note_id)
+                .ok_or_else(|| PortError::Validation("NO_POLL".to_string()))?;
+            if vote.choice >= poll.choices.len() {
+                return Err(PortError::Validation("INVALID_CHOICE".to_string()));
+            }
+            let mut votes = self.poll_votes.lock().unwrap();
+            if poll.multiple {
+                if votes
+                    .contains_key(&(vote.user_id.clone(), vote.note_id.clone(), vote.choice))
+                {
+                    return Err(PortError::Conflict("ALREADY_VOTED".to_string()));
+                }
+            } else if votes
+                .keys()
+                .any(|(u, n, _)| u == &vote.user_id && n == &vote.note_id)
+            {
+                return Err(PortError::Conflict("ALREADY_VOTED".to_string()));
+            }
+            if let Some(slot) = poll.votes.get_mut(vote.choice) {
+                *slot = slot.saturating_add(1);
+            }
+            votes.insert(
+                (vote.user_id.clone(), vote.note_id.clone(), vote.choice),
+                vote.clone(),
+            );
+            Ok(vote)
+        }
+        fn sync_poll_votes(
+            &self,
+            note_id: &str,
+            counts_by_name: &[PollChoiceCount],
+            _jobs: Vec<NewJob>,
+        ) -> Result<Poll, PortError> {
+            let mut polls = self.polls.lock().unwrap();
+            let poll = polls
+                .get_mut(note_id)
+                .ok_or_else(|| PortError::NotFound("NO_POLL".to_string()))?;
+            for (i, choice) in poll.choices.iter().enumerate() {
+                if let Some(count) = counts_by_name.iter().find(|c| &c.name == choice) {
+                    if let Some(slot) = poll.votes.get_mut(i) {
+                        *slot = count.votes;
+                    }
+                }
+            }
+            Ok(poll.clone())
         }
     }
 
@@ -1184,7 +2147,10 @@ mod tests {
             accounts: mem.clone(),
             notes: mem.clone(),
             follows: mem.clone(),
+            blocks: mem.clone(),
+            mutes: mem.clone(),
             reactions: mem.clone(),
+            polls: mem.clone(),
             jobs: mem.clone(),
             media: mem.clone(),
             blobs: mem.clone(),
@@ -1203,6 +2169,9 @@ mod tests {
             preserved_usernames: Vec::new(),
             prohibited_words: Vec::new(),
             sensitive_words: Vec::new(),
+            note_draft_limit: crate::domain::draft::DEFAULT_NOTE_DRAFT_LIMIT,
+            scheduled_note_limit: crate::domain::draft::DEFAULT_SCHEDULED_NOTE_LIMIT,
+            pin_limit: crate::domain::pinning::DEFAULT_PIN_LIMIT,
         };
         (services, mem, clock)
     }
@@ -1245,6 +2214,8 @@ mod tests {
             is_deleted: false,
             reply_parent_uri: None,
             quote: None,
+            updated_at_ms: None,
+            process_errors: None,
         }
     }
 
@@ -1522,6 +2493,180 @@ mod tests {
         assert_eq!(packed["email"], Value::Null);
         assert_eq!(packed["securityKeysList"], Value::Array(Vec::new()));
         assert_eq!(packed["policies"]["driveCapacityMb"], 1024);
+    }
+
+    #[test]
+    fn me_detailed_packs_profile_store_defaults_and_values() {
+        use crate::domain::account::ProfileField;
+
+        let (services, mem, _) = test_services(1_700_000_000_000);
+        let alice = test_account("aid00000000000001", "alice");
+        mem.accounts
+            .lock()
+            .unwrap()
+            .insert(alice.id.clone(), alice.clone());
+
+        // Fresh accounts pack the upstream column defaults (were hardcoded
+        // `false` before §0B).
+        let packed = pack_me_detailed(&alice, false, &services).unwrap();
+        assert_eq!(packed["preventAiLearning"], true);
+        assert_eq!(packed["injectFeaturedNote"], true);
+        assert_eq!(packed["receiveAnnouncementEmail"], true);
+        assert_eq!(packed["chatScope"], "mutual");
+        assert_eq!(packed["publicReactions"], true);
+        assert_eq!(packed["followingVisibility"], "public");
+        assert_eq!(packed["followersVisibility"], "public");
+        assert_eq!(
+            packed["emailNotificationTypes"],
+            serde_json::json!(["follow", "receiveFollowRequest"])
+        );
+        assert_eq!(packed["mutedWords"], serde_json::json!([]));
+        assert_eq!(packed["notificationRecieveConfig"], serde_json::json!({}));
+        assert_eq!(packed["hideOnlineStatus"], false);
+        assert_eq!(packed["onlineStatus"], "online");
+        assert_eq!(packed["rejectQuotes"], false);
+        assert_eq!(packed["defaultReaction"], Value::Null);
+
+        // Stored values round-trip with Misskey shapes.
+        let mut stored = alice.clone();
+        stored.hide_online_status = true;
+        stored.lang = Some("en".to_string());
+        stored.fields = vec![ProfileField {
+            name: "site".to_string(),
+            value: "https://example.local".to_string(),
+        }];
+        stored.followed_message = Some("hi".to_string());
+        stored.following_visibility = crate::domain::account::FollowVisibility::Followers;
+        stored.chat_scope = crate::domain::account::ChatScope::None;
+        stored.muted_words = vec![crate::domain::account::MutedWord::Single(
+            "/x/i".to_string(),
+        )];
+        stored.muted_instances = vec!["spam.example".to_string()];
+        stored.follow_approval_local_seconds = Some(60);
+        stored.also_known_as = Some(vec!["https://example.local/users/".to_string()]);
+        stored.reject_quotes = true;
+        stored.default_reaction = Some("❤".to_string());
+        let packed = pack_me_detailed(&stored, false, &services).unwrap();
+        assert_eq!(packed["onlineStatus"], "unknown");
+        assert_eq!(packed["lang"], "en");
+        assert_eq!(
+            packed["fields"],
+            serde_json::json!([{"name": "site", "value": "https://example.local"}])
+        );
+        assert_eq!(packed["followedMessage"], "hi");
+        assert_eq!(packed["followingVisibility"], "followers");
+        assert_eq!(packed["chatScope"], "none");
+        assert_eq!(packed["mutedWords"], serde_json::json!(["/x/i"]));
+        assert_eq!(packed["mutedInstances"], serde_json::json!(["spam.example"]));
+        assert_eq!(packed["followApprovalLocalSeconds"], 60);
+        // Unresolvable alias URIs pack as null (upstream maps to ids).
+        assert_eq!(packed["alsoKnownAs"], Value::Null);
+        assert_eq!(packed["rejectQuotes"], true);
+        assert_eq!(packed["defaultReaction"], "❤");
+
+        // Remote viewers never see public reactions.
+        let mut remote = test_account("aid00000000000002", "bob");
+        remote.host = Some("remote.example".to_string());
+        let packed = pack_user_detailed_not_me(&remote, Some(&alice.id), &services).unwrap();
+        assert_eq!(packed["publicReactions"], false);
+    }
+
+    #[test]
+    fn ff_visibility_count_masking_cases() {
+        use crate::domain::account::FollowVisibility;
+
+        let (services, mem, _) = test_services(1_700_000_000_000);
+        let alice = test_account("aid00000000000001", "alice");
+        let bob = test_account("aid00000000000002", "bob");
+        mem.accounts
+            .lock()
+            .unwrap()
+            .insert(alice.id.clone(), alice.clone());
+        mem.accounts
+            .lock()
+            .unwrap()
+            .insert(bob.id.clone(), bob.clone());
+
+        // Public: everyone (including anonymous) sees counts.
+        let packed = pack_user_detailed_not_me(&alice, None, &services).unwrap();
+        assert_eq!(packed["followersCount"], 3);
+        assert_eq!(packed["followingCount"], 5);
+
+        // Private: only self sees counts.
+        let mut shy = alice.clone();
+        shy.followers_visibility = FollowVisibility::Private;
+        shy.following_visibility = FollowVisibility::Private;
+        let packed = pack_user_detailed_not_me(&shy, Some(&bob.id), &services).unwrap();
+        assert_eq!(packed["followersCount"], Value::Null);
+        assert_eq!(packed["followingCount"], Value::Null);
+        let packed =
+            pack_user_detailed_not_me(&shy, Some(&alice.id), &services).unwrap();
+        assert_eq!(packed["followersCount"], 3);
+        assert_eq!(packed["followingCount"], 5);
+
+        // Followers-only: self + followers see counts; strangers see null.
+        let mut semi = alice.clone();
+        semi.followers_visibility = FollowVisibility::Followers;
+        semi.following_visibility = FollowVisibility::Followers;
+        let packed = pack_user_detailed_not_me(&semi, Some(&bob.id), &services).unwrap();
+        assert_eq!(packed["followersCount"], Value::Null);
+        assert_eq!(packed["followingCount"], Value::Null);
+        mem.follows
+            .lock()
+            .unwrap()
+            .insert((bob.id.clone(), alice.id.clone()));
+        let packed = pack_user_detailed_not_me(&semi, Some(&bob.id), &services).unwrap();
+        assert_eq!(packed["followersCount"], 3);
+        assert_eq!(packed["followingCount"], 5);
+    }
+
+    #[test]
+    fn public_reactions_pack_rule_local_profile_remote_false() {
+        let (services, mem, _) = test_services(1_700_000_000_000);
+        let alice = test_account("aid00000000000001", "alice");
+        mem.accounts
+            .lock()
+            .unwrap()
+            .insert(alice.id.clone(), alice.clone());
+
+        // `publicReactions: isLocal ? profile : false`.
+        let packed = pack_user_detailed_not_me(&alice, None, &services).unwrap();
+        assert_eq!(packed["publicReactions"], true);
+        let mut hidden = alice.clone();
+        hidden.public_reactions = false;
+        let packed = pack_user_detailed_not_me(&hidden, None, &services).unwrap();
+        assert_eq!(packed["publicReactions"], false);
+        let mut remote = alice.clone();
+        remote.host = Some("remote.example".to_string());
+        remote.public_reactions = true;
+        let packed = pack_user_detailed_not_me(&remote, None, &services).unwrap();
+        assert_eq!(packed["publicReactions"], false);
+    }
+
+    #[test]
+    fn pack_note_reaction_with_note_shape() {
+        use crate::domain::reaction::Reaction;
+
+        let (services, mem, _) = test_services(1_700_000_000_000);
+        let alice = test_account("aid00000000000001", "alice");
+        mem.accounts
+            .lock()
+            .unwrap()
+            .insert(alice.id.clone(), alice.clone());
+        let note = test_note("nid00000000000001", &alice.id);
+        let reaction = Reaction {
+            id: "rid00000000000001".to_string(),
+            user_id: alice.id.clone(),
+            note_id: note.id.clone(),
+            reaction: "👍".to_string(),
+        };
+        let packed =
+            pack_note_reaction_with_note(&reaction, &alice, &note, None, &services).unwrap();
+        assert_eq!(packed["id"], "rid00000000000001");
+        assert!(packed["createdAt"].as_str().is_some());
+        assert_eq!(packed["user"]["id"], alice.id);
+        assert_eq!(packed["type"], "👍");
+        assert_eq!(packed["note"]["id"], note.id);
     }
 
     #[test]

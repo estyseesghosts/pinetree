@@ -7,8 +7,8 @@ use pinetree::api::misskey::response::{RateLimiter, UploadSlots};
 use pinetree::api::misskey::{ApiState, build_router};
 use pinetree::application::commands::AppServices;
 use pinetree::application::ports::{
-    AccountStore, ActivityDedup, AuthStore, BlobStore, FollowStore, JobQueue, MediaStore,
-    NoteStore, NotificationStore, ReactionStore, StreamingSink,
+    AccountStore, ActivityDedup, AuthStore, BlobStore, BlockStore, FollowStore, JobQueue, MediaStore,
+    MuteStore, NoteStore, NotificationStore, PollStore, ReactionStore, StreamingSink,
 };
 use pinetree::streaming::hub::hub_and_sink;
 use pinetree::application::ports::{Clock, IdGenerator};
@@ -37,7 +37,10 @@ fn build_services(cfg: &Config) -> Result<(Arc<AppServices>, pinetree::streaming
         accounts: store.clone() as Arc<dyn AccountStore>,
         notes: store.clone() as Arc<dyn NoteStore>,
         follows: store.clone() as Arc<dyn FollowStore>,
+        blocks: store.clone() as Arc<dyn BlockStore>,
+        mutes: store.clone() as Arc<dyn MuteStore>,
         reactions: store.clone() as Arc<dyn ReactionStore>,
+        polls: store.clone() as Arc<dyn PollStore>,
         jobs: store.clone() as Arc<dyn JobQueue>,
         media: store.clone() as Arc<dyn MediaStore>,
         blobs,
@@ -51,6 +54,9 @@ fn build_services(cfg: &Config) -> Result<(Arc<AppServices>, pinetree::streaming
         preserved_usernames: cfg.preserved_usernames.clone(),
         prohibited_words: cfg.prohibited_words.clone(),
         sensitive_words: cfg.sensitive_words.clone(),
+        note_draft_limit: cfg.note_draft_limit,
+        scheduled_note_limit: cfg.scheduled_note_limit,
+        pin_limit: cfg.pin_limit,
     });
     Ok((services, hub))
 }
@@ -192,6 +198,7 @@ async fn main() {
         upload_slots: Arc::new(UploadSlots::with_defaults()),
         hub,
         trusted_proxies: Arc::new(cfg.trusted_proxies.clone()),
+        featured_cache: Arc::new(pinetree::application::commands::pins::FeaturedCache::default()),
     };
     let app = build_router(api_state);
     let listener = tokio::net::TcpListener::bind(cfg.listen)

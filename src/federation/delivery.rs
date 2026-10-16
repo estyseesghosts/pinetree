@@ -1304,6 +1304,7 @@ pub fn upsert_remote_actor_from_doc(
                 is_bot: Some(parsed.is_bot()),
                 is_cat: Some(parsed.is_cat),
                 is_explorable: Some(parsed.discoverable),
+                ..Default::default()
             },
             Vec::new(),
         )?

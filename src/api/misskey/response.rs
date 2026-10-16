@@ -83,11 +83,20 @@ impl RateLimiter {
         Self::new(clock)
             .with_limit("i/update", 20, HOUR_MS, None)
             .with_limit("notes/create", 300, HOUR_MS, None)
+            .with_limit("notes/edit", 300, HOUR_MS, None)
             .with_limit("notes/delete", 300, HOUR_MS, Some(1_000))
             .with_limit("following/create", 100, HOUR_MS, None)
             .with_limit("following/delete", 100, HOUR_MS, None)
+            .with_limit("blocking/create", 20, HOUR_MS, None)
+            .with_limit("blocking/delete", 100, HOUR_MS, None)
+            .with_limit("mute/create", 20, HOUR_MS, None)
+            .with_limit("renote-mute/create", 20, HOUR_MS, None)
             .with_limit("notes/reactions/delete", 60, HOUR_MS, Some(3_000))
             .with_limit("drive/files/create", 120, HOUR_MS, None)
+            // Draft endpoints (§5; same 300/h cost class as `notes/*`).
+            .with_limit("notes/drafts/create", 300, HOUR_MS, None)
+            .with_limit("notes/drafts/update", 300, HOUR_MS, None)
+            .with_limit("notes/drafts/delete", 300, HOUR_MS, None)
             // Every signup attempt from one IP counts (see `check`).
             .with_limit("auth/signup", 20, HOUR_MS, None)
             // MiAuth check polls: every request counts per IP.

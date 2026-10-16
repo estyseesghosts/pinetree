@@ -69,7 +69,10 @@ impl LiveServer {
             accounts: store.clone(),
             notes: store.clone(),
             follows: store.clone(),
+            blocks: store.clone(),
+            mutes: store.clone(),
             reactions: store.clone(),
+            polls: store.clone(),
             jobs: store.clone(),
             media: store.clone(),
             blobs,
@@ -86,6 +89,9 @@ impl LiveServer {
             preserved_usernames: Vec::new(),
             prohibited_words: Vec::new(),
             sensitive_words: Vec::new(),
+            note_draft_limit: pinetree::domain::draft::DEFAULT_NOTE_DRAFT_LIMIT,
+            scheduled_note_limit: pinetree::domain::draft::DEFAULT_SCHEDULED_NOTE_LIMIT,
+            pin_limit: pinetree::domain::pinning::DEFAULT_PIN_LIMIT,
         });
         let worker = Arc::new(JobWorker {
             clock: clock.clone(),
@@ -110,6 +116,9 @@ impl LiveServer {
             upload_slots: Arc::new(UploadSlots::with_defaults()),
             hub,
             trusted_proxies: Arc::new(Vec::new()),
+            featured_cache: std::sync::Arc::new(
+                pinetree::application::commands::pins::FeaturedCache::default(),
+            ),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

@@ -83,7 +83,10 @@ fn open_stack(dir: &Path) -> (Arc<RedbStore>, Arc<FsBlobStore>, Arc<AppServices>
         accounts: store.clone(),
         notes: store.clone(),
         follows: store.clone(),
+        blocks: store.clone(),
+        mutes: store.clone(),
         reactions: store.clone(),
+        polls: store.clone(),
         jobs: store.clone(),
         media: store.clone(),
         blobs: blobs.clone(),
@@ -100,6 +103,9 @@ fn open_stack(dir: &Path) -> (Arc<RedbStore>, Arc<FsBlobStore>, Arc<AppServices>
         preserved_usernames: Vec::new(),
         prohibited_words: Vec::new(),
         sensitive_words: Vec::new(),
+        note_draft_limit: pinetree::domain::draft::DEFAULT_NOTE_DRAFT_LIMIT,
+        scheduled_note_limit: pinetree::domain::draft::DEFAULT_SCHEDULED_NOTE_LIMIT,
+        pin_limit: pinetree::domain::pinning::DEFAULT_PIN_LIMIT,
     });
     (store, blobs, services)
 }

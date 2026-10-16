@@ -91,6 +91,10 @@ impl AppServices {
             ) {
                 Ok(_) => Ok(None),
                 Err(PortError::Conflict(_)) => Ok(None),
+                // §0A: blocked follower — skip instead of failing delivery.
+                Err(PortError::Validation(msg)) if msg == "BLOCKING" || msg == "BLOCKED" => {
+                    Ok(None)
+                }
                 Err(e) => Err(e),
             };
         }
@@ -105,6 +109,9 @@ impl AppServices {
             Ok(v) => Ok(v),
             // Lost a commit race with a duplicate delivery: already following.
             Err(PortError::Conflict(_)) => Ok(None),
+            // §0A: the followee blocks the follower (or vice versa) — skip
+            // instead of failing the inbox delivery (no retry storm).
+            Err(PortError::Validation(msg)) if msg == "BLOCKING" || msg == "BLOCKED" => Ok(None),
             Err(e) => Err(e),
         }
     }

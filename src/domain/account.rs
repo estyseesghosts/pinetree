@@ -64,7 +64,7 @@ pub fn validate_birthday(b: &str) -> Result<(), DomainError> {
         .map_err(|_| invalid(format!("invalid birthday (not a calendar date): {b}")))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Account {
     pub id: String,
     pub username: String,
@@ -88,7 +88,293 @@ pub struct Account {
     pub is_explorable: bool,
     pub is_deleted: bool,
     pub is_cat: bool,
+    // --- Full profile store (§0B; Misskey `MiUser` columns) -----------------
+    /// `MiUser.hideOnlineStatus` (default false).
+    #[serde(default)]
+    pub hide_online_status: bool,
+    /// `MiUser.avatarDecorations` (default `[]`, max 16).
+    #[serde(default)]
+    pub avatar_decorations: Vec<AvatarDecoration>,
+    /// `MiUser.alsoKnownAs`: resolved actor URIs (default null, max 10).
+    #[serde(default)]
+    pub also_known_as: Option<Vec<String>>,
+    /// `MiUser.requireSigninToViewContents` (default false).
+    #[serde(default)]
+    pub require_signin_to_view_contents: bool,
+    /// `MiUser.makeNotesFollowersOnlyBefore` (seconds, default null).
+    #[serde(default)]
+    pub make_notes_followers_only_before: Option<i64>,
+    /// `MiUser.makeNotesHiddenBefore` (seconds, default null).
+    #[serde(default)]
+    pub make_notes_hidden_before: Option<i64>,
+    /// `MiUser.chatScope` (default `mutual`).
+    #[serde(default)]
+    pub chat_scope: ChatScope,
+    // --- Full profile store (§0B; Misskey `MiUserProfile` columns) -----------
+    /// `MiUserProfile.followedMessage` (1..=256 chars, default null).
+    #[serde(default)]
+    pub followed_message: Option<String>,
+    /// `MiUserProfile.lang` (default null).
+    #[serde(default)]
+    pub lang: Option<String>,
+    /// `MiUserProfile.fields` (default `[]`, max 16).
+    #[serde(default)]
+    pub fields: Vec<ProfileField>,
+    /// `MiUserProfile.verifiedLinks` (default `[]`; reset on every update,
+    /// re-verified off-request — see `update.ts` `verifyLink`).
+    #[serde(default)]
+    pub verified_links: Vec<String>,
+    /// `MiUserProfile.publicReactions` (default true).
+    #[serde(default = "default_true")]
+    pub public_reactions: bool,
+    /// `MiUserProfile.followingVisibility` (default `public`).
+    #[serde(default)]
+    pub following_visibility: FollowVisibility,
+    /// `MiUserProfile.followersVisibility` (default `public`).
+    #[serde(default)]
+    pub followers_visibility: FollowVisibility,
+    /// `MiUserProfile.autoAcceptFollowed` (default false).
+    #[serde(default)]
+    pub auto_accept_followed: bool,
+    /// `MiUserProfile.followApprovalLocalSeconds/RemoteSeconds`
+    /// (0..=2_592_000, default null).
+    #[serde(default)]
+    pub follow_approval_local_seconds: Option<i64>,
+    #[serde(default)]
+    pub follow_approval_remote_seconds: Option<i64>,
+    /// `MiUserProfile.noCrawle` (upstream misspelling kept; default false).
+    #[serde(default)]
+    pub no_crawle: bool,
+    /// `MiUserProfile.preventAiLearning` (default true).
+    #[serde(default = "default_true")]
+    pub prevent_ai_learning: bool,
+    /// `MiUserProfile.alwaysMarkNsfw` (default false; role-guarded on write).
+    #[serde(default)]
+    pub always_mark_nsfw: bool,
+    /// `MiUserProfile.autoSensitive` (default false).
+    #[serde(default)]
+    pub auto_sensitive: bool,
+    /// `MiUserProfile.carefulBot` (default false).
+    #[serde(default)]
+    pub careful_bot: bool,
+    /// `MiUserProfile.injectFeaturedNote` (default true).
+    #[serde(default = "default_true")]
+    pub inject_featured_note: bool,
+    /// `MiUserProfile.receiveAnnouncementEmail` (default true).
+    #[serde(default = "default_true")]
+    pub receive_announcement_email: bool,
+    /// `MiUserProfile.pinnedPageId` (default null; no pages store yet, so
+    /// only null clears are accepted — see TODO(§0B) in `accounts.rs`).
+    #[serde(default)]
+    pub pinned_page_id: Option<String>,
+    /// `MiUserProfile.enableWordMute` (derived: `mutedWords` non-empty).
+    #[serde(default)]
+    pub enable_word_mute: bool,
+    /// `MiUserProfile.mutedWords/hardMutedWords` (default `[]`).
+    #[serde(default)]
+    pub muted_words: Vec<MutedWord>,
+    #[serde(default)]
+    pub hard_muted_words: Vec<MutedWord>,
+    /// `MiUserProfile.mutedInstances` (default `[]`).
+    #[serde(default)]
+    pub muted_instances: Vec<String>,
+    /// `MiUserProfile.notificationRecieveConfig` (upstream misspelling kept
+    /// so §11 can use this column verbatim; default `{}`).
+    #[serde(default)]
+    pub notification_recieve_config: std::collections::BTreeMap<String, NotificationRecieveConfig>,
+    /// `MiUserProfile.emailNotificationTypes`
+    /// (default `["follow", "receiveFollowRequest"]`).
+    #[serde(default = "default_email_notification_types")]
+    pub email_notification_types: Vec<String>,
+    // --- DIVERGENCE columns (defined now so §§3/6 need no migration) ---------
+    /// Sharkey-style quote rejection (`User.rejectQuotes`, default false).
+    /// Wired by §3; stored/validated/packed here.
+    #[serde(default)]
+    pub reject_quotes: bool,
+    /// Per-user default reaction (nullable, 1..=260 chars like reactions).
+    /// Resolved server-side by §6; stored/validated/packed here.
+    #[serde(default)]
+    pub default_reaction: Option<String>,
 }
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_email_notification_types() -> Vec<String> {
+    vec!["follow".to_string(), "receiveFollowRequest".to_string()]
+}
+
+/// `MiUser.chatScope`: who may start a chat (`mutual` default).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatScope {
+    Everyone,
+    Followers,
+    Following,
+    #[default]
+    Mutual,
+    None,
+}
+
+impl ChatScope {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "everyone" => Some(Self::Everyone),
+            "followers" => Some(Self::Followers),
+            "following" => Some(Self::Following),
+            "mutual" => Some(Self::Mutual),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Everyone => "everyone",
+            Self::Followers => "followers",
+            Self::Following => "following",
+            Self::Mutual => "mutual",
+            Self::None => "none",
+        }
+    }
+}
+
+/// `followingVisibilities` / `followersVisibilities`: `public` default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FollowVisibility {
+    #[default]
+    Public,
+    Followers,
+    Private,
+}
+
+impl FollowVisibility {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "public" => Some(Self::Public),
+            "followers" => Some(Self::Followers),
+            "private" => Some(Self::Private),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Followers => "followers",
+            Self::Private => "private",
+        }
+    }
+}
+
+/// One `MiUserProfile.fields` entry (blank name/value rows are dropped on
+/// write, `update.ts` fields filter parity).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProfileField {
+    pub name: String,
+    pub value: String,
+}
+
+/// One `MiUser.avatarDecorations` entry (`update.ts` param shape).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AvatarDecoration {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub angle: Option<f64>,
+    #[serde(default, rename = "flipH", skip_serializing_if = "Option::is_none")]
+    pub flip_h: Option<bool>,
+    #[serde(default, rename = "offsetX", skip_serializing_if = "Option::is_none")]
+    pub offset_x: Option<f64>,
+    #[serde(default, rename = "offsetY", skip_serializing_if = "Option::is_none")]
+    pub offset_y: Option<f64>,
+}
+
+impl AvatarDecoration {
+    /// `update.ts` numeric ranges (`angle` ±0.5, offsets ±0.25).
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if let Some(angle) = self.angle {
+            if !angle.is_finite() || angle < -0.5 || angle > 0.5 {
+                return Err(invalid("avatarDecorations angle must be within -0.5..=0.5".to_string()));
+            }
+        }
+        for (label, value) in [("offsetX", self.offset_x), ("offsetY", self.offset_y)] {
+            if let Some(v) = value {
+                if !v.is_finite() || v < -0.25 || v > 0.25 {
+                    return Err(invalid(format!(
+                        "avatarDecorations {label} must be within -0.25..=0.25"
+                    )));
+                }
+            }
+        }
+        if self.id.is_empty() || self.id.chars().count() > 128 {
+            return Err(invalid("avatarDecorations id must be 1..=128 chars".to_string()));
+        }
+        Ok(())
+    }
+}
+
+/// One `mutedWords`/`hardMutedWords` entry: a single word (plain substring
+/// or `/pattern/flags` regex) or an AND-combination of words.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum MutedWord {
+    Single(String),
+    And(Vec<String>),
+}
+
+impl MutedWord {
+    /// Total char count contribution (`update.ts` `checkMuteWordCount` parity).
+    pub fn char_len(&self) -> usize {
+        match self {
+            Self::Single(s) => s.chars().count(),
+            Self::And(words) => words.iter().map(|w| w.chars().count()).sum(),
+        }
+    }
+}
+
+/// One `notificationRecieveConfig` value (upstream misspelling kept):
+/// `{type: all|never|following|follower|mutualFollow|followingOrFollower}` or
+/// `{type: list, userListId}`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NotificationRecieveConfig {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(rename = "userListId", default, skip_serializing_if = "Option::is_none")]
+    pub user_list_id: Option<String>,
+}
+
+impl NotificationRecieveConfig {
+    /// Valid `type` values (`models/json-schema/user.ts`
+    /// `notificationRecieveConfig` parity).
+    pub fn validate(&self) -> Result<(), DomainError> {
+        match self.kind.as_str() {
+            "all" | "never" | "following" | "follower" | "mutualFollow" | "followingOrFollower" => {
+                Ok(())
+            }
+            "list" => match &self.user_list_id {
+                Some(id) if !id.is_empty() => Ok(()),
+                _ => Err(invalid(
+                    "notificationRecieveConfig list entries require userListId".to_string(),
+                )),
+            },
+            _ => Err(invalid(format!(
+                "unknown notificationRecieveConfig type: {}",
+                self.kind
+            ))),
+        }
+    }
+}
+
+/// `i/update.ts` `FOLLOW_APPROVAL_MAX_SECONDS` (30 days).
+pub const FOLLOW_APPROVAL_MAX_SECONDS: i64 = 30 * 24 * 60 * 60;
+
+/// `RoleService` default `wordMuteLimit` (no roles infra yet; see TODO(§0B)).
+pub const WORD_MUTE_LIMIT_DEFAULT: usize = 200;
+
+/// `RoleService` default `avatarDecorationLimit` (no roles infra yet).
+pub const AVATAR_DECORATION_LIMIT_DEFAULT: usize = 1;
 
 impl Account {
     pub fn new_local(id: String, username: String) -> Result<Self, DomainError> {
@@ -116,6 +402,39 @@ impl Account {
             is_explorable: true,
             is_deleted: false,
             is_cat: false,
+            hide_online_status: false,
+            avatar_decorations: Vec::new(),
+            also_known_as: None,
+            require_signin_to_view_contents: false,
+            make_notes_followers_only_before: None,
+            make_notes_hidden_before: None,
+            chat_scope: ChatScope::default(),
+            followed_message: None,
+            lang: None,
+            fields: Vec::new(),
+            verified_links: Vec::new(),
+            public_reactions: true,
+            following_visibility: FollowVisibility::default(),
+            followers_visibility: FollowVisibility::default(),
+            auto_accept_followed: false,
+            follow_approval_local_seconds: None,
+            follow_approval_remote_seconds: None,
+            no_crawle: false,
+            prevent_ai_learning: true,
+            always_mark_nsfw: false,
+            auto_sensitive: false,
+            careful_bot: false,
+            inject_featured_note: true,
+            receive_announcement_email: true,
+            pinned_page_id: None,
+            enable_word_mute: false,
+            muted_words: Vec::new(),
+            hard_muted_words: Vec::new(),
+            muted_instances: Vec::new(),
+            notification_recieve_config: std::collections::BTreeMap::new(),
+            email_notification_types: default_email_notification_types(),
+            reject_quotes: false,
+            default_reaction: None,
         })
     }
 
@@ -190,6 +509,59 @@ impl Account {
         if let Some(birthday) = &self.birthday {
             validate_birthday(birthday)?;
         }
+        // --- §0B profile bounds (storage-level; the `i/update` endpoint
+        // enforces the same bounds as `INVALID_PARAM` before reaching here).
+        if let Some(followed_message) = &self.followed_message {
+            let n = followed_message.chars().count();
+            if n == 0 || n > 256 {
+                return Err(invalid(
+                    "followed_message must be 1..=256 chars".to_string(),
+                ));
+            }
+        }
+        if let Some(lang) = &self.lang {
+            let n = lang.chars().count();
+            if n == 0 || n > 32 {
+                return Err(invalid("lang must be 1..=32 chars".to_string()));
+            }
+        }
+        if self.fields.len() > 16 {
+            return Err(invalid("fields exceeds 16 entries".to_string()));
+        }
+        if self.avatar_decorations.len() > 16 {
+            return Err(invalid("avatarDecorations exceeds 16 entries".to_string()));
+        }
+        for decoration in &self.avatar_decorations {
+            decoration.validate()?;
+        }
+        if let Some(also_known_as) = &self.also_known_as {
+            if also_known_as.len() > 10 {
+                return Err(invalid("alsoKnownAs exceeds 10 entries".to_string()));
+            }
+        }
+        for approval in [
+            self.follow_approval_local_seconds,
+            self.follow_approval_remote_seconds,
+        ] {
+            if let Some(seconds) = approval {
+                if seconds < 0 || seconds > FOLLOW_APPROVAL_MAX_SECONDS {
+                    return Err(invalid(format!(
+                        "follow approval seconds must be 0..={FOLLOW_APPROVAL_MAX_SECONDS}"
+                    )));
+                }
+            }
+        }
+        for entry in self.notification_recieve_config.values() {
+            entry.validate()?;
+        }
+        if let Some(default_reaction) = &self.default_reaction {
+            let n = default_reaction.chars().count();
+            if n == 0 || n > 260 {
+                return Err(invalid(
+                    "defaultReaction must be 1..=260 chars".to_string(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -236,6 +608,39 @@ mod tests {
             is_explorable: false,
             is_deleted: false,
             is_cat: false,
+            hide_online_status: false,
+            avatar_decorations: Vec::new(),
+            also_known_as: None,
+            require_signin_to_view_contents: false,
+            make_notes_followers_only_before: None,
+            make_notes_hidden_before: None,
+            chat_scope: ChatScope::default(),
+            followed_message: None,
+            lang: None,
+            fields: Vec::new(),
+            verified_links: Vec::new(),
+            public_reactions: true,
+            following_visibility: FollowVisibility::default(),
+            followers_visibility: FollowVisibility::default(),
+            auto_accept_followed: false,
+            follow_approval_local_seconds: None,
+            follow_approval_remote_seconds: None,
+            no_crawle: false,
+            prevent_ai_learning: true,
+            always_mark_nsfw: false,
+            auto_sensitive: false,
+            careful_bot: false,
+            inject_featured_note: true,
+            receive_announcement_email: true,
+            pinned_page_id: None,
+            enable_word_mute: false,
+            muted_words: Vec::new(),
+            hard_muted_words: Vec::new(),
+            muted_instances: Vec::new(),
+            notification_recieve_config: std::collections::BTreeMap::new(),
+            email_notification_types: default_email_notification_types(),
+            reject_quotes: false,
+            default_reaction: None,
         }
     }
 
@@ -362,5 +767,140 @@ mod tests {
             remote.actor_url("https://example.local"),
             "https://remote.example/users/bob"
         );
+    }
+
+    #[test]
+    fn profile_store_defaults_match_upstream_columns() {
+        // `MiUser` / `MiUserProfile` column defaults (verified against the
+        // Misskey 2026.10.1-alpha.0 checkout: `models/User.ts`,
+        // `models/UserProfile.ts`).
+        let a = local_account();
+        assert!(a.public_reactions);
+        assert!(a.prevent_ai_learning);
+        assert!(a.inject_featured_note);
+        assert!(a.receive_announcement_email);
+        assert_eq!(a.chat_scope, ChatScope::Mutual);
+        assert_eq!(a.following_visibility, FollowVisibility::Public);
+        assert_eq!(a.followers_visibility, FollowVisibility::Public);
+        assert_eq!(
+            a.email_notification_types,
+            vec!["follow".to_string(), "receiveFollowRequest".to_string()]
+        );
+        assert!(!a.hide_online_status);
+        assert!(!a.careful_bot);
+        assert!(!a.auto_accept_followed);
+        assert!(!a.no_crawle);
+        assert!(!a.always_mark_nsfw);
+        assert!(!a.auto_sensitive);
+        assert!(!a.require_signin_to_view_contents);
+        assert!(!a.enable_word_mute);
+        assert!(!a.reject_quotes);
+        assert_eq!(a.default_reaction, None);
+        assert!(a.validate().is_ok());
+        // Serde round-trip preserves the defaults (old rows without the new
+        // keys decode via `#[serde(default)]`).
+        let json = serde_json::to_string(&a).unwrap();
+        let back: Account = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, a);
+        // Rows written before §0B (no profile keys) decode to the upstream
+        // column defaults instead of failing.
+        let legacy = serde_json::json!({
+            "id": a.id,
+            "username": a.username,
+            "username_lower": "alice",
+            "host": null,
+            "display_name": null,
+            "description": null,
+            "location": null,
+            "birthday": null,
+            "uri": null,
+            "inbox": null,
+            "shared_inbox": null,
+            "followers_count": 0,
+            "following_count": 0,
+            "notes_count": 0,
+            "avatar_id": null,
+            "banner_id": null,
+            "is_locked": false,
+            "is_bot": false,
+            "is_suspended": false,
+            "is_explorable": true,
+            "is_deleted": false,
+            "is_cat": false,
+        });
+        let decoded: Account = serde_json::from_value(legacy).unwrap();
+        assert!(decoded.public_reactions);
+        assert!(decoded.prevent_ai_learning);
+        assert!(decoded.inject_featured_note);
+        assert!(decoded.receive_announcement_email);
+        assert_eq!(decoded.chat_scope, ChatScope::Mutual);
+        assert!(decoded.validate().is_ok());
+    }
+
+    #[test]
+    fn profile_store_bounds() {
+        let mut a = local_account();
+        a.followed_message = Some("".to_string());
+        assert!(a.validate().is_err());
+        a.followed_message = Some("m".repeat(256));
+        assert!(a.validate().is_ok());
+        a.followed_message = Some("m".repeat(257));
+        assert!(a.validate().is_err());
+
+        let mut a = local_account();
+        a.fields = vec![
+            ProfileField { name: "n".to_string(), value: "v".to_string() };
+            17
+        ];
+        assert!(a.validate().is_err());
+
+        let mut a = local_account();
+        a.avatar_decorations = vec![
+            AvatarDecoration {
+                id: "d".to_string(),
+                angle: Some(0.6),
+                flip_h: None,
+                offset_x: None,
+                offset_y: None,
+            };
+            1
+        ];
+        assert!(a.validate().is_err());
+
+        let mut a = local_account();
+        a.follow_approval_local_seconds = Some(-1);
+        assert!(a.validate().is_err());
+        a.follow_approval_local_seconds = Some(FOLLOW_APPROVAL_MAX_SECONDS + 1);
+        assert!(a.validate().is_err());
+        a.follow_approval_local_seconds = Some(3600);
+        assert!(a.validate().is_ok());
+
+        let mut a = local_account();
+        a.default_reaction = Some("".to_string());
+        assert!(a.validate().is_err());
+        a.default_reaction = Some("r".repeat(261));
+        assert!(a.validate().is_err());
+        a.default_reaction = Some("❤".to_string());
+        assert!(a.validate().is_ok());
+
+        let mut a = local_account();
+        a.also_known_as = Some(vec!["u".to_string(); 11]);
+        assert!(a.validate().is_err());
+
+        let bad = NotificationRecieveConfig {
+            kind: "sometimes".to_string(),
+            user_list_id: None,
+        };
+        assert!(bad.validate().is_err());
+        let bad_list = NotificationRecieveConfig {
+            kind: "list".to_string(),
+            user_list_id: None,
+        };
+        assert!(bad_list.validate().is_err());
+        let good = NotificationRecieveConfig {
+            kind: "mutualFollow".to_string(),
+            user_list_id: None,
+        };
+        assert!(good.validate().is_ok());
     }
 }

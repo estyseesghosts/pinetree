@@ -34,6 +34,16 @@ pub enum HubMessage {
         user_id: String,
         reaction: String,
     },
+    /// A poll vote was recorded on a captured note.
+    PollVoted {
+        note_id: String,
+        user_id: String,
+        choice: usize,
+    },
+    /// A captured note's poll expired.
+    PollEnded { note_id: String },
+    /// A captured note was edited: subscribers refetch it.
+    NoteUpdated { note_id: String },
     /// A note was deleted.
     NoteDeleted { note_id: String },
     /// A `main`-channel event for one user.
@@ -112,6 +122,21 @@ impl StreamingSink for BroadcastStreamingSink {
                 user_id,
                 reaction,
             }),
+            StreamingEvent::PollVoted {
+                note_id,
+                user_id,
+                choice,
+            } => self.hub.send(HubMessage::PollVoted {
+                note_id,
+                user_id,
+                choice,
+            }),
+            StreamingEvent::PollEnded { note_id } => {
+                self.hub.send(HubMessage::PollEnded { note_id });
+            }
+            StreamingEvent::NoteUpdated { note_id } => {
+                self.hub.send(HubMessage::NoteUpdated { note_id });
+            }
             // The bare `MeUpdated` marker wakes `main` channels, which pack
             // `MeDetailed` on receipt (per-connection token scoping).
             StreamingEvent::MeUpdated { account_id } => {

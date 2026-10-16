@@ -16,6 +16,19 @@ pub enum StreamingEvent {
         user_id: String,
         reaction: String,
     },
+    /// A poll vote was recorded (Misskey note-stream `pollVoted` parity:
+    /// `{ choice, userId }`).
+    PollVoted {
+        note_id: String,
+        user_id: String,
+        choice: usize,
+    },
+    /// A poll reached its expiry (Misskey note-stream `pollEnded` parity).
+    PollEnded { note_id: String },
+    /// A note was edited (§8; Sharkey `publishNoteStream(note.id,
+    /// 'updated', ...)` parity). The server arm packs the current note and
+    /// emits the `updated` frame with its `{ cw, text }`.
+    NoteUpdated { note_id: String },
     /// Local `follower_id` unfollowed `followee_id`: the follower's `main`
     /// channel gets `unfollow` with the packed followee (Misskey
     /// `UserFollowingService` parity).
@@ -43,6 +56,8 @@ pub enum MainEventKind {
     Mention,
     Reply,
     Renote,
+    /// Sharkey `edited` main-stream event (the packed edited note).
+    Edited,
     Follow,
     Followed,
     Unfollow,
@@ -58,6 +73,7 @@ impl MainEventKind {
             MainEventKind::Mention => "mention",
             MainEventKind::Reply => "reply",
             MainEventKind::Renote => "renote",
+            MainEventKind::Edited => "edited",
             MainEventKind::Follow => "follow",
             MainEventKind::Followed => "followed",
             MainEventKind::Unfollow => "unfollow",

@@ -23,7 +23,7 @@ use crate::activitypub::objects::{
 use crate::activitypub::webfinger::extract_host;
 use crate::application::commands::AppServices;
 use crate::application::ports::{PortError, TimelineCursor};
-use crate::domain::account::Account;
+use crate::domain::account::{Account, FollowVisibility};
 use crate::domain::note::Visibility;
 use crate::domain::visibility::{ViewerContext, is_visible};
 
@@ -802,6 +802,18 @@ pub async fn get_actor_outbox(
     )
 }
 
+/// `403` for a followers/following collection whose owner restricted its
+/// visibility (`ActivityPubServerService` ff-visibility parity: any
+/// non-`public` visibility denies every requester, with no per-requester
+/// exception). Carries upstream's `Cache-Control: public, max-age=30`.
+fn forbidden_collection() -> Response {
+    let mut resp = StatusCode::FORBIDDEN.into_response();
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=30"),
+    );
+    resp
+}
 /// `GET /users/{id}/followers` — ActivityPub `OrderedCollection` of follower actor URIs.
 /// Paging contract: `docs/activitypub-collections.md`.
 pub async fn get_actor_followers(
@@ -813,6 +825,9 @@ pub async fn get_actor_followers(
         Ok(a) => a,
         Err(code) => return code.into_response(),
     };
+    if account.followers_visibility != FollowVisibility::Public {
+        return forbidden_collection();
+    }
     let base = services.public_url.trim_end_matches('/');
     let coll_url = format!("{base}/users/{}/followers", account.id);
     if !wants_collection_page(&params) {
@@ -869,6 +884,9 @@ pub async fn get_actor_following(
         Ok(a) => a,
         Err(code) => return code.into_response(),
     };
+    if account.following_visibility != FollowVisibility::Public {
+        return forbidden_collection();
+    }
     let base = services.public_url.trim_end_matches('/');
     let coll_url = format!("{base}/users/{}/following", account.id);
     if !wants_collection_page(&params) {
@@ -944,7 +962,9 @@ mod tests {
 
     use crate::application::ports::{
         AccountStore, ActivityDedup, BlobStore, Clock, IdGenerator, NoopStreamingSink,
+        UpdateAccountPatch,
     };
+    use crate::domain::account::FollowVisibility;
     use crate::domain::id::{AidxGenerator, ManualClock};
     use crate::federation::delivery::{
         SafeHttpClient, SafeHttpConfig, upsert_remote_actor_from_doc,
@@ -994,7 +1014,10 @@ mod tests {
             accounts: store.clone(),
             notes: store.clone(),
             follows: store.clone(),
+            blocks: store.clone(),
+            mutes: store.clone(),
             reactions: store.clone(),
+            polls: store.clone(),
             jobs: store.clone(),
             media: store.clone(),
             blobs,
@@ -1011,6 +1034,9 @@ mod tests {
             preserved_usernames: Vec::new(),
             prohibited_words: Vec::new(),
             sensitive_words: Vec::new(),
+            note_draft_limit: crate::domain::draft::DEFAULT_NOTE_DRAFT_LIMIT,
+            scheduled_note_limit: crate::domain::draft::DEFAULT_SCHEDULED_NOTE_LIMIT,
+            pin_limit: crate::domain::pinning::DEFAULT_PIN_LIMIT,
         }
     }
 
@@ -1461,6 +1487,71 @@ mod tests {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "{collection} page must surface the storage error"
             );
+        }
+    }
+
+    // (b2) §§1–2 parity: any non-`public` followers/following visibility
+    // denies the ActivityPub collections (index and page alike) with 403 —
+    // no per-requester exception.
+    #[tokio::test]
+    async fn ff_visibility_non_public_collections_are_403() {
+        let services = Arc::new(test_services("s11-ffvis"));
+        let target = slice11_local(&services, "shy");
+        let fan = slice11_local(&services, "fan");
+        services
+            .follows
+            .follow(&fan.id, &target.id, false, None, Vec::new())
+            .expect("follow");
+
+        for visibility in [FollowVisibility::Followers, FollowVisibility::Private] {
+            for list in ["followers", "following"] {
+                services
+                    .accounts
+                    .update_account(
+                        &target.id,
+                        UpdateAccountPatch {
+                            followers_visibility: Some(visibility),
+                            following_visibility: Some(visibility),
+                            ..Default::default()
+                        },
+                        Vec::new(),
+                    )
+                    .expect("set visibility");
+                for params in
+                    [Vec::new(), vec![("page", "true")]]
+                {
+                    let (status, _) =
+                        slice11_get(&services, list, &target.id, &params).await;
+                    assert_eq!(
+                        status,
+                        StatusCode::FORBIDDEN,
+                        "{list} {visibility:?} {params:?} must be 403"
+                    );
+                }
+            }
+        }
+
+        // Back to public: both collections read again.
+        services
+            .accounts
+            .update_account(
+                &target.id,
+                UpdateAccountPatch {
+                    followers_visibility: Some(FollowVisibility::Public),
+                    following_visibility: Some(FollowVisibility::Public),
+                    ..Default::default()
+                },
+                Vec::new(),
+            )
+            .expect("set public");
+        for (list, params) in [
+            ("followers", Vec::new()),
+            ("followers", vec![("page", "true")]),
+            ("following", Vec::new()),
+            ("following", vec![("page", "true")]),
+        ] {
+            let (status, _) = slice11_get(&services, list, &target.id, &params).await;
+            assert_eq!(status, StatusCode::OK, "{list} {params:?} must read again");
         }
     }
 

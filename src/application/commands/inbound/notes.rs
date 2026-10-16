@@ -3,9 +3,10 @@ use std::collections::HashSet;
 use super::super::AppServices;
 
 use crate::application::events::StreamingEvent;
-use crate::application::ports::{CreateNoteInput, NewJob, PortError};
+use crate::application::ports::{CreateNoteInput, EditNoteInput, NewJob, PortError};
 use crate::domain::note::{Note, extract_mentions};
 use crate::domain::notification::NotificationKind;
+use crate::domain::poll::PollInput;
 use crate::domain::reaction::{Reaction, coerce_reaction};
 
 impl AppServices {
@@ -135,6 +136,84 @@ impl AppServices {
         }
     }
 
+    /// Record an inbound `Update(Note|Article|Page)` (§8; Sharkey
+    /// `ApNoteService.updateNote` parity): apply a remote author's edit to
+    /// the cached local copy through the same storage path as local edits.
+    /// `renote_of` is the inbox-resolved quote-target note id (`None` =
+    /// detach/absent — the reply link is always kept, the audience/files
+    /// are never touched by federation input). Unknown notes, locally
+    /// authored copies, suspended authors, and attribution mismatches
+    /// converge to `Ok(None)` (fail-closed); a deletion race maps to
+    /// `Ok(None)`. Replays converge to `Ok(None)` via the dedup mark.
+    pub fn handle_inbound_update_note(
+        &self,
+        activity_id: &str,
+        note_uri: &str,
+        actor_uri: &str,
+        text: Option<String>,
+        cw: Option<String>,
+        renote_of: Option<String>,
+        poll: Option<PollInput>,
+    ) -> Result<Option<Note>, PortError> {
+        let Some(cached) = self.notes.find_by_uri(note_uri)? else {
+            return Ok(None);
+        };
+        if cached.is_deleted {
+            return Ok(None);
+        }
+        let Some(author) = self.accounts.find_by_id(&cached.author_id)? else {
+            return Ok(None);
+        };
+        // Never rewrite a local note from federation input (same rule as
+        // the `Update(Person)` actor path).
+        if author.is_local() {
+            return Ok(None);
+        }
+        if author.is_suspended {
+            return Ok(None);
+        }
+        // Authority: the signer must be the cached copy's author (Misskey
+        // `attribution === user.uri` parity).
+        let base = self.public_url.trim_end_matches('/');
+        let owner_uri = author.uri.clone().unwrap_or_else(|| author.actor_url(base));
+        if owner_uri != actor_uri {
+            return Ok(None);
+        }
+        let old_poll = self.polls.get_poll(&cached.id)?;
+        let input = EditNoteInput {
+            editor_id: author.id.clone(),
+            note_id: cached.id.clone(),
+            text,
+            cw,
+            renote_of,
+            // Files and the audience are never touched by federation input
+            // (Sharkey resolves attachments off-request; pinetree keeps the
+            // cached values — documented divergence).
+            file_ids: cached.file_ids.clone(),
+            poll,
+            reaction_acceptance: cached.reaction_acceptance,
+            visible_users: cached.visible_user_ids.clone(),
+            prohibited_words: self.prohibited_words.clone(),
+            sensitive_words: self.sensitive_words.clone(),
+            uri_base: base.to_string(),
+        };
+        let jobs = self.edit_side_effect_jobs(
+            &cached,
+            &author.id,
+            &input.poll,
+            old_poll.as_ref(),
+            false,
+        )?;
+        match self
+            .dedup
+            .record_note_edit_activity(activity_id, input, jobs)
+        {
+            Ok(note) => Ok(note),
+            Err(PortError::NotFound(msg)) if msg == "NO_SUCH_NOTE" => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Record an inbound `Like`. A commit race surfacing as `Conflict` maps
     /// to `Ok(None)`.
     pub fn handle_inbound_like(
@@ -181,6 +260,9 @@ impl AppServices {
         ) {
             Ok(v) => Ok(v),
             Err(PortError::Conflict(_)) => Ok(None),
+            // §0A: the note author blocks the reactor — skip instead of
+            // failing the inbox delivery.
+            Err(PortError::Validation(msg)) if msg == "YOU_HAVE_BEEN_BLOCKED" => Ok(None),
             Err(e) => Err(e),
         }
     }

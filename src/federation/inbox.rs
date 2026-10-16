@@ -22,12 +22,13 @@ use serde_json::Value;
 use crate::activitypub::actor::{parse_remote_actor, parse_url_host};
 use crate::activitypub::objects::{
     ParsedRemoteNote, extract_like_reaction, extract_object_uri, extract_uri_list,
-    parse_note_audience, parse_remote_note, sanitize_html_to_mfm,
+    parse_note_audience, parse_question_poll, parse_remote_note, sanitize_html_to_mfm,
 };
 use crate::activitypub::signatures::{parse_signature_header, verify_http_signature};
 use crate::application::commands::AppServices;
 use crate::application::ports::{Clock, CreateNoteInput, PortError, TimelineCursor, UpdateAccountPatch};
 use crate::domain::account::Account;
+use crate::domain::poll::PollInput;
 use crate::domain::note::{Note, Visibility};
 use crate::domain::quote::QuoteReference;
 use crate::federation::delivery::{
@@ -217,7 +218,7 @@ fn check_object_authority(
     signer_actor: &str,
 ) -> bool {
     match activity_type {
-        "Follow" | "Accept" | "Reject" | "Undo" | "Announce" | "Like" | "Delete"
+        "Follow" | "Accept" | "Reject" | "Undo" | "Announce" | "Like" | "Delete" | "Block"
         | "QuoteRequest" => true,
         "Create" => {
             let Some(object_uri) = extract_object_uri(activity.get("object")) else {
@@ -230,7 +231,9 @@ fn check_object_authority(
         }
         "Update" => {
             match activity.get("object") {
-                // Update(Note) is deferred: dispatch ignores it.
+                // `Update(Question)` is handled by the §4 poll branch and
+                // `Update(Note|Article|Page)` is deferred to §8: dispatch
+                // re-validates, so the gate passes both through.
                 Some(Value::Object(map))
                     if matches!(
                         map.get("type").and_then(Value::as_str).unwrap_or(""),
@@ -269,6 +272,7 @@ fn dispatch(
         "Accept" => handle_accept(services, activity, activity_id, actor_uri),
         "Reject" => handle_reject(services, activity, activity_id, actor_uri),
         "Undo" => handle_undo(services, activity, activity_id, actor_uri),
+        "Block" => handle_block(services, activity, activity_id, actor_uri),
         "Create" => handle_create(services, activity, activity_id, actor_uri),
         "Announce" => handle_announce(services, activity, activity_id, actor_uri),
         "Like" => handle_like(services, activity, activity_id, actor_uri),
@@ -297,6 +301,28 @@ fn handle_follow(
         return Ok(accepted());
     }
     services.handle_inbound_follow(activity_id, &follower.id, &followee.id, false)?;
+    Ok(accepted())
+}
+
+/// Inbound `Block` (Misskey `ApInboxService.block()` parity): the remote
+/// actor blocks a local user. Unknown or remote objects are skipped.
+fn handle_block(
+    services: &AppServices,
+    activity: &Value,
+    activity_id: &str,
+    actor_uri: &str,
+) -> Result<Response, PortError> {
+    let Some(object_uri) = non_empty_str(activity.get("object")) else {
+        return Ok(accepted());
+    };
+    let blocker = resolve_remote_account(services, actor_uri)?;
+    let Some(blockee) = resolve_local_account(services, &object_uri)? else {
+        return Ok(accepted());
+    };
+    if !blockee.is_local() {
+        return Ok(accepted());
+    }
+    services.handle_inbound_block(activity_id, &blocker.id, &blockee.id)?;
     Ok(accepted())
 }
 
@@ -651,6 +677,23 @@ fn handle_undo(
                     services.handle_inbound_unlike(activity_id, &liker.id, &note.id)?;
                     Ok(accepted())
                 }
+                // `Undo(Block)` (Misskey `ApInboxService.undoBlock()`
+                // parity): the inner `Block`'s object is the local
+                // blockee.
+                "Block" => {
+                    let blocker = resolve_remote_account(services, actor_uri)?;
+                    let Some(blockee_uri) = extract_object_uri(map.get("object")) else {
+                        return Ok(accepted());
+                    };
+                    let Some(blockee) = resolve_local_account(services, &blockee_uri)? else {
+                        return Ok(accepted());
+                    };
+                    if !blockee.is_local() {
+                        return Ok(accepted());
+                    }
+                    services.handle_inbound_unblock(activity_id, &blocker.id, &blockee.id)?;
+                    Ok(accepted())
+                }
                 "Announce" => {
                     let actor_account = resolve_remote_account(services, actor_uri)?;
                     let Some(target_uri) = extract_object_uri(map.get("object")) else {
@@ -716,6 +759,32 @@ fn handle_create(
         return Ok(unauthorized());
     }
     let author = resolve_remote_account(services, actor_uri)?;
+    // §4 remote votes (Misskey `ApNoteService` vote branch parity): a
+    // content-less `Create(Note)` carrying `inReplyTo` (the poll note) plus
+    // `name` (the choice text) records a vote instead of a note. Misskey
+    // returns after the vote attempt unconditionally — vote objects never
+    // become notes — so any `inReplyTo` resolving to a poll note
+    // short-circuits ingest (unknown choices, expired polls, and
+    // duplicates converge inside `handle_inbound_vote`).
+    if parsed.text.is_none() && parsed.cw.is_none() {
+        if let (Some(choice_name), Some(reply_uri)) =
+            (parsed.name.clone(), parsed.in_reply_to.clone())
+        {
+            if !choice_name.trim().is_empty() {
+                if let Some(target) = find_note_by_uri(services, reply_uri.trim())? {
+                    if services.polls.get_poll(&target.id)?.is_some() {
+                        let _ = services.handle_inbound_vote(
+                            activity_id,
+                            &author.id,
+                            &target.id,
+                            choice_name.trim(),
+                        )?;
+                        return Ok(accepted());
+                    }
+                }
+            }
+        }
+    }
     ingest_remote_note(services, activity_id, &parsed, &author, true)?;
     Ok(accepted())
 }
@@ -764,6 +833,8 @@ fn handle_announce(
         no_extract_hashtags: false,
         no_extract_emojis: false,
         has_poll: false,
+        poll: None,
+        poll_initial_votes: None,
         has_channel: false,
         prohibited_words: Vec::new(),
         sensitive_words: Vec::new(),
@@ -892,12 +963,14 @@ fn handle_update(
         }
         Some(doc @ Value::Object(map)) => {
             let obj_type = map.get("type").and_then(Value::as_str).unwrap_or("");
-            if matches!(
-                obj_type,
-                "Note" | "Article" | "Page" | "Question"
-            ) {
-                // Update(Note) is deferred.
-                return Ok(accepted());
+            // §4 owns ONLY the poll-vote/`Question`-expiry branch of inbound
+            // `Update` (this slice). Embedded `Note`/`Article`/`Page`
+            // objects are NOT handled here (see below).
+            if obj_type == "Question" {
+                return handle_update_question(services, doc, activity_id, actor_uri);
+            }
+            if matches!(obj_type, "Note" | "Article" | "Page") {
+                return handle_update_note(services, doc, activity_id, actor_uri);
             }
             let Some(id) = non_empty_str(map.get("id")) else {
                 return Ok(accepted());
@@ -958,9 +1031,168 @@ fn handle_update(
         is_bot: Some(parsed.is_bot()),
         is_cat: Some(parsed.is_cat),
         is_explorable: Some(parsed.discoverable),
+        ..Default::default()
     };
     services.handle_inbound_update_actor(activity_id, &account.id, patch)?;
     Ok(accepted())
+}
+
+/// Inbound `Update(Question)` (§4; Misskey `ApQuestionService.updateQuestion`
+/// parity): refresh a cached remote poll's tallies from the embedded
+/// question document. Authority: the question must be attributed to the
+/// cached poll's owner and the signer must be that owner. Unknown notes,
+/// locally authored polls, unattributed/misattributed questions, and
+/// unparseable options all converge to accept-without-change. Count sync
+/// itself is idempotent (overwrite by choice name), so replays converge.
+///
+/// §8 owns the sibling `Update(Note)`/`Update(Article)`/`Update(Page)`
+/// edit branch (`handle_update_note` above, sharing this same inbox
+/// dispatcher). This function stays scoped to `Question` objects only.
+fn handle_update_question(
+    services: &AppServices,
+    doc: &Value,
+    activity_id: &str,
+    actor_uri: &str,
+) -> Result<Response, PortError> {
+    let Some(map) = doc.as_object() else {
+        return Ok(accepted());
+    };
+    let Some(question_id) = map
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(accepted());
+    };
+    // Authority gate first (before any fetch): the signer must own the
+    // question it claims to update. `attributedTo` may be a string or an
+    // embedded actor object; absent attribution inherits the signer.
+    let attributed_to = match map.get("attributedTo") {
+        Some(Value::String(s)) if !s.trim().is_empty() => Some(s.trim().to_string()),
+        Some(Value::Object(m)) => m
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned),
+        _ => None,
+    };
+    if let Some(attribution) = attributed_to.as_deref() {
+        if attribution != actor_uri {
+            return Ok(accepted());
+        }
+    }
+    let question = match parse_question_poll(map) {
+        Some(question) => question,
+        None => return Ok(accepted()),
+    };
+    let counts: Vec<crate::application::ports::PollChoiceCount> = question
+        .choices
+        .iter()
+        .enumerate()
+        .map(|(i, name)| crate::application::ports::PollChoiceCount {
+            name: name.clone(),
+            votes: question.votes.get(i).copied().unwrap_or(0),
+        })
+        .collect();
+    // `handle_inbound_question_update` re-checks authority against the
+    // cached poll owner (attribution must equal the owner's actor URI) and
+    // ignores locally authored polls, so a forged `Update` can only ever
+    // refresh tallies on a remote poll its own owner signed.
+    let _ = services.handle_inbound_question_update(
+        activity_id,
+        question_id,
+        attributed_to.as_deref().or(Some(actor_uri)),
+        counts,
+    )?;
+    Ok(accepted())
+}
+
+/// Inbound `Update(Note|Article|Page)` (§8; Sharkey
+/// `ApInboxService.update` → `ApNoteService.updateNote` parity): apply a
+/// remote author's edit to the cached local copy. Embedded documents only
+/// (string-URI objects are accepted without fetching — same divergence as
+/// the `Question` arm). Authority: the signer must be the note's author
+/// (`attributedTo`, defaulting to the signer when absent) and the cached
+/// copy's author; locally authored copies, unknown notes, and suspended
+/// authors converge to accept-without-change. A missing note is NOT
+/// created here (DIVERGENCE from Sharkey, which falls back to create —
+/// pinetree's `Create` path already ingests new notes). Poison-pill
+/// validation failures accept (no retry storm); storage faults propagate
+/// (the delivery retries).
+fn handle_update_note(
+    services: &AppServices,
+    doc: &Value,
+    activity_id: &str,
+    actor_uri: &str,
+) -> Result<Response, PortError> {
+    // Attribution defaults to the signer when absent (same rule as the
+    // `Question` arm and Misskey's `getOneApId ... ?? user.uri` fallback).
+    let attributed_to = match doc.get("attributedTo") {
+        Some(Value::String(s)) if !s.trim().is_empty() => Some(s.trim().to_string()),
+        Some(Value::Object(m)) => m
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned),
+        _ => None,
+    };
+    if let Some(attribution) = attributed_to.as_deref() {
+        if attribution != actor_uri {
+            return Ok(accepted());
+        }
+    }
+    let parsed = match parse_remote_note(doc) {
+        Ok(parsed) => parsed,
+        Err(_) => return Ok(accepted()),
+    };
+    if parsed.uri.trim().is_empty() || parsed.attributed_to != actor_uri {
+        return Ok(accepted());
+    }
+    // Quote-target (renote) resolution: a present-but-unresolvable quote
+    // detaches (Sharkey `quote ?? null` parity); an unchanged target
+    // resolves to the same id (no-change, no history row).
+    let renote_of = match parsed.quote_target_uri.as_deref() {
+        Some(uri) => find_note_by_uri(services, uri)?.map(|note| note.id),
+        None => None,
+    };
+    // Poll shapes below the storage invariant degrade to poll-less (same
+    // divergence as the `Create` ingest path); a parsed-but-invalid poll
+    // removes the cached poll (Sharkey `catch → undefined` parity).
+    let poll = match parsed.poll.as_ref() {
+        Some(p)
+            if p.choices.len() >= 2
+                && p.choices.len() <= 10
+                && p.choices.iter().all(|c| {
+                    let n = c.chars().count();
+                    n >= 1 && n <= 50
+                }) =>
+        {
+            Some(PollInput {
+                choices: p.choices.clone(),
+                multiple: p.multiple,
+                expires_at_ms: p.expires_at_ms,
+            })
+        }
+        _ => None,
+    };
+    match services.handle_inbound_update_note(
+        activity_id,
+        parsed.uri.trim(),
+        actor_uri,
+        parsed.text.clone(),
+        parsed.cw.clone(),
+        renote_of,
+        poll,
+    ) {
+        Ok(_) => Ok(accepted()),
+        Err(PortError::Validation(_))
+        | Err(PortError::NotFound(_))
+        | Err(PortError::Conflict(_)) => Ok(accepted()),
+        Err(e) => Err(e),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1102,6 +1334,19 @@ fn ingest_remote_note_inner(
         (None, None)
     };
 
+    // Inbound polls (§4): attach only when the remote Question meets the
+    // storage invariants (2..=10 choices, each 1..=50 chars); anything else
+    // degrades to a poll-less note rather than rejecting the whole post
+    // (Misskey stores whatever arrives — DIVERGENCE, documented: pinetree
+    // keeps one invariant for local and remote polls).
+    let inbound_poll = parsed.poll.as_ref().filter(|p| {
+        p.choices.len() >= 2
+            && p.choices.len() <= 10
+            && p.choices.iter().all(|c| {
+                let n = c.chars().count();
+                n >= 1 && n <= 50
+            })
+    });
     let input = CreateNoteInput {
         author_id: author.id.clone(),
         text: parsed.text.clone(),
@@ -1117,7 +1362,14 @@ fn ingest_remote_note_inner(
         no_extract_mentions: false,
         no_extract_hashtags: false,
         no_extract_emojis: false,
-        has_poll: false,
+        has_poll: inbound_poll.is_some(),
+        poll: inbound_poll.map(|p| crate::domain::poll::PollInput {
+            choices: p.choices.clone(),
+            multiple: p.multiple,
+            expires_at_ms: p.expires_at_ms,
+        }),
+        // Seed the cached tallies the origin reported (same transaction).
+        poll_initial_votes: inbound_poll.map(|p| p.votes.clone()),
         has_channel: false,
         prohibited_words: Vec::new(),
         sensitive_words: Vec::new(),
@@ -1448,7 +1700,10 @@ mod media_safety_tests {
             accounts: store.clone(),
             notes: store.clone(),
             follows: store.clone(),
+            blocks: store.clone(),
+            mutes: store.clone(),
             reactions: store.clone(),
+            polls: store.clone(),
             jobs: store.clone(),
             media: store.clone(),
             blobs,
@@ -1465,6 +1720,9 @@ mod media_safety_tests {
             preserved_usernames: Vec::new(),
             prohibited_words: Vec::new(),
             sensitive_words: Vec::new(),
+            note_draft_limit: crate::domain::draft::DEFAULT_NOTE_DRAFT_LIMIT,
+            scheduled_note_limit: crate::domain::draft::DEFAULT_SCHEDULED_NOTE_LIMIT,
+            pin_limit: crate::domain::pinning::DEFAULT_PIN_LIMIT,
         }
     }
 
@@ -1849,7 +2107,10 @@ mod key_ownership_tests {
             accounts: store.clone(),
             notes: store.clone(),
             follows: store.clone(),
+            blocks: store.clone(),
+            mutes: store.clone(),
             reactions: store.clone(),
+            polls: store.clone(),
             jobs: store.clone(),
             media: store.clone(),
             blobs,
@@ -1866,6 +2127,9 @@ mod key_ownership_tests {
             preserved_usernames: Vec::new(),
             prohibited_words: Vec::new(),
             sensitive_words: Vec::new(),
+            note_draft_limit: crate::domain::draft::DEFAULT_NOTE_DRAFT_LIMIT,
+            scheduled_note_limit: crate::domain::draft::DEFAULT_SCHEDULED_NOTE_LIMIT,
+            pin_limit: crate::domain::pinning::DEFAULT_PIN_LIMIT,
         }
     }
 
@@ -2258,6 +2522,70 @@ mod key_ownership_tests {
             "honest signed activity must still be accepted"
         );
     }
+
+    #[test]
+    fn inbox_block_and_undo_block_roundtrip() {
+        let services = test_services("block-inbox");
+        let (remote_priv, remote_pub) = keypair_pems();
+        let remote_key = format!("{VICTIM_URI}#main-key");
+        let remote_doc = actor_doc(VICTIM_URI, "victim", &remote_key, Some(VICTIM_URI), &remote_pub);
+        upsert_remote_actor_from_doc(&services, VICTIM_URI, &remote_doc).expect("honest upsert");
+
+        let local = services.create_account("local", None).unwrap();
+        let base = services.public_url.trim_end_matches('/').to_string();
+        let local_uri = format!("{base}/users/{}", local.id);
+        let remote_id = services
+            .accounts
+            .find_by_uri(VICTIM_URI)
+            .unwrap()
+            .unwrap()
+            .id;
+
+        // Inbound `Block`: the remote actor blocks the local user.
+        let block_id = "https://victim.invalid/activities/block-1";
+        let activity = json!({
+            "id": block_id,
+            "type": "Block",
+            "actor": VICTIM_URI,
+            "object": local_uri,
+        });
+        let body = serde_json::to_vec(&activity).unwrap();
+        let headers = signed_inbox_headers(&services, "/inbox", &body, &remote_key, &remote_priv);
+        let resp = process_inbox(&services, None, headers, body.into());
+        assert_eq!(resp.status(), StatusCode::ACCEPTED, "Block must be accepted");
+        assert!(
+            services.blocks.is_blocking(&remote_id, &local.id).unwrap(),
+            "inbound Block records the block"
+        );
+
+        // Replay converges without error.
+        let body = serde_json::to_vec(&activity).unwrap();
+        let headers = signed_inbox_headers(&services, "/inbox", &body, &remote_key, &remote_priv);
+        let resp = process_inbox(&services, None, headers, body.into());
+        assert_eq!(resp.status(), StatusCode::ACCEPTED, "Block replay must be accepted");
+
+        // Inbound `Undo(Block)` removes it.
+        let undo = json!({
+            "id": "https://victim.invalid/activities/undo-block-1",
+            "type": "Undo",
+            "actor": VICTIM_URI,
+            "object": {
+                "id": block_id,
+                "type": "Block",
+                "actor": VICTIM_URI,
+                "object": local_uri,
+            },
+        });
+        let body = serde_json::to_vec(&undo).unwrap();
+        let headers = signed_inbox_headers(&services, "/inbox", &body, &remote_key, &remote_priv);
+        let resp = process_inbox(&services, None, headers, body.into());
+        assert_eq!(resp.status(), StatusCode::ACCEPTED, "Undo(Block) must be accepted");
+        assert!(
+            !services.blocks.is_blocking(&remote_id, &local.id).unwrap(),
+            "inbound Undo(Block) removes the block"
+        );
+    }
+
 }
 
 /// Slice B end-to-end (`docs/replies.md` §6): a reply to an unknown parent
@@ -2311,7 +2639,10 @@ mod reply_resolution_tests {
             accounts: store.clone(),
             notes: store.clone(),
             follows: store.clone(),
+            blocks: store.clone(),
+            mutes: store.clone(),
             reactions: store.clone(),
+            polls: store.clone(),
             jobs: store.clone(),
             media: store.clone(),
             blobs,
@@ -2328,6 +2659,9 @@ mod reply_resolution_tests {
             preserved_usernames: Vec::new(),
             prohibited_words: Vec::new(),
             sensitive_words: Vec::new(),
+            note_draft_limit: crate::domain::draft::DEFAULT_NOTE_DRAFT_LIMIT,
+            scheduled_note_limit: crate::domain::draft::DEFAULT_SCHEDULED_NOTE_LIMIT,
+            pin_limit: crate::domain::pinning::DEFAULT_PIN_LIMIT,
         }
     }
 

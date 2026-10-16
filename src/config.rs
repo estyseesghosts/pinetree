@@ -21,6 +21,15 @@ pub struct Config {
     /// Reverse proxies whose `X-Forwarded-For` is honored for client IPs
     /// (slice 9, H4). Empty by default: the TCP peer is always the client.
     pub trusted_proxies: Vec<IpAddr>,
+    /// Maximum note drafts per account (Misskey `RoleService`
+    /// `noteDraftLimit` default 10; §5).
+    pub note_draft_limit: usize,
+    /// Maximum actually-scheduled drafts per account (Misskey `RoleService`
+    /// `scheduledNoteLimit` default 1; §5).
+    pub scheduled_note_limit: usize,
+    /// Maximum pinned notes per account (Misskey `RoleService` `pinLimit`
+    /// default 5; §7).
+    pub pin_limit: usize,
 }
 
 impl Default for Config {
@@ -40,6 +49,9 @@ impl Default for Config {
             prohibited_words: Vec::new(),
             sensitive_words: Vec::new(),
             trusted_proxies: Vec::new(),
+            note_draft_limit: crate::domain::draft::DEFAULT_NOTE_DRAFT_LIMIT,
+            scheduled_note_limit: crate::domain::draft::DEFAULT_SCHEDULED_NOTE_LIMIT,
+            pin_limit: crate::domain::pinning::DEFAULT_PIN_LIMIT,
         }
     }
 }

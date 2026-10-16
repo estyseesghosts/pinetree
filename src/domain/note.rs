@@ -91,6 +91,19 @@ pub struct Note {
     /// before quotes existed decoding as non-quotes (migration by default).
     #[serde(default)]
     pub quote: Option<QuoteReference>,
+    /// Last edit time as unix millis (`None` = never edited). Set on every
+    /// effective `notes/edit` (§8); packed as upstream `updatedAt`
+    /// (ISO string or null). `#[serde(default)]` keeps rows written before
+    /// §8 decoding as never-edited (migration by default).
+    #[serde(default)]
+    pub updated_at_ms: Option<i64>,
+    /// Internal edit/strip diagnostics (Sharkey `processErrors` parity):
+    /// entries are translation keys such as `quoteUnavailable` (set when a
+    /// §3 strip downgrades a quote to a plain note). Packed on the Note
+    /// shape; `None` packs as null. `#[serde(default)]` keeps older rows
+    /// decoding without diagnostics (migration by default).
+    #[serde(default)]
+    pub process_errors: Option<Vec<String>>,
 }
 
 impl Note {
@@ -119,6 +132,13 @@ impl Note {
 
     /// API-create bounds: `text` 1..=3000 chars, `cw` 1..=100 chars.
     pub fn validate_api_create(&self) -> Result<(), DomainError> {
+        self.validate_api_create_with_poll(false)
+    }
+
+    /// API-create validation with poll presence (Misskey `notes/create.ts`
+    /// parity: text is required only when the note carries no renote, no
+    /// files, and no poll).
+    pub fn validate_api_create_with_poll(&self, has_poll: bool) -> Result<(), DomainError> {
         if let Some(cw) = &self.cw {
             let n = cw.chars().count();
             if n == 0 || n > MAX_CW_API_CHARS {
@@ -127,11 +147,17 @@ impl Note {
                 )));
             }
         }
-        self.validate_common()
+        self.validate_common(has_poll)
     }
 
     /// Storage bounds: same as API create except `cw` carries up to 512 chars.
     pub fn validate_storage(&self) -> Result<(), DomainError> {
+        self.validate_storage_with_poll(false)
+    }
+
+    /// Storage validation with poll presence (same text rule as the API
+    /// path: a poll stands in for text).
+    pub fn validate_storage_with_poll(&self, has_poll: bool) -> Result<(), DomainError> {
         if let Some(cw) = &self.cw {
             if cw.chars().count() > MAX_CW_STORAGE_CHARS {
                 return Err(invalid(format!(
@@ -139,10 +165,10 @@ impl Note {
                 )));
             }
         }
-        self.validate_common()
+        self.validate_common(has_poll)
     }
 
-    fn validate_common(&self) -> Result<(), DomainError> {
+    fn validate_common(&self, has_poll: bool) -> Result<(), DomainError> {
         match &self.text {
             Some(text) => {
                 let n = text.chars().count();
@@ -153,17 +179,18 @@ impl Note {
                 }
                 if self.renote_id.is_none()
                     && self.file_ids.is_empty()
+                    && !has_poll
                     && text.trim().is_empty()
                 {
                     return Err(invalid(
-                        "text must be non-blank without renote or files".to_string(),
+                        "text must be non-blank without renote, files, or poll".to_string(),
                     ));
                 }
             }
             None => {
-                if self.renote_id.is_none() && self.file_ids.is_empty() {
+                if self.renote_id.is_none() && self.file_ids.is_empty() && !has_poll {
                     return Err(invalid(
-                        "text is required without renote or files".to_string(),
+                        "text is required without renote, files, or poll".to_string(),
                     ));
                 }
             }
@@ -222,6 +249,53 @@ impl Note {
             if user_host.chars().count() > 128 {
                 return Err(invalid("user_host exceeds 128 chars".to_string()));
             }
+        }
+        Ok(())
+    }
+}
+
+/// Sharkey `isQuote` parity (`NoteCreateService.isQuote`, synced with
+/// `misc/is-renote.ts`): a renote carrying any of these is a quote, a pure
+/// renote otherwise. `text`/`cw` count by presence (not blankness — the
+/// caller trims later); `has_reply` is a resolved reply link (an unresolved
+/// pending parent carries no relationship yet); `has_poll` is a poll
+/// definition; `file_count` is attached files.
+pub fn is_quote_content(
+    text: Option<&str>,
+    cw: Option<&str>,
+    has_reply: bool,
+    has_poll: bool,
+    file_count: usize,
+) -> bool {
+    text.is_some() || cw.is_some() || has_reply || has_poll || file_count > 0
+}
+
+/// One `note_edits` version-history row (§8; Sharkey `MiNoteEdit` parity).
+/// A row is written per *effective* edit (same-note no-ops write nothing).
+/// `old_date_ms` is the note's previous `updated_at_ms` (the creation time
+/// derived from the note id on the first edit); `updated_at_ms` is the
+/// edit time. `file_ids` mirrors upstream (always unset on rows pinetree
+/// writes — file changes are detected but their ids are not versioned).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NoteEdit {
+    pub id: String,
+    pub note_id: String,
+    pub old_text: Option<String>,
+    pub new_text: Option<String>,
+    pub cw: Option<String>,
+    #[serde(default)]
+    pub file_ids: Option<Vec<String>>,
+    pub old_date_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+impl NoteEdit {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.id.trim().is_empty() {
+            return Err(invalid("note edit id is required".to_string()));
+        }
+        if self.note_id.trim().is_empty() {
+            return Err(invalid("note edit note_id is required".to_string()));
         }
         Ok(())
     }
@@ -357,6 +431,8 @@ mod tests {
             is_deleted: false,
             reply_parent_uri: None,
             quote: None,
+            updated_at_ms: None,
+            process_errors: None,
         }
     }
 
@@ -402,6 +478,18 @@ mod tests {
         // Empty string text is never valid.
         n.text = Some(String::new());
         assert!(n.validate_api_create().is_err());
+    }
+
+    #[test]
+    fn poll_stands_in_for_text() {
+        let mut n = valid_note();
+        n.text = None;
+        assert!(n.validate_api_create().is_err());
+        assert!(n.validate_api_create_with_poll(true).is_ok());
+        assert!(n.validate_storage_with_poll(true).is_ok());
+        n.text = Some("   ".to_string());
+        assert!(n.validate_api_create().is_err());
+        assert!(n.validate_api_create_with_poll(true).is_ok());
     }
 
     #[test]

@@ -1,18 +1,24 @@
 use std::sync::Arc;
 
 use crate::application::ports::{
-    AccountStore, ActivityDedup, AuthStore, BlobStore, Clock, FollowStore, IdGenerator, JobQueue,
-    MediaStore, NoteStore, NotificationStore, ReactionStore, StreamingSink,
+    AccountStore, ActivityDedup, AuthStore, BlobStore, BlockStore, Clock, FollowStore, IdGenerator,
+    JobQueue, MediaStore, MuteStore, NoteStore, NotificationStore, PollStore, ReactionStore,
+    StreamingSink,
 };
 use crate::federation::delivery::SafeHttpClient;
 
 pub mod accounts;
+pub mod blocks;
+pub mod drafts;
 pub mod follows;
 pub mod helpers;
 pub mod inbound;
 pub mod keys;
 pub mod media;
+pub mod notifications;
 pub mod notes;
+pub mod pins;
+pub mod polls;
 #[cfg(test)]
 mod tests;
 
@@ -27,7 +33,10 @@ pub struct AppServices {
     pub accounts: Arc<dyn AccountStore>,
     pub notes: Arc<dyn NoteStore>,
     pub follows: Arc<dyn FollowStore>,
+    pub blocks: Arc<dyn BlockStore>,
+    pub mutes: Arc<dyn MuteStore>,
     pub reactions: Arc<dyn ReactionStore>,
+    pub polls: Arc<dyn PollStore>,
     pub jobs: Arc<dyn JobQueue>,
     pub media: Arc<dyn MediaStore>,
     pub blobs: Arc<dyn BlobStore>,
@@ -41,4 +50,12 @@ pub struct AppServices {
     pub preserved_usernames: Vec<String>,
     pub prohibited_words: Vec<String>,
     pub sensitive_words: Vec<String>,
+    /// Maximum note drafts per account (§5; Misskey `noteDraftLimit`,
+    /// wired from [`crate::config::Config`]).
+    pub note_draft_limit: usize,
+    /// Maximum actually-scheduled drafts per account (§5; Misskey
+    /// `scheduledNoteLimit`).
+    pub scheduled_note_limit: usize,
+    /// Maximum pinned notes per account (§7; Misskey `pinLimit`).
+    pub pin_limit: usize,
 }

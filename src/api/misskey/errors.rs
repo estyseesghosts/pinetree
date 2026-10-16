@@ -36,9 +36,28 @@ pub const NO_SUCH_RENOTE_TARGET_ID: &str = "b5c90186-4ab0-49c8-9bba-a1f76c282ba4
 pub const NO_SUCH_FILE_ID: &str = "b6992544-63e7-67f0-fa7f-32444b1b5306";
 pub const CONTAINS_PROHIBITED_WORDS_ID: &str = "aa6e01d3-a85c-669d-758a-76aab43af334";
 pub const FOLLOWEE_IS_YOURSELF_ID: &str = "26fbe7bb-a331-4857-af17-205b426669a9";
-pub const ALREADY_FOLLOWING_ID: &str = "35387507-38c7-4cb9-9197-300b93783fa0";
-pub const NO_FOLLOW_REQUEST_ID: &str = "bcde4f8b-0913-4614-8736-2e2d5fa29d5b";
+pub const ALREADY_FOLLOWING_ID: &str = "35387507-38c7-4cb9-9197-300b93783fa0";pub const NO_FOLLOW_REQUEST_ID: &str = "bcde4f8b-0913-4614-8736-2e2d5fa29d5b";
 pub const NOT_FOLLOWING_ID: &str = "7f6e1c2d-9f9b-4c1a-9e2a-9b9b9b9b9b01";
+pub const BLOCKEE_IS_YOURSELF_ID: &str = "88b19138-f28d-42c0-8499-6a31bbd0fdc6";
+pub const ALREADY_BLOCKING_ID: &str = "787fed64-acb9-464a-82eb-afbd745b9614";
+pub const NOT_BLOCKING_ID: &str = "291b2efa-60c6-45c0-9f6a-045c8f9b02cd";
+pub const MUTEE_IS_YOURSELF_ID: &str = "a4619cb2-5f23-484b-9301-94c903074e10";
+pub const ALREADY_MUTING_ID: &str = "7e7359cb-160c-4956-b08f-4d1c653cd007";
+pub const NOT_MUTING_ID: &str = "5467d020-daa9-4553-81e1-135c0c35a96d4";
+pub const NO_SUCH_AVATAR_ID: &str = "539f3a45-f215-4f81-a9a8-31293640207f";
+pub const NO_SUCH_BANNER_ID: &str = "0d8f5629-f210-41c2-9433-735831a58595";
+pub const AVATAR_NOT_AN_IMAGE_ID: &str = "f419f9f8-2f4d-46b1-9fb4-49d3a2fd7191";
+pub const BANNER_NOT_AN_IMAGE_ID: &str = "75aedb19-2afd-4e6d-87fc-67941256fa60";
+pub const NO_SUCH_PAGE_ID: &str = "8e01b590-7eb9-431b-a239-860e086c408e";
+pub const INVALID_REGEXP_ID: &str = "0d786918-10df-41cd-8f33-8dec7d9a89a5";
+pub const TOO_MANY_MUTED_WORDS_ID: &str = "010665b1-a211-42d2-bc64-8f6609d79785";
+pub const URI_NULL_ID: &str = "bf326f31-d430-4f97-9933-5d61e4d48a23";
+pub const FORBIDDEN_TO_SET_YOURSELF_ID: &str = "25c90186-4ab0-49c8-9bba-a1fa6c202ba4";
+pub const RESTRICTED_BY_ROLE_ID: &str = "8feff0ba-5ab5-585b-31f4-4df816663fad";
+pub const YOUR_NAME_CONTAINS_PROHIBITED_WORDS_ID: &str = "0b3f9f6a-2f4d-4b1f-9fb4-49d3a2fd7191";
+pub const YOUR_ACCOUNT_MOVED_ID: &str = "56f20ec9-fd06-4fa5-841b-edd6d7d4fa31";
+pub const BLOCKING_ID: &str = "4e2206ec-aa4f-4960-b865-6c23ac38e2d9";
+pub const BLOCKED_ID: &str = "c4ab57cc-4e41-45e9-bfd9-584f61e35ce0";
 pub const ALREADY_REACTED_ID: &str = "71efcf98-86d6-4e2b-b2ad-9d032369366b";
 pub const NOT_REACTED_ID: &str = "7f6e1c2d-9f9b-4c1a-9e2a-9b9b9b9b9b02";
 pub const CANNOT_REACT_TO_RENOTE_ID: &str = "eaccdc08-ddef-43fe-908f-d108faad57f5";
@@ -47,6 +66,43 @@ pub const BOTH_WITH_REPLIES_AND_WITH_FILES_ID: &str = "91c8cb9f-36ed-46e7-9ca2-7
 pub const YOU_HAVE_BEEN_BLOCKED_ID: &str = "b390d7e1-8a5e-46ed-b625-06271cafd3d3";
 pub const MAX_FILE_SIZE_EXCEEDED_ID: &str = "7f6e1c2d-9f9b-4c1a-9e2a-9b9b9b9b9b03";
 pub const INTERNAL_ERROR_ID: &str = "5d37dbcb-891e-41ca-a3d6-e690c97775ac";
+pub const FORBIDDEN_ID: &str = "3c6a84db-d619-26af-ca14-06232a21df8a";
+pub const REACTIONS_NOT_PUBLIC_ID: &str = "673a7dd2-6924-1093-e0c0-e68456ceae5c";
+pub const IS_REMOTE_USER_ID: &str = "6b95fa98-8cf9-2350-e284-f0ffdb54a805";
+/// Misskey `notes/polls/vote.ts` idents (verbatim upstream UUIDs).
+pub const NO_POLL_ID: &str = "5f979967-52d9-4314-a911-1c673727f92f";
+pub const INVALID_CHOICE_ID: &str = "e0cc9a04-f2e8-41e4-a5f1-4127293260cc";
+pub const ALREADY_VOTED_ID: &str = "0963fc77-efac-419b-9424-b391608dc6d8";
+pub const ALREADY_EXPIRED_ID: &str = "1022a357-b085-4054-9083-8f8de358337e";
+/// Misskey `notes/create.ts` ident (verbatim upstream UUID).
+pub const CANNOT_CREATE_ALREADY_EXPIRED_POLL_ID: &str = "04da457d-b083-4055-9082-955525eda5a5";
+/// Misskey `notes/drafts/*` idents (verbatim upstream UUIDs; the
+/// create-endpoint UUID is canonical — the update endpoint reuses the same
+/// `code` with its own UUID, see the endpoint manifest §§16–17).
+pub const TOO_MANY_DRAFTS_ID: &str = "9ee33bbe-fde3-4c71-9b51-e50492c6b9c8";
+pub const TOO_MANY_SCHEDULED_NOTES_ID: &str = "22ae69eb-09e3-4541-a850-773cfa45e693";
+pub const SCHEDULED_AT_REQUIRED_ID: &str = "15e28a55-e74c-4d65-89b7-8880cdaaa87d";
+pub const SCHEDULED_AT_MUST_BE_IN_FUTURE_ID: &str = "e4bed6c9-017e-4934-aed0-01c22cc60ec1";
+pub const NO_SUCH_NOTE_DRAFT_ID: &str = "49cd6b9d-848e-41ee-b0b9-adaca711a6b1";
+/// Misskey `i/pin.ts` idents (verbatim upstream UUIDs).
+pub const PIN_LIMIT_EXCEEDED_ID: &str = "72dab508-c64d-498f-8740-a8eec1ba385a";
+pub const ALREADY_PINNED_ID: &str = "8b18c2b7-68fe-4edb-9892-c0cbaeb6c913";
+/// Sharkey `notes/edit.ts` idents (verbatim upstream UUIDs). Codes already
+/// known to pinetree (`NO_SUCH_NOTE`, `NO_SUCH_REPLY_TARGET`, …) keep the
+/// existing pinetree UUID (one UUID per code, §16 convention); only new
+/// codes take their Sharkey UUID here.
+pub const NEEDS_EDIT_ID: &str = "d697edc8-8c73-4de8-bded-35fd198b79e5";
+pub const YOU_ARE_NOT_THE_AUTHOR_ID: &str = "c6e61685-411d-43d0-b90a-a448d2539001";
+pub const NOT_LOCAL_USER_ID: &str = "b907f407-2aa0-4283-800b-a2c56290b822";
+pub const CANNOT_QUOTE_THE_CURRENT_NOTE_ID: &str = "33510210-8452-094c-6227-4a6c05d99f02";
+pub const CANNOT_QUOTE_A_QUOTE_OF_EDITED_NOTE_ID: &str = "33510210-8452-094c-6227-4a6c05d99f01";
+pub const QUOTE_DISABLED_FOR_USER_ID: &str = "1c0ea108-d1e3-4e8e-aa3f-4d2487626153";
+pub const CANNOT_PRIVATE_RENOTE_ID: &str = "19a50f1c-84fa-4e33-81d3-17834ccc0ad8";
+pub const CANNOT_RENOTE_OUTSIDE_OF_CHANNEL_ID: &str = "33510210-8452-094c-6227-4a6c05d99f00";
+pub const CANNOT_REPLY_TO_SPECIFIED_VISIBILITY_NOTE_WITH_EXTENDED_VISIBILITY_ID: &str =
+    "ed940410-535c-4d5e-bfa3-af798671e93c";
+pub const MAX_LENGTH_ID: &str = "3ac74a84-8fd5-4bb0-870f-01804f82ce16";
+pub const MAX_CW_LENGTH_ID: &str = "7004c478-bda3-4b4f-acb2-4316398c9d52";
 
 /// Misskey API error: stable `code`/`id` ident, human `message`,
 /// machine `kind` (`client` | `permission` | `server`), optional `info`,
@@ -339,6 +395,12 @@ fn is_known_client_code(code: &str) -> bool {
             | "CONTAINS_TOO_MANY_MENTIONS"
             | "FOLLOWEE_IS_YOURSELF"
             | "ALREADY_FOLLOWING"
+            | "BLOCKEE_IS_YOURSELF"
+            | "ALREADY_BLOCKING"
+            | "NOT_BLOCKING"
+            | "MUTEE_IS_YOURSELF"
+            | "ALREADY_MUTING"
+            | "NOT_MUTING"
             | "NO_FOLLOW_REQUEST"
             | "NOT_FOLLOWING"
             | "ALREADY_REACTED"
@@ -353,11 +415,51 @@ fn is_known_client_code(code: &str) -> bool {
             | "YOU_HAVE_BEEN_BLOCKED"
             | "BLOCKING"
             | "BLOCKED"
+            | "NO_SUCH_AVATAR"
+            | "NO_SUCH_BANNER"
+            | "AVATAR_NOT_AN_IMAGE"
+            | "BANNER_NOT_AN_IMAGE"
+            | "NO_SUCH_PAGE"
+            | "INVALID_REGEXP"
+            | "TOO_MANY_MUTED_WORDS"
+            | "URI_NULL"
+            | "FORBIDDEN_TO_SET_YOURSELF"
+            | "RESTRICTED_BY_ROLE"
+            | "YOUR_NAME_CONTAINS_PROHIBITED_WORDS"
+            | "YOUR_ACCOUNT_MOVED"
+            | "YOUR_ACCOUNT_MOVED"
             | "UNSUPPORTED_FIELD"
             | "INVALID_PARAM"
+            | "FORBIDDEN"
+            | "REACTIONS_NOT_PUBLIC"
+            | "IS_REMOTE_USER"
+            | "NO_POLL"
+            | "INVALID_CHOICE"
+            | "ALREADY_VOTED"
+            | "ALREADY_EXPIRED"
+            | "CANNOT_CREATE_ALREADY_EXPIRED_POLL"
+            | "TOO_MANY_DRAFTS"
+            | "TOO_MANY_SCHEDULED_NOTES"
+            | "SCHEDULED_AT_REQUIRED"
+            | "SCHEDULED_AT_MUST_BE_IN_FUTURE"
+            | "NO_SUCH_NOTE_DRAFT"
+            | "PIN_LIMIT_EXCEEDED"
+            | "ALREADY_PINNED"
             | "FILE_REQUIRED"
             | "INVALID_FILE_NAME"
             | "UNALLOWED_FILE_TYPE"
+            // `notes/edit` (Sharkey `edit.ts` verbatim) + §3 quote-disable.
+            | "NEEDS_EDIT_ID"
+            | "YOU_ARE_NOT_THE_AUTHOR"
+            | "NOT_LOCAL_USER"
+            | "CANNOT_QUOTE_THE_CURRENT_NOTE"
+            | "CANNOT_QUOTE_A_QUOTE_OF_EDITED_NOTE"
+            | "QUOTE_DISABLED_FOR_USER"
+            | "CANNOT_PRIVATE_RENOTE"
+            | "CANNOT_RENOTE_OUTSIDE_OF_CHANNEL"
+            | "CANNOT_REPLY_TO_SPECIFIED_VISIBILITY_NOTE_WITH_EXTENDED_VISIBILITY"
+            | "MAX_LENGTH"
+            | "MAX_CW_LENGTH"
     )
 }
 
@@ -405,6 +507,63 @@ fn lookup_known_code(code: &str) -> Option<(&'static str, &'static str, u16, &'s
         ),
         "NO_SUCH_NOTE" => ("No such note.", NO_SUCH_NOTE_ID, 400, "client"),
         "NO_SUCH_USER" => ("No such user.", NO_SUCH_USER_ID, 400, "client"),
+        "NO_SUCH_AVATAR" => ("No such avatar file.", NO_SUCH_AVATAR_ID, 400, "client"),
+        "NO_SUCH_BANNER" => ("No such banner file.", NO_SUCH_BANNER_ID, 400, "client"),
+        "AVATAR_NOT_AN_IMAGE" => (
+            "The file specified as an avatar is not an image.",
+            AVATAR_NOT_AN_IMAGE_ID,
+            400,
+            "client",
+        ),
+        "BANNER_NOT_AN_IMAGE" => (
+            "The file specified as a banner is not an image.",
+            BANNER_NOT_AN_IMAGE_ID,
+            400,
+            "client",
+        ),
+        "NO_SUCH_PAGE" => ("No such page.", NO_SUCH_PAGE_ID, 400, "client"),
+        "INVALID_REGEXP" => (
+            "Invalid Regular Expression.",
+            INVALID_REGEXP_ID,
+            400,
+            "client",
+        ),
+        "TOO_MANY_MUTED_WORDS" => (
+            "Too many muted words.",
+            TOO_MANY_MUTED_WORDS_ID,
+            400,
+            "client",
+        ),
+        "URI_NULL" => (
+            "User ActivityPup URI is null.",
+            URI_NULL_ID,
+            400,
+            "client",
+        ),
+        "FORBIDDEN_TO_SET_YOURSELF" => (
+            "You can't set yourself as your own alias.",
+            FORBIDDEN_TO_SET_YOURSELF_ID,
+            400,
+            "client",
+        ),
+        "RESTRICTED_BY_ROLE" => (
+            "This feature is restricted by your role.",
+            RESTRICTED_BY_ROLE_ID,
+            400,
+            "client",
+        ),
+        "YOUR_NAME_CONTAINS_PROHIBITED_WORDS" => (
+            "Your new name contains prohibited words.",
+            YOUR_NAME_CONTAINS_PROHIBITED_WORDS_ID,
+            422,
+            "client",
+        ),
+        "YOUR_ACCOUNT_MOVED" => (
+            "You have moved your account.",
+            YOUR_ACCOUNT_MOVED_ID,
+            403,
+            "permission",
+        ),
         "NO_FOLLOW_REQUEST" => ("No follow request.", NO_FOLLOW_REQUEST_ID, 400, "client"),
         "NO_SUCH_REPLY_TARGET" => (
             "No such reply target.",
@@ -438,6 +597,44 @@ fn lookup_known_code(code: &str) -> Option<(&'static str, &'static str, u16, &'s
             "client",
         ),
         "NOT_FOLLOWING" => ("You are not following that user.", NOT_FOLLOWING_ID, 400, "client"),
+        "BLOCKEE_IS_YOURSELF" => (
+            "Blockee is yourself.",
+            BLOCKEE_IS_YOURSELF_ID,
+            400,
+            "client",
+        ),
+        "ALREADY_BLOCKING" => (
+            "You are already blocking that user.",
+            ALREADY_BLOCKING_ID,
+            400,
+            "client",
+        ),
+        "NOT_BLOCKING" => (
+            "You are not blocking that user.",
+            NOT_BLOCKING_ID,
+            400,
+            "client",
+        ),
+        "MUTEE_IS_YOURSELF" => ("Mutee is yourself.", MUTEE_IS_YOURSELF_ID, 400, "client"),
+        "ALREADY_MUTING" => (
+            "You are already muting that user.",
+            ALREADY_MUTING_ID,
+            400,
+            "client",
+        ),
+        "NOT_MUTING" => ("You are not muting that user.", NOT_MUTING_ID, 400, "client"),
+        "BLOCKING" => (
+            "You are blocking that user.",
+            BLOCKING_ID,
+            400,
+            "client",
+        ),
+        "BLOCKED" => (
+            "You are blocked by that user.",
+            BLOCKED_ID,
+            400,
+            "client",
+        ),
         "ALREADY_REACTED" => (
             "You are already reacting to that note.",
             ALREADY_REACTED_ID,
@@ -473,6 +670,166 @@ fn lookup_known_code(code: &str) -> Option<(&'static str, &'static str, u16, &'s
         ),
         "UNSUPPORTED_FIELD" => ("Unsupported field.", UNSUPPORTED_FIELD_ID, 400, "client"),
         "INVALID_PARAM" => ("Invalid param.", INVALID_PARAM_ID, 400, "client"),
+        // `users/followers` + `users/following` visibility gate (Misskey
+        // `FORBIDDEN`, kind `client` → HTTP 400 per `ApiCallService`
+        // mapping; the two upstream endpoints carry different UUIDs for
+        // the same code — pinetree emits the `users/followers` one, see
+        // `FORBIDDEN_ID`).
+        "FORBIDDEN" => ("Forbidden.", FORBIDDEN_ID, 400, "client"),
+        // `users/reactions` gates (Misskey `reactions.ts` verbatim).
+        "REACTIONS_NOT_PUBLIC" => (
+            "Reactions of the user is not public.",
+            REACTIONS_NOT_PUBLIC_ID,
+            400,
+            "client",
+        ),
+        "IS_REMOTE_USER" => (
+            "Currently unavailable to display reactions of remote users. See https://github.com/misskey-dev/misskey/issues/12964",
+            IS_REMOTE_USER_ID,
+            400,
+            "client",
+        ),
+        // `notes/polls/vote` gates (Misskey `polls/vote.ts` verbatim).
+        "NO_POLL" => (
+            "The note does not attach a poll.",
+            NO_POLL_ID,
+            400,
+            "client",
+        ),
+        "INVALID_CHOICE" => ("Choice ID is invalid.", INVALID_CHOICE_ID, 400, "client"),
+        "ALREADY_VOTED" => (
+            "You have already voted.",
+            ALREADY_VOTED_ID,
+            400,
+            "client",
+        ),
+        "ALREADY_EXPIRED" => (
+            "The poll is already expired.",
+            ALREADY_EXPIRED_ID,
+            400,
+            "client",
+        ),
+        // `notes/create` poll gate (Misskey `create.ts` verbatim).
+        "CANNOT_CREATE_ALREADY_EXPIRED_POLL" => (
+            "Poll is already expired.",
+            CANNOT_CREATE_ALREADY_EXPIRED_POLL_ID,
+            400,
+            "client",
+        ),
+        // `notes/drafts/*` gates (Misskey `drafts/create|update.ts`
+        // verbatim code/message; the create-endpoint UUID is canonical).
+        "TOO_MANY_DRAFTS" => (
+            "You cannot create drafts any more.",
+            TOO_MANY_DRAFTS_ID,
+            400,
+            "client",
+        ),
+        "TOO_MANY_SCHEDULED_NOTES" => (
+            "You cannot create scheduled notes any more.",
+            TOO_MANY_SCHEDULED_NOTES_ID,
+            400,
+            "client",
+        ),
+        "SCHEDULED_AT_REQUIRED" => (
+            "scheduledAt is required when isActuallyScheduled is true.",
+            SCHEDULED_AT_REQUIRED_ID,
+            400,
+            "client",
+        ),
+        "SCHEDULED_AT_MUST_BE_IN_FUTURE" => (
+            "scheduledAt must be in the future.",
+            SCHEDULED_AT_MUST_BE_IN_FUTURE_ID,
+            400,
+            "client",
+        ),
+        "NO_SUCH_NOTE_DRAFT" => (
+            "No such note draft.",
+            NO_SUCH_NOTE_DRAFT_ID,
+            400,
+            "client",
+        ),
+        // `i/pin.ts` gates (verbatim code/message/id).
+        "PIN_LIMIT_EXCEEDED" => (
+            "You can not pin notes any more.",
+            PIN_LIMIT_EXCEEDED_ID,
+            400,
+            "client",
+        ),
+        "ALREADY_PINNED" => (
+            "That note has already been pinned.",
+            ALREADY_PINNED_ID,
+            400,
+            "client",
+        ),
+        // `notes/edit` gates (Sharkey `edit.ts` verbatim code/message/id).
+        "NEEDS_EDIT_ID" => (
+            "You need to specify `editId`.",
+            NEEDS_EDIT_ID,
+            400,
+            "client",
+        ),
+        "YOU_ARE_NOT_THE_AUTHOR" => (
+            "You are not the author of this note.",
+            YOU_ARE_NOT_THE_AUTHOR_ID,
+            400,
+            "client",
+        ),
+        "NOT_LOCAL_USER" => (
+            "You are not a local user.",
+            NOT_LOCAL_USER_ID,
+            400,
+            "client",
+        ),
+        "CANNOT_QUOTE_THE_CURRENT_NOTE" => (
+            "Cannot quote the current note.",
+            CANNOT_QUOTE_THE_CURRENT_NOTE_ID,
+            400,
+            "client",
+        ),
+        "CANNOT_QUOTE_A_QUOTE_OF_EDITED_NOTE" => (
+            "Cannot quote a quote of edited note.",
+            CANNOT_QUOTE_A_QUOTE_OF_EDITED_NOTE_ID,
+            400,
+            "client",
+        ),
+        // §3 quote-disable (Sharkey `notes/create.ts` + `notes/edit.ts`
+        // verbatim — same code/message/id on both endpoints).
+        "QUOTE_DISABLED_FOR_USER" => (
+            "You do not have permission to create quote posts.",
+            QUOTE_DISABLED_FOR_USER_ID,
+            400,
+            "client",
+        ),
+        "CANNOT_PRIVATE_RENOTE" => (
+            "You can not perform a private renote.",
+            CANNOT_PRIVATE_RENOTE_ID,
+            400,
+            "client",
+        ),
+        "CANNOT_RENOTE_OUTSIDE_OF_CHANNEL" => (
+            "Cannot renote outside of channel.",
+            CANNOT_RENOTE_OUTSIDE_OF_CHANNEL_ID,
+            400,
+            "client",
+        ),
+        "CANNOT_REPLY_TO_SPECIFIED_VISIBILITY_NOTE_WITH_EXTENDED_VISIBILITY" => (
+            "You cannot reply to a specified visibility note with extended visibility.",
+            CANNOT_REPLY_TO_SPECIFIED_VISIBILITY_NOTE_WITH_EXTENDED_VISIBILITY_ID,
+            400,
+            "client",
+        ),
+        "MAX_LENGTH" => (
+            "You tried posting a note which is too long.",
+            MAX_LENGTH_ID,
+            400,
+            "client",
+        ),
+        "MAX_CW_LENGTH" => (
+            "You tried posting a content warning which is too long.",
+            MAX_CW_LENGTH_ID,
+            400,
+            "client",
+        ),
         "INTERNAL_ERROR" => (
             "Internal error occurred. Please contact us if the error persists.",
             INTERNAL_ERROR_ID,

@@ -3,11 +3,11 @@ use std::collections::HashSet;
 use super::AppServices;
 
 use crate::application::events::StreamingEvent;
-use crate::application::ports::{CreateNoteInput, PortError};
+use crate::application::ports::{CreateNoteInput, EditNoteInput, PortError};
 use crate::domain::note::{Note, extract_mentions};
 use crate::domain::notification::NotificationKind;
 use crate::domain::policy::{ViewerContext, is_visible};
-use crate::domain::reaction::{Reaction, coerce_reaction};
+use crate::domain::reaction::{Reaction, coerce_reaction, normalize_reaction};
 
 impl AppServices {
     #[allow(clippy::too_many_lines)]
@@ -21,6 +21,13 @@ impl AppServices {
         if input.reply_parent_uri.is_some() {
             return Err(PortError::Validation(
                 "reply_parent_uri is set only by inbound federation".to_string(),
+            ));
+        }
+        // `poll_initial_votes` is inbox-only (§4): local polls always start
+        // zeroed; only cached remote polls seed origin-reported tallies.
+        if input.poll_initial_votes.is_some() {
+            return Err(PortError::Validation(
+                "poll_initial_votes is set only by inbound federation".to_string(),
             ));
         }
 
@@ -149,17 +156,18 @@ impl AppServices {
         }
 
         // Quote detection: a renote carrying own commentary (non-blank text,
-        // CW, or files) is a quote, semantically distinct from a pure
-        // renote. The quote relation + the `QuoteRequest` delivery job
-        // commit in the same transaction as the note below.
-        let has_commentary = input
-            .text
-            .as_deref()
-            .map(|t| !t.trim().is_empty())
-            .unwrap_or(false)
-            || input.cw.is_some()
-            || !input.file_ids.is_empty();
-        let is_quote = input.renote_of.is_some() && has_commentary;
+        // CW, files, or a poll — Misskey `isQuote` parity) is a quote,
+        // semantically distinct from a pure renote. The quote relation +
+        // the `QuoteRequest` delivery job commit in the same transaction as
+        // the note below.
+        let is_quote = input.renote_of.is_some()
+            && crate::domain::note::is_quote_content(
+                input.text.as_deref(),
+                input.cw.as_deref(),
+                input.reply_to.is_some(),
+                input.poll.is_some(),
+                input.file_ids.len(),
+            );
         if is_quote {
             if let Some(target) = renote_target.as_ref() {
                 let base = self.public_url.trim_end_matches('/').to_string();
@@ -268,12 +276,32 @@ impl AppServices {
         let mut input_with_instance_words = input;
         input_with_instance_words.prohibited_words = self.prohibited_words.clone();
         input_with_instance_words.sensitive_words = self.sensitive_words.clone();
+        // Polls (§4): normalize the flag, validate against the server
+        // clock, and arm the delayed expiry job (committed atomically with
+        // the note via the `__PENDING_NOTE_ID__` substitution).
+        input_with_instance_words.has_poll = input_with_instance_words.poll.is_some();
+        if let Some(poll) = input_with_instance_words.poll.clone() {
+            poll.validate(self.now_ms()).map_err(|e| match e {
+                crate::domain::id::DomainError::Validation(msg) => {
+                    PortError::Validation(msg)
+                }
+                crate::domain::id::DomainError::Conflict(msg) => PortError::Conflict(msg),
+                crate::domain::id::DomainError::NotFound(msg) => PortError::NotFound(msg),
+                crate::domain::id::DomainError::StorageUnavailable(msg) => {
+                    PortError::StorageUnavailable(msg)
+                }
+            })?;
+            if let Some(expiry_job) =
+                self.poll_expiry_job("__PENDING_NOTE_ID__", &poll)?
+            {
+                jobs.push(expiry_job);
+            }
+        }
         self.notes
             .create_note(input_with_instance_words, jobs)
     }
 
-    pub fn delete_note(&self, actor_id: &str, note_id: &str) -> Result<(), PortError> {
-        self.accounts.get_owner(actor_id)?;
+    pub fn delete_note(&self, actor_id: &str, note_id: &str) -> Result<(), PortError> {        self.accounts.get_owner(actor_id)?;
         let note = match self.notes.get_note(note_id)? {
             None => return Err(PortError::NotFound("NO_SUCH_NOTE".to_string())),
             Some(note) => note,
@@ -329,6 +357,113 @@ impl AppServices {
         self.notes.delete_note(note_id, jobs)
     }
 
+    /// Edit a note (§8; Sharkey `NoteEditService.edit` parity). Author-only
+    /// (`NOT_LOCAL_USER` when the editor is remote —
+    /// `apply_note_edit_in_txn` re-checks authorship atomically);
+    /// `reply_id`, `visibility`, and `local_only` are forced back to the
+    /// original note's values inside storage. Side effects reuse the create
+    /// path: a note-stream `updated` event, an `edited` notification to the
+    /// reply author, and an `Update(Note)` federated deliver (followers +
+    /// mentioned/replied/renoted/reacted remote users). A no-change edit
+    /// returns the original note and enqueues nothing.
+    pub fn edit_note(&self, mut input: EditNoteInput) -> Result<Note, PortError> {
+        self.accounts.get_owner(&input.editor_id)?;
+        let editor = self
+            .accounts
+            .find_by_id(&input.editor_id)?
+            .ok_or_else(|| PortError::NotFound("NO_SUCH_USER".to_string()))?;
+        if editor.host.is_some() {
+            return Err(PortError::Validation("NOT_LOCAL_USER".to_string()));
+        }
+        let old = match self.notes.get_note(&input.note_id)? {
+            None => return Err(PortError::NotFound("NO_SUCH_NOTE".to_string())),
+            Some(note) => note,
+        };
+        if old.author_id != input.editor_id {
+            return Err(PortError::Validation(
+                "YOU_ARE_NOT_THE_AUTHOR".to_string(),
+            ));
+        }
+        input.prohibited_words = self.prohibited_words.clone();
+        input.sensitive_words = self.sensitive_words.clone();
+        input.uri_base = self.public_url.trim_end_matches('/').to_string();
+        let old_poll = self.polls.get_poll(&old.id)?;
+        let jobs = self.edit_side_effect_jobs(&old, &input.editor_id, &input.poll, old_poll.as_ref(), true)?;
+        self.notes.apply_note_edit(input, jobs)
+    }
+
+    /// Jobs shared by the local and inbound edit paths: the `updated`
+    /// streaming event, the `edited` notification to the reply author, and
+    /// (local path only) the `Update(Note)` federated deliver plus a
+    /// re-armed poll-expiry job when the edit leaves an expiring poll. The
+    /// old poll row decides the re-arm: an unchanged poll keeps its
+    /// existing arming; a removed poll lets the old job converge quietly.
+    pub(super) fn edit_side_effect_jobs(
+        &self,        old: &Note,
+        editor_id: &str,
+        new_poll: &Option<crate::domain::poll::PollInput>,
+        old_poll: Option<&crate::domain::poll::Poll>,
+        federate: bool,
+    ) -> Result<Vec<crate::application::ports::NewJob>, PortError> {
+        let mut jobs = Vec::new();
+        jobs.push(self.streaming_job(
+            &StreamingEvent::NoteUpdated {
+                note_id: old.id.clone(),
+            },
+            format!("note-edit:{}:{}", old.id, self.ids.generate()),
+        )?);
+        // `edited` goes to the reply author only (Sharkey
+        // `postNoteEdited` parity — new mentions and renote targets are not
+        // notified on edit). The `Notify` worker gate drops self-notifies,
+        // mutes, and receive-config denials.
+        if let Some(reply_id) = old.reply_id.as_deref() {
+            if let Some(parent) = self.notes.get_note(reply_id)? {
+                if parent.author_id != editor_id {
+                    jobs.push(self.notify_job(
+                        &parent.author_id,
+                        editor_id,
+                        NotificationKind::Edited,
+                        Some(old.id.clone()),
+                        None,
+                        "edit",
+                    )?);
+                }
+            }
+        }
+        if federate && !old.local_only {
+            jobs.push(
+                crate::federation::outbox::FederateDeliverPayload::NoteUpdated {
+                    note_id: old.id.clone(),
+                    author_id: old.author_id.clone(),
+                    inbox_override: None,
+                }
+                .into_job(
+                    format!("federate:note-update:{}:{}", old.id, self.ids.generate()),
+                    self.now_ms(),
+                )?,
+            );
+        }
+        let poll_changed = match (old_poll, new_poll.as_ref()) {
+            (None, None) => false,
+            (Some(_), None) | (None, Some(_)) => true,
+            (Some(old_poll), Some(new_poll)) => {
+                old_poll.choices != new_poll.choices
+                    || old_poll.multiple != new_poll.multiple
+                    || old_poll.expires_at_ms != new_poll.expires_at_ms
+            }
+        };
+        if poll_changed {
+            if let Some(poll) = new_poll.as_ref() {
+                // The storage transaction re-validates; a `None` here only
+                // means the poll never expires (no arming needed).
+                if let Some(expiry_job) = self.poll_expiry_job(&old.id, poll)? {
+                    jobs.push(expiry_job);
+                }
+            }
+        }
+        Ok(jobs)
+    }
+
     pub fn unrenote(&self, actor_id: &str, note_id: &str) -> Result<usize, PortError> {
         self.accounts.get_owner(actor_id)?;
         let target = match self.notes.get_note(note_id)? {
@@ -367,6 +502,15 @@ impl AppServices {
             None => return Err(PortError::NotFound("NO_SUCH_NOTE".to_string())),
             Some(note) => note,
         };
+        // §0A: block check first, then visibility (Misskey
+        // `ReactionService.create` parity). The storage transaction
+        // re-checks atomically; this keeps the error precedence identical
+        // on the local path.
+        if note.author_id != user_id && self.blocks.is_blocking(&note.author_id, user_id)? {
+            return Err(PortError::Validation(
+                "YOU_HAVE_BEEN_BLOCKED".to_string(),
+            ));
+        }
         let follows_author = if user_id == note.author_id {
             true
         } else {
@@ -386,6 +530,14 @@ impl AppServices {
             ));
         }
         let coerced = coerce_reaction(reaction, note.reaction_acceptance, false);
+        // §6 wire compat (Misskey `ReactionService` parity): `likeOnly`
+        // already forced the bare-heart fallback above; every other
+        // reaction is normalized (legacies map, FE0F strip unless ZWJ).
+        let coerced = if coerced == reaction {
+            normalize_reaction(Some(reaction))
+        } else {
+            coerced
+        };
         let mut jobs = Vec::new();
         jobs.push(self.streaming_job(
             &StreamingEvent::NoteReacted {

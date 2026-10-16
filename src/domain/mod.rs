@@ -1,8 +1,13 @@
 pub mod id;
 pub mod account;
 pub mod note;
+pub mod draft;
+pub mod pinning;
 pub mod quote;
 pub mod follow;
+pub mod blocking;
+pub mod muting;
+pub mod poll;
 pub mod reaction;
 pub mod media;
 pub mod visibility;

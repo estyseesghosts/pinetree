@@ -26,13 +26,19 @@ use http_body_util::{BodyExt, Limited};
 use serde_json::{Map, Value};
 
 use crate::activitypub::{actor as ap_actor, objects as ap_objects, webfinger as ap_webfinger};
+use crate::application::commands::pins::FeaturedCache;
 use crate::application::commands::AppServices;
 use crate::application::ports::{
-    ApiTokenRecord, CreateNoteInput, LegacyAuthSessionRecord, MiAuthSessionRecord, PortError,
-    TimelineCursor, UpdateAccountPatch,
+    ApiTokenRecord, CreateDraftInput, CreateNoteInput, EditNoteInput, LegacyAuthSessionRecord,
+    MiAuthSessionRecord, PortError, TimelineCursor, UpdateAccountPatch, UpdateDraftPatch,
 };
-use crate::domain::account::Account;
-use crate::domain::note::{ReactionAcceptance, Visibility};
+use crate::domain::account::{
+    Account, AvatarDecoration, ChatScope, FollowVisibility, MutedWord,
+    NotificationRecieveConfig, ProfileField,
+};
+use crate::domain::note::{
+    ReactionAcceptance, Visibility, MAX_CW_API_CHARS, MAX_NOTE_TEXT_CHARS,
+};
 use crate::domain::notification::NotificationKind;
 use crate::federation::delivery::{
     fetch_and_upsert_remote_actor, fetch_remote_note, webfinger_discover_actor_uri,
@@ -49,8 +55,10 @@ use super::auth::{
 };
 use super::errors::ApiError;
 use super::packers::{
-    pack_drive_file, pack_following, pack_me_detailed, pack_meta, pack_note,
-    pack_notification, pack_user_detailed_not_me, pack_user_lite,
+    pack_blocking, pack_drive_file, pack_following, pack_me_detailed,
+    pack_meta, pack_muting, pack_note, pack_note_draft, pack_note_reaction_with_note,
+    pack_notification, pack_renote_muting, pack_user_detailed_not_me, pack_user_lite,
+    pack_user_relation,
 };
 use super::request::check_allowed_fields;
 use super::response::{RateLimiter, UploadSlots};
@@ -67,6 +75,9 @@ pub struct ApiState {
     pub upload_slots: Arc<UploadSlots>,
     pub hub: Hub,
     pub trusted_proxies: Arc<Vec<IpAddr>>,
+    /// Timed featured-ranking cache (§7; 3600s TTL, one entry per scope
+    /// key). Per-state so tests get isolated caches.
+    pub featured_cache: Arc<FeaturedCache>,
 }
 
 /// Build the full Phase 1 Axum router.
@@ -388,6 +399,429 @@ fn str_list(obj: &Map<String, Value>, key: &str) -> Result<Vec<String>, ApiError
     }
 }
 
+/// Parse a `notes/create` `poll` param (Misskey `notes/create.ts:168-184`
+/// parity): `{ choices[2..10] unique 1..50, multiple?, expiresAt?,
+/// expiredAfter? }`. `null`/absent → `None`. Choice-shape violations are
+/// `INVALID_PARAM`; an already-past expiry is the exact
+/// `CANNOT_CREATE_ALREADY_EXPIRED_POLL` ident (surfaced through
+/// `ApiError::from_port_error` so the UUID matches `create.ts`).
+fn parse_poll_param(
+    obj: &Map<String, Value>,
+    key: &str,
+    now_ms: i64,
+) -> Result<Option<crate::domain::poll::PollInput>, ApiError> {
+    let raw = match obj.get(key) {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Object(map)) => map,
+        Some(_) => return Err(ApiError::invalid_param(key, "must be an object")),
+    };
+    for field in raw.keys() {
+        if !matches!(field.as_str(), "choices" | "multiple" | "expiresAt" | "expiredAfter") {
+            return Err(ApiError::invalid_param(
+                key,
+                &format!("unknown field: {field}"),
+            ));
+        }
+    }
+    let choices = match raw.get("choices") {
+        Some(Value::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    Value::String(s) => out.push(s.clone()),
+                    _ => {
+                        return Err(ApiError::invalid_param(
+                            key,
+                            "choices must be an array of strings",
+                        ));
+                    }
+                }
+            }
+            out
+        }
+        _ => {
+            return Err(ApiError::invalid_param(
+                key,
+                "choices is required and must be an array of strings",
+            ));
+        }
+    };
+    let multiple = match raw.get("multiple") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(ApiError::invalid_param(key, "multiple must be a boolean")),
+    };
+    let expires_at_ms = match raw.get("expiresAt") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(n)) => Some(
+            n.as_i64()
+                .ok_or_else(|| ApiError::invalid_param(key, "expiresAt must be an integer"))?,
+        ),
+        Some(_) => return Err(ApiError::invalid_param(key, "expiresAt must be an integer")),
+    };
+    let expired_after_ms = match raw.get("expiredAfter") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(n)) => {
+            let v = n
+                .as_i64()
+                .ok_or_else(|| ApiError::invalid_param(key, "expiredAfter must be an integer"))?;
+            if v < 1 {
+                return Err(ApiError::invalid_param(
+                    key,
+                    "expiredAfter must be at least 1",
+                ));
+            }
+            Some(v)
+        }
+        Some(_) => return Err(ApiError::invalid_param(key, "expiredAfter must be an integer")),
+    };
+    // `expiredAfter` wins over `expiresAt` (Misskey `create.ts:230` parity).
+    let expires_at = match (expired_after_ms, expires_at_ms) {
+        (Some(after), _) => Some(now_ms.saturating_add(after)),
+        (None, at) => at,
+    };
+    let input = crate::domain::poll::PollInput {
+        choices,
+        multiple,
+        expires_at_ms: expires_at,
+    };
+    input.validate(now_ms).map_err(|e| match e {
+        crate::domain::id::DomainError::Validation(msg)
+            if msg == "CANNOT_CREATE_ALREADY_EXPIRED_POLL" =>
+        {
+            ApiError::from_port_error(crate::application::ports::PortError::Validation(msg))
+        }
+        crate::domain::id::DomainError::Validation(msg) => {
+            ApiError::invalid_param(key, &msg)
+        }
+        other => ApiError::invalid_param(key, &format!("{other:?}")),
+    })?;
+    Ok(Some(input))
+}
+
+/// Parsed draft `poll` columns (§5; Misskey `notes/drafts/create|update.ts`
+/// `paramDef` parity): choices may be empty (relaxed draft rules —
+/// `minItems: 0`), each 1..=50 chars, at most 10, unique. `null`/absent →
+///
+/// `None` (no poll content in the patch). Shape violations are
+/// `INVALID_PARAM`; expiry-vs-now is service-level (the exact
+/// `CANNOT_CREATE_ALREADY_EXPIRED_POLL` ident) so both endpoints share it.
+struct DraftPollParam {
+    choices: Vec<String>,
+    multiple: Option<bool>,
+    expires_at_ms: Option<Option<i64>>,
+    expired_after_ms: Option<Option<i64>>,
+}
+
+fn parse_draft_poll_param(obj: &Map<String, Value>) -> Result<Option<DraftPollParam>, ApiError> {
+    let raw = match obj.get("poll") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Object(map)) => map,
+        Some(_) => return Err(ApiError::invalid_param("poll", "must be an object")),
+    };
+    for field in raw.keys() {
+        if !matches!(field.as_str(), "choices" | "multiple" | "expiresAt" | "expiredAfter") {
+            return Err(ApiError::invalid_param(
+                "poll",
+                &format!("unknown field: {field}"),
+            ));
+        }
+    }
+    let choices = match raw.get("choices") {
+        Some(Value::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    Value::String(s) => out.push(s.clone()),
+                    _ => {
+                        return Err(ApiError::invalid_param(
+                            "poll",
+                            "choices must be an array of strings",
+                        ));
+                    }
+                }
+            }
+            out
+        }
+        _ => {
+            return Err(ApiError::invalid_param(
+                "poll",
+                "choices is required and must be an array of strings",
+            ));
+        }
+    };
+    if choices.len() > 10 {
+        return Err(ApiError::invalid_param("poll", "choices must have at most 10 items"));
+    }
+    {
+        let mut seen = std::collections::HashSet::new();
+        if !choices.iter().all(|c| seen.insert(c)) {
+            return Err(ApiError::invalid_param("poll", "choices must be unique"));
+        }
+    }
+    for choice in &choices {
+        let n = choice.chars().count();
+        if n == 0 || n > 50 {
+            return Err(ApiError::invalid_param(
+                "poll",
+                "choices must be 1..=50 chars",
+            ));
+        }
+    }
+    let multiple = match raw.get("multiple") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(b)) => Some(*b),
+        Some(_) => return Err(ApiError::invalid_param("poll", "multiple must be a boolean")),
+    };
+    let expires_at_ms = match raw.get("expiresAt") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::Number(n)) => Some(Some(
+            n.as_i64()
+                .ok_or_else(|| ApiError::invalid_param("poll", "expiresAt must be an integer"))?,
+        )),
+        Some(_) => return Err(ApiError::invalid_param("poll", "expiresAt must be an integer")),
+    };
+    let expired_after_ms = match raw.get("expiredAfter") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::Number(n)) => {
+            let v = n
+                .as_i64()
+                .ok_or_else(|| ApiError::invalid_param("poll", "expiredAfter must be an integer"))?;
+            if v < 1 {
+                return Err(ApiError::invalid_param(
+                    "poll",
+                    "expiredAfter must be at least 1",
+                ));
+            }
+            Some(Some(v))
+        }
+        Some(_) => {
+            return Err(ApiError::invalid_param("poll", "expiredAfter must be an integer"));
+        }
+    };
+    Ok(Some(DraftPollParam {
+        choices,
+        multiple,
+        expires_at_ms,
+        expired_after_ms,
+    }))
+}
+
+/// Draft text (`minLength: 0, maxLength: 3000, nullable` parity): empty is
+/// allowed, overlong is `INVALID_PARAM`.
+fn opt_draft_text(obj: &Map<String, Value>, key: &str) -> Result<Option<String>, ApiError> {
+    match opt_string(obj, key)? {
+        Some(text) if text.chars().count() > 3000 => Err(ApiError::invalid_param(
+            key,
+            "must be at most 3000 chars",
+        )),
+        text => Ok(text),
+    }
+}
+
+/// Draft cw (`minLength: 1, maxLength: 100, nullable` parity).
+fn opt_draft_cw(obj: &Map<String, Value>) -> Result<Option<String>, ApiError> {
+    match opt_string(obj, "cw")? {
+        Some(cw) => {
+            let n = cw.chars().count();
+            if n == 0 || n > 100 {
+                return Err(ApiError::invalid_param("cw", "must be 1..=100 chars"));
+            }
+            Ok(Some(cw))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Draft hashtag (`maxLength: 200, nullable` parity).
+fn opt_draft_hashtag(obj: &Map<String, Value>) -> Result<Option<String>, ApiError> {
+    match opt_string(obj, "hashtag")? {
+        Some(tag) if tag.chars().count() > 200 => Err(ApiError::invalid_param(
+            "hashtag",
+            "must be at most 200 chars",
+        )),
+        tag => Ok(tag),
+    }
+}
+
+/// Draft `fileIds` (`minItems: 0, maxItems: 16, uniqueItems` parity).
+fn draft_file_ids(obj: &Map<String, Value>) -> Result<Vec<String>, ApiError> {
+    let ids = str_list(obj, "fileIds")?;
+    if ids.len() > 16 {
+        return Err(ApiError::invalid_param("fileIds", "must have at most 16 items"));
+    }
+    let mut seen = std::collections::HashSet::new();
+    if !ids.iter().all(|id| seen.insert(id)) {
+        return Err(ApiError::invalid_param("fileIds", "must be unique"));
+    }
+    Ok(ids)
+}
+
+/// Draft `visibleUserIds` (`uniqueItems` parity).
+fn draft_visible_user_ids(obj: &Map<String, Value>) -> Result<Vec<String>, ApiError> {
+    let ids = str_list(obj, "visibleUserIds")?;
+    let mut seen = std::collections::HashSet::new();
+    if !ids.iter().all(|id| seen.insert(id)) {
+        return Err(ApiError::invalid_param(
+            "visibleUserIds",
+            "must be unique",
+        ));
+    }
+    Ok(ids)
+}
+
+/// Build a [`CreateDraftInput`] from a `notes/drafts/create` body.
+/// `channelId` must be null (channels do not exist; a non-null channel is
+/// `NO_SUCH_CHANNEL`, the upstream existence-check outcome for an unknown
+/// channel).
+fn parse_draft_create(obj: &Map<String, Value>) -> Result<CreateDraftInput, ApiError> {
+    if let Some(channel) = obj.get("channelId") {
+        if !channel.is_null() {
+            return Err(ApiError::from_port_error(PortError::NotFound(
+                "NO_SUCH_CHANNEL".to_string(),
+            )));
+        }
+    }
+    let poll = parse_draft_poll_param(obj)?;
+    Ok(CreateDraftInput {
+        text: opt_draft_text(obj, "text")?,
+        cw: opt_draft_cw(obj)?,
+        visibility: parse_visibility(obj.get("visibility"))?,
+        visible_users: draft_visible_user_ids(obj)?,
+        local_only: opt_bool(obj, "localOnly", false)?,
+        reply_to: opt_string(obj, "replyId")?,
+        renote_of: opt_string(obj, "renoteId")?,
+        file_ids: draft_file_ids(obj)?,
+        hashtag: opt_draft_hashtag(obj)?,
+        reaction_acceptance: parse_reaction_acceptance(obj.get("reactionAcceptance"))?,
+        has_poll: poll.is_some(),
+        poll_choices: poll.as_ref().map(|p| p.choices.clone()).unwrap_or_default(),
+        poll_multiple: poll.as_ref().and_then(|p| p.multiple).unwrap_or(false),
+        poll_expires_at_ms: poll.as_ref().and_then(|p| p.expires_at_ms).flatten(),
+        poll_expired_after_ms: poll.as_ref().and_then(|p| p.expired_after_ms).flatten(),
+        scheduled_at_ms: opt_i64(obj, "scheduledAt")?,
+        is_actually_scheduled: opt_bool(obj, "isActuallyScheduled", false)?,
+    })
+}
+
+/// Nullable-string patch field: absent → `None` (unchanged), `null` →
+/// `Some(None)` (clear), string → `Some(Some(_))`.
+fn patch_nullable_string(
+    obj: &Map<String, Value>,
+    key: &str,
+) -> Result<Option<Option<String>>, ApiError> {
+    match obj.get(key) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::String(s)) => Ok(Some(Some(s.clone()))),
+        Some(_) => Err(ApiError::invalid_param(key, "must be a string")),
+    }
+}
+
+/// Nullable-bool patch field.
+fn patch_nullable_bool(obj: &Map<String, Value>, key: &str) -> Result<Option<bool>, ApiError> {
+    match obj.get(key) {
+        None => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(_) => Err(ApiError::invalid_param(key, "must be a boolean")),
+    }
+}
+
+/// Nullable-integer patch field: absent → `None`, `null` → `Some(None)`,
+/// integer → `Some(Some(_))`.
+fn patch_nullable_i64(obj: &Map<String, Value>, key: &str) -> Result<Option<Option<i64>>, ApiError> {
+    match obj.get(key) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::Number(n)) => Ok(Some(Some(
+            n.as_i64()
+                .ok_or_else(|| ApiError::invalid_param(key, "must be an integer"))?,
+        ))),
+        Some(_) => Err(ApiError::invalid_param(key, "must be an integer")),
+    }
+}
+
+/// Build an [`UpdateDraftPatch`] from a `notes/drafts/update` body.
+/// Every field is optional; `poll: null`/absent leaves poll columns
+/// untouched (upstream `ps.poll?.choices` parity), while a `poll` object
+/// replaces the poll columns wholesale (absent sub-fields clear, mirroring
+/// the upstream `.set(data)` with `null` defaults).
+fn parse_draft_update(obj: &Map<String, Value>) -> Result<UpdateDraftPatch, ApiError> {
+    if let Some(channel) = obj.get("channelId") {
+        if !channel.is_null() {
+            return Err(ApiError::from_port_error(PortError::NotFound(
+                "NO_SUCH_CHANNEL".to_string(),
+            )));
+        }
+    }
+    let poll = parse_draft_poll_param(obj)?;
+    let text = match patch_nullable_string(obj, "text")? {
+        Some(Some(text)) if text.chars().count() > 3000 => {
+            return Err(ApiError::invalid_param("text", "must be at most 3000 chars"));
+        }
+        text => text,
+    };
+    let cw = match patch_nullable_string(obj, "cw")? {
+        Some(Some(cw)) => {
+            let n = cw.chars().count();
+            if n == 0 || n > 100 {
+                return Err(ApiError::invalid_param("cw", "must be 1..=100 chars"));
+            }
+            Some(Some(cw))
+        }
+        other => other,
+    };
+    let hashtag = match patch_nullable_string(obj, "hashtag")? {
+        Some(Some(tag)) if tag.chars().count() > 200 => {
+            return Err(ApiError::invalid_param("hashtag", "must be at most 200 chars"));
+        }
+        tag => tag,
+    };
+    let file_ids = match obj.get("fileIds") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(_)) => Some(draft_file_ids(obj)?),
+        Some(_) => return Err(ApiError::invalid_param("fileIds", "must be an array of strings")),
+    };
+    let visible_users = match obj.get("visibleUserIds") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(_)) => Some(draft_visible_user_ids(obj)?),
+        Some(_) => {
+            return Err(ApiError::invalid_param(
+                "visibleUserIds",
+                "must be an array of strings",
+            ));
+        }
+    };
+    let visibility = match obj.get("visibility") {
+        None | Some(Value::Null) => None,
+        Some(_) => Some(parse_visibility(obj.get("visibility"))?),
+    };
+    let reaction_acceptance = match obj.get("reactionAcceptance") {
+        None => None,
+        Some(_) => Some(parse_reaction_acceptance(obj.get("reactionAcceptance"))?),
+    };
+    Ok(UpdateDraftPatch {
+        text,
+        cw,
+        visibility,
+        visible_users,
+        local_only: patch_nullable_bool(obj, "localOnly")?,
+        reply_to: patch_nullable_string(obj, "replyId")?,
+        renote_of: patch_nullable_string(obj, "renoteId")?,
+        file_ids,
+        hashtag,
+        reaction_acceptance,
+        poll_choices: poll.as_ref().map(|p| p.choices.clone()),
+        poll_multiple: poll.as_ref().and_then(|p| p.multiple),
+        poll_expires_at_ms: poll.as_ref().and_then(|p| p.expires_at_ms),
+        poll_expired_after_ms: poll.as_ref().and_then(|p| p.expired_after_ms),
+        scheduled_at_ms: patch_nullable_i64(obj, "scheduledAt")?,
+        is_actually_scheduled: patch_nullable_bool(obj, "isActuallyScheduled")?,
+    })
+}
+
 /// Split a permission parameter (array or comma-separated string) into a
 /// permission list.
 fn parse_permissions(value: Option<&Value>) -> Vec<String> {
@@ -462,17 +896,41 @@ fn parse_cursor(obj: &Map<String, Value>) -> Result<TimelineCursor, ApiError> {
     })
 }
 
+/// Cursor paging for the block/mute list endpoints (Misskey parity: `limit`
+/// defaults to 30, range 1–100).
+fn parse_list_cursor(obj: &Map<String, Value>) -> Result<TimelineCursor, ApiError> {
+    let limit = match opt_usize(obj, "limit")? {
+        None => 30,
+        Some(limit) if (1..=100).contains(&limit) => limit,
+        Some(_) => {
+            return Err(ApiError::invalid_param(
+                "limit",
+                "must be an integer between 1 and 100",
+            ));
+        }
+    };
+    Ok(TimelineCursor {
+        since_id: opt_string(obj, "sinceId")?,
+        until_id: opt_string(obj, "untilId")?,
+        since_date: opt_i64(obj, "sinceDate")?,
+        until_date: opt_i64(obj, "untilDate")?,
+        limit,
+    })
+}
+
 /// Misskey notification types (misskey `types.ts` `notificationTypes`) that
 /// are valid `i/notifications` `includeTypes`/`excludeTypes` entries but can
-/// never match a local row: pinetree only emits the six kinds of
-/// [`NotificationKind`].
+/// never match a local row. The `reaction:grouped` / `renote:grouped`
+/// pseudo-types are valid entries too (§10): like upstream (whose DB query
+/// only matches stored rows), including only a grouped type matches nothing
+/// and excluding one excludes nothing.
 fn is_unemitted_notification_type(name: &str) -> bool {
     matches!(
         name,
         "note"
             | "pollEnded"
-            | "scheduledNotePosted"
-            | "scheduledNotePostFailed"
+            | "reaction:grouped"
+            | "renote:grouped"
             | "followRequestAccepted"
             | "roleAssigned"
             | "chatRoomInvitationReceived"
@@ -503,8 +961,14 @@ fn notification_kind_for(field: &str, name: &str) -> Result<Option<NotificationK
         // Quotes notify as `Renote` locally (no separate quote kind), so
         // both Misskey types select renote notifications.
         "renote" | "quote" => Ok(Some(NotificationKind::Renote)),
+        // Sharkey `edited` notification (a `notes/edit` addition —
+        // Misskey `notificationTypes` has no such entry).
+        "edited" => Ok(Some(NotificationKind::Edited)),
         "reaction" => Ok(Some(NotificationKind::Reaction)),
         "receiveFollowRequest" => Ok(Some(NotificationKind::ReceiveFollowRequest)),
+        // §5: scheduling notifications are now emitted locally.
+        "scheduledNotePosted" => Ok(Some(NotificationKind::ScheduledNotePosted)),
+        "scheduledNotePostFailed" => Ok(Some(NotificationKind::ScheduledNotePostFailed)),
         _ if is_unemitted_notification_type(name) => Ok(None),
         _ => Err(ApiError::invalid_param(
             field,
@@ -515,14 +979,72 @@ fn notification_kind_for(field: &str, name: &str) -> Result<Option<NotificationK
 
 /// Every [`NotificationKind`] the local store can emit, for the
 /// exclude-everything early return (`i/notifications` Misskey parity).
-const ALL_NOTIFICATION_KINDS: [NotificationKind; 6] = [
+const ALL_NOTIFICATION_KINDS: [NotificationKind; 9] = [
     NotificationKind::Follow,
     NotificationKind::ReceiveFollowRequest,
     NotificationKind::Mention,
     NotificationKind::Reply,
     NotificationKind::Renote,
     NotificationKind::Reaction,
+    NotificationKind::ScheduledNotePosted,
+    NotificationKind::ScheduledNotePostFailed,
+    NotificationKind::Edited,
 ];
+
+/// Shared query params of `i/notifications` and `i/notifications-grouped`
+/// (§10; upstream `paramDef` is identical on both endpoints).
+struct NotificationQuery {
+    cursor: TimelineCursor,
+    mark_as_read: bool,
+    include: Vec<NotificationKind>,
+    exclude: Vec<NotificationKind>,
+    matches_nothing: bool,
+}
+
+/// Parse the shared notification-list params: cursor + `markAsRead` +
+/// kind allow/deny lists (Misskey `notifications.ts` parity — presence,
+/// not emptiness, of `includeTypes` decides filtering; an explicitly
+/// empty or never-matching allow-list, or denying every emittable kind,
+/// matches nothing without touching the store).
+fn parse_notification_query(obj: &Map<String, Value>) -> Result<NotificationQuery, ApiError> {
+    let cursor = parse_cursor(obj)?;
+    let mark_as_read = opt_bool(obj, "markAsRead", true)?;
+    let include_requested = obj.contains_key("includeTypes");
+    let mut include: Vec<NotificationKind> = Vec::new();
+    for name in str_list(obj, "includeTypes")? {
+        if is_obsolete_notification_type(&name) {
+            continue;
+        }
+        if let Some(kind) = notification_kind_for("includeTypes", &name)? {
+            if !include.contains(&kind) {
+                include.push(kind);
+            }
+        }
+    }
+    let mut exclude: Vec<NotificationKind> = Vec::new();
+    for name in str_list(obj, "excludeTypes")? {
+        if is_obsolete_notification_type(&name) {
+            continue;
+        }
+        if let Some(kind) = notification_kind_for("excludeTypes", &name)? {
+            if !exclude.contains(&kind) {
+                exclude.push(kind);
+            }
+        }
+    }
+    let matches_nothing = (include_requested && include.is_empty())
+        || (!exclude.is_empty()
+            && ALL_NOTIFICATION_KINDS
+                .iter()
+                .all(|kind| exclude.contains(kind)));
+    Ok(NotificationQuery {
+        cursor,
+        mark_as_read,
+        include,
+        exclude,
+        matches_nothing,
+    })
+}
 
 /// Pack `account` for `viewer`: the caller's own account packs as
 /// `MeDetailed`, everyone else as `UserDetailedNotMe`.
@@ -1766,36 +2288,61 @@ fn api_dispatch_blocking(
         }
 
         "i/update" => {
+            // Full profile store (§0B): all 39 `i/update.ts` params plus the
+            // DIVERGENCE `rejectQuotes` (§3) and `defaultReaction` (§6)
+            // params. Business rules (prohibited words, media checks, mute
+            // limits, alias resolution, unlock-accept) live in
+            // `AppServices::update_profile`; this arm only parses shapes.
             check_allowed_fields(
                 &obj,
                 &[
                     "name",
                     "description",
+                    "followedMessage",
                     "location",
                     "birthday",
+                    "lang",
                     "avatarId",
+                    "avatarDecorations",
                     "bannerId",
+                    "fields",
                     "isLocked",
+                    "isExplorable",
+                    "hideOnlineStatus",
+                    "publicReactions",
+                    "carefulBot",
+                    "autoAcceptFollowed",
+                    "followApprovalLocalSeconds",
+                    "followApprovalRemoteSeconds",
+                    "noCrawle",
+                    "preventAiLearning",
+                    "requireSigninToViewContents",
+                    "makeNotesFollowersOnlyBefore",
+                    "makeNotesHiddenBefore",
                     "isBot",
                     "isCat",
-                    "isExplorable",
+                    "injectFeaturedNote",
+                    "receiveAnnouncementEmail",
+                    "alwaysMarkNsfw",
+                    "autoSensitive",
+                    "followingVisibility",
+                    "followersVisibility",
+                    "chatScope",
+                    "pinnedPageId",
+                    "mutedWords",
+                    "hardMutedWords",
+                    "mutedInstances",
+                    "notificationRecieveConfig",
+                    "emailNotificationTypes",
+                    "alsoKnownAs",
+                    "rejectQuotes",
+                    "defaultReaction",
                 ],
             )?;
             let caller = require_caller(caller)?;
             caller.require_permission("write:account")?;
             state.rate_limiter.check(&rate_key, "i/update")?;
-            let patch = UpdateAccountPatch {
-                display_name: update_string_field(&obj, "name")?,
-                description: update_string_field(&obj, "description")?,
-                location: update_string_field(&obj, "location")?,
-                birthday: update_string_field(&obj, "birthday")?,
-                avatar_id: update_string_field(&obj, "avatarId")?,
-                banner_id: update_string_field(&obj, "bannerId")?,
-                is_locked: update_bool_field(&obj, "isLocked")?,
-                is_bot: update_bool_field(&obj, "isBot")?,
-                is_cat: update_bool_field(&obj, "isCat")?,
-                is_explorable: update_bool_field(&obj, "isExplorable")?,
-            };
+            let patch = parse_profile_patch(&obj)?;
             let account = state
                 .services
                 .update_profile(&caller.account.id, patch)
@@ -1953,14 +2500,8 @@ fn api_dispatch_blocking(
                     return Err(ApiError::unsupported_field("channelId"));
                 }
             }
-            if let Some(poll) = obj.get("poll") {
-                if !poll.is_null() {
-                    return Err(ApiError::invalid_param(
-                        "poll",
-                        "polls are unsupported in Phase 1",
-                    ));
-                }
-            }
+            // §4 polls (Misskey `notes/create.ts:168-184` parity).
+            let poll_input = parse_poll_param(&obj, "poll", state.services.clock.now_ms())?;
             let caller = require_caller(caller)?;
             caller.require_permission("write:notes")?;
             state.rate_limiter.check(&rate_key, "notes/create")?;
@@ -1985,7 +2526,9 @@ fn api_dispatch_blocking(
                 no_extract_mentions: opt_bool(&obj, "noExtractMentions", false)?,
                 no_extract_hashtags: opt_bool(&obj, "noExtractHashtags", false)?,
                 no_extract_emojis: opt_bool(&obj, "noExtractEmojis", false)?,
-                has_poll: false,
+                has_poll: poll_input.is_some(),
+                poll: poll_input,
+                poll_initial_votes: None,
                 has_channel: false,
                 prohibited_words: Vec::new(),
                 sensitive_words: Vec::new(),
@@ -2028,6 +2571,267 @@ fn api_dispatch_blocking(
                 .delete_note(&caller.account.id, &note_id)
                 .map_err(ApiError::from_port_error)?;
             Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // §8 `notes/edit` (Sharkey `notes/edit.ts` 484-line parity, backend
+        // only): `requireCredential`, `write:notes`, 300/h, res
+        // `{createdNote: Note}`. `replyId` is validated when supplied but
+        // the original parent is always kept; `visibility`/`localOnly` are
+        // parsed (for the specified-reply check) then forced back to the
+        // original note's values by the service. Pinetree has no
+        // moved-account machinery, so `prohibitMoved` has nothing to hook
+        // (same as every other write endpoint).
+        "notes/edit" => {
+            check_allowed_fields(
+                &obj,
+                &[
+                    "editId",
+                    "visibility",
+                    "visibleUserIds",
+                    "text",
+                    "cw",
+                    "localOnly",
+                    "reactionAcceptance",
+                    "noExtractMentions",
+                    "noExtractHashtags",
+                    "noExtractEmojis",
+                    "replyId",
+                    "renoteId",
+                    "channelId",
+                    "fileIds",
+                    "mediaIds",
+                    "poll",
+                ],
+            )?;
+            if let Some(channel) = obj.get("channelId") {
+                if !channel.is_null() {
+                    // No channels exist: same `UNSUPPORTED_FIELD` rule as
+                    // `notes/create` (the `NO_SUCH_CHANNEL` below is
+                    // unreachable while channels are absent).
+                    return Err(ApiError::unsupported_field("channelId"));
+                }
+            }
+            // Missing/empty `editId` is `NEEDS_EDIT_ID`, not
+            // `INVALID_PARAM` (Sharkey error-set parity).
+            let edit_id = match obj.get("editId") {
+                Some(Value::String(s)) if !s.is_empty() => s.clone(),
+                _ => {
+                    return Err(ApiError::from_port_error(PortError::Validation(
+                        "NEEDS_EDIT_ID".to_string(),
+                    )));
+                }
+            };
+            // Length pre-gates (Sharkey `edit.ts` parity — the endpoint
+            // rejects, the service trims/truncates for the inbound path).
+            // Counts are Rust chars (upstream counts UTF-16 code units).
+            if let Some(Value::String(text)) = obj.get("text") {
+                if text.chars().count() > MAX_NOTE_TEXT_CHARS {
+                    return Err(ApiError::from_port_error(PortError::Validation(
+                        "MAX_LENGTH".to_string(),
+                    )));
+                }
+            }
+            if let Some(Value::String(cw)) = obj.get("cw") {
+                if cw.chars().count() > MAX_CW_API_CHARS {
+                    return Err(ApiError::from_port_error(PortError::Validation(
+                        "MAX_CW_LENGTH".to_string(),
+                    )));
+                }
+            }
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:notes")?;
+            state.rate_limiter.check(&rate_key, "notes/edit")?;
+            let requested_visibility = parse_visibility(obj.get("visibility"))?;
+            // §8 poll params (same `parse_poll_param` as `notes/create`:
+            // `expiredAfter` wins, past expiry is the exact
+            // `CANNOT_CREATE_ALREADY_EXPIRED_POLL` ident).
+            let poll_input =
+                parse_poll_param(&obj, "poll", state.services.clock.now_ms())?;
+            // The edit target must exist here so the renote/reply checks
+            // below run against the original note (the service re-checks
+            // authorship atomically; a deleted target is `NO_SUCH_NOTE`).
+            let original = match state.services.notes.get_note(&edit_id).map_err(ApiError::from_port_error)? {
+                Some(note) => note,
+                None => {
+                    return Err(ApiError::from_port_error(PortError::NotFound(
+                        "NO_SUCH_NOTE".to_string(),
+                    )));
+                }
+            };
+            if original.author_id != caller.account.id {
+                return Err(ApiError::from_port_error(PortError::Validation(
+                    "YOU_ARE_NOT_THE_AUTHOR".to_string(),
+                )));
+            }
+            // Renote checks (Sharkey `edit.ts` endpoint order: self-quote,
+            // existence, pure-renote target, quote-of-edited-note,
+            // blocking, visibility).
+            let mut renote_of: Option<String> = None;
+            if let Some(renote_id) = opt_string(&obj, "renoteId")? {
+                if renote_id == edit_id {
+                    return Err(ApiError::from_port_error(PortError::Validation(
+                        "CANNOT_QUOTE_THE_CURRENT_NOTE".to_string(),
+                    )));
+                }
+                let target = match state.services.notes.get_note(&renote_id).map_err(ApiError::from_port_error)? {
+                    Some(note) => note,
+                    None => {
+                        return Err(ApiError::from_port_error(PortError::NotFound(
+                            "NO_SUCH_RENOTE_TARGET".to_string(),
+                        )));
+                    }
+                };
+                if target.renote_id.is_some() && target.quote.is_none() {
+                    return Err(ApiError::from_port_error(PortError::Validation(
+                        "CANNOT_RENOTE_TO_A_PURE_RENOTE".to_string(),
+                    )));
+                }
+                if target.renote_id.as_deref() == Some(edit_id.as_str()) {
+                    return Err(ApiError::from_port_error(PortError::Validation(
+                        "CANNOT_QUOTE_A_QUOTE_OF_EDITED_NOTE".to_string(),
+                    )));
+                }
+                if target.author_id != caller.account.id
+                    && state
+                        .services
+                        .blocks
+                        .is_blocking(&target.author_id, &caller.account.id)
+                        .map_err(ApiError::from_port_error)?
+                {
+                    return Err(ApiError::from_port_error(PortError::Validation(
+                        "YOU_HAVE_BEEN_BLOCKED".to_string(),
+                    )));
+                }
+                if target.visibility == Visibility::Specified
+                    || (target.visibility == Visibility::Followers
+                        && target.author_id != caller.account.id)
+                {
+                    return Err(ApiError::from_port_error(PortError::Validation(
+                        "CANNOT_RENOTE_DUE_TO_VISIBILITY".to_string(),
+                    )));
+                }
+                // Renote-in-channel narrowing (`NO_SUCH_CHANNEL` /
+                // `CANNOT_RENOTE_OUTSIDE_OF_CHANNEL`) is unreachable: stored
+                // notes never carry a channel (creation rejects them).
+                renote_of = Some(renote_id);
+            }
+            // Reply checks (Sharkey `edit.ts` endpoint order). The supplied
+            // reply is validated but then discarded: the service always keeps
+            // the original parent (`replyId` immutable).
+            if let Some(reply_id) = opt_string(&obj, "replyId")? {
+                let reply = match state.services.notes.get_note(&reply_id).map_err(ApiError::from_port_error)? {
+                    Some(note) => note,
+                    None => {
+                        return Err(ApiError::from_port_error(PortError::NotFound(
+                            "NO_SUCH_REPLY_TARGET".to_string(),
+                        )));
+                    }
+                };
+                if reply.renote_id.is_some() && reply.quote.is_none() {
+                    return Err(ApiError::from_port_error(PortError::Validation(
+                        "CANNOT_REPLY_TO_A_PURE_RENOTE".to_string(),
+                    )));
+                }
+                let follows_author = reply.author_id == caller.account.id
+                    || state
+                        .services
+                        .follows
+                        .is_following(&caller.account.id, &reply.author_id)
+                        .map_err(ApiError::from_port_error)?;
+                let viewer = crate::domain::policy::ViewerContext::local_user(
+                    &caller.account.id,
+                    follows_author,
+                );
+                if !crate::domain::visibility::is_visible(&reply, &viewer) {
+                    return Err(ApiError::from_port_error(PortError::Validation(
+                        "CANNOT_REPLY_TO_AN_INVISIBLE_NOTE".to_string(),
+                    )));
+                }
+                if reply.visibility == Visibility::Specified
+                    && requested_visibility != Visibility::Specified
+                {
+                    return Err(ApiError::from_port_error(PortError::Validation(
+                        "CANNOT_REPLY_TO_SPECIFIED_VISIBILITY_NOTE_WITH_EXTENDED_VISIBILITY"
+                            .to_string(),
+                    )));
+                }
+                if reply.author_id != caller.account.id
+                    && state
+                        .services
+                        .blocks
+                        .is_blocking(&reply.author_id, &caller.account.id)
+                        .map_err(ApiError::from_port_error)?
+                {
+                    return Err(ApiError::from_port_error(PortError::Validation(
+                        "YOU_HAVE_BEEN_BLOCKED".to_string(),
+                    )));
+                }
+            }
+            let mut file_ids = str_list(&obj, "fileIds")?;
+            for id in str_list(&obj, "mediaIds")? {
+                if !file_ids.contains(&id) {
+                    file_ids.push(id);
+                }
+            }
+            let input = EditNoteInput {
+                editor_id: caller.account.id.clone(),
+                note_id: edit_id,
+                text: opt_string(&obj, "text")?,
+                cw: opt_string(&obj, "cw")?,
+                renote_of,
+                file_ids,
+                poll: poll_input,
+                reaction_acceptance: parse_reaction_acceptance(
+                    obj.get("reactionAcceptance"),
+                )?,
+                visible_users: str_list(&obj, "visibleUserIds")?,
+                // `noExtract*` params are accepted and ignored: pinetree
+                // extracts mentions/tags unconditionally (same as the
+                // `notes/create` arm, which reads them for validation only).
+                prohibited_words: Vec::new(),
+                sensitive_words: Vec::new(),
+                uri_base: String::new(),
+            };
+            let note = state
+                .services
+                .edit_note(input)
+                .map_err(ApiError::from_port_error)?;
+            let packed = pack_note(&note, Some(&caller.account.id), &state.services, 0)
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(serde_json::json!({ "createdNote": packed })).into_response())
+        }
+
+        // §3 `admin/reject-quotes` (Sharkey `admin/reject-quotes.ts`
+        // parity): moderation toggle for one user's `rejectQuotes` flag.
+        // `credential` + `write:admin:reject-quotes` (first-party callers
+        // pass). DIVERGENCE: pinetree has no moderator-role infra, so any
+        // first-party credential may call it (TODO: gate on a moderator
+        // role when roles land). No moderation-log row exists yet either
+        // (TODO: `ModerationLogService` equivalent). The `MeUpdated`
+        // streaming job commits atomically (the `localUserUpdated`
+        // equivalent); unlike `i/update` a moderation toggle never
+        // federates `Update(Person)`.
+        "admin/reject-quotes" => {
+            check_allowed_fields(&obj, &["userId", "rejectQuotes"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:reject-quotes")?;
+            let user_id = required_str(&obj, "userId")?;
+            let reject = match obj.get("rejectQuotes") {
+                Some(Value::Bool(b)) => *b,
+                _ => {
+                    return Err(ApiError::invalid_param(
+                        "rejectQuotes",
+                        "must be a boolean",
+                    ));
+                }
+            };
+            let account = state
+                .services
+                .set_reject_quotes(&user_id, reject)
+                .map_err(ApiError::from_port_error)?;
+            let packed = pack_me_detailed(&account, caller.is_first_party, &state.services)
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(packed).into_response())
         }
 
         "following/create" => {
@@ -2282,6 +3086,29 @@ fn api_dispatch_blocking(
             Ok(StatusCode::NO_CONTENT.into_response())
         }
 
+        // §4 polls (Misskey `notes/polls/vote.ts` parity:
+        // `requireCredential`, kind `write:votes`). Pinetree has no
+        // moved-account machinery, so `prohibitMoved` has nothing to hook
+        // (same as every other write endpoint).
+        "notes/polls/vote" => {
+            check_allowed_fields(&obj, &["noteId", "choice"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:votes")?;
+            state.rate_limiter.check(&rate_key, "notes/polls/vote")?;
+            let note_id = required_str(&obj, "noteId")?;
+            let choice = match obj.get("choice") {
+                Some(Value::Number(n)) => n.as_u64().and_then(|v| usize::try_from(v).ok()).ok_or_else(
+                    || ApiError::invalid_param("choice", "must be an integer"),
+                )?,
+                _ => return Err(ApiError::invalid_param("choice", "this field is required")),
+            };
+            state
+                .services
+                .vote_on_poll(&caller.account.id, &note_id, choice)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
         "i/notifications" => {
             check_allowed_fields(
                 &obj,
@@ -2299,43 +3126,9 @@ fn api_dispatch_blocking(
             let caller = require_caller(caller)?;
             // Misskey kind is `read:notifications` (not `read:account`).
             caller.require_permission("read:notifications")?;
-            let cursor = parse_cursor(&obj)?;
-            let mark_as_read = opt_bool(&obj, "markAsRead", true)?;
-            // Presence (not emptiness) of `includeTypes` decides filtering:
-            // an explicitly empty array matches nothing (Misskey parity).
-            let include_requested = obj.contains_key("includeTypes");
-            let mut include: Vec<NotificationKind> = Vec::new();
-            for name in str_list(&obj, "includeTypes")? {
-                if is_obsolete_notification_type(&name) {
-                    continue;
-                }
-                if let Some(kind) = notification_kind_for("includeTypes", &name)? {
-                    if !include.contains(&kind) {
-                        include.push(kind);
-                    }
-                }
-            }
-            let mut exclude: Vec<NotificationKind> = Vec::new();
-            for name in str_list(&obj, "excludeTypes")? {
-                if is_obsolete_notification_type(&name) {
-                    continue;
-                }
-                if let Some(kind) = notification_kind_for("excludeTypes", &name)? {
-                    if !exclude.contains(&kind) {
-                        exclude.push(kind);
-                    }
-                }
-            }
-            // Misskey parity: an explicitly empty (or never-matching)
-            // `includeTypes`, or excluding every emittable type, matches
-            // nothing — without touching the store.
-            let matches_nothing = (include_requested && include.is_empty())
-                || (!exclude.is_empty()
-                    && ALL_NOTIFICATION_KINDS
-                        .iter()
-                        .all(|kind| exclude.contains(kind)));
-            if matches_nothing {
-                if mark_as_read {
+            let query = parse_notification_query(&obj)?;
+            if query.matches_nothing {
+                if query.mark_as_read {
                     state
                         .services
                         .mark_all_notifications_read(&caller.account.id)
@@ -2346,13 +3139,18 @@ fn api_dispatch_blocking(
             let notifications = state
                 .services
                 .notifications
-                .list_notifications_filtered(&caller.account.id, &cursor, &include, &exclude)
+                .list_notifications_filtered(
+                    &caller.account.id,
+                    &query.cursor,
+                    &query.include,
+                    &query.exclude,
+                )
                 .map_err(ApiError::from_port_error)?;
             let packed: Vec<Value> = notifications
                 .iter()
                 .map(|note| pack_notification(note, &state.services))
                 .collect();
-            if mark_as_read {
+            if query.mark_as_read {
                 state
                     .services
                     .mark_all_notifications_read(&caller.account.id)
@@ -2598,12 +3396,12 @@ fn api_dispatch_blocking(
             let follows = if endpoint == "users/followers" {
                 state
                     .services
-                    .user_followers(&account.id, &cursor)
+                    .user_followers(&account.id, viewer_id, &cursor)
                     .map_err(ApiError::from_port_error)?
             } else {
                 state
                     .services
-                    .user_following(&account.id, &cursor)
+                    .user_following(&account.id, viewer_id, &cursor)
                     .map_err(ApiError::from_port_error)?
             };
             let mut out = Vec::with_capacity(follows.len());
@@ -2611,6 +3409,45 @@ fn api_dispatch_blocking(
                 out.push(
                     pack_following(follow, viewer_id, &state.services)
                         .map_err(ApiError::from_port_error)?,
+                );
+            }
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        "users/reactions" => {
+            check_allowed_fields(
+                &obj,
+                &[
+                    "userId",
+                    "limit",
+                    "sinceId",
+                    "untilId",
+                    "sinceDate",
+                    "untilDate",
+                ],
+            )?;
+            let user_id = required_str(&obj, "userId")?;
+            let cursor = parse_cursor(&obj)?;
+            let viewer_id = caller.as_ref().map(|caller| caller.account.id.as_str());
+            let rows = state
+                .services
+                .user_reactions(&user_id, viewer_id, &cursor)
+                .map_err(ApiError::from_port_error)?;
+            let target = state
+                .services
+                .users_show_by_id(&user_id)
+                .map_err(ApiError::from_port_error)?;
+            let mut out = Vec::with_capacity(rows.len());
+            for row in &rows {
+                out.push(
+                    pack_note_reaction_with_note(
+                        &row.reaction,
+                        &target,
+                        &row.note,
+                        viewer_id,
+                        &state.services,
+                    )
+                    .map_err(ApiError::from_port_error)?,
                 );
             }
             Ok(Json(Value::Array(out)).into_response())
@@ -2960,6 +3797,16 @@ fn api_dispatch_blocking(
                             state.services.notes.find_by_uri(u).ok().flatten()
                         })
                         .map(|n| n.id);
+                    // Same inbound-poll gate as the federated inbox: attach
+                    // only invariant-meeting Questions, never fail the note.
+                    let lookup_poll = parsed.poll.as_ref().filter(|p| {
+                        p.choices.len() >= 2
+                            && p.choices.len() <= 10
+                            && p.choices.iter().all(|c| {
+                                let n = c.chars().count();
+                                n >= 1 && n <= 50
+                            })
+                    });
                     let input = CreateNoteInput {
                         author_id: author.id.clone(),
                         text: parsed.text.clone(),
@@ -2975,7 +3822,15 @@ fn api_dispatch_blocking(
                         no_extract_mentions: false,
                         no_extract_hashtags: false,
                         no_extract_emojis: false,
-                        has_poll: false,
+                        has_poll: lookup_poll.is_some(),
+                        poll: lookup_poll.map(|p| {
+                            crate::domain::poll::PollInput {
+                                choices: p.choices.clone(),
+                                multiple: p.multiple,
+                                expires_at_ms: p.expires_at_ms,
+                            }
+                        }),
+                        poll_initial_votes: lookup_poll.map(|p| p.votes.clone()),
                         has_channel: false,
                         prohibited_words: Vec::new(),
                         sensitive_words: Vec::new(),
@@ -3036,6 +3891,570 @@ fn api_dispatch_blocking(
             }
         }
 
+        "blocking/create" => {
+            check_allowed_fields(&obj, &["userId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:blocks")?;
+            state.rate_limiter.check(&rate_key, "blocking/create")?;
+            let user_id = required_str(&obj, "userId")?;
+            // Upstream order: self-check, then user existence, then dup.
+            if caller.account.id == user_id {
+                return Err(ApiError::from_port_error(PortError::Validation(
+                    "BLOCKEE_IS_YOURSELF".to_string(),
+                )));
+            }
+            state
+                .services
+                .users_show_by_id(&user_id)
+                .map_err(ApiError::from_port_error)?;
+            state
+                .services
+                .block(&caller.account.id, &user_id)
+                .map_err(ApiError::from_port_error)?;
+            let blockee = state
+                .services
+                .users_show_by_id(&user_id)
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(
+                pack_user_detailed_not_me(&blockee, Some(&caller.account.id), &state.services)
+                    .map_err(ApiError::from_port_error)?,
+            )
+            .into_response())
+        }
+
+        "blocking/delete" => {
+            check_allowed_fields(&obj, &["userId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:blocks")?;
+            state.rate_limiter.check(&rate_key, "blocking/delete")?;
+            let user_id = required_str(&obj, "userId")?;
+            if caller.account.id == user_id {
+                return Err(ApiError::from_port_error(PortError::Validation(
+                    "BLOCKEE_IS_YOURSELF".to_string(),
+                )));
+            }
+            state
+                .services
+                .users_show_by_id(&user_id)
+                .map_err(ApiError::from_port_error)?;
+            state
+                .services
+                .unblock(&caller.account.id, &user_id)
+                .map_err(ApiError::from_port_error)?;
+            let blockee = state
+                .services
+                .users_show_by_id(&user_id)
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(
+                pack_user_detailed_not_me(&blockee, Some(&caller.account.id), &state.services)
+                    .map_err(ApiError::from_port_error)?,
+            )
+            .into_response())
+        }
+
+        "blocking/list" => {
+            check_allowed_fields(
+                &obj,
+                &["limit", "sinceId", "untilId", "sinceDate", "untilDate"],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:blocks")?;
+            let cursor = parse_list_cursor(&obj)?;
+            let rows = state
+                .services
+                .blocks
+                .list_blockings(&caller.account.id, &cursor)
+                .map_err(ApiError::from_port_error)?;
+            let viewer_id = Some(caller.account.id.as_str());
+            let mut out = Vec::with_capacity(rows.len());
+            for row in &rows {
+                out.push(
+                    pack_blocking(row, viewer_id, &state.services)
+                        .map_err(ApiError::from_port_error)?,
+                );
+            }
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        "mute/create" => {
+            check_allowed_fields(&obj, &["userId", "expiresAt"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:mutes")?;
+            state.rate_limiter.check(&rate_key, "mute/create")?;
+            let user_id = required_str(&obj, "userId")?;
+            if caller.account.id == user_id {
+                return Err(ApiError::from_port_error(PortError::Validation(
+                    "MUTEE_IS_YOURSELF".to_string(),
+                )));
+            }
+            state
+                .services
+                .users_show_by_id(&user_id)
+                .map_err(ApiError::from_port_error)?;
+            let expires_at = opt_i64(&obj, "expiresAt")?;
+            state
+                .services
+                .mute(&caller.account.id, &user_id, expires_at)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "mute/delete" => {
+            check_allowed_fields(&obj, &["userId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:mutes")?;
+            let user_id = required_str(&obj, "userId")?;
+            if caller.account.id == user_id {
+                return Err(ApiError::from_port_error(PortError::Validation(
+                    "MUTEE_IS_YOURSELF".to_string(),
+                )));
+            }
+            state
+                .services
+                .users_show_by_id(&user_id)
+                .map_err(ApiError::from_port_error)?;
+            state
+                .services
+                .unmute(&caller.account.id, &user_id)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "mute/list" => {
+            check_allowed_fields(
+                &obj,
+                &["limit", "sinceId", "untilId", "sinceDate", "untilDate"],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:mutes")?;
+            let cursor = parse_list_cursor(&obj)?;
+            let rows = state
+                .services
+                .mutes
+                .list_mutings(&caller.account.id, &cursor)
+                .map_err(ApiError::from_port_error)?;
+            let viewer_id = Some(caller.account.id.as_str());
+            let mut out = Vec::with_capacity(rows.len());
+            for row in &rows {
+                out.push(
+                    pack_muting(row, viewer_id, &state.services)
+                        .map_err(ApiError::from_port_error)?,
+                );
+            }
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        "renote-mute/create" => {
+            check_allowed_fields(&obj, &["userId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:mutes")?;
+            state.rate_limiter.check(&rate_key, "renote-mute/create")?;
+            let user_id = required_str(&obj, "userId")?;
+            if caller.account.id == user_id {
+                return Err(ApiError::from_port_error(PortError::Validation(
+                    "MUTEE_IS_YOURSELF".to_string(),
+                )));
+            }
+            state
+                .services
+                .users_show_by_id(&user_id)
+                .map_err(ApiError::from_port_error)?;
+            state
+                .services
+                .renote_mute(&caller.account.id, &user_id)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "renote-mute/delete" => {
+            check_allowed_fields(&obj, &["userId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:mutes")?;
+            let user_id = required_str(&obj, "userId")?;
+            if caller.account.id == user_id {
+                return Err(ApiError::from_port_error(PortError::Validation(
+                    "MUTEE_IS_YOURSELF".to_string(),
+                )));
+            }
+            state
+                .services
+                .users_show_by_id(&user_id)
+                .map_err(ApiError::from_port_error)?;
+            state
+                .services
+                .renote_unmute(&caller.account.id, &user_id)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "renote-mute/list" => {
+            check_allowed_fields(
+                &obj,
+                &["limit", "sinceId", "untilId", "sinceDate", "untilDate"],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:mutes")?;
+            let cursor = parse_list_cursor(&obj)?;
+            let rows = state
+                .services
+                .mutes
+                .list_renote_mutings(&caller.account.id, &cursor)
+                .map_err(ApiError::from_port_error)?;
+            let viewer_id = Some(caller.account.id.as_str());
+            let mut out = Vec::with_capacity(rows.len());
+            for row in &rows {
+                out.push(
+                    pack_renote_muting(row, viewer_id, &state.services)
+                        .map_err(ApiError::from_port_error)?,
+                );
+            }
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        "users/relation" => {
+            check_allowed_fields(&obj, &["userId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:account")?;
+            let me = caller.account.id.clone();
+            // Misskey parity: always an array (a single `userId` yields a
+            // one-element array), with no existence check on the targets.
+            let ids: Vec<String> = match obj.get("userId") {
+                Some(Value::String(id)) => vec![id.clone()],
+                Some(Value::Array(ids)) => {
+                    let mut out = Vec::with_capacity(ids.len());
+                    for id in ids {
+                        out.push(
+                            id.as_str()
+                                .ok_or_else(|| {
+                                    ApiError::invalid_param(
+                                        "userId",
+                                        "must be a string or an array of strings",
+                                    )
+                                })?
+                                .to_string(),
+                        );
+                    }
+                    out
+                }
+                _ => {
+                    return Err(ApiError::invalid_param(
+                        "userId",
+                        "this field is required",
+                    ));
+                }
+            };
+            let mut out = Vec::with_capacity(ids.len());
+            for id in &ids {
+                out.push(
+                    pack_user_relation(&me, id, &state.services)
+                        .map_err(ApiError::from_port_error)?,
+                );
+            }
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        "notes/drafts/create" => {
+            check_allowed_fields(
+                &obj,
+                &[
+                    "visibility",
+                    "visibleUserIds",
+                    "cw",
+                    "hashtag",
+                    "localOnly",
+                    "reactionAcceptance",
+                    "replyId",
+                    "renoteId",
+                    "channelId",
+                    "text",
+                    "fileIds",
+                    "poll",
+                    "scheduledAt",
+                    "isActuallyScheduled",
+                ],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state.rate_limiter.check(&rate_key, "notes/drafts/create")?;
+            let input = parse_draft_create(&obj)?;
+            let draft = state
+                .services
+                .create_draft(&caller.account.id, input)
+                .map_err(ApiError::from_port_error)?;
+            let packed = pack_note_draft(&draft, &state.services);
+            Ok(Json(serde_json::json!({ "createdDraft": packed })).into_response())
+        }
+
+        "notes/drafts/update" => {
+            check_allowed_fields(
+                &obj,
+                &[
+                    "draftId",
+                    "visibility",
+                    "visibleUserIds",
+                    "cw",
+                    "hashtag",
+                    "localOnly",
+                    "reactionAcceptance",
+                    "replyId",
+                    "renoteId",
+                    "channelId",
+                    "text",
+                    "fileIds",
+                    "poll",
+                    "scheduledAt",
+                    "isActuallyScheduled",
+                ],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state.rate_limiter.check(&rate_key, "notes/drafts/update")?;
+            let draft_id = required_str(&obj, "draftId")?;
+            let patch = parse_draft_update(&obj)?;
+            let draft = state
+                .services
+                .update_draft(&caller.account.id, &draft_id, patch)
+                .map_err(ApiError::from_port_error)?;
+            let packed = pack_note_draft(&draft, &state.services);
+            Ok(Json(serde_json::json!({ "updatedDraft": packed })).into_response())
+        }
+
+        "notes/drafts/delete" => {
+            check_allowed_fields(&obj, &["draftId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state.rate_limiter.check(&rate_key, "notes/drafts/delete")?;
+            let draft_id = required_str(&obj, "draftId")?;
+            // The endpoint distinguishes foreign drafts (`ACCESS_DENIED`)
+            // from missing ones (`NO_SUCH_NOTE_DRAFT`); the application op
+            // filters by owner first, so the ownership check below decides
+            // the error before delegating.
+            match state
+                .services
+                .notes
+                .get_draft(&draft_id)
+                .map_err(ApiError::from_port_error)?
+            {
+                Some(draft) if draft.user_id != caller.account.id => {
+                    return Err(ApiError::from_port_error(PortError::Validation(
+                        "ACCESS_DENIED".to_string(),
+                    )));
+                }
+                _ => {}
+            }
+            state
+                .services
+                .delete_draft(&caller.account.id, &draft_id)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "notes/drafts/list" => {
+            check_allowed_fields(
+                &obj,
+                &["limit", "sinceId", "untilId", "sinceDate", "untilDate", "scheduled"],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:account")?;
+            let limit = match opt_usize(&obj, "limit")? {
+                None => 30,
+                Some(limit) if (1..=100).contains(&limit) => limit,
+                Some(_) => {
+                    return Err(ApiError::invalid_param(
+                        "limit",
+                        "must be an integer between 1 and 100",
+                    ));
+                }
+            };
+            let cursor = TimelineCursor {
+                since_id: opt_string(&obj, "sinceId")?,
+                until_id: opt_string(&obj, "untilId")?,
+                since_date: opt_i64(&obj, "sinceDate")?,
+                until_date: opt_i64(&obj, "untilDate")?,
+                limit,
+            };
+            let scheduled = match obj.get("scheduled") {
+                None | Some(Value::Null) => None,
+                Some(Value::Bool(b)) => Some(*b),
+                Some(_) => {
+                    return Err(ApiError::invalid_param("scheduled", "must be a boolean"));
+                }
+            };
+            let drafts = state
+                .services
+                .list_drafts(&caller.account.id, &cursor, scheduled)
+                .map_err(ApiError::from_port_error)?;
+            let mut out = Vec::with_capacity(drafts.len());
+            for draft in &drafts {
+                out.push(pack_note_draft(draft, &state.services));
+            }
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        "notes/drafts/count" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:account")?;
+            let count = state
+                .services
+                .count_drafts(&caller.account.id)
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(Value::Number(count.into())).into_response())
+        }
+
+        "i/pin" => {
+            check_allowed_fields(&obj, &["noteId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            let note_id = required_str(&obj, "noteId")?;
+            state
+                .services
+                .pin_note(&caller.account.id, &note_id)
+                .map_err(ApiError::from_port_error)?;
+            let packed =
+                pack_me_detailed(&caller.account, caller.is_first_party, &state.services)
+                    .map_err(ApiError::from_port_error)?;
+            Ok(Json(packed).into_response())
+        }
+
+        "i/unpin" => {
+            check_allowed_fields(&obj, &["noteId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            let note_id = required_str(&obj, "noteId")?;
+            state
+                .services
+                .unpin_note(&caller.account.id, &note_id)
+                .map_err(ApiError::from_port_error)?;
+            let packed =
+                pack_me_detailed(&caller.account, caller.is_first_party, &state.services)
+                    .map_err(ApiError::from_port_error)?;
+            Ok(Json(packed).into_response())
+        }
+
+        "notes/featured" => {
+            check_allowed_fields(&obj, &["limit", "untilId", "channelId"])?;
+            // No channels exist: any channel ranking is empty (upstream
+            // serves an empty ranking set for unknown channels).
+            if let Some(channel) = obj.get("channelId") {
+                if !channel.is_null() {
+                    return Ok(Json(Value::Array(Vec::new())).into_response());
+                }
+            }
+            let limit = get_limit(&obj)?;
+            let until_id = opt_string(&obj, "untilId")?;
+            let now = state.services.clock.now_ms();
+            let ranked = match state.featured_cache.get("global", now) {
+                Some(ids) => ids,
+                None => {
+                    let ids = state
+                        .services
+                        .rank_featured_global()
+                        .map_err(ApiError::from_port_error)?;
+                    state.featured_cache.put("global", ids.clone(), now);
+                    ids
+                }
+            };
+            let viewer_id = caller.as_ref().map(|caller| caller.account.id.as_str());
+            let notes = state
+                .services
+                .featured_notes_visible(&ranked, viewer_id, until_id.as_deref(), limit)
+                .map_err(ApiError::from_port_error)?;
+            pack_note_list(&state.services, &notes, viewer_id)
+        }
+
+        "users/featured-notes" => {
+            check_allowed_fields(&obj, &["limit", "untilId", "userId"])?;
+            let user_id = required_str(&obj, "userId")?;
+            let limit = get_limit(&obj)?;
+            let until_id = opt_string(&obj, "untilId")?;
+            let viewer_id = caller.as_ref().map(|caller| caller.account.id.as_str());
+            // Early return when the target blocks the viewer (Misskey
+            // `featured-notes.ts` parity).
+            if let Some(viewer) = viewer_id {
+                if state
+                    .services
+                    .blocks
+                    .is_blocking(&user_id, viewer)
+                    .map_err(ApiError::from_port_error)?
+                {
+                    return Ok(Json(Value::Array(Vec::new())).into_response());
+                }
+            }
+            let now = state.services.clock.now_ms();
+            let key = format!("user:{user_id}");
+            let ranked = match state.featured_cache.get(&key, now) {
+                Some(ids) => ids,
+                None => {
+                    let ids = state
+                        .services
+                        .rank_featured_for_user(&user_id)
+                        .map_err(ApiError::from_port_error)?;
+                    state.featured_cache.put(&key, ids.clone(), now);
+                    ids
+                }
+            };
+            let notes = state
+                .services
+                .featured_notes_visible(&ranked, viewer_id, until_id.as_deref(), limit)
+                .map_err(ApiError::from_port_error)?;
+            pack_note_list(&state.services, &notes, viewer_id)
+        }
+
+        "i/notifications-grouped" => {
+            check_allowed_fields(
+                &obj,
+                &[
+                    "limit",
+                    "sinceId",
+                    "untilId",
+                    "sinceDate",
+                    "untilDate",
+                    "markAsRead",
+                    "includeTypes",
+                    "excludeTypes",
+                ],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:notifications")?;
+            let query = parse_notification_query(&obj)?;
+            if query.matches_nothing {
+                if query.mark_as_read {
+                    state
+                        .services
+                        .mark_all_notifications_read(&caller.account.id)
+                        .map_err(ApiError::from_port_error)?;
+                }
+                return Ok(Json(Value::Array(Vec::new())).into_response());
+            }
+            let notifications = state
+                .services
+                .notifications
+                .list_notifications_filtered(
+                    &caller.account.id,
+                    &query.cursor,
+                    &query.include,
+                    &query.exclude,
+                )
+                .map_err(ApiError::from_port_error)?;
+            if notifications.is_empty() {
+                return Ok(Json(Value::Array(Vec::new())).into_response());
+            }
+            if query.mark_as_read {
+                state
+                    .services
+                    .mark_all_notifications_read(&caller.account.id)
+                    .map_err(ApiError::from_port_error)?;
+            }
+            let mut packed = crate::api::misskey::packers::pack_grouped_notifications(
+                &notifications,
+                &caller.account.id,
+                &state.services,
+            );
+            packed.truncate(query.cursor.limit.max(1));
+            Ok(Json(Value::Array(packed)).into_response())
+        }
+
         _ => Err(ApiError::unknown_endpoint()),
     }
 }
@@ -3074,6 +4493,440 @@ fn update_bool_field(obj: &Map<String, Value>, key: &str) -> Result<Option<bool>
     }
 }
 
+/// Parse the full `i/update` body into an [`UpdateAccountPatch`]
+/// (`i/update.ts` `paramDef` parity: all 39 params plus the DIVERGENCE
+/// `rejectQuotes`/`defaultReaction`). Length/enum shapes are enforced here
+/// as `INVALID_PARAM`; role-gated and cross-entity rules (prohibited words,
+/// media checks, mute limits, alias resolution) live in
+/// `AppServices::update_profile` with their exact Misskey error codes.
+fn parse_profile_patch(obj: &Map<String, Value>) -> Result<UpdateAccountPatch, ApiError> {
+    // `name`: raw value validated at 1..=50 chars (`nameSchema`); the
+    // trim / `""` → null step runs in `update_profile`.
+    if let Some(raw) = obj.get("name") {
+        match raw {
+            Value::Null => {}
+            Value::String(s) => {
+                let n = s.chars().count();
+                if n == 0 || n > 50 {
+                    return Err(ApiError::invalid_param(
+                        "name",
+                        "must be 1..=50 chars",
+                    ));
+                }
+            }
+            _ => return Err(ApiError::invalid_param("name", "must be a string")),
+        }
+    }
+    Ok(UpdateAccountPatch {
+        display_name: update_string_field(obj, "name")?,
+        description: bounded_nullable_string(obj, "description", 1500)?,
+        followed_message: bounded_nullable_string(obj, "followedMessage", 256)?,
+        location: bounded_nullable_string(obj, "location", 50)?,
+        birthday: update_string_field(obj, "birthday")?,
+        // Upstream restricts `lang` to its langmap enum; pinetree has no
+        // langmap yet, so any 1..=32-char tag is accepted (TODO(§0B)).
+        lang: bounded_nullable_string(obj, "lang", 32)?,
+        avatar_id: profile_file_id(obj, "avatarId")?,
+        avatar_decorations: parse_avatar_decorations(obj)?,
+        banner_id: profile_file_id(obj, "bannerId")?,
+        fields: parse_profile_fields(obj)?,
+        is_locked: update_bool_field(obj, "isLocked")?,
+        is_bot: update_bool_field(obj, "isBot")?,
+        is_cat: update_bool_field(obj, "isCat")?,
+        is_explorable: update_bool_field(obj, "isExplorable")?,
+        hide_online_status: update_bool_field(obj, "hideOnlineStatus")?,
+        public_reactions: update_bool_field(obj, "publicReactions")?,
+        careful_bot: update_bool_field(obj, "carefulBot")?,
+        auto_accept_followed: update_bool_field(obj, "autoAcceptFollowed")?,
+        follow_approval_local_seconds: bounded_nullable_seconds(
+            obj,
+            "followApprovalLocalSeconds",
+        )?,
+        follow_approval_remote_seconds: bounded_nullable_seconds(
+            obj,
+            "followApprovalRemoteSeconds",
+        )?,
+        no_crawle: update_bool_field(obj, "noCrawle")?,
+        prevent_ai_learning: update_bool_field(obj, "preventAiLearning")?,
+        require_signin_to_view_contents: update_bool_field(
+            obj,
+            "requireSigninToViewContents",
+        )?,
+        make_notes_followers_only_before: nullable_integer(obj, "makeNotesFollowersOnlyBefore")?,
+        make_notes_hidden_before: nullable_integer(obj, "makeNotesHiddenBefore")?,
+        inject_featured_note: update_bool_field(obj, "injectFeaturedNote")?,
+        receive_announcement_email: update_bool_field(obj, "receiveAnnouncementEmail")?,
+        always_mark_nsfw: update_bool_field(obj, "alwaysMarkNsfw")?,
+        auto_sensitive: update_bool_field(obj, "autoSensitive")?,
+        following_visibility: parse_follow_visibility(obj, "followingVisibility")?,
+        followers_visibility: parse_follow_visibility(obj, "followersVisibility")?,
+        chat_scope: parse_chat_scope(obj)?,
+        pinned_page_id: profile_file_id(obj, "pinnedPageId")?,
+        muted_words: parse_muted_words(obj, "mutedWords")?,
+        hard_muted_words: parse_muted_words(obj, "hardMutedWords")?,
+        muted_instances: parse_string_array(obj, "mutedInstances", None)?,
+        notification_recieve_config: parse_notification_recieve_config(obj)?,
+        email_notification_types: parse_string_array(obj, "emailNotificationTypes", None)?,
+        also_known_as: parse_string_array(obj, "alsoKnownAs", Some(10))?.map(Some),
+        verified_links: None,
+        reject_quotes: update_bool_field(obj, "rejectQuotes")?,
+        default_reaction: bounded_nullable_string(obj, "defaultReaction", 260)?,
+    })
+}
+
+/// Nullable string with a 1..=max char bound (empty strings rejected like
+/// upstream `minLength: 1` schemas).
+fn bounded_nullable_string(
+    obj: &Map<String, Value>,
+    key: &str,
+    max_chars: usize,
+) -> Result<Option<Option<String>>, ApiError> {
+    match obj.get(key) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::String(s)) => {
+            let n = s.chars().count();
+            if n == 0 || n > max_chars {
+                return Err(ApiError::invalid_param(
+                    key,
+                    &format!("must be 1..={max_chars} chars"),
+                ));
+            }
+            Ok(Some(Some(s.clone())))
+        }
+        Some(_) => Err(ApiError::invalid_param(key, "must be a string")),
+    }
+}
+
+/// Nullable file/page id: a non-empty string or explicit null.
+fn profile_file_id(
+    obj: &Map<String, Value>,
+    key: &str,
+) -> Result<Option<Option<String>>, ApiError> {
+    match obj.get(key) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::String(s)) => {
+            if s.is_empty() {
+                return Err(ApiError::invalid_param(key, "must be a non-empty id"));
+            }
+            Ok(Some(Some(s.clone())))
+        }
+        Some(_) => Err(ApiError::invalid_param(key, "must be a string")),
+    }
+}
+
+/// Nullable integer (`followApproval*Seconds` are range-checked again in
+/// domain validation; `makeNotes*Before` accept any integer).
+fn nullable_integer(obj: &Map<String, Value>, key: &str) -> Result<Option<Option<i64>>, ApiError> {
+    match obj.get(key) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::Number(n)) => match n.as_i64() {
+            Some(v) => Ok(Some(Some(v))),
+            None => Err(ApiError::invalid_param(key, "must be an integer")),
+        },
+        Some(_) => Err(ApiError::invalid_param(key, "must be an integer")),
+    }
+}
+
+fn bounded_nullable_seconds(
+    obj: &Map<String, Value>,
+    key: &str,
+) -> Result<Option<Option<i64>>, ApiError> {
+    match nullable_integer(obj, key)? {
+        None => Ok(None),
+        Some(None) => Ok(Some(None)),
+        Some(Some(v)) => {
+            if v < 0 || v > crate::domain::account::FOLLOW_APPROVAL_MAX_SECONDS {
+                return Err(ApiError::invalid_param(
+                    key,
+                    "must be 0..=2592000 (30 days)",
+                ));
+            }
+            Ok(Some(Some(v)))
+        }
+    }
+}
+
+fn parse_follow_visibility(
+    obj: &Map<String, Value>,
+    key: &str,
+) -> Result<Option<FollowVisibility>, ApiError> {
+    match obj.get(key) {
+        None => Ok(None),
+        Some(Value::String(s)) => FollowVisibility::parse(s).map(Some).ok_or_else(|| {
+            ApiError::invalid_param(key, "must be public, followers, or private")
+        }),
+        Some(_) => Err(ApiError::invalid_param(
+            key,
+            "must be public, followers, or private",
+        )),
+    }
+}
+
+fn parse_chat_scope(obj: &Map<String, Value>) -> Result<Option<ChatScope>, ApiError> {
+    match obj.get("chatScope") {
+        None => Ok(None),
+        Some(Value::String(s)) => ChatScope::parse(s).map(Some).ok_or_else(|| {
+            ApiError::invalid_param(
+                "chatScope",
+                "must be everyone, followers, following, mutual, or none",
+            )
+        }),
+        Some(_) => Err(ApiError::invalid_param(
+            "chatScope",
+            "must be everyone, followers, following, mutual, or none",
+        )),
+    }
+}
+
+/// `fields`: max 16 `{name, value}` entries; blank-after-trim rows are
+/// dropped (`update.ts` fields filter parity).
+fn parse_profile_fields(
+    obj: &Map<String, Value>,
+) -> Result<Option<Vec<ProfileField>>, ApiError> {
+    let Some(value) = obj.get("fields") else {
+        return Ok(None);
+    };
+    let Value::Array(items) = value else {
+        return Err(ApiError::invalid_param("fields", "must be an array"));
+    };
+    if items.len() > 16 {
+        return Err(ApiError::invalid_param("fields", "must have at most 16 entries"));
+    }
+    let mut out = Vec::new();
+    for item in items {
+        let entry = item.as_object().ok_or_else(|| {
+            ApiError::invalid_param("fields", "each entry must be {name, value}")
+        })?;
+        let name = entry.get("name").and_then(Value::as_str).ok_or_else(|| {
+            ApiError::invalid_param("fields", "each entry must be {name, value}")
+        })?;
+        let val = entry.get("value").and_then(Value::as_str).ok_or_else(|| {
+            ApiError::invalid_param("fields", "each entry must be {name, value}")
+        })?;
+        let (name, val) = (name.trim(), val.trim());
+        if name.is_empty() || val.is_empty() {
+            continue;
+        }
+        out.push(ProfileField {
+            name: name.to_string(),
+            value: val.to_string(),
+        });
+    }
+    Ok(Some(out))
+}
+
+/// `avatarDecorations`: max 16 entries with `update.ts` numeric ranges.
+fn parse_avatar_decorations(
+    obj: &Map<String, Value>,
+) -> Result<Option<Vec<AvatarDecoration>>, ApiError> {
+    let Some(value) = obj.get("avatarDecorations") else {
+        return Ok(None);
+    };
+    let Value::Array(items) = value else {
+        return Err(ApiError::invalid_param(
+            "avatarDecorations",
+            "must be an array",
+        ));
+    };
+    if items.len() > 16 {
+        return Err(ApiError::invalid_param(
+            "avatarDecorations",
+            "must have at most 16 entries",
+        ));
+    }
+    let mut out = Vec::new();
+    for item in items {
+        let entry = item.as_object().ok_or_else(|| {
+            ApiError::invalid_param("avatarDecorations", "each entry must be an object")
+        })?;
+        let id = entry.get("id").and_then(Value::as_str).ok_or_else(|| {
+            ApiError::invalid_param("avatarDecorations", "each entry requires id")
+        })?;
+        if id.is_empty() {
+            return Err(ApiError::invalid_param(
+                "avatarDecorations",
+                "each entry requires id",
+            ));
+        }
+        let opt_num = |key: &str, min: f64, max: f64| -> Result<Option<f64>, ApiError> {
+            match entry.get(key) {
+                None | Some(Value::Null) => Ok(None),
+                Some(Value::Number(n)) => {
+                    let v = n.as_f64().ok_or_else(|| {
+                        ApiError::invalid_param("avatarDecorations", "bad numeric value")
+                    })?;
+                    if !v.is_finite() || v < min || v > max {
+                        return Err(ApiError::invalid_param(
+                            "avatarDecorations",
+                            "numeric value out of range",
+                        ));
+                    }
+                    Ok(Some(v))
+                }
+                Some(_) => Err(ApiError::invalid_param(
+                    "avatarDecorations",
+                    "bad numeric value",
+                )),
+            }
+        };
+        let flip_h = match entry.get("flipH") {
+            None | Some(Value::Null) => None,
+            Some(Value::Bool(b)) => Some(*b),
+            Some(_) => {
+                return Err(ApiError::invalid_param(
+                    "avatarDecorations",
+                    "flipH must be a boolean",
+                ));
+            }
+        };
+        out.push(AvatarDecoration {
+            id: id.to_string(),
+            angle: opt_num("angle", -0.5, 0.5)?,
+            flip_h,
+            offset_x: opt_num("offsetX", -0.25, 0.25)?,
+            offset_y: opt_num("offsetY", -0.25, 0.25)?,
+        });
+    }
+    Ok(Some(out))
+}
+
+/// `mutedWords`/`hardMutedWords`: each entry a string or string array.
+/// Count and regex rules run in `update_profile`.
+fn parse_muted_words(
+    obj: &Map<String, Value>,
+    key: &str,
+) -> Result<Option<Vec<MutedWord>>, ApiError> {
+    let Some(value) = obj.get(key) else {
+        return Ok(None);
+    };
+    let Value::Array(items) = value else {
+        return Err(ApiError::invalid_param(key, "must be an array"));
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            Value::String(s) => out.push(MutedWord::Single(s.clone())),
+            Value::Array(words) => {
+                let mut and = Vec::with_capacity(words.len());
+                for word in words {
+                    match word {
+                        Value::String(s) => and.push(s.clone()),
+                        _ => {
+                            return Err(ApiError::invalid_param(
+                                key,
+                                "entries must be strings or string arrays",
+                            ));
+                        }
+                    }
+                }
+                out.push(MutedWord::And(and));
+            }
+            _ => {
+                return Err(ApiError::invalid_param(
+                    key,
+                    "entries must be strings or string arrays",
+                ));
+            }
+        }
+    }
+    Ok(Some(out))
+}
+
+/// Plain string arrays (`mutedInstances`, `emailNotificationTypes`,
+/// `alsoKnownAs` with `maxItems: 10` + `uniqueItems` parity).
+fn parse_string_array(
+    obj: &Map<String, Value>,
+    key: &str,
+    max_items: Option<usize>,
+) -> Result<Option<Vec<String>>, ApiError> {
+    let Some(value) = obj.get(key) else {
+        return Ok(None);
+    };
+    let Value::Array(items) = value else {
+        return Err(ApiError::invalid_param(key, "must be an array"));
+    };
+    if let Some(max) = max_items {
+        if items.len() > max {
+            return Err(ApiError::invalid_param(
+                key,
+                &format!("must have at most {max} entries"),
+            ));
+        }
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            Value::String(s) => out.push(s.clone()),
+            _ => return Err(ApiError::invalid_param(key, "must be an array of strings")),
+        }
+    }
+    if key == "alsoKnownAs" {
+        let mut seen = std::collections::HashSet::new();
+        for entry in &out {
+            if !seen.insert(entry) {
+                return Err(ApiError::invalid_param(key, "entries must be unique"));
+            }
+        }
+    }
+    Ok(Some(out))
+}
+
+/// `notificationRecieveConfig` (upstream misspelling kept): an object whose
+/// values are `{type}` or `{type: list, userListId}` shapes.
+fn parse_notification_recieve_config(
+    obj: &Map<String, Value>,
+) -> Result<
+    Option<std::collections::BTreeMap<String, NotificationRecieveConfig>>,
+    ApiError,
+> {
+    let Some(value) = obj.get("notificationRecieveConfig") else {
+        return Ok(None);
+    };
+    let Value::Object(map) = value else {
+        return Err(ApiError::invalid_param(
+            "notificationRecieveConfig",
+            "must be an object",
+        ));
+    };
+    let mut out = std::collections::BTreeMap::new();
+    for (key, entry) in map {
+        let entry_obj = entry.as_object().ok_or_else(|| {
+            ApiError::invalid_param("notificationRecieveConfig", "each value must be an object")
+        })?;
+        let kind = entry_obj
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ApiError::invalid_param(
+                    "notificationRecieveConfig",
+                    "each value requires type",
+                )
+            })?;
+        let user_list_id = match entry_obj.get("userListId") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => Some(s.clone()),
+            Some(_) => {
+                return Err(ApiError::invalid_param(
+                    "notificationRecieveConfig",
+                    "userListId must be a string",
+                ));
+            }
+        };
+        let config = NotificationRecieveConfig {
+            kind: kind.to_string(),
+            user_list_id,
+        };
+        config
+            .validate()
+            .map_err(|_| ApiError::invalid_param("notificationRecieveConfig", "bad entry shape"))?;
+        out.insert(key.clone(), config);
+    }
+    Ok(Some(out))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -3087,7 +4940,7 @@ mod tests {
     use crate::application::ports::{
         ActivityDedup, BlobStore, NoopStreamingSink, StreamingSink,
     };
-    use crate::domain::id::{AidxGenerator, ManualClock};
+    use crate::domain::id::{AidxGenerator, Clock, ManualClock};
     use crate::federation::delivery::{SafeHttpClient, SafeHttpConfig};
     use crate::federation::retry::DestinationTracker;
     use crate::persistence::redb::RedbStore;
@@ -3133,7 +4986,10 @@ mod tests {
             accounts: store.clone(),
             notes: store.clone(),
             follows: store.clone(),
+            blocks: store.clone(),
+            mutes: store.clone(),
             reactions: store.clone(),
+            polls: store.clone(),
             jobs: store.clone(),
             media: store.clone(),
             blobs,
@@ -3150,6 +5006,9 @@ mod tests {
             preserved_usernames: Vec::new(),
             prohibited_words: Vec::new(),
             sensitive_words: Vec::new(),
+            note_draft_limit: crate::domain::draft::DEFAULT_NOTE_DRAFT_LIMIT,
+            scheduled_note_limit: crate::domain::draft::DEFAULT_SCHEDULED_NOTE_LIMIT,
+            pin_limit: crate::domain::pinning::DEFAULT_PIN_LIMIT,
         });
         let worker = Arc::new(JobWorker {
             clock: clock.clone(),
@@ -3172,6 +5031,9 @@ mod tests {
                 upload_slots,
                 hub: Hub::new(1024),
                 trusted_proxies: Arc::new(Vec::new()),
+                featured_cache: Arc::new(
+                    crate::application::commands::pins::FeaturedCache::default(),
+                ),
             },
             clock,
         )
@@ -3624,6 +5486,300 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{value}");
         assert_eq!(value["code"], "RATE_LIMIT_EXCEEDED");
+    }
+
+    #[tokio::test]
+    async fn i_update_full_profile_round_trip_and_defaults() {
+        let (state, _) = test_state();
+        let (_, token) = signup_user(&state, "prof").await;
+
+        // Fresh accounts pack the upstream column defaults.
+        let (status, me) = call(&state, "i", serde_json::json!({}), Some(&token)).await;
+        assert_eq!(status, StatusCode::OK, "{me}");
+        assert_eq!(me["preventAiLearning"], true);
+        assert_eq!(me["injectFeaturedNote"], true);
+        assert_eq!(me["receiveAnnouncementEmail"], true);
+        assert_eq!(me["chatScope"], "mutual");
+        assert_eq!(me["publicReactions"], true);
+        assert_eq!(me["followingVisibility"], "public");
+        assert_eq!(me["followersVisibility"], "public");
+        assert_eq!(
+            me["emailNotificationTypes"],
+            serde_json::json!(["follow", "receiveFollowRequest"])
+        );
+        assert_eq!(me["mutedWords"], serde_json::json!([]));
+        assert_eq!(me["notificationRecieveConfig"], serde_json::json!({}));
+        assert_eq!(me["rejectQuotes"], false);
+        assert_eq!(me["defaultReaction"], Value::Null);
+
+        // Full round-trip across the new params.
+        let (status, me) = call(
+            &state,
+            "i/update",
+            serde_json::json!({
+                "name": "  Prof  ",
+                "description": "bio",
+                "followedMessage": "thanks for following",
+                "location": "nowhere",
+                "birthday": "1990-02-28",
+                "lang": "en",
+                "fields": [
+                    {"name": " site ", "value": " https://example.local "},
+                    {"name": "  ", "value": "blank"},
+                ],
+                "isLocked": true,
+                "hideOnlineStatus": true,
+                "publicReactions": false,
+                "carefulBot": true,
+                "autoAcceptFollowed": true,
+                "followApprovalLocalSeconds": 3600,
+                "followApprovalRemoteSeconds": null,
+                "noCrawle": true,
+                "preventAiLearning": false,
+                "requireSigninToViewContents": true,
+                "makeNotesFollowersOnlyBefore": 123,
+                "makeNotesHiddenBefore": null,
+                "injectFeaturedNote": false,
+                "receiveAnnouncementEmail": false,
+                "alwaysMarkNsfw": true,
+                "autoSensitive": true,
+                "followingVisibility": "followers",
+                "followersVisibility": "private",
+                "chatScope": "followers",
+                "mutedWords": [["foo", "bar"], "/^spam/i"],
+                "hardMutedWords": [],
+                "mutedInstances": ["spam.example"],
+                "notificationRecieveConfig": {
+                    "mention": {"type": "following"},
+                    "follow": {"type": "list", "userListId": "lst1"},
+                },
+                "emailNotificationTypes": ["mention"],
+                "isBot": true,
+                "isCat": true,
+                "isExplorable": false,
+                "avatarDecorations": [{"id": "deco1", "angle": 0.1, "flipH": true}],
+                "rejectQuotes": true,
+                "defaultReaction": "❤",
+            }),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{me}");
+        assert_eq!(me["name"], "Prof");
+        assert_eq!(me["followedMessage"], "thanks for following");
+        assert_eq!(me["lang"], "en");
+        assert_eq!(
+            me["fields"],
+            serde_json::json!([{"name": "site", "value": "https://example.local"}])
+        );
+        assert_eq!(me["isLocked"], true);
+        assert_eq!(me["hideOnlineStatus"], true);
+        assert_eq!(me["onlineStatus"], "unknown");
+        assert_eq!(me["requireSigninToViewContents"], true);
+        assert_eq!(me["makeNotesFollowersOnlyBefore"], 123);
+        assert_eq!(me["publicReactions"], false);
+        assert_eq!(me["followApprovalLocalSeconds"], 3600);
+        assert_eq!(me["followApprovalRemoteSeconds"], Value::Null);
+        assert_eq!(me["preventAiLearning"], false);
+        assert_eq!(me["chatScope"], "followers");
+        assert_eq!(me["followingVisibility"], "followers");
+        assert_eq!(me["followersVisibility"], "private");
+        assert_eq!(me["mutedWords"], serde_json::json!([["foo", "bar"], "/^spam/i"]));
+        assert_eq!(me["mutedInstances"], serde_json::json!(["spam.example"]));
+        assert_eq!(me["notificationRecieveConfig"]["mention"]["type"], "following");
+        assert_eq!(me["notificationRecieveConfig"]["follow"]["userListId"], "lst1");
+        assert_eq!(me["emailNotificationTypes"], serde_json::json!(["mention"]));
+        assert_eq!(
+            me["avatarDecorations"],
+            serde_json::json!([{"id": "deco1", "angle": 0.1, "flipH": true}])
+        );
+        assert_eq!(me["rejectQuotes"], true);
+        assert_eq!(me["defaultReaction"], "❤");
+        assert_eq!(me["verifiedLinks"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn i_update_profile_validation_errors() {
+        use crate::application::ports::{InsertMediaInput, MediaStore};
+
+        let (state, _) = test_state();
+        let (alice_id, token) = signup_user(&state, "vald").await;
+
+        async fn expect_code(
+            state: &ApiState,
+            token: &str,
+            body: Value,
+            code: &str,
+        ) -> Value {
+            let (status, value) = call(state, "i/update", body, Some(token)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+            assert_eq!(value["code"], code, "{value}");
+            value
+        }
+
+        expect_code(
+            &state,
+            &token,
+            serde_json::json!({"chatScope": "everyone!"}),
+            "INVALID_PARAM",
+        )
+        .await;
+        expect_code(
+            &state,
+            &token,
+            serde_json::json!({"name": "x".repeat(51)}),
+            "INVALID_PARAM",
+        )
+        .await;
+        expect_code(
+            &state,
+            &token,
+            serde_json::json!({"avatarDecorations": [{"id": "d", "angle": 0.9}]}),
+            "INVALID_PARAM",
+        )
+        .await;
+        // Plain (non-`/regex/`) single words are rejected like upstream.
+        expect_code(
+            &state,
+            &token,
+            serde_json::json!({"mutedWords": ["plain"]}),
+            "INVALID_REGEXP",
+        )
+        .await;
+        expect_code(
+            &state,
+            &token,
+            serde_json::json!({"mutedWords": ["/(/"]}),
+            "INVALID_REGEXP",
+        )
+        .await;
+        // 201 mute chars exceed the default wordMuteLimit of 200.
+        expect_code(
+            &state,
+            &token,
+            serde_json::json!({"mutedWords": [format!("/{}/", "a".repeat(199))]}),
+            "TOO_MANY_MUTED_WORDS",
+        )
+        .await;
+        // Own username resolves locally to self.
+        expect_code(
+            &state,
+            &token,
+            serde_json::json!({"alsoKnownAs": ["vald"]}),
+            "FORBIDDEN_TO_SET_YOURSELF",
+        )
+        .await;
+        // `uniqueItems` parity.
+        expect_code(
+            &state,
+            &token,
+            serde_json::json!({"alsoKnownAs": ["someone@example.local", "someone@example.local"]}),
+            "INVALID_PARAM",
+        )
+        .await;
+        // No pages store yet: any non-null page is missing.
+        expect_code(
+            &state,
+            &token,
+            serde_json::json!({"pinnedPageId": "pag00000000000001"}),
+            "NO_SUCH_PAGE",
+        )
+        .await;
+        expect_code(
+            &state,
+            &token,
+            serde_json::json!({"avatarId": "mid00000000000009"}),
+            "NO_SUCH_AVATAR",
+        )
+        .await;
+        expect_code(
+            &state,
+            &token,
+            serde_json::json!({"notificationRecieveConfig": {"mention": {"type": "sometimes"}}}),
+            "INVALID_PARAM",
+        )
+        .await;
+        // Misskey spells it `name`; camelCase guesses stay unsupported.
+        expect_code(
+            &state,
+            &token,
+            serde_json::json!({"displayName": "x"}),
+            "UNSUPPORTED_FIELD",
+        )
+        .await;
+
+        // A non-image file cannot be an avatar; an image can (and clears).
+        let text_file = state
+            .services
+            .media
+            .insert_metadata(InsertMediaInput {
+                id: None,
+                owner_id: Some(alice_id.clone()),
+                name: "note.txt".to_string(),
+                mime: "text/plain".to_string(),
+                size_bytes: 8,
+                hash: "d41d8cd98f00b204e9800998ecf8427e".to_string(),
+                blob_key: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    .to_string(),
+                blurhash: None,
+                properties: crate::domain::media::MediaProperties::default(),
+                is_sensitive: false,
+                is_link: false,
+                url: "https://example.local/files/note".to_string(),
+                thumbnail_url: None,
+                comment: None,
+                source_url: None,
+                max_file_size: 10_000_000,
+            })
+            .unwrap();
+        expect_code(
+            &state,
+            &token,
+            serde_json::json!({"avatarId": text_file.id}),
+            "AVATAR_NOT_AN_IMAGE",
+        )
+        .await;
+        let image_file = state
+            .services
+            .media
+            .insert_metadata(InsertMediaInput {
+                id: None,
+                owner_id: Some(alice_id.clone()),
+                name: "photo.png".to_string(),
+                mime: "image/png".to_string(),
+                size_bytes: 512,
+                hash: "d41d8cd98f00b204e9800998ecf8427e".to_string(),
+                blob_key: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    .to_string(),
+                blurhash: None,
+                properties: crate::domain::media::MediaProperties::default(),
+                is_sensitive: false,
+                is_link: false,
+                url: "https://example.local/files/photo".to_string(),
+                thumbnail_url: None,
+                comment: None,
+                source_url: None,
+                max_file_size: 10_000_000,
+            })
+            .unwrap();
+        let (status, me) = call(
+            &state,
+            "i/update",
+            serde_json::json!({"avatarId": image_file.id}),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{me}");
+        assert_eq!(me["avatarId"], image_file.id);
+        let (status, me) = call(
+            &state,
+            "i/update",
+            serde_json::json!({"avatarId": null}),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{me}");
+        assert_eq!(me["avatarId"], Value::Null);
     }
 
     #[tokio::test]
@@ -4778,6 +6934,222 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blocking_mute_endpoints_and_relation() {
+        let (state, _clock) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (bob_id, bob_token) = signup_user(&state, "bob").await;
+
+        // blocking/create packs the blockee as UserDetailedNotMe.
+        let (status, packed) = call(
+            &state,
+            "blocking/create",
+            serde_json::json!({ "userId": bob_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{packed}");
+        assert_eq!(packed["id"], bob_id);
+
+        // Duplicate → ALREADY_BLOCKING (exact Misskey code).
+        let (status, err) = call(
+            &state,
+            "blocking/create",
+            serde_json::json!({ "userId": bob_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+        assert_eq!(err["code"], "ALREADY_BLOCKING");
+        assert_eq!(err["error"]["code"], "ALREADY_BLOCKING");
+
+        // Self-block → BLOCKEE_IS_YOURSELF.
+        let (status, err) = call(
+            &state,
+            "blocking/create",
+            serde_json::json!({ "userId": alice_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+        assert_eq!(err["code"], "BLOCKEE_IS_YOURSELF");
+
+        // Unknown user → NO_SUCH_USER.
+        let (status, err) = call(
+            &state,
+            "blocking/create",
+            serde_json::json!({ "userId": "aid00000000009999" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+        assert_eq!(err["code"], "NO_SUCH_USER");
+
+        // blocking/list carries the row with the packed blockee.
+        let (status, list) = call(
+            &state,
+            "blocking/list",
+            serde_json::json!({}),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        assert_eq!(list.as_array().unwrap().len(), 1);
+        assert_eq!(list[0]["blockeeId"], bob_id);
+        assert_eq!(list[0]["blockee"]["id"], bob_id);
+
+        // users/relation reflects the block both ways (single → 1-array).
+        let (status, rel) = call(
+            &state,
+            "users/relation",
+            serde_json::json!({ "userId": bob_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{rel}");
+        assert_eq!(rel.as_array().unwrap().len(), 1);
+        assert_eq!(rel[0]["isBlocking"], true);
+        assert_eq!(rel[0]["isBlocked"], false);
+        let (status, rel) = call(
+            &state,
+            "users/relation",
+            serde_json::json!({ "userId": [bob_id.clone(), alice_id.clone()] }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{rel}");
+        assert_eq!(rel[0]["id"], bob_id);
+        assert_eq!(rel[1]["isBlocked"], true);
+        assert_eq!(rel[1]["isBlocking"], false);
+        assert_eq!(rel[1]["id"], alice_id);
+
+        // Blocked follow → BLOCKING / BLOCKED through the HTTP envelope.
+        let (status, err) = call(
+            &state,
+            "following/create",
+            serde_json::json!({ "userId": bob_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+        assert_eq!(err["code"], "BLOCKING");
+        let (status, err) = call(
+            &state,
+            "following/create",
+            serde_json::json!({ "userId": alice_id }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+        assert_eq!(err["code"], "BLOCKED");
+
+        // blocking/delete removes the row; repeat → NOT_BLOCKING.
+        let (status, packed) = call(
+            &state,
+            "blocking/delete",
+            serde_json::json!({ "userId": bob_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{packed}");
+        assert_eq!(packed["id"], bob_id);
+        let (status, err) = call(
+            &state,
+            "blocking/delete",
+            serde_json::json!({ "userId": bob_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+        assert_eq!(err["code"], "NOT_BLOCKING");
+
+        // mute/create → 204; duplicate → ALREADY_MUTING.
+        let (status, _) = call(
+            &state,
+            "mute/create",
+            serde_json::json!({ "userId": bob_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, err) = call(
+            &state,
+            "mute/create",
+            serde_json::json!({ "userId": bob_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+        assert_eq!(err["code"], "ALREADY_MUTING");
+        // mute/list carries the row; expiresAt is null for indefinite mutes.
+        let (status, list) = call(
+            &state,
+            "mute/list",
+            serde_json::json!({}),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        assert_eq!(list.as_array().unwrap().len(), 1);
+        assert_eq!(list[0]["muteeId"], bob_id);
+        assert!(list[0]["expiresAt"].is_null());
+        // mute/delete → 204; repeat → NOT_MUTING.
+        let (status, _) = call(
+            &state,
+            "mute/delete",
+            serde_json::json!({ "userId": bob_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, err) = call(
+            &state,
+            "mute/delete",
+            serde_json::json!({ "userId": bob_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+        assert_eq!(err["code"], "NOT_MUTING");
+
+        // renote-mute endpoints mirror mute (no expiresAt).
+        let (status, _) = call(
+            &state,
+            "renote-mute/create",
+            serde_json::json!({ "userId": bob_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, err) = call(
+            &state,
+            "renote-mute/create",
+            serde_json::json!({ "userId": alice_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+        assert_eq!(err["code"], "MUTEE_IS_YOURSELF");
+        let (status, list) = call(
+            &state,
+            "renote-mute/list",
+            serde_json::json!({}),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        assert_eq!(list.as_array().unwrap().len(), 1);
+        assert_eq!(list[0]["muteeId"], bob_id);
+        let (status, _) = call(
+            &state,
+            "renote-mute/delete",
+            serde_json::json!({ "userId": bob_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
     async fn phase3_users_notes_filters_and_pagination() {
         let (state, clock) = test_state();
         let (alice_id, alice_token) = signup_user(&state, "alice").await;
@@ -5352,6 +7724,556 @@ mod tests {
         assert_eq!(value["code"], "INVALID_PARAM");
     }
 
+    async fn set_ff_visibility(state: &ApiState, token: &str, followers: &str, following: &str) {
+        let (status, value) = call(
+            state,
+            "i/update",
+            serde_json::json!({
+                "followersVisibility": followers,
+                "followingVisibility": following,
+            }),
+            Some(token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "i/update visibility: {value}");
+    }
+
+    async fn ff_lists(
+        state: &ApiState,
+        target: &str,
+        token: Option<&str>,
+    ) -> ((StatusCode, Value), (StatusCode, Value)) {
+        let followers = call(
+            state,
+            "users/followers",
+            serde_json::json!({ "userId": target }),
+            token,
+        )
+        .await;
+        let following = call(
+            state,
+            "users/following",
+            serde_json::json!({ "userId": target }),
+            token,
+        )
+        .await;
+        (followers, following)
+    }
+
+    fn assert_forbidden(status: StatusCode, value: &Value) {
+        // Upstream `FORBIDDEN` is `kind: client` → HTTP 400, not 403.
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "FORBIDDEN");
+        assert_eq!(value["error"]["code"], "FORBIDDEN");
+        assert_eq!(value["error"]["kind"], "client");
+        assert_eq!(value["message"], "Forbidden.");
+    }
+
+    #[tokio::test]
+    async fn ff_visibility_gates_and_count_masking() {
+        let (state, _) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (bob_id, bob_token) = signup_user(&state, "bob").await;
+        let (carol_id, carol_token) = signup_user(&state, "carol").await;
+
+        // Bob follows Alice; Alice follows Carol.
+        for (token, target) in [(&alice_token, carol_id.as_str()), (&bob_token, alice_id.as_str())] {
+            let (status, value) = call(
+                &state,
+                "following/create",
+                serde_json::json!({ "userId": target }),
+                Some(token),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{value}");
+        }
+
+        // Public (default): everyone reads both directions.
+        let ((status, followers), (status2, following)) = ff_lists(&state, &alice_id, None).await;
+        assert_eq!(status, StatusCode::OK, "{followers}");
+        assert_eq!(followers.as_array().unwrap().len(), 1);
+        assert_eq!(status2, StatusCode::OK, "{following}");
+        assert_eq!(following.as_array().unwrap().len(), 1);
+        let (status, counts) = call(
+            &state,
+            "users/show",
+            serde_json::json!({ "userId": alice_id }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{counts}");
+        assert_eq!(counts["followersCount"], 1);
+        assert_eq!(counts["followingCount"], 1);
+
+        // `followers` mode: owner + follower read; strangers denied.
+        set_ff_visibility(&state, &alice_token, "followers", "followers").await;
+        let ((status, value), (status2, value2)) = ff_lists(&state, &alice_id, None).await;
+        assert_forbidden(status, &value);
+        assert_forbidden(status2, &value2);
+        let ((status, value), (status2, value2)) =
+            ff_lists(&state, &alice_id, Some(&carol_token)).await;
+        assert_forbidden(status, &value);
+        assert_forbidden(status2, &value2);
+        // Bob follows Alice: both directions read fine.
+        let ((status, followers), (status2, following)) =
+            ff_lists(&state, &alice_id, Some(&bob_token)).await;
+        assert_eq!(status, StatusCode::OK, "{followers}");
+        assert_eq!(followers.as_array().unwrap().len(), 1);
+        assert_eq!(status2, StatusCode::OK, "{following}");
+        assert_eq!(following[0]["followee"]["id"], carol_id);
+        // Self reads fine.
+        let ((status, _), (status2, _)) = ff_lists(&state, &alice_id, Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status2, StatusCode::OK);
+
+        // Count masking in `followers` mode: follower + self see counts,
+        // strangers see null.
+        let (status, masked) = call(
+            &state,
+            "users/show",
+            serde_json::json!({ "userId": alice_id }),
+            Some(&carol_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{masked}");
+        assert_eq!(masked["followersCount"], Value::Null);
+        assert_eq!(masked["followingCount"], Value::Null);
+        let (status, shown) = call(
+            &state,
+            "users/show",
+            serde_json::json!({ "userId": alice_id }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{shown}");
+        assert_eq!(shown["followersCount"], 1);
+        assert_eq!(shown["followingCount"], 1);
+        let (status, me) = call(
+            &state,
+            "users/show",
+            serde_json::json!({ "userId": alice_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{me}");
+        assert_eq!(me["followersCount"], 1);
+        assert_eq!(me["followingCount"], 1);
+
+        // `private` mode: only self reads; follower denied; counts masked
+        // for everyone but self.
+        set_ff_visibility(&state, &alice_token, "private", "private").await;
+        let ((status, value), (status2, value2)) =
+            ff_lists(&state, &alice_id, Some(&bob_token)).await;
+        assert_forbidden(status, &value);
+        assert_forbidden(status2, &value2);
+        let ((status, _), (status2, _)) = ff_lists(&state, &alice_id, Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status2, StatusCode::OK);
+        let (status, masked) = call(
+            &state,
+            "users/show",
+            serde_json::json!({ "userId": alice_id }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{masked}");
+        assert_eq!(masked["followersCount"], Value::Null);
+        assert_eq!(masked["followingCount"], Value::Null);
+
+        // Unknown users still report NO_SUCH_USER (not FORBIDDEN).
+        let (status, value) = call(
+            &state,
+            "users/followers",
+            serde_json::json!({ "userId": "aid00000000000099" }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_USER");
+        let _ = bob_id;
+    }
+
+    #[tokio::test]
+    async fn users_reactions_gates_and_filters() {
+        use crate::application::ports::{AccountStore, CreateAccountInput};
+
+        async fn post(state: &ApiState, body: Value, token: Option<&str>) -> String {
+            let (status, value) = call(state, "notes/create", body, token).await;
+            assert_eq!(status, StatusCode::OK, "{value}");
+            value["createdNote"]["id"].as_str().unwrap().to_string()
+        }
+
+        let (state, _) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (bob_id, bob_token) = signup_user(&state, "bob").await;
+        let (carol_id, carol_token) = signup_user(&state, "carol").await;
+        let (dave_id, dave_token) = signup_user(&state, "dave").await;
+
+        // Bob's public note; Alice reacts to it.
+        let note_id = post(
+            &state,
+            serde_json::json!({ "text": "bob note" }),
+            Some(&bob_token),
+        )
+        .await;
+        let (status, value) = call(
+            &state,
+            "notes/reactions/create",
+            serde_json::json!({ "noteId": note_id, "reaction": "👍" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{value}");
+
+        // Public target: anonymous readers see the reaction with its note.
+        let (status, reactions) = call(
+            &state,
+            "users/reactions",
+            serde_json::json!({ "userId": alice_id }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{reactions}");
+        let reactions = reactions.as_array().unwrap();
+        assert_eq!(reactions.len(), 1);
+        assert_eq!(reactions[0]["user"]["id"], alice_id);
+        assert_eq!(reactions[0]["type"], "👍");
+        assert_eq!(reactions[0]["note"]["id"], note_id);
+        assert!(reactions[0]["createdAt"].as_str().is_some());
+
+        // Unknown target → NO_SUCH_USER; missing userId → INVALID_PARAM.
+        let (status, value) = call(
+            &state,
+            "users/reactions",
+            serde_json::json!({ "userId": "aid00000000000099" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_USER");
+        let (status, value) = call(&state, "users/reactions", serde_json::json!({}), None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "INVALID_PARAM");
+
+        // Remote target → IS_REMOTE_USER (exact upstream strings).
+        let remote = state
+            .services
+            .accounts
+            .create_account(CreateAccountInput {
+                handle: "rem".to_string(),
+                host: Some("remote.example".to_string()),
+                display_name: None,
+                description: None,
+                location: None,
+                birthday: None,
+                uri: Some("https://remote.example/users/rem".to_string()),
+                inbox: Some("https://remote.example/users/rem/inbox".to_string()),
+                shared_inbox: None,
+                is_bot: false,
+                is_cat: false,
+                is_locked: false,
+                preserved_usernames: Vec::new(),
+            })
+            .expect("remote account");
+        let (status, value) = call(
+            &state,
+            "users/reactions",
+            serde_json::json!({ "userId": remote.id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "IS_REMOTE_USER");
+        assert_eq!(value["error"]["kind"], "client");
+        assert_eq!(
+            value["message"],
+            "Currently unavailable to display reactions of remote users. See https://github.com/misskey-dev/misskey/issues/12964"
+        );
+
+        // Private reactions: strangers denied, self allowed.
+        let (status, value) = call(
+            &state,
+            "i/update",
+            serde_json::json!({ "publicReactions": false }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        for token in [None, Some(bob_token.as_str()), Some(carol_token.as_str())] {
+            let (status, value) = call(
+                &state,
+                "users/reactions",
+                serde_json::json!({ "userId": alice_id }),
+                token,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+            assert_eq!(value["code"], "REACTIONS_NOT_PUBLIC");
+            assert_eq!(value["error"]["kind"], "client");
+            assert_eq!(value["message"], "Reactions of the user is not public.");
+        }
+        let (status, own) = call(
+            &state,
+            "users/reactions",
+            serde_json::json!({ "userId": alice_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{own}");
+        assert_eq!(own.as_array().unwrap().len(), 1);
+
+        // Blocked-by-target reads as silent `[]` (re-open reactions first:
+        // the gate order is remote → private → blocked).
+        let (status, value) = call(
+            &state,
+            "i/update",
+            serde_json::json!({ "publicReactions": true }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let (status, value) = call(
+            &state,
+            "blocking/create",
+            serde_json::json!({ "userId": carol_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let (status, reactions) = call(
+            &state,
+            "users/reactions",
+            serde_json::json!({ "userId": alice_id }),
+            Some(&carol_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{reactions}");
+        assert_eq!(reactions.as_array().unwrap().len(), 0);
+        // Non-blocked strangers still read.
+        let (status, reactions) = call(
+            &state,
+            "users/reactions",
+            serde_json::json!({ "userId": alice_id }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{reactions}");
+        assert_eq!(reactions.as_array().unwrap().len(), 1);
+        // Unblock so later filter checks exercise visibility, not the gate.
+        let (status, value) = call(
+            &state,
+            "blocking/delete",
+            serde_json::json!({ "userId": carol_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+
+        // Visibility filter: Alice reacts to Dave's followers-only note
+        // (Dave follows Alice? no — Alice cannot see it either unless she
+        // follows Dave or authored it). Setup: Dave posts followers-only;
+        // Alice follows Dave so her reaction path is valid, then Carol
+        // (stranger) must not see the reaction while Alice still does.
+        let (status, value) = call(
+            &state,
+            "following/create",
+            serde_json::json!({ "userId": dave_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let followers_note = post(
+            &state,
+            serde_json::json!({ "text": "dave followers", "visibility": "followers" }),
+            Some(&dave_token),
+        )
+        .await;
+        let (status, value) = call(
+            &state,
+            "notes/reactions/create",
+            serde_json::json!({ "noteId": followers_note, "reaction": "❤" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{value}");
+        // Carol cannot see Dave's followers-only note, so that reaction is
+        // filtered from her view while Bob's public-note reaction stays;
+        // Alice (follower) still sees both.
+        let (status, reactions) = call(
+            &state,
+            "users/reactions",
+            serde_json::json!({ "userId": alice_id }),
+            Some(&carol_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{reactions}");
+        let reactions = reactions.as_array().unwrap();
+        assert_eq!(reactions.len(), 1);
+        assert_eq!(reactions[0]["note"]["id"], note_id);
+        let (status, reactions) = call(
+            &state,
+            "users/reactions",
+            serde_json::json!({ "userId": alice_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{reactions}");
+        assert_eq!(reactions.as_array().unwrap().len(), 2);
+
+        // Mute filter: Carol mutes Bob (note author). Dave reacts to Bob's
+        // public note and to his own public note; Carol's view of Dave's
+        // reactions drops the Bob-authored one while the reaction to Dave's
+        // own note stays (the target-author exemption).
+        let own_note = post(
+            &state,
+            serde_json::json!({ "text": "dave public" }),
+            Some(&dave_token),
+        )
+        .await;
+        let (status, value) = call(
+            &state,
+            "notes/reactions/create",
+            serde_json::json!({ "noteId": own_note, "reaction": "🎉" }),
+            Some(&dave_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{value}");
+        let (status, value) = call(
+            &state,
+            "mute/create",
+            serde_json::json!({ "userId": bob_id }),
+            Some(&carol_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{value}");
+        let (status, value) = call(
+            &state,
+            "notes/reactions/create",
+            serde_json::json!({ "noteId": note_id, "reaction": "👀" }),
+            Some(&dave_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{value}");
+        let (status, reactions) = call(
+            &state,
+            "users/reactions",
+            serde_json::json!({ "userId": dave_id }),
+            Some(&carol_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{reactions}");
+        let reactions = reactions.as_array().unwrap();
+        assert_eq!(reactions.len(), 1);
+        assert_eq!(reactions[0]["note"]["id"], own_note);
+        // Unmuted viewers still see both of Dave's reactions.
+        let (status, reactions) = call(
+            &state,
+            "users/reactions",
+            serde_json::json!({ "userId": dave_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{reactions}");
+        assert_eq!(reactions.as_array().unwrap().len(), 2);
+    }
+
+    /// §9 full follower list sweep: 250 follows page through completely in
+    /// both directions with no duplicates or gaps across cursor pages.
+    #[tokio::test]
+    async fn follow_list_sweep_250_both_directions() {
+        use crate::application::ports::{AccountStore, CreateAccountInput, FollowStore};
+
+        let (state, _) = test_state();
+        let owner = state
+            .services
+            .accounts
+            .create_account(CreateAccountInput::local("owner"))
+            .expect("owner account");
+        let mut fans: Vec<String> = Vec::with_capacity(250);
+        for i in 0..250 {
+            let fan = state
+                .services
+                .accounts
+                .create_account(CreateAccountInput::local(format!("fan{i:03}")))
+                .expect("fan account");
+            // Both directions: every fan follows the owner and vice versa.
+            state
+                .services
+                .follows
+                .follow(&fan.id, &owner.id, false, None, Vec::new())
+                .expect("fan follows owner");
+            state
+                .services
+                .follows
+                .follow(&owner.id, &fan.id, false, None, Vec::new())
+                .expect("owner follows fan");
+            fans.push(fan.id);
+        }
+
+        // Limit validation: range 1–100, default 10.
+        let (status, value) = call(
+            &state,
+            "users/followers",
+            serde_json::json!({ "userId": owner.id, "limit": 101 }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "INVALID_PARAM");
+        let (status, page) = call(
+            &state,
+            "users/followers",
+            serde_json::json!({ "userId": owner.id }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page.as_array().unwrap().len(), 10);
+
+        // Walk every page (limit 100 → 100 + 100 + 50) in both directions.
+        async fn walk(state: &ApiState, endpoint: &str, target: &str, side: &str) -> Vec<String> {
+            let mut seen: Vec<String> = Vec::new();
+            let mut last_entry_id: Option<String> = None;
+            loop {
+                let mut body = serde_json::json!({ "userId": target, "limit": 100 });
+                if let Some(until) = &last_entry_id {
+                    body["untilId"] = Value::String(until.clone());
+                }
+                let (status, page) = call(state, endpoint, body, None).await;
+                assert_eq!(status, StatusCode::OK, "{page}");
+                let page = page.as_array().unwrap();
+                if page.is_empty() {
+                    break;
+                }
+                assert!(page.len() <= 100);
+                for entry in page {
+                    // Newest-first: entry ids strictly descend across pages.
+                    let entry_id = entry["id"].as_str().unwrap().to_string();
+                    if let Some(prev) = &last_entry_id {
+                        assert!(prev.as_str() > entry_id.as_str(), "cursor order broke");
+                    }
+                    last_entry_id = Some(entry_id);
+                    let side_id = entry[side].as_str().unwrap().to_string();
+                    assert!(!seen.contains(&side_id), "duplicate {side_id}");
+                    seen.push(side_id);
+                }
+                if page.len() < 100 {
+                    break;
+                }
+            }
+            seen
+        }
+
+        let mut newest_first = fans.clone();
+        newest_first.reverse();
+        let followers = walk(&state, "users/followers", &owner.id, "followerId").await;
+        assert_eq!(followers.len(), 250, "no gaps in followers sweep");
+        assert_eq!(followers, newest_first, "followers newest-first, no dupes");
+        let following = walk(&state, "users/following", &owner.id, "followeeId").await;
+        assert_eq!(following.len(), 250, "no gaps in following sweep");
+        assert_eq!(following, newest_first, "following newest-first, no dupes");
+    }
+
     #[tokio::test]
     async fn phase3_drive_files() {
         let (state, clock) = test_state();
@@ -5645,6 +8567,7 @@ mod tests {
                     kind,
                     note_id: None,
                     reaction: None,
+                    draft_id: None,
                     is_read: false,
                 })
                 .unwrap();
@@ -5699,7 +8622,7 @@ mod tests {
             "i/notifications",
             serde_json::json!({
                 "markAsRead": false,
-                "excludeTypes": ["follow", "mention", "reply", "renote", "reaction", "receiveFollowRequest"],
+                "excludeTypes": ["follow", "mention", "reply", "renote", "reaction", "receiveFollowRequest", "scheduledNotePosted", "scheduledNotePostFailed"],
             }),
             Some(&bob_token),
         )
@@ -5769,6 +8692,7 @@ mod tests {
                 kind: NotificationKind::Reaction,
                 note_id: None,
                 reaction: Some("❤".to_string()),
+                draft_id: None,
                 is_read: false,
             })
             .unwrap();
@@ -5810,6 +8734,833 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
         assert_eq!(value["code"], "INVALID_PARAM");
+    }
+
+    #[tokio::test]
+    async fn drafts_crud_count_and_error_codes() {
+        use crate::domain::notification::NotificationKind;
+
+        let (state, clock) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (_, bob_token) = signup_user(&state, "bob").await;
+
+        // Auth: no credential → 401.
+        let (status, value) = call(
+            &state,
+            "notes/drafts/create",
+            serde_json::json!({ "text": "hi" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // Create a plain draft.
+        let (status, created) = call(
+            &state,
+            "notes/drafts/create",
+            serde_json::json!({ "text": "hello drafts", "visibility": "public" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let draft_id = created["createdDraft"]["id"].as_str().unwrap().to_string();
+        assert_eq!(created["createdDraft"]["text"], "hello drafts");
+        assert_eq!(created["createdDraft"]["scheduledAt"], serde_json::Value::Null);
+        assert_eq!(created["createdDraft"]["isActuallyScheduled"], false);
+        assert_eq!(created["createdDraft"]["userId"], alice_id);
+
+        // List + count.
+        let (status, list) = call(
+            &state,
+            "notes/drafts/list",
+            serde_json::json!({}),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        assert_eq!(list.as_array().unwrap().len(), 1);
+        let (status, count) = call(
+            &state,
+            "notes/drafts/count",
+            serde_json::json!({}),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{count}");
+        assert_eq!(count, 1);
+
+        // Update merges.
+        let (status, updated) = call(
+            &state,
+            "notes/drafts/update",
+            serde_json::json!({ "draftId": draft_id, "text": "edited" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{updated}");
+        assert_eq!(updated["updatedDraft"]["text"], "edited");
+        // Unknown draft → NO_SUCH_NOTE_DRAFT.
+        let (status, value) = call(
+            &state,
+            "notes/drafts/update",
+            serde_json::json!({ "draftId": draft_id, "text": "x" }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_NOTE_DRAFT");
+
+        // Schedule gates carry the exact upstream codes.
+        let (status, value) = call(
+            &state,
+            "notes/drafts/create",
+            serde_json::json!({ "text": "sched", "isActuallyScheduled": true }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "SCHEDULED_AT_REQUIRED");
+        let (status, value) = call(
+            &state,
+            "notes/drafts/create",
+            serde_json::json!({
+                "text": "sched",
+                "scheduledAt": clock.now_ms(),
+                "isActuallyScheduled": true,
+            }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "SCHEDULED_AT_MUST_BE_IN_FUTURE");
+
+        // One scheduled draft fits the default cap of 1...
+        let (status, scheduled) = call(
+            &state,
+            "notes/drafts/create",
+            serde_json::json!({
+                "text": "future",
+                "scheduledAt": clock.now_ms() + 60_000,
+                "isActuallyScheduled": true,
+            }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{scheduled}");
+        let scheduled_id = scheduled["createdDraft"]["id"].as_str().unwrap().to_string();
+        // ...the second is rejected with the exact upstream code.
+        let (status, value) = call(
+            &state,
+            "notes/drafts/create",
+            serde_json::json!({
+                "text": "future 2",
+                "scheduledAt": clock.now_ms() + 120_000,
+                "isActuallyScheduled": true,
+            }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "TOO_MANY_SCHEDULED_NOTES");
+
+        // Delete: foreign drafts are ACCESS_DENIED, missing ones are
+        // NO_SUCH_NOTE_DRAFT, success is 204.
+        let (status, value) = call(
+            &state,
+            "notes/drafts/delete",
+            serde_json::json!({ "draftId": draft_id }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{value}");
+        assert_eq!(value["code"], "ACCESS_DENIED");
+        let (status, value) = call(
+            &state,
+            "notes/drafts/delete",
+            serde_json::json!({ "draftId": "did00000000000001" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_NOTE_DRAFT");
+        let (status, _) = call(
+            &state,
+            "notes/drafts/delete",
+            serde_json::json!({ "draftId": draft_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // The scheduled draft posts through the worker once due.
+        clock.advance_ms(61_000);
+        state.worker.drain(100).unwrap();
+        let (status, list) = call(
+            &state,
+            "notes/drafts/list",
+            serde_json::json!({}),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        assert!(list.as_array().unwrap().is_empty());
+        let (status, count) = call(
+            &state,
+            "notes/drafts/count",
+            serde_json::json!({}),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{count}");
+        assert_eq!(count, 0);
+        // The posted note is visible on the author's timeline.
+        let (status, notes) = call(
+            &state,
+            "users/notes",
+            serde_json::json!({ "userId": alice_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{notes}");
+        assert_eq!(notes.as_array().unwrap().len(), 1);
+        assert_eq!(notes[0]["text"], "future");
+        // ...and the scheduling notification exists (findable by kind).
+        let (status, notifs) = call(
+            &state,
+            "i/notifications",
+            serde_json::json!({
+                "markAsRead": false,
+                "includeTypes": ["scheduledNotePosted"],
+            }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{notifs}");
+        assert_eq!(notifs.as_array().unwrap().len(), 1);
+        assert_eq!(notifs[0]["type"], "scheduledNotePosted");
+        assert!(notifs[0].get("note").is_some());
+        let _ = (scheduled_id, NotificationKind::ScheduledNotePosted);
+    }
+
+    #[tokio::test]
+    async fn pin_unpin_flows_and_errors() {
+        let (state, _) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (bob_id, bob_token) = signup_user(&state, "bob").await;
+
+        // Auth: no credential → 401.
+        let (status, _) = call(
+            &state,
+            "i/pin",
+            serde_json::json!({ "noteId": "x" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // Alice posts a note; Bob posts one too.
+        let (status, created) = call(
+            &state,
+            "notes/create",
+            serde_json::json!({ "text": "pin me" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let note_id = created["createdNote"]["id"].as_str().unwrap().to_string();
+        let (status, created) = call(
+            &state,
+            "notes/create",
+            serde_json::json!({ "text": "bob note" }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let bob_note = created["createdNote"]["id"].as_str().unwrap().to_string();
+
+        // Pinning a foreign note is NO_SUCH_NOTE (must own the note).
+        let (status, value) = call(
+            &state,
+            "i/pin",
+            serde_json::json!({ "noteId": bob_note }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_NOTE");
+
+        // Pin works and packs into MeDetailed.
+        let (status, me) = call(
+            &state,
+            "i/pin",
+            serde_json::json!({ "noteId": note_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{me}");
+        assert_eq!(me["pinnedNoteIds"][0], note_id);
+        assert_eq!(me["pinnedNotes"][0]["id"], note_id);
+        assert_eq!(me["pinnedNotes"][0]["text"], "pin me");
+
+        // Duplicate pins conflict with the exact upstream code.
+        let (status, value) = call(
+            &state,
+            "i/pin",
+            serde_json::json!({ "noteId": note_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "ALREADY_PINNED");
+
+        // Fill to the pin limit of 5, then exceed it.
+        let mut pinned = vec![note_id.clone()];
+        for n in 0..4 {
+            let (status, created) = call(
+                &state,
+                "notes/create",
+                serde_json::json!({ "text": format!("note {n}") }),
+                Some(&alice_token),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{created}");
+            let id = created["createdNote"]["id"].as_str().unwrap().to_string();
+            let (status, _) = call(
+                &state,
+                "i/pin",
+                serde_json::json!({ "noteId": id }),
+                Some(&alice_token),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            pinned.push(id);
+        }
+        let (status, created) = call(
+            &state,
+            "notes/create",
+            serde_json::json!({ "text": "one too many" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let sixth = created["createdNote"]["id"].as_str().unwrap().to_string();
+        let (status, value) = call(
+            &state,
+            "i/pin",
+            serde_json::json!({ "noteId": sixth }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "PIN_LIMIT_EXCEEDED");
+
+        // Unpin removes the id; unpinning again is a no-op success.
+        let (status, me) = call(
+            &state,
+            "i/unpin",
+            serde_json::json!({ "noteId": pinned[0] }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{me}");
+        assert_eq!(me["pinnedNoteIds"].as_array().unwrap().len(), 4);
+        let (status, _) = call(
+            &state,
+            "i/unpin",
+            serde_json::json!({ "noteId": pinned[0] }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        // Unpinning a foreign note is NO_SUCH_NOTE.
+        let (status, value) = call(
+            &state,
+            "i/unpin",
+            serde_json::json!({ "noteId": bob_note }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_NOTE");
+        let _ = (alice_id, bob_id);
+    }
+
+    #[tokio::test]
+    async fn featured_endpoints_return_ranked_notes() {
+        let (state, clock) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (bob_id, bob_token) = signup_user(&state, "bob").await;
+
+        // Alice posts two notes; Bob reacts to both and renotes one.
+        let (status, created) = call(
+            &state,
+            "notes/create",
+            serde_json::json!({ "text": "first note" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let first = created["createdNote"]["id"].as_str().unwrap().to_string();
+        clock.advance_ms(1_000);
+        let (status, created) = call(
+            &state,
+            "notes/create",
+            serde_json::json!({ "text": "second note" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let second = created["createdNote"]["id"].as_str().unwrap().to_string();
+        for target in [&first, &second] {
+            let (status, _) = call(
+                &state,
+                "notes/reactions/create",
+                serde_json::json!({ "noteId": target, "reaction": "❤" }),
+                Some(&bob_token),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+        }
+        let (status, created) = call(
+            &state,
+            "notes/create",
+            serde_json::json!({ "renoteId": second }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let rt = created["createdNote"]["id"].as_str().unwrap().to_string();
+
+        // Global featured returns all three notes newest-first (the pure
+        // renote is itself a recent public note with no sensitivity flags,
+        // so it ranks too).
+        let (status, featured) = call(
+            &state,
+            "notes/featured",
+            serde_json::json!({}),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{featured}");
+        let ids: Vec<&str> = featured
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&first.as_str()) && ids.contains(&second.as_str()));
+        assert_eq!(featured[0]["id"], rt, "newest first");
+        assert_eq!(featured[1]["id"], second);
+        assert_eq!(featured[2]["id"], first);
+        // Anonymous callers are served too; unknown params are rejected.
+        let (status, anon) = call(&state, "notes/featured", serde_json::json!({}), None).await;
+        assert_eq!(status, StatusCode::OK, "{anon}");
+        assert_eq!(anon.as_array().unwrap().len(), ids.len());
+        let (status, value) = call(
+            &state,
+            "notes/featured",
+            serde_json::json!({ "bogus": 1 }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "UNSUPPORTED_FIELD");
+        // A non-null channelId ranks empty (no channels exist).
+        let (status, empty) = call(
+            &state,
+            "notes/featured",
+            serde_json::json!({ "channelId": "ch1" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{empty}");
+        assert!(empty.as_array().unwrap().is_empty());
+        // `untilId` pages newest-first.
+        let (status, page) = call(
+            &state,
+            "notes/featured",
+            serde_json::json!({ "untilId": second }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page.as_array().unwrap().len(), 1);
+        assert_eq!(page[0]["id"], first);
+
+        // Per-user featured scopes to the author; unknown users rank empty.
+        let (status, user_featured) = call(
+            &state,
+            "users/featured-notes",
+            serde_json::json!({ "userId": alice_id }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{user_featured}");
+        assert_eq!(user_featured.as_array().unwrap().len(), 2);
+        let (status, bob_featured) = call(
+            &state,
+            "users/featured-notes",
+            serde_json::json!({ "userId": bob_id }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{bob_featured}");
+        assert_eq!(bob_featured.as_array().unwrap().len(), 1);
+        let (status, ghost) = call(
+            &state,
+            "users/featured-notes",
+            serde_json::json!({ "userId": "aid00000000000099" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{ghost}");
+        assert!(ghost.as_array().unwrap().is_empty());
+        // Missing userId is INVALID_PARAM.
+        let (status, value) = call(
+            &state,
+            "users/featured-notes",
+            serde_json::json!({}),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "INVALID_PARAM");
+    }
+
+    #[tokio::test]
+    async fn notifications_grouped_shapes() {
+        use crate::domain::notification::{Notification, NotificationKind};
+
+        let (state, clock) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (bob_id, bob_token) = signup_user(&state, "bob").await;
+        let (carol_id, _) = signup_user(&state, "carol").await;
+        let (dave_id, _) = signup_user(&state, "dave").await;
+
+        // Two notes by Alice; Bob renotes the first twice (two renote notes).
+        let n1 = state
+            .services
+            .create_note(crate::application::ports::CreateNoteInput::simple_public(
+                &alice_id, "n1",
+            ))
+            .unwrap();
+        clock.advance_ms(1_000);
+        let n2 = state
+            .services
+            .create_note(crate::application::ports::CreateNoteInput::simple_public(
+                &alice_id, "n2",
+            ))
+            .unwrap();
+        clock.advance_ms(1_000);
+        let r1 = state
+            .services
+            .create_note(crate::application::ports::CreateNoteInput {
+                renote_of: Some(n1.id.clone()),
+                ..crate::application::ports::CreateNoteInput::simple_public(&bob_id, "rt1")
+            })
+            .unwrap();
+        clock.advance_ms(1_000);
+        let r2 = state
+            .services
+            .create_note(crate::application::ports::CreateNoteInput {
+                renote_of: Some(n1.id.clone()),
+                ..crate::application::ports::CreateNoteInput::simple_public(&carol_id, "rt2")
+            })
+            .unwrap();
+
+        // Flat notifications for Bob, oldest first (clock advances make ids
+        // time-ordered): follow, react(n1, bob), react(n1, carol),
+        // react(n2, dave), renote(r1), renote(r2), mention(n2).
+        let mut insert = |kind: NotificationKind,
+                          notifier: &str,
+                          note: Option<String>,
+                          reaction: Option<String>| {
+            let id = state.services.ids.generate();
+            state
+                .services
+                .notifications
+                .insert_notification(Notification {
+                    id,
+                    notifiee_id: bob_id.clone(),
+                    notifier_id: notifier.to_string(),
+                    kind,
+                    note_id: note,
+                    reaction,
+                    draft_id: None,
+                    is_read: false,
+                })
+                .unwrap();
+            clock.advance_ms(1_000);
+        };
+        insert(NotificationKind::Follow, &alice_id, None, None);
+        insert(
+            NotificationKind::Reaction,
+            &bob_id,
+            Some(n1.id.clone()),
+            Some("❤".to_string()),
+        );
+        insert(
+            NotificationKind::Reaction,
+            &carol_id,
+            Some(n1.id.clone()),
+            Some("👍".to_string()),
+        );
+        insert(
+            NotificationKind::Reaction,
+            &dave_id,
+            Some(n2.id.clone()),
+            Some("❤".to_string()),
+        );
+        insert(NotificationKind::Renote, &bob_id, Some(r1.id.clone()), None);
+        insert(NotificationKind::Renote, &carol_id, Some(r2.id.clone()), None);
+        insert(
+            NotificationKind::Mention,
+            &alice_id,
+            Some(n2.id.clone()),
+            None,
+        );
+
+        // Grouped fetch: newest-first =
+        // mention | renote:grouped(r2+r1) | reaction(n2) |
+        // reaction:grouped(n1+n1) | follow.
+        let (status, grouped) = call(
+            &state,
+            "i/notifications-grouped",
+            serde_json::json!({ "markAsRead": false }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{grouped}");
+        let grouped = grouped.as_array().unwrap();
+        assert_eq!(grouped.len(), 5);
+        assert_eq!(grouped[0]["type"], "mention");
+        assert!(grouped[0].get("userId").is_some(), "plain packs keep userId");
+        assert_eq!(grouped[1]["type"], "renote:grouped");
+        assert_eq!(grouped[1]["note"]["id"], r2.id, "group carries the newest renote");
+        assert_eq!(
+            grouped[1]["users"].as_array().unwrap().len(),
+            2,
+            "both renoters merge: {}",
+            grouped[1]
+        );
+        assert!(grouped[1].get("userId").is_none(), "groups drop top-level userId");
+        assert_eq!(grouped[2]["type"], "reaction", "lone reactions pass through");
+        assert_eq!(grouped[2]["note"]["id"], n2.id);
+        assert_eq!(grouped[2]["reaction"], "❤");
+        assert_eq!(grouped[3]["type"], "reaction:grouped");
+        assert_eq!(grouped[3]["note"]["id"], n1.id);
+        let reactions = grouped[3]["reactions"].as_array().unwrap();
+        assert_eq!(reactions.len(), 2);
+        assert_eq!(reactions[0]["reaction"], "👍", "newest member first");
+        assert_eq!(reactions[1]["reaction"], "❤");
+        assert_eq!(grouped[4]["type"], "follow");
+
+        // Same params as `i/notifications` are accepted (full param set).
+        let (status, full) = call(
+            &state,
+            "i/notifications-grouped",
+            serde_json::json!({
+                "limit": 100,
+                "sinceId": grouped[4]["id"],
+                "untilId": grouped[0]["id"],
+                "sinceDate": 1,
+                "untilDate": 9_999_999_999_999i64,
+                "markAsRead": false,
+                "includeTypes": ["reaction", "renote", "follow", "mention"],
+                "excludeTypes": [],
+            }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{full}");
+        // includeTypes filters before grouping (mention + follow dropped).
+        assert_eq!(full.as_array().unwrap().len(), 3);
+
+        // markAsRead defaults to true and flips everything read.
+        let (status, _) = call(
+            &state,
+            "i/notifications-grouped",
+            serde_json::json!({}),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, after) = call(
+            &state,
+            "i/notifications",
+            serde_json::json!({ "markAsRead": false, "limit": 100 }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{after}");
+        assert!(after.as_array().unwrap().iter().all(|n| n["isRead"] == true));
+
+        // Grouped pseudo-types are valid filter entries (and match nothing
+        // alone, upstream parity).
+        let (status, none) = call(
+            &state,
+            "i/notifications-grouped",
+            serde_json::json!({ "markAsRead": false, "includeTypes": ["reaction:grouped"] }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{none}");
+        assert!(none.as_array().unwrap().is_empty());
+        // Auth + unknown-type validation mirror `i/notifications`.
+        let (status, _) = call(
+            &state,
+            "i/notifications-grouped",
+            serde_json::json!({}),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, value) = call(
+            &state,
+            "i/notifications-grouped",
+            serde_json::json!({ "includeTypes": ["bogus"] }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "INVALID_PARAM");
+        let _ = alice_token;
+    }
+
+    /// §11 read-time parity: `includeTypes`/`excludeTypes` accept the same
+    /// 20 upstream type names on `i/notifications` and
+    /// `i/notifications-grouped`, with identical matching. Covers the
+    /// remaining name mappings not exercised by the per-endpoint tests:
+    /// `quote` selects renote rows, unemitted `pollEnded` matches nothing,
+    /// obsolete `pollVote`/`groupInvited` are silently dropped (so an
+    /// include-list of only obsolete types matches nothing), and the
+    /// grouped pseudo-types match nothing alone while excluding nothing.
+    #[tokio::test]
+    async fn notifications_type_filters_agree_on_both_endpoints() {
+        use crate::domain::notification::{Notification, NotificationKind};
+
+        let (state, clock) = test_state();
+        let (alice_id, _) = signup_user(&state, "alice").await;
+        let (bob_id, bob_token) = signup_user(&state, "bob").await;
+
+        // One notification per emittable kind (direct inserts, oldest first).
+        let kinds = [
+            NotificationKind::Follow,
+            NotificationKind::ReceiveFollowRequest,
+            NotificationKind::Mention,
+            NotificationKind::Reply,
+            NotificationKind::Renote,
+            NotificationKind::Reaction,
+            NotificationKind::ScheduledNotePosted,
+            NotificationKind::ScheduledNotePostFailed,
+        ];
+        for kind in kinds {
+            state
+                .services
+                .notifications
+                .insert_notification(Notification {
+                    id: state.services.ids.generate(),
+                    notifiee_id: bob_id.clone(),
+                    notifier_id: alice_id.clone(),
+                    kind,
+                    note_id: None,
+                    reaction: None,
+                    draft_id: None,
+                    is_read: false,
+                })
+                .unwrap();
+            clock.advance_ms(1_000);
+        }
+
+        // `quote` selects the renote row on both endpoints (local quotes
+        // notify as `Renote`).
+        for endpoint in ["i/notifications", "i/notifications-grouped"] {
+            let (status, rows) = call(
+                &state,
+                endpoint,
+                serde_json::json!({ "markAsRead": false, "includeTypes": ["quote"] }),
+                Some(&bob_token),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{endpoint}: {rows}");
+            let rows = rows.as_array().unwrap();
+            assert_eq!(rows.len(), 1, "{endpoint}: quote selects the renote row");
+            assert!(rows[0]["type"] == "renote" || rows[0]["type"] == "renote:grouped");
+        }
+        // Unemitted `pollEnded` matches nothing on both endpoints.
+        for endpoint in ["i/notifications", "i/notifications-grouped"] {
+            let (status, rows) = call(
+                &state,
+                endpoint,
+                serde_json::json!({ "markAsRead": false, "includeTypes": ["pollEnded"] }),
+                Some(&bob_token),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{endpoint}: {rows}");
+            assert!(rows.as_array().unwrap().is_empty(), "{endpoint}");
+        }
+        // Obsolete types are dropped: an include-list of only obsolete
+        // types matches nothing (presence of `includeTypes` still filters).
+        for endpoint in ["i/notifications", "i/notifications-grouped"] {
+            let (status, rows) = call(
+                &state,
+                endpoint,
+                serde_json::json!({ "markAsRead": false, "includeTypes": ["pollVote", "groupInvited"] }),
+                Some(&bob_token),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{endpoint}: {rows}");
+            assert!(rows.as_array().unwrap().is_empty(), "{endpoint}");
+        }
+        // Grouped pseudo-types match nothing alone and exclude nothing, on
+        // both endpoints identically.
+        for endpoint in ["i/notifications", "i/notifications-grouped"] {
+            let (status, none) = call(
+                &state,
+                endpoint,
+                serde_json::json!({ "markAsRead": false, "includeTypes": ["reaction:grouped", "renote:grouped"] }),
+                Some(&bob_token),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{endpoint}: {none}");
+            assert!(none.as_array().unwrap().is_empty(), "{endpoint}");
+            let (status, all) = call(
+                &state,
+                endpoint,
+                serde_json::json!({ "markAsRead": false, "excludeTypes": ["reaction:grouped", "renote:grouped"] }),
+                Some(&bob_token),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{endpoint}: {all}");
+            assert_eq!(all.as_array().unwrap().len(), 8, "{endpoint}");
+        }
+        // Excluding every emittable kind matches nothing on both endpoints.
+        for endpoint in ["i/notifications", "i/notifications-grouped"] {
+            let (status, none) = call(
+                &state,
+                endpoint,
+                serde_json::json!({
+                    "markAsRead": false,
+                    "excludeTypes": ["follow", "receiveFollowRequest", "mention", "reply", "renote", "reaction", "scheduledNotePosted", "scheduledNotePostFailed"],
+                }),
+                Some(&bob_token),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{endpoint}: {none}");
+            assert!(none.as_array().unwrap().is_empty(), "{endpoint}");
+        }
+        // Unknown names are INVALID_PARAM on both endpoints.
+        for endpoint in ["i/notifications", "i/notifications-grouped"] {
+            let (status, value) = call(
+                &state,
+                endpoint,
+                serde_json::json!({ "includeTypes": ["bogus"] }),
+                Some(&bob_token),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{endpoint}");
+            assert_eq!(value["code"], "INVALID_PARAM");
+        }
     }
 
     #[tokio::test]
@@ -6050,5 +9801,259 @@ mod tests {
             assert_eq!(status, StatusCode::BAD_REQUEST, "{endpoint}: {value}");
             assert_eq!(value["code"], "UNSUPPORTED_FIELD");
         }
+    }
+
+    /// §4 polls + §6 wire compat, endpoint level: `notes/create` poll
+    /// params, `notes/polls/vote` flows and exact Misskey error codes, and
+    /// reaction normalization on `notes/reactions/create`.
+    #[tokio::test]
+    async fn notes_polls_vote_flows_and_error_codes() {
+        let (state, clock) = test_state();
+        let (_alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (_bob_id, bob_token) = signup_user(&state, "bob").await;
+        let now = clock.now_ms();
+
+        // Poll choices validation: too few, dupes, overlong.
+        for poll in [
+            serde_json::json!({ "choices": ["only"] }),
+            serde_json::json!({ "choices": ["a", "a"] }),
+            serde_json::json!({ "choices": ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k"] }),
+            serde_json::json!({ "choices": ["", "b"] }),
+        ] {
+            let (status, value) = call(
+                &state,
+                "notes/create",
+                serde_json::json!({ "text": "t", "poll": poll }),
+                Some(&alice_token),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{poll}: {value}");
+            assert_eq!(value["code"], "INVALID_PARAM");
+        }
+        // Already-expired poll → exact Misskey ident + UUID.
+        let (status, value) = call(
+            &state,
+            "notes/create",
+            serde_json::json!({ "text": "t", "poll": { "choices": ["a", "b"], "expiresAt": now - 1 } }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "CANNOT_CREATE_ALREADY_EXPIRED_POLL");
+        assert_eq!(value["error"]["id"], "04da457d-b083-4055-9082-955525eda5a5");
+        assert_eq!(value["message"], "Poll is already expired.");
+
+        // A live poll creates with the Misskey pack shape.
+        let (status, created) = call(
+            &state,
+            "notes/create",
+            serde_json::json!({
+                "text": "pick one",
+                "poll": { "choices": ["a", "b"], "multiple": false, "expiredAfter": 3_600_000 },
+            }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let note_id = created["createdNote"]["id"].as_str().unwrap().to_string();
+        assert_eq!(created["createdNote"]["hasPoll"], serde_json::json!(true));
+        assert_eq!(created["createdNote"]["poll"]["choices"][0]["text"], serde_json::json!("a"));
+
+        // A poll stands in for text (Misskey `notes/create.ts` parity).
+        let (status, created) = call(
+            &state,
+            "notes/create",
+            serde_json::json!({ "poll": { "choices": ["a", "b"] } }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        assert_eq!(created["createdNote"]["hasPoll"], serde_json::json!(true));
+
+        // Vote: 204, then duplicate → ALREADY_VOTED (exact UUID).
+        let (status, _) = call(
+            &state,
+            "notes/polls/vote",
+            serde_json::json!({ "noteId": note_id, "choice": 0 }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, value) = call(
+            &state,
+            "notes/polls/vote",
+            serde_json::json!({ "noteId": note_id, "choice": 0 }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "ALREADY_VOTED");
+        assert_eq!(value["error"]["id"], "0963fc77-efac-419b-9424-b391608dc6d8");
+
+        // Tallies + isVoted visible on show.
+        let (status, shown) = call(
+            &state,
+            "notes/show",
+            serde_json::json!({ "noteId": note_id }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{shown}");
+        assert_eq!(shown["poll"]["choices"][0]["votes"], serde_json::json!(1));
+        assert_eq!(shown["poll"]["choices"][0]["isVoted"], serde_json::json!(true));
+        assert_eq!(shown["poll"]["choices"][1]["isVoted"], serde_json::json!(false));
+
+        // Full error set with exact codes.
+        let (status, value) = call(
+            &state,
+            "notes/polls/vote",
+            serde_json::json!({ "noteId": "aid00000000000099", "choice": 0 }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_NOTE");
+        let (status, value) = call(
+            &state,
+            "notes/polls/vote",
+            serde_json::json!({ "noteId": note_id, "choice": 9 }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "INVALID_CHOICE");
+        assert_eq!(value["error"]["id"], "e0cc9a04-f2e8-41e4-a5f1-4127293260cc");
+
+        // NO_POLL on a plain note.
+        let (status, plain) = call(
+            &state,
+            "notes/create",
+            serde_json::json!({ "text": "plain" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{plain}");
+        let plain_id = plain["createdNote"]["id"].as_str().unwrap();
+        assert_eq!(plain["createdNote"]["hasPoll"], serde_json::json!(false));
+        assert!(plain["createdNote"]["poll"].is_null());
+        let (status, value) = call(
+            &state,
+            "notes/polls/vote",
+            serde_json::json!({ "noteId": plain_id, "choice": 0 }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_POLL");
+        assert_eq!(value["error"]["id"], "5f979967-52d9-4314-a911-1c673727f92f");
+
+        // Blocked voter → YOU_HAVE_BEEN_BLOCKED (author blocked the voter).
+        let (status, _) = call(
+            &state,
+            "blocking/create",
+            serde_json::json!({ "userId": _bob_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "alice blocks bob");
+        let (status, value) = call(
+            &state,
+            "notes/polls/vote",
+            serde_json::json!({ "noteId": note_id, "choice": 1 }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "YOU_HAVE_BEEN_BLOCKED");
+    }
+
+    /// §6 wire compat, endpoint level: legacy names, VS16 fallback, FE0F
+    /// stripping, and `likeOnly` coercion on `notes/reactions/create`.
+    #[tokio::test]
+    async fn reactions_normalize_like_misskey() {
+        use crate::application::ports::ReactionStore;
+
+        let (state, _clock) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (_bob_id, bob_token) = signup_user(&state, "bob").await;
+
+        // A likeOnly note coerces everything to the bare heart.
+        let (status, created) = call(
+            &state,
+            "notes/create",
+            serde_json::json!({ "text": "like only", "reactionAcceptance": "likeOnly" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let note_id = created["createdNote"]["id"].as_str().unwrap().to_string();
+        let (status, _) = call(
+            &state,
+            "notes/reactions/create",
+            serde_json::json!({ "noteId": note_id, "reaction": "👍" }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let stored = state
+            .services
+            .reactions
+            .get_reaction(&_bob_id, &note_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.reaction, "❤");
+
+        // Legacy names map; VS16 hearts normalize to the bare fallback.
+        let (status, created) = call(
+            &state,
+            "notes/create",
+            serde_json::json!({ "text": "open" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let open_id = created["createdNote"]["id"].as_str().unwrap().to_string();
+        let (status, _) = call(
+            &state,
+            "notes/reactions/create",
+            serde_json::json!({ "noteId": open_id, "reaction": "like" }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let stored = state
+            .services
+            .reactions
+            .get_reaction(&_bob_id, &open_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.reaction, "👍");
+
+        let (status, created) = call(
+            &state,
+            "notes/create",
+            serde_json::json!({ "text": "open 2" }),
+            Some(&alice_token),
+        )
+        .await;
+        // Alice reacts with the VS16 heart on her own note (first-party
+        // token path exercises the same normalization).
+        let open2_id = created["createdNote"]["id"].as_str().unwrap().to_string();
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let (status, _) = call(
+            &state,
+            "notes/reactions/create",
+            serde_json::json!({ "noteId": open2_id, "reaction": "❤️" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let stored = state
+            .services
+            .reactions
+            .get_reaction(&alice_id, &open2_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.reaction, "❤");
     }
 }

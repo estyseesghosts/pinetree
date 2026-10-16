@@ -710,6 +710,27 @@ pub fn render_note_object(
         "attachment": attachments,
         "sensitive": note.cw.is_some() || any_sensitive_file,
     });
+    // §4 polls: a poll note renders as a `Question` object carrying
+    // `oneOf`/`anyOf` tallies (Misskey `renderNote` `...asPoll` parity —
+    // the spread overwrites `type` there too).
+    if let Some(poll) = services.polls.get_poll(&note.id)? {
+        let question = render_question(
+            base,
+            &author_uri,
+            &note.id,
+            note.text.as_deref(),
+            &poll,
+            services.clock.now_ms(),
+        );
+        if let Some(qmap) = question.as_object() {
+            for key in ["oneOf", "anyOf", "endTime", "closed"] {
+                if let Some(v) = qmap.get(key) {
+                    obj[key] = v.clone();
+                }
+            }
+        }
+        obj["type"] = Value::String("Question".to_string());
+    }
     for (k, v) in quote_extra {
         obj[k] = v;
     }
@@ -804,6 +825,24 @@ pub fn render_create_or_announce_for_note(
     }))
 }
 
+/// Render a `Block` activity (§0A; Misskey `ApRendererService.renderBlock`
+/// parity: `{url}/blocks/{id}`, actor = blocker, object = blockee URI).
+pub fn render_block_activity(
+    public_url: &str,
+    block_id: &str,
+    blocker_uri: &str,
+    blockee_uri: &str,
+) -> Value {
+    let base = public_url.trim_end_matches('/');
+    json!({
+        "@context": ap_context(),
+        "id": format!("{base}/blocks/{block_id}"),
+        "type": "Block",
+        "actor": blocker_uri,
+        "object": blockee_uri,
+    })
+}
+
 /// Render a `Follow` activity.
 pub fn render_follow_activity(
     public_url: &str,
@@ -881,6 +920,28 @@ pub fn render_undo_activity(
     doc
 }
 
+/// Render an `Add`/`Remove` of a note to/from the actor's featured
+/// collection (pinning §7; Misskey `NotePiningService.deliverPinnedChange`
+/// `renderAdd`/`renderRemove` parity: `target =
+/// {actor}/collections/featured`, `object` = the note URI).
+pub fn render_featured_change_activity(
+    public_url: &str,
+    change_id: &str,
+    actor_uri: &str,
+    note_uri: &str,
+    added: bool,
+) -> Value {
+    let base = public_url.trim_end_matches('/');
+    json!({
+        "@context": ap_context(),
+        "id": format!("{base}/activities/{change_id}"),
+        "type": if added { "Add" } else { "Remove" },
+        "actor": actor_uri,
+        "target": format!("{actor_uri}/collections/featured"),
+        "object": note_uri,
+    })
+}
+
 /// Render a `Like` activity with Misskey `_misskey_reaction`.
 pub fn render_like_activity(
     public_url: &str,
@@ -898,6 +959,109 @@ pub fn render_like_activity(
         "object": target_note_uri,
         "content": reaction,
         "_misskey_reaction": reaction,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Polls (§4; Misskey `ApRendererService.renderQuestion` + `renderVote`)
+// ---------------------------------------------------------------------------
+
+/// Render a standalone `Question` object for a poll note (Misskey
+/// `renderQuestion` parity): `{ type: Question, id: {base}/questions/{id},
+/// actor, content, oneOf|anyOf: [{ name, _misskey_votes,
+/// replies: { type: Collection, totalItems } }] }`. `multiple` selects
+/// `anyOf`, otherwise `oneOf`.
+pub fn render_question(
+    public_url: &str,
+    author_actor_uri: &str,
+    note_id: &str,
+    text: Option<&str>,
+    poll: &crate::domain::poll::Poll,
+    now_ms: i64,
+) -> Value {
+    let base = public_url.trim_end_matches('/');
+    let options: Vec<Value> = poll
+        .choices
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let count = poll.votes.get(i).copied().unwrap_or(0);
+            json!({
+                "name": name,
+                "_misskey_votes": count,
+                "replies": { "type": "Collection", "totalItems": count },
+            })
+        })
+        .collect();
+    let mut doc = json!({
+        "type": "Question",
+        "id": format!("{base}/questions/{note_id}"),
+        "actor": author_actor_uri,
+        "attributedTo": author_actor_uri,
+        "content": text.unwrap_or(""),
+        if poll.multiple { "anyOf" } else { "oneOf" }: options,
+    });
+    if let Some(expires_at_ms) = poll.expires_at_ms {
+        // Misskey `renderNote` parity: an already-past expiry serializes
+        // as `closed`, a future one as `endTime`.
+        doc[if expires_at_ms < now_ms { "closed" } else { "endTime" }] =
+            Value::String(format_millis(expires_at_ms));
+    }
+    doc
+}
+
+/// Render an `Update(Question)` activity carrying the fresh tallies
+/// (Misskey `PollService.deliverQuestionUpdate` parity:
+/// `renderUpdate(renderNote(note))` to followers + relays).
+pub fn render_question_update_activity(
+    public_url: &str,
+    update_id: &str,
+    author_actor_uri: &str,
+    question: Value,
+    to: Vec<String>,
+    now_ms: i64,
+) -> Value {
+    let base = public_url.trim_end_matches('/');
+    json!({
+        "@context": ap_context(),
+        "id": format!("{base}/activities/{update_id}"),
+        "actor": author_actor_uri,
+        "type": "Update",
+        "to": to,
+        "object": question,
+        "published": format_millis(now_ms),
+    })
+}
+
+/// Render a `Create` vote activity for a vote on a remote poll note
+/// (Misskey `ApRendererService.renderVote` parity): the object is a `Note`
+/// with `inReplyTo` = poll note URI and `name` = choice text.
+#[allow(clippy::too_many_arguments)]
+pub fn render_vote_activity(
+    public_url: &str,
+    vote_id: &str,
+    voter_actor_uri: &str,
+    poll_owner_uri: &str,
+    target_note_uri: &str,
+    choice_name: &str,
+    now_ms: i64,
+) -> Value {
+    let base = public_url.trim_end_matches('/');
+    json!({
+        "@context": ap_context(),
+        "id": format!("{base}/users/{vote_id}/votes/activity"),
+        "actor": voter_actor_uri,
+        "type": "Create",
+        "to": [poll_owner_uri],
+        "published": format_millis(now_ms),
+        "object": {
+            "id": format!("{base}/users/{vote_id}/votes"),
+            "type": "Note",
+            "attributedTo": voter_actor_uri,
+            "to": [poll_owner_uri],
+            "inReplyTo": target_note_uri,
+            "name": choice_name,
+        },
     })
 }
 
@@ -1028,6 +1192,31 @@ pub fn render_tombstone(note_uri: &str) -> Value {
     })
 }
 
+/// Render an `Update(Note)` activity for an edited local note (§8;
+/// Sharkey `postNoteEdited` AP-deliver parity: the full re-rendered note
+/// object wrapped in `Update`, addressed like the create path).
+pub fn render_note_update_activity(
+    public_url: &str,
+    update_id: &str,
+    author_actor_uri: &str,
+    note: Value,
+    to: Vec<String>,
+    cc: Vec<String>,
+    now_ms: i64,
+) -> Value {
+    let base = public_url.trim_end_matches('/');
+    json!({
+        "@context": ap_context(),
+        "id": format!("{base}/activities/{update_id}"),
+        "actor": author_actor_uri,
+        "type": "Update",
+        "to": to,
+        "cc": cc,
+        "object": note,
+        "published": format_millis(now_ms),
+    })
+}
+
 /// Render an `Update(Person)` activity when a local account updates its profile.
 pub fn render_update_actor_activity(
     services: &AppServices,
@@ -1069,6 +1258,10 @@ pub struct ParsedRemoteNote {
     pub attributed_to: String,
     pub text: Option<String>,
     pub cw: Option<String>,
+    /// The object's `name` (vote choice text on `Create` vote activities;
+    /// Misskey `ApNoteService` vote branch reads `note.name`).
+    #[serde(default)]
+    pub name: Option<String>,
     pub in_reply_to: Option<String>,
     pub to: Vec<String>,
     pub cc: Vec<String>,
@@ -1076,6 +1269,10 @@ pub struct ParsedRemoteNote {
     pub hashtags: Vec<String>,
     pub attachments: Vec<ParsedAttachment>,
     pub sensitive: bool,
+    /// The attached poll when the object carries `oneOf`/`anyOf`
+    /// (Misskey `ApQuestionService.extractPollFromQuestion` parity).
+    #[serde(default)]
+    pub poll: Option<ParsedPoll>,
     /// Normalized structured quote target (any of the five carriers), if any.
     /// Quote detection is independent of authorization metadata.
     #[serde(default)]
@@ -1281,6 +1478,12 @@ pub fn parse_remote_note(obj_val: &Value) -> Result<ParsedRemoteNote, String> {
         attributed_to,
         text,
         cw,
+        name: obj
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned),
         in_reply_to,
         to,
         cc,
@@ -1288,6 +1491,7 @@ pub fn parse_remote_note(obj_val: &Value) -> Result<ParsedRemoteNote, String> {
         hashtags,
         attachments,
         sensitive,
+        poll: parse_question_poll(obj),
         quote_target_uri: normalized.as_ref().map(|q| q.target_uri.clone()),
         quote_authorization_uri: super::quotes::inbound_authorization_iri(obj_val),
         quote_has_conflict: normalized
@@ -1297,8 +1501,85 @@ pub fn parse_remote_note(obj_val: &Value) -> Result<ParsedRemoteNote, String> {
     })
 }
 
+/// A poll carried on an inbound `Note`/`Question` object (Misskey
+/// `ApQuestionService.extractPollFromQuestion` parity): `oneOf` selects
+/// single-choice, `anyOf` multi-choice; expiry reads `endTime` (else
+/// `closed`); per-choice counts read `replies.totalItems` (else
+/// `_misskey_votes`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParsedPoll {
+    pub choices: Vec<String>,
+    pub votes: Vec<u64>,
+    pub multiple: bool,
+    pub expires_at_ms: Option<i64>,
+}
+
+/// Extract a [`ParsedPoll`] from a Note/Question object map, or `None`
+/// when the object carries no usable `oneOf`/`anyOf` (fewer than 2 named
+/// choices — the storage invariant minimum).
+pub fn parse_question_poll(
+    obj: &serde_json::Map<String, Value>,
+) -> Option<ParsedPoll> {
+    let one_of = obj.get("oneOf").and_then(Value::as_array);
+    let any_of = obj.get("anyOf").and_then(Value::as_array);
+    // Misskey parity: `multiple = oneOf === undefined` (an object carrying
+    // both reads as `oneOf`).
+    let (options, multiple) = match (one_of, any_of) {
+        (Some(options), _) => (options, false),
+        (None, Some(options)) => (options, true),
+        (None, None) => return None,
+    };
+    let mut choices = Vec::new();
+    let mut votes = Vec::new();
+    for option in options {
+        let name = option.get("name").and_then(Value::as_str)?;
+        choices.push(name.to_string());
+        let count = option
+            .get("replies")
+            .and_then(|r| r.get("totalItems"))
+            .and_then(Value::as_u64)
+            .or_else(|| option.get("_misskey_votes").and_then(Value::as_u64))
+            .unwrap_or(0);
+        votes.push(count);
+    }
+    if choices.len() < 2 {
+        return None;
+    }
+    let expires_at_ms = obj
+        .get("endTime")
+        .or_else(|| obj.get("closed"))
+        .and_then(parse_ap_time_ms);
+    Some(ParsedPoll {
+        choices,
+        votes,
+        multiple,
+        expires_at_ms,
+    })
+}
+
+/// Parse an ActivityPub time value (unix millis integer or ISO-8601/RFC3339
+/// string) to unix millis. `None` on missing/unparseable input.
+pub fn parse_ap_time_ms(val: &Value) -> Option<i64> {
+    match val {
+        Value::Number(n) => n.as_i64().or_else(|| {
+            n.as_u64()
+                .and_then(|u| i64::try_from(u).ok())
+        }),
+        Value::String(s) => {
+            let s = s.trim();
+            if s.is_empty() {
+                return None;
+            }
+            chrono::DateTime::parse_from_rfc3339(s)
+                .ok()
+                .map(|dt| dt.timestamp_millis())
+        }
+        _ => None,
+    }
+}
+
 /// Extract the reaction string from an incoming `Like` activity:
-/// prefers `_misskey_reaction`, then `content`, falling back to `❤️`.
+/// prefers `_misskey_reaction`, then `content`, then the bare-heart fallback.
 pub fn extract_like_reaction(activity: &Value) -> String {
     if let Some(r) = activity
         .get("_misskey_reaction")
@@ -1501,7 +1782,10 @@ mod tests {
             accounts: store.clone(),
             notes: store.clone(),
             follows: store.clone(),
+            blocks: store.clone(),
+            mutes: store.clone(),
             reactions: store.clone(),
+            polls: store.clone(),
             jobs: store.clone(),
             media: store.clone(),
             blobs,
@@ -1518,6 +1802,9 @@ mod tests {
             preserved_usernames: Vec::new(),
             prohibited_words: Vec::new(),
             sensitive_words: Vec::new(),
+            note_draft_limit: crate::domain::draft::DEFAULT_NOTE_DRAFT_LIMIT,
+            scheduled_note_limit: crate::domain::draft::DEFAULT_SCHEDULED_NOTE_LIMIT,
+            pin_limit: crate::domain::pinning::DEFAULT_PIN_LIMIT,
         }
     }
 
@@ -1526,6 +1813,23 @@ mod tests {
         let ctx = serde_json::to_string(&ap_context()).unwrap();
         assert!(!ctx.contains("_misskey_content"));
         assert!(ctx.contains("_misskey_reaction"));
+    }
+
+    #[test]
+    fn featured_change_renders_add_remove_to_featured_collection() {
+        let actor = "https://pinetree.local/users/alice";
+        let note = "https://pinetree.local/notes/n1";
+        let add = render_featured_change_activity("https://pinetree.local/", "c1", actor, note, true);
+        assert_eq!(add["type"], "Add");
+        assert_eq!(add["actor"], actor);
+        assert_eq!(add["target"], format!("{actor}/collections/featured"));
+        assert_eq!(add["object"], note);
+        assert_eq!(add["id"], "https://pinetree.local/activities/c1");
+        let remove =
+            render_featured_change_activity("https://pinetree.local", "c2", actor, note, false);
+        assert_eq!(remove["type"], "Remove");
+        assert_eq!(remove["target"], format!("{actor}/collections/featured"));
+        assert_eq!(remove["object"], note);
     }
 
     #[test]
@@ -1640,7 +1944,10 @@ mod quote_render_tests {
             accounts: store.clone(),
             notes: store.clone(),
             follows: store.clone(),
+            blocks: store.clone(),
+            mutes: store.clone(),
             reactions: store.clone(),
+            polls: store.clone(),
             jobs: store.clone(),
             media: store.clone(),
             blobs,
@@ -1657,6 +1964,9 @@ mod quote_render_tests {
             preserved_usernames: Vec::new(),
             prohibited_words: Vec::new(),
             sensitive_words: Vec::new(),
+            note_draft_limit: crate::domain::draft::DEFAULT_NOTE_DRAFT_LIMIT,
+            scheduled_note_limit: crate::domain::draft::DEFAULT_SCHEDULED_NOTE_LIMIT,
+            pin_limit: crate::domain::pinning::DEFAULT_PIN_LIMIT,
         }
     }
 
@@ -1865,5 +2175,182 @@ mod quote_render_tests {
         let activity = render_create_or_announce_for_note(&services, &renote).unwrap();
         assert_eq!(activity["type"], "Announce");
         assert!(activity.get("quote").is_none());
+    }
+
+    // --- §4 polls: Question render/parse -----------------------------------
+
+    fn poll_fixture() -> crate::domain::poll::Poll {
+        crate::domain::poll::Poll {
+            note_id: "note1".to_string(),
+            choices: vec!["red".to_string(), "blue".to_string()],
+            votes: vec![3, 7],
+            multiple: false,
+            expires_at_ms: Some(1_760_400_060_000),
+        }
+    }
+
+    #[test]
+    fn render_question_matches_misskey_shape() {
+        let now = 1_760_400_000_000;
+        let poll = poll_fixture();
+        let doc = render_question(
+            "https://pinetree.local",
+            "https://pinetree.local/users/alice",
+            "note1",
+            Some("pick a color"),
+            &poll,
+            now,
+        );
+        assert_eq!(doc["type"], "Question");
+        assert_eq!(doc["id"], "https://pinetree.local/questions/note1");
+        // Single-choice → `oneOf`, future expiry → `endTime`.
+        assert!(doc.get("oneOf").is_some());
+        assert!(doc.get("anyOf").is_none());
+        assert!(doc.get("endTime").is_some());
+        assert!(doc.get("closed").is_none());
+        assert_eq!(doc["oneOf"][0]["name"], "red");
+        assert_eq!(doc["oneOf"][0]["replies"]["totalItems"], 3);
+        assert_eq!(doc["oneOf"][0]["_misskey_votes"], 3);
+        assert_eq!(doc["oneOf"][1]["replies"]["totalItems"], 7);
+
+        // Multi-choice → `anyOf`; past expiry → `closed`.
+        let mut multi = poll;
+        multi.multiple = true;
+        let doc = render_question(
+            "https://pinetree.local",
+            "https://pinetree.local/users/alice",
+            "note1",
+            None,
+            &multi,
+            1_760_400_061_000,
+        );
+        assert!(doc.get("anyOf").is_some());
+        assert!(doc.get("oneOf").is_none());
+        assert!(doc.get("closed").is_some());
+        assert!(doc.get("endTime").is_none());
+    }
+
+    #[test]
+    fn parse_question_poll_reads_oneof_anyof_and_times() {
+        // `oneOf` with `replies.totalItems`.
+        let doc = serde_json::json!({
+            "type": "Question",
+            "id": "https://remote.example/questions/1",
+            "oneOf": [
+                {"name": "a", "replies": {"type": "Collection", "totalItems": 2}},
+                {"name": "b", "replies": {"type": "Collection", "totalItems": 5}},
+            ],
+            "endTime": "2026-10-16T00:01:00.000Z",
+        });
+        let parsed = parse_question_poll(doc.as_object().unwrap()).unwrap();
+        assert!(!parsed.multiple);
+        assert_eq!(parsed.choices, vec!["a", "b"]);
+        assert_eq!(parsed.votes, vec![2, 5]);
+        assert_eq!(
+            parsed.expires_at_ms,
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2026-10-16T00:01:00.000Z")
+                    .unwrap()
+                    .timestamp_millis()
+            )
+        );
+
+        // `anyOf` with `_misskey_votes` fallback + `closed`.
+        let doc = serde_json::json!({
+            "type": "Question",
+            "id": "https://remote.example/questions/2",
+            "anyOf": [
+                {"name": "x", "_misskey_votes": 1},
+                {"name": "y", "_misskey_votes": 0},
+            ],
+            "closed": "2026-10-15T00:00:00.000Z",
+        });
+        let parsed = parse_question_poll(doc.as_object().unwrap()).unwrap();
+        assert!(parsed.multiple);
+        assert_eq!(parsed.votes, vec![1, 0]);
+        assert!(parsed.expires_at_ms.is_some());
+
+        // No options / fewer than two named choices → no poll.
+        let doc = serde_json::json!({"type": "Note", "id": "https://x/1"});
+        assert!(parse_question_poll(doc.as_object().unwrap()).is_none());
+        let doc = serde_json::json!({
+            "type": "Question", "id": "https://x/2",
+            "oneOf": [{"name": "lonely"}],
+        });
+        assert!(parse_question_poll(doc.as_object().unwrap()).is_none());
+    }
+
+    #[test]
+    fn question_render_parse_roundtrip() {
+        let now = 1_760_400_000_000;
+        let poll = poll_fixture();
+        let doc = render_question(
+            "https://pinetree.local",
+            "https://pinetree.local/users/alice",
+            "note1",
+            Some("pick a color"),
+            &poll,
+            now,
+        );
+        let back = parse_question_poll(doc.as_object().unwrap()).unwrap();
+        assert_eq!(back.choices, poll.choices);
+        assert_eq!(back.votes, poll.votes);
+        assert_eq!(back.multiple, poll.multiple);
+        assert_eq!(back.expires_at_ms, poll.expires_at_ms);
+    }
+
+    #[test]
+    fn render_note_object_embeds_question_for_poll_notes() {
+        let services = test_services("question-embed");
+        let alice = services.create_account("alice", None).unwrap();
+        let mut input = CreateNoteInput::simple_public(&alice.id, "pick one");
+        input.poll = Some(crate::domain::poll::PollInput {
+            choices: vec!["a".to_string(), "b".to_string()],
+            multiple: true,
+            expires_at_ms: None,
+        });
+        input.has_poll = true;
+        let note = services.create_note(input).unwrap();
+
+        let doc = render_note_object(&services, &note, true).unwrap();
+        // Misskey `renderNote` `...asPoll` parity: the poll overwrites the type.
+        assert_eq!(doc["type"], "Question");
+        assert!(doc.get("anyOf").is_some());
+        assert_eq!(doc["anyOf"][0]["replies"]["totalItems"], 0);
+
+        // Poll-less notes still render as `Note` with no options.
+        let plain = services
+            .create_note(CreateNoteInput::simple_public(&alice.id, "plain"))
+            .unwrap();
+        let doc = render_note_object(&services, &plain, true).unwrap();
+        assert_eq!(doc["type"], "Note");
+        assert!(doc.get("oneOf").is_none());
+        assert!(doc.get("anyOf").is_none());
+
+        // The rendered Question re-parses (federation round-trip).
+        let doc = render_note_object(&services, &note, true).unwrap();
+        let parsed = parse_remote_note(&doc).unwrap();
+        let poll = parsed.poll.unwrap();
+        assert_eq!(poll.choices, vec!["a", "b"]);
+        assert!(poll.multiple);
+    }
+
+    #[test]
+    fn render_vote_activity_matches_misskey_shape() {
+        let doc = render_vote_activity(
+            "https://pinetree.local",
+            "vote1",
+            "https://pinetree.local/users/bob",
+            "https://remote.example/users/alice",
+            "https://remote.example/notes/1",
+            "blue",
+            1_760_400_000_000,
+        );
+        assert_eq!(doc["type"], "Create");
+        assert_eq!(doc["actor"], "https://pinetree.local/users/bob");
+        assert_eq!(doc["to"], serde_json::json!(["https://remote.example/users/alice"]));
+        assert_eq!(doc["object"]["type"], "Note");
+        assert_eq!(doc["object"]["inReplyTo"], "https://remote.example/notes/1");
+        assert_eq!(doc["object"]["name"], "blue");
     }
 }

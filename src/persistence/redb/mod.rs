@@ -6,20 +6,28 @@ use std::sync::Arc;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
 
 use crate::application::ports::{
-    AccountStore, ActivityDedup, ActorKeypairRecord, ApiTokenRecord, AuthStore, Clock,
-    CreateAccountInput, CreateNoteInput, FollowStore, IdGenerator, InsertMediaInput, Job,
-    JobQueue, LegacyAuthSessionRecord, MediaStore, MiAuthSessionRecord, NewJob, NoteStore,
-    NotificationStore, PortError, ReactionStore, RemotePublicKeyRecord, TimelineCursor,
-    UpdateAccountPatch, MAX_JOBS_PER_TXN, MAX_JOB_ATTEMPTS,
+    AccountStore, ActivityDedup, ActorKeypairRecord, ApiTokenRecord, AuthStore, BlockStore, Clock,
+    CreateAccountInput, CreateNoteInput, EditNoteInput, FollowStore, IdGenerator, InsertMediaInput,
+    Job, JobQueue, LegacyAuthSessionRecord, MediaStore, MiAuthSessionRecord, MuteStore, NewJob,
+    NoteStore, NotificationStore, PollChoiceCount, PollStore, PortError, ReactionStore,
+    RemotePublicKeyRecord, TimelineCursor, UpdateAccountPatch, MAX_JOBS_PER_TXN, MAX_JOB_ATTEMPTS,
 };
 use crate::domain::account::{validate_local_username, Account};
+use crate::domain::blocking::Blocking;
+use crate::domain::draft::NoteDraft;
 use crate::domain::follow::{Follow, FollowNotify, FollowRequest};
+use crate::domain::muting::{validate_mute_expiry, validate_mute_params, Muting, RenoteMuting};
 use crate::domain::id::{parse_aidx_time, AidxGenerator};
 use crate::domain::media::MediaMeta;
-use crate::domain::note::{extract_hashtags, extract_mentions, Note, MAX_FILE_IDS};
+use crate::domain::note::{
+    extract_hashtags, is_quote_content, Note, NoteEdit, MAX_CW_STORAGE_CHARS,
+    MAX_FILE_IDS, MAX_NOTE_TEXT_CHARS,
+};
 use crate::domain::notification::{Notification, NotificationKind};
+use crate::domain::pinning::UserNotePining;
 use crate::domain::policy::{narrow_on_create, NarrowingInput};
-use crate::domain::quote::{QuoteAuthorizationState, QuoteStamp};
+use crate::domain::quote::{QuoteAuthorizationState, QuoteReference, QuoteStamp};
+use crate::domain::poll::{Poll, PollVote};
 use crate::domain::reaction::Reaction;
 
 const ACCOUNTS: TableDefinition<&str, &[u8]> = TableDefinition::new("accounts");
@@ -33,11 +41,43 @@ const FOLLOWS_FORWARD: TableDefinition<(&str, &str), &[u8]> =
     TableDefinition::new("follows_forward");
 const FOLLOWS_REVERSE: TableDefinition<(&str, &str), &[u8]> =
     TableDefinition::new("follows_reverse");
+/// Blocks, keyed `(blocker_id, blockee_id)` with a reverse index keyed
+/// `(blockee_id, blocker_id)` (§0A). Values are JSON [`Blocking`] rows.
+const BLOCKINGS_FORWARD: TableDefinition<(&str, &str), &[u8]> =
+    TableDefinition::new("blockings_forward");
+const BLOCKINGS_REVERSE: TableDefinition<(&str, &str), &[u8]> =
+    TableDefinition::new("blockings_reverse");
+/// Mutes, keyed `(muter_id, mutee_id)` (§0A). Values are JSON [`Muting`]
+/// rows (which carry the optional expiry).
+const MUTINGS_FORWARD: TableDefinition<(&str, &str), &[u8]> =
+    TableDefinition::new("mutings_forward");
+/// Renote-mutes, keyed `(muter_id, mutee_id)` (§0A). Values are JSON
+/// [`RenoteMuting`] rows.
+const RENOTE_MUTINGS_FORWARD: TableDefinition<(&str, &str), &[u8]> =
+    TableDefinition::new("renote_mutings_forward");
 const FOLLOW_REQ_FORWARD: TableDefinition<(&str, &str), &[u8]> =
     TableDefinition::new("follow_requests_forward");
 const FOLLOW_REQ_REVERSE: TableDefinition<(&str, &str), &[u8]> =
     TableDefinition::new("follow_requests_reverse");
 const REACTIONS: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new("reactions");
+/// Note drafts by id (`docs/misskey-parity-plan.md` §5; Misskey
+/// `note_draft`). Values are JSON [`NoteDraft`] rows.
+const NOTE_DRAFTS: TableDefinition<&str, &[u8]> = TableDefinition::new("note_drafts");
+/// Draft index keyed `(user_id, draft_id)` (aidx draft ids are
+/// time-ordered, so reverse ranges read newest-first).
+const NOTE_DRAFTS_BY_USER: TableDefinition<(&str, &str), u8> =
+    TableDefinition::new("note_drafts_by_user");
+/// Note pinnings keyed `(user_id, note_id)` (`UNIQUE(user,note)`;
+/// `docs/misskey-parity-plan.md` §7; Misskey `user_note_pining`).
+/// Values are JSON [`UserNotePining`] rows (which carry the pinning id
+/// used for oldest-first ordering).
+const PINNINGS: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new("pinnings");
+/// Polls by note id (`docs/misskey-parity-plan.md` §4; Misskey `MiPoll`).
+const POLLS: TableDefinition<&str, &[u8]> = TableDefinition::new("polls");
+/// Poll votes keyed `(user_id, note_id, choice)` (`UNIQUE(user,note,choice)`
+/// parity with Misskey `MiPollVote`).
+const POLL_VOTES: TableDefinition<(&str, &str, i64), &[u8]> =
+    TableDefinition::new("poll_votes");
 const JOBS: TableDefinition<&str, &[u8]> = TableDefinition::new("jobs");
 const JOBS_DUE_INDEX: TableDefinition<(i64, &str), u8> = TableDefinition::new("jobs_due_index");
 const ACTIVITY_DEDUP: TableDefinition<&str, u8> = TableDefinition::new("activity_dedup");
@@ -68,6 +108,13 @@ const NOTES_BY_REPLY_PENDING: TableDefinition<(&str, &str), u8> =
 /// Schema/migration markers (`docs/replies.md` §4): single-row string
 /// keys (done markers, resume cursors) for versioned backfills.
 const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
+/// Note edit history, keyed by edit row id (§8 `docs/misskey-parity-plan.md`;
+/// Sharkey `MiNoteEdit` parity).
+const NOTE_EDITS: TableDefinition<&str, &[u8]> = TableDefinition::new("note_edits");
+/// Edit rows by `(note_id, edit_id)`, oldest-first by construction (edit ids
+/// are time-ordered), driving `NoteStore::note_edits`.
+const NOTE_EDITS_BY_NOTE: TableDefinition<(&str, &str), u8> =
+    TableDefinition::new("note_edits_by_note");
 
 /// `NOTES_BY_REPLY` backfill version marker: present with value
 /// [`REPLY_INDEX_DONE_VALUE`] once every stored note has been indexed.
@@ -153,9 +200,26 @@ impl RedbStore {
         let _ = write_txn.open_table(NOTES_BY_AUTHOR).map_err(map_redb_err)?;
         let _ = write_txn.open_table(FOLLOWS_FORWARD).map_err(map_redb_err)?;
         let _ = write_txn.open_table(FOLLOWS_REVERSE).map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(BLOCKINGS_FORWARD)
+            .map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(BLOCKINGS_REVERSE)
+            .map_err(map_redb_err)?;
+        let _ = write_txn.open_table(MUTINGS_FORWARD).map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(RENOTE_MUTINGS_FORWARD)
+            .map_err(map_redb_err)?;
         let _ = write_txn.open_table(FOLLOW_REQ_FORWARD).map_err(map_redb_err)?;
         let _ = write_txn.open_table(FOLLOW_REQ_REVERSE).map_err(map_redb_err)?;
         let _ = write_txn.open_table(REACTIONS).map_err(map_redb_err)?;
+        let _ = write_txn.open_table(NOTE_DRAFTS).map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(NOTE_DRAFTS_BY_USER)
+            .map_err(map_redb_err)?;
+        let _ = write_txn.open_table(PINNINGS).map_err(map_redb_err)?;
+        let _ = write_txn.open_table(POLLS).map_err(map_redb_err)?;
+        let _ = write_txn.open_table(POLL_VOTES).map_err(map_redb_err)?;
         let _ = write_txn.open_table(JOBS).map_err(map_redb_err)?;
         let _ = write_txn.open_table(JOBS_DUE_INDEX).map_err(map_redb_err)?;
         let _ = write_txn.open_table(ACTIVITY_DEDUP).map_err(map_redb_err)?;
@@ -178,6 +242,10 @@ impl RedbStore {
             .map_err(map_redb_err)?;
         let _ = write_txn
             .open_table(NOTES_BY_REPLY_PENDING)
+            .map_err(map_redb_err)?;
+        let _ = write_txn.open_table(NOTE_EDITS).map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(NOTE_EDITS_BY_NOTE)
             .map_err(map_redb_err)?;
         let _ = write_txn.open_table(META).map_err(map_redb_err)?;
         write_txn.commit().map_err(map_redb_err)?;
@@ -395,13 +463,31 @@ impl RedbStore {
     fn create_note_in_txn(
         &self,
         write_txn: &WriteTransaction,
-        input: CreateNoteInput,
+        mut input: CreateNoteInput,
         jobs: Vec<NewJob>,
     ) -> Result<Note, PortError> {
-        if input.has_poll {
+        // `has_poll` must agree with `poll` (the application layer sets the
+        // flag from the input;storage enforces the invariant).
+        if input.has_poll != input.poll.is_some() {
             return Err(PortError::Validation(
-                "polls are unsupported in Phase 1".to_string(),
+                "has_poll must agree with poll".to_string(),
             ));
+        }
+        // Validate the poll params inside the transaction too (the
+        // application layer validates against the same clock first; this
+        // keeps the invariant storage-side for every caller, including
+        // inbound federation).
+        if let Some(poll_input) = input.poll.as_ref() {
+            poll_input.validate(self.clock.now_ms()).map_err(|e| match e {
+                crate::domain::id::DomainError::Validation(msg) => {
+                    PortError::Validation(msg)
+                }
+                crate::domain::id::DomainError::Conflict(msg) => PortError::Conflict(msg),
+                crate::domain::id::DomainError::NotFound(msg) => PortError::NotFound(msg),
+                crate::domain::id::DomainError::StorageUnavailable(msg) => {
+                    PortError::StorageUnavailable(msg)
+                }
+            })?;
         }
         if input.has_channel {
             return Err(PortError::Validation(
@@ -529,6 +615,18 @@ impl RedbStore {
             }
         }
 
+        // Sharkey `isQuote` parity (`NoteCreateService.isQuote`, synced with
+        // `misc/is-renote.ts`): text/cw presence (not blankness), a resolved
+        // reply link, a poll, or attached files turn a renote into a quote.
+        // `reply_parent_uri` (unresolved inbound parent) is NOT commentary.
+        let is_quote = input.renote_of.is_some()
+            && crate::domain::note::is_quote_content(
+                input.text.as_deref(),
+                input.cw.as_deref(),
+                input.reply_to.is_some(),
+                input.poll.is_some(),
+                input.file_ids.len(),
+            );
         let narrowed = narrow_on_create(NarrowingInput {
             requested_visibility: input.visibility,
             requested_local_only: input.local_only,
@@ -538,10 +636,80 @@ impl RedbStore {
             cw: input.cw.as_deref(),
             renote_target: renote_target.as_ref(),
             reply_target: reply_target.as_ref(),
-            renote_target_blocks_author: false,
+            renote_target_blocks_author: {
+                // §0A: real block lookup (was hardcoded `false`). Pure
+                // renotes of an author who blocks the replier are rejected
+                // with `YOU_HAVE_BEEN_BLOCKED` (Misskey
+                // `NoteCreateService` parity, enforced here so the local
+                // and inbound create paths share one check atomically).
+                // Gated on `!is_quote` (Sharkey `isRenote && !isQuote`
+                // parity): quotes skip the pure-renote block gate and fall
+                // through to the §3 permission check below instead.
+                match renote_target.as_ref() {
+                    Some(target)
+                        if !is_quote && target.author_id != input.author_id =>
+                    {
+                        self.blocking_exists_in_txn(
+                            write_txn,
+                            &target.author_id,
+                            &input.author_id,
+                        )?
+                    }
+                    _ => false,
+                }
+            },
             sensitive_words: &input.sensitive_words,
             can_public_note: true,
         })?;
+
+        // §0A: replying to an author who blocks the replier is rejected
+        // with `YOU_HAVE_BEEN_BLOCKED` (Misskey `NoteCreateService`
+        // reply-blocking parity), in the same transaction as the insert.
+        if let Some(target) = reply_target.as_ref() {
+            if target.author_id != input.author_id
+                && self.blocking_exists_in_txn(write_txn, &target.author_id, &input.author_id)?
+            {
+                return Err(PortError::Validation(
+                    "YOU_HAVE_BEEN_BLOCKED".to_string(),
+                ));
+            }
+        }
+
+        // §3 (Sharkey `NoteCreateService.checkQuotePermissions` parity):
+        // the QUOTER's own `rejectQuotes` flag gates quote creation — it is
+        // a per-user moderation switch (admin `admin/reject-quotes` +
+        // self-service `i/update {rejectQuotes}`), not the target author's.
+        // Local quoters fail closed with `QUOTE_DISABLED_FOR_USER`; remote
+        // quoters (inbound federation, which runs this same transaction via
+        // `record_note_activity`) are stripped to a plain note with a
+        // `quoteUnavailable` diagnostic. Position: after renote-narrowing,
+        // before the pure-renote block gate — the inputs (quote shape +
+        // author flag) are narrowing-independent, and the narrow gate above
+        // is pure-renote-only, so upstream error precedence holds exactly.
+        let mut process_errors: Option<Vec<String>> = None;
+        if is_quote && author.reject_quotes {
+            if author.host.is_none() {
+                return Err(PortError::Validation(
+                    "QUOTE_DISABLED_FOR_USER".to_string(),
+                ));
+            }
+            input.renote_of = None;
+            process_errors = Some(vec!["quoteUnavailable".to_string()]);
+        }
+        // A stripped quote leaves no renote behind: drop the loaded target
+        // so no `renote_count` bump or quote record is written below.
+        // (`renote_target` is `Some` only when `renote_of` was set, so this
+        // is a no-op for ordinary notes.)
+        let renote_target = if input.renote_of.is_none() {
+            None
+        } else {
+            renote_target
+        };
+        // The strip above also drops any inbound quote relation: the stored
+        // note is an ordinary plain note carrying only the diagnostic.
+        if input.renote_of.is_none() {
+            input.quote = None;
+        }
 
         // Extract mentions & tags
         let mut mentions = input.extra_mentions;
@@ -622,11 +790,13 @@ impl RedbStore {
             is_deleted: false,
             reply_parent_uri,
             quote,
+            updated_at_ms: None,
+            process_errors,
         };
         if author.host.is_some() {
-            note.validate_storage()?;
+            note.validate_storage_with_poll(input.poll.is_some())?;
         } else {
-            note.validate_api_create()?;
+            note.validate_api_create_with_poll(input.poll.is_some())?;
         }
 
         // Update reply_target.replies_count
@@ -686,8 +856,500 @@ impl RedbStore {
         drop(by_reply_pending_table);
         drop(media_table);
 
+        // §4: the poll row commits in the same transaction as the note
+        // (Misskey `NoteCreateService` transactional `MiNote` + `MiPoll`
+        // insert parity). `votes` starts zeroed with one slot per choice,
+        // or seeded from the origin-reported tallies for cached remote
+        // polls (the local path always seeds zeros).
+        if let Some(poll_input) = input.poll.as_ref() {
+            let mut polls_table = write_txn.open_table(POLLS).map_err(map_redb_err)?;
+            let votes = match input.poll_initial_votes.as_ref() {
+                None => vec![0u64; poll_input.choices.len()],
+                Some(seed) => {
+                    if seed.len() != poll_input.choices.len() {
+                        return Err(PortError::Validation(
+                            "poll seed votes must match choices".to_string(),
+                        ));
+                    }
+                    seed.clone()
+                }
+            };
+            let poll = Poll {
+                note_id: note.id.clone(),
+                choices: poll_input.choices.clone(),
+                votes,
+                multiple: poll_input.multiple,
+                expires_at_ms: poll_input.expires_at_ms,
+            };
+            let poll_bytes = encode_json(&poll)?;
+            polls_table
+                .insert(note.id.as_str(), poll_bytes.as_slice())
+                .map_err(map_redb_err)?;
+        }
+
         self.enqueue_jobs_in_txn(write_txn, jobs, Some(&note.id))?;
         Ok(note)
+    }
+
+    /// `notes/edit` storage path (§8; Sharkey `NoteEditService.edit`
+    /// parity). One transaction commits the updated note row, the
+    /// `note_edits` history row (effective edits only), the poll
+    /// add/remove/replace (votes reset), and `jobs` atomically.
+    #[allow(clippy::too_many_lines)]
+    fn apply_note_edit_in_txn(
+        &self,
+        write_txn: &WriteTransaction,
+        edit: EditNoteInput,
+        jobs: Vec<NewJob>,
+    ) -> Result<Note, PortError> {
+        for job in &jobs {
+            job.validate()?;
+        }
+        let mut notes_table = write_txn.open_table(NOTES).map_err(map_redb_err)?;
+        let accounts_table = write_txn.open_table(ACCOUNTS).map_err(map_redb_err)?;
+        let media_table = write_txn.open_table(MEDIA_META).map_err(map_redb_err)?;
+
+        let old: Note = match notes_table
+            .get(edit.note_id.as_str())
+            .map_err(map_redb_err)?
+        {
+            Some(g) => decode_json(g.value())?,
+            None => return Err(PortError::NotFound("NO_SUCH_NOTE".to_string())),
+        };
+        if old.is_deleted {
+            return Err(PortError::NotFound("NO_SUCH_NOTE".to_string()));
+        }
+        if old.author_id != edit.editor_id {
+            return Err(PortError::Validation(
+                "YOU_ARE_NOT_THE_AUTHOR".to_string(),
+            ));
+        }
+        let author: Account = match accounts_table
+            .get(old.author_id.as_str())
+            .map_err(map_redb_err)?
+        {
+            Some(g) => decode_json(g.value())?,
+            None => return Err(PortError::NotFound("NO_SUCH_NOTE".to_string())),
+        };
+
+        // The new renote target (None = detach; the reply parent is
+        // immutable and stays on the original). A pure-renote target is
+        // rejected (Sharkey endpoint `cannotReRenote` parity, re-checked
+        // here so the gate holds inside the atomic transaction).
+        let mut renote_target: Option<Note> = None;
+        if let Some(renote_id) = edit.renote_of.as_deref() {
+            let target: Note = match notes_table
+                .get(renote_id)
+                .map_err(map_redb_err)?
+            {
+                Some(g) => decode_json(g.value())?,
+                None => {
+                    return Err(PortError::NotFound(
+                        "NO_SUCH_RENOTE_TARGET".to_string(),
+                    ))
+                }
+            };
+            if target.is_deleted {
+                return Err(PortError::NotFound(
+                    "NO_SUCH_RENOTE_TARGET".to_string(),
+                ));
+            }
+            if target.renote_id.is_some() && target.quote.is_none() {
+                return Err(PortError::Validation(
+                    "CANNOT_RENOTE_TO_A_PURE_RENOTE".to_string(),
+                ));
+            }
+            renote_target = Some(target);
+        }
+
+        // Files must exist and be owned (same rule as create).
+        for fid in &edit.file_ids {
+            let media: MediaMeta = match media_table
+                .get(fid.as_str())
+                .map_err(map_redb_err)?
+            {
+                Some(g) => decode_json(g.value())?,
+                None => return Err(PortError::Validation("NO_SUCH_FILE".to_string())),
+            };
+            let owner_ok = media.owner_id.as_deref() == Some(old.author_id.as_str())
+                || (author.host.is_some() && media.owner_id.is_none());
+            if !owner_ok {
+                return Err(PortError::Validation("NO_SUCH_FILE".to_string()));
+            }
+        }
+        // `specified` audiences must resolve (same rule as create).
+        for uid in &edit.visible_users {
+            if accounts_table
+                .get(uid.as_str())
+                .map_err(map_redb_err)?
+                .is_none()
+            {
+                return Err(PortError::Validation(format!(
+                    "visible user {uid} does not exist"
+                )));
+            }
+        }
+
+        // Effective text/cw: trimmed + truncated to the storage bounds
+        // (Sharkey service trim parity; the endpoint pre-gates the local
+        // API limits, the inbound path relies on this trim).
+        let new_text = trim_to_none(edit.text.as_deref(), MAX_NOTE_TEXT_CHARS);
+        let new_cw = trim_to_none(edit.cw.as_deref(), MAX_CW_STORAGE_CHARS);
+        let new_has_poll = edit.poll.is_some();
+
+        // Effective quote shape (Sharkey `isQuote` parity — same predicate
+        // as the create path).
+        let new_is_quote = edit.renote_of.is_some()
+            && is_quote_content(
+                new_text.as_deref(),
+                new_cw.as_deref(),
+                old.reply_id.is_some(),
+                new_has_poll,
+                edit.file_ids.len(),
+            );
+
+        // Visibility narrowing over the FORCED original values (Sharkey
+        // edit parity: `visibility`/`localOnly` are reset to the original
+        // note's, then renote/reply-driven narrowing still applies, so a
+        // tighter new target narrows — or rejects — the edit).
+        let narrowed = narrow_on_create(NarrowingInput {
+            requested_visibility: old.visibility,
+            requested_local_only: old.local_only,
+            requested_visible_user_ids: edit.visible_users.clone(),
+            author_id: &old.author_id,
+            text: new_text.as_deref(),
+            cw: new_cw.as_deref(),
+            renote_target: renote_target.as_ref(),
+            reply_target: None,
+            renote_target_blocks_author: match renote_target.as_ref() {
+                Some(target)
+                    if !new_is_quote && target.author_id != old.author_id =>
+                {
+                    self.blocking_exists_in_txn(
+                        write_txn,
+                        &target.author_id,
+                        &old.author_id,
+                    )?
+                }
+                _ => false,
+            },
+            sensitive_words: &edit.sensitive_words,
+            can_public_note: true,
+        })?;
+        // Reply-driven §0A gate against the ORIGINAL reply parent (the
+        // reply link itself is immutable, but its author may have blocked
+        // the editor since the note was created).
+        if let Some(reply_id) = old.reply_id.as_deref() {
+            if let Some(parent) = notes_table
+                .get(reply_id)
+                .map_err(map_redb_err)?
+                .map(|g| decode_json::<Note>(g.value()))
+                .transpose()?
+            {
+                if !parent.is_deleted
+                    && parent.author_id != old.author_id
+                    && self.blocking_exists_in_txn(
+                        write_txn,
+                        &parent.author_id,
+                        &old.author_id,
+                    )?
+                {
+                    return Err(PortError::Validation(
+                        "YOU_HAVE_BEEN_BLOCKED".to_string(),
+                    ));
+                }
+            }
+        }
+
+        // §3 quote-permission check on the effective shape (same position
+        // and semantics as the create path: quoter-side flag, local throws,
+        // remote strips). On the edit path the strip also detaches the
+        // renote and drops the quote relation.
+        let mut new_renote_id = edit.renote_of.clone();
+        let mut process_errors = old.process_errors.clone();
+        if new_is_quote && author.reject_quotes {
+            if author.host.is_none() {
+                return Err(PortError::Validation(
+                    "QUOTE_DISABLED_FOR_USER".to_string(),
+                ));
+            }
+            new_renote_id = None;
+            renote_target = None;
+            process_errors = Some(vec!["quoteUnavailable".to_string()]);
+        }
+
+        // Prohibited words over text/cw/poll choices (Sharkey
+        // `checkProhibitedWordsContain` parity — storage-side so the
+        // inbound edit path shares the gate atomically).
+        {
+            let mut haystacks: Vec<&str> = Vec::new();
+            if let Some(text) = new_text.as_deref() {
+                haystacks.push(text);
+            }
+            if let Some(cw) = new_cw.as_deref() {
+                haystacks.push(cw);
+            }
+            if contains_any_word(&haystacks, &edit.prohibited_words) {
+                return Err(PortError::Validation(
+                    "CONTAINS_PROHIBITED_WORDS".to_string(),
+                ));
+            }
+            if let Some(poll) = edit.poll.as_ref() {
+                let choices: Vec<&str> =
+                    poll.choices.iter().map(String::as_str).collect();
+                if contains_any_word(&choices, &edit.prohibited_words) {
+                    return Err(PortError::Validation(
+                        "CONTAINS_PROHIBITED_WORDS".to_string(),
+                    ));
+                }
+            }
+        }
+
+        // Poll change detection against the stored row (add/remove/replace
+        // all reset votes; an untouched poll keeps its tallies even past
+        // expiry).
+        let mut polls_table = write_txn.open_table(POLLS).map_err(map_redb_err)?;
+        let old_poll: Option<Poll> = match polls_table
+            .get(old.id.as_str())
+            .map_err(map_redb_err)?
+        {
+            Some(g) => Some(decode_json(g.value())?),
+            None => None,
+        };
+        let poll_changed = match (old_poll.as_ref(), edit.poll.as_ref()) {
+            (None, None) => false,
+            (Some(_), None) | (None, Some(_)) => true,
+            (Some(old_poll), Some(new_poll)) => {
+                old_poll.choices != new_poll.choices
+                    || old_poll.multiple != new_poll.multiple
+                    || old_poll.expires_at_ms != new_poll.expires_at_ms
+            }
+        };
+        if let Some(new_poll) = edit.poll.as_ref() {
+            if poll_changed {
+                new_poll.validate(self.clock.now_ms()).map_err(|e| match e {
+                    crate::domain::id::DomainError::Validation(msg) => {
+                        PortError::Validation(msg)
+                    }
+                    crate::domain::id::DomainError::Conflict(msg) => PortError::Conflict(msg),
+                    crate::domain::id::DomainError::NotFound(msg) => PortError::NotFound(msg),
+                    crate::domain::id::DomainError::StorageUnavailable(msg) => {
+                        PortError::StorageUnavailable(msg)
+                    }
+                })?;
+            }
+        }
+
+        // No-change edits return the original note and write nothing
+        // (Sharkey `else { return oldnote; }` parity — no history row, no
+        // jobs). Files use the upstream truthy-OR detection (any files on
+        // either side count as changed; no deep compare).
+        let text_changed = new_text != old.text;
+        let cw_changed = new_cw != old.cw;
+        let has_poll_changed = old_poll.is_some() != new_has_poll;
+        let files_changed = !old.file_ids.is_empty() || !edit.file_ids.is_empty();
+        let renote_changed = new_renote_id != old.renote_id;
+        let acceptance_changed = edit.reaction_acceptance != old.reaction_acceptance;
+        if !text_changed
+            && !cw_changed
+            && !has_poll_changed
+            && !files_changed
+            && !poll_changed
+            && !renote_changed
+            && !acceptance_changed
+        {
+            return Ok(old);
+        }
+
+        // Recompute mentions/tags from the new text (same extraction as
+        // create). A `specified` edit merges the visible audience into the
+        // mentions (Sharkey service parity).
+        let mut mentions: Vec<String> = Vec::new();
+        if let Some(text) = new_text.as_deref() {
+            let handle_table = write_txn.open_table(HANDLE_INDEX).map_err(map_redb_err)?;
+            for (uname, host_opt) in crate::domain::note::extract_all_mentions(text) {
+                let key =
+                    Self::handle_key(&uname.to_ascii_lowercase(), host_opt.as_deref());
+                if let Some(uid_guard) =
+                    handle_table.get(key.as_str()).map_err(map_redb_err)?
+                {
+                    let uid = uid_guard.value().to_string();
+                    if !mentions.contains(&uid) {
+                        mentions.push(uid);
+                    }
+                }
+            }
+        }
+        let mut tags: Vec<String> = Vec::new();
+        if let Some(text) = new_text.as_deref() {
+            for t in extract_hashtags(text) {
+                if !tags.contains(&t) {
+                    tags.push(t);
+                }
+            }
+        }
+        let visible_user_ids = narrowed.visible_user_ids.clone();
+        if narrowed.visibility == crate::domain::note::Visibility::Specified {
+            for uid in visible_user_ids.clone() {
+                if !mentions.contains(&uid) {
+                    mentions.push(uid);
+                }
+            }
+        }
+
+        // Poll mutation with vote reset (votes table rows for this note are
+        // dropped; the poll row is replaced or removed; tallies restart
+        // zeroed).
+        if poll_changed {
+            let mut votes_table =
+                write_txn.open_table(POLL_VOTES).map_err(map_redb_err)?;
+            let stale: Vec<(String, String, i64)> = votes_table
+                .iter()
+                .map_err(map_redb_err)?
+                .filter_map(|entry| {
+                    entry.ok().and_then(|(k, _)| {
+                        let (user, note, choice) = k.value();
+                        if note == old.id.as_str() {
+                            Some((user.to_string(), note.to_string(), choice))
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .collect();
+            for (user, note, choice) in stale {
+                votes_table
+                    .remove((user.as_str(), note.as_str(), choice))
+                    .map_err(map_redb_err)?;
+            }
+            match edit.poll.as_ref() {
+                Some(new_poll) => {
+                    let poll = Poll {
+                        note_id: old.id.clone(),
+                        choices: new_poll.choices.clone(),
+                        votes: vec![0u64; new_poll.choices.len()],
+                        multiple: new_poll.multiple,
+                        expires_at_ms: new_poll.expires_at_ms,
+                    };
+                    let poll_bytes = encode_json(&poll)?;
+                    polls_table
+                        .insert(old.id.as_str(), poll_bytes.as_slice())
+                        .map_err(map_redb_err)?;
+                }
+                None => {
+                    polls_table
+                        .remove(old.id.as_str())
+                        .map_err(map_redb_err)?;
+                }
+            }
+        }
+
+        // Quote relation maintenance on renote change (Sharkey edit parity:
+        // no `QuoteRequest` is issued on edit — the relation is just set).
+        // An unchanged renote keeps its existing authorization record.
+        let new_quote = match (old.renote_id.as_deref(), new_renote_id.as_deref()) {
+            (a, b) if a == b => old.quote.clone(),
+            (_, None) => None,
+            (_, Some(new_id)) => {
+                let base = edit.uri_base.trim_end_matches('/');
+                let target_uri = renote_target
+                    .as_ref()
+                    .and_then(|t| t.uri.clone())
+                    .unwrap_or_else(|| format!("{base}/notes/{new_id}"));
+                Some(QuoteReference::unapproved(target_uri))
+            }
+        };
+        // Keep `target_note_id` in sync with `renote_id` (create-path
+        // invariant): a carried-over quote pointing elsewhere is reset to
+        // the effective target.
+        let mut new_quote = new_quote;
+        if let (Some(q), Some(rid)) = (new_quote.as_mut(), new_renote_id.as_deref()) {
+            q.target_note_id = Some(rid.to_string());
+        }
+
+        let now_ms = self.clock.now_ms();
+        let edited = Note {
+            id: old.id.clone(),
+            author_id: old.author_id.clone(),
+            text: new_text.clone(),
+            cw: new_cw.clone(),
+            visibility: narrowed.visibility,
+            visible_user_ids,
+            local_only: narrowed.local_only,
+            reply_id: old.reply_id.clone(),
+            renote_id: new_renote_id,
+            reply_user_id: old.reply_user_id.clone(),
+            file_ids: edit.file_ids.clone(),
+            mentions,
+            mentioned_remote_users: old.mentioned_remote_users.clone(),
+            tags,
+            emojis: Vec::new(),
+            reactions: old.reactions.clone(),
+            renote_count: old.renote_count,
+            replies_count: old.replies_count,
+            reaction_acceptance: edit.reaction_acceptance,
+            uri: old.uri.clone(),
+            url: old.url.clone(),
+            user_host: old.user_host.clone(),
+            is_deleted: false,
+            reply_parent_uri: old.reply_parent_uri.clone(),
+            quote: new_quote,
+            updated_at_ms: Some(now_ms),
+            process_errors,
+        };
+        edited.validate_storage_with_poll(new_has_poll)?;
+
+        // History row (Sharkey `noteEditRepository.insert` parity):
+        // `oldDate` is the previous edit time (note creation time on the
+        // first edit, derived from the time-ordered note id).
+        let old_date_ms = old.updated_at_ms.unwrap_or_else(|| {
+            self.ids
+                .parse_time(&old.id)
+                .unwrap_or_else(|_| now_ms)
+        });
+        let history = NoteEdit {
+            id: self.ids.generate(),
+            note_id: old.id.clone(),
+            old_text: old.text.clone(),
+            new_text: if text_changed { new_text.clone() } else { None },
+            cw: if cw_changed { new_cw.clone() } else { None },
+            file_ids: None,
+            old_date_ms,
+            updated_at_ms: now_ms,
+        };
+        history.validate().map_err(|e| match e {
+            crate::domain::id::DomainError::Validation(msg) => PortError::Validation(msg),
+            other => PortError::Validation(format!("invalid note edit: {other:?}")),
+        })?;
+        {
+            let mut edits_table =
+                write_txn.open_table(NOTE_EDITS).map_err(map_redb_err)?;
+            let mut by_note_table = write_txn
+                .open_table(NOTE_EDITS_BY_NOTE)
+                .map_err(map_redb_err)?;
+            let history_bytes = encode_json(&history)?;
+            edits_table
+                .insert(history.id.as_str(), history_bytes.as_slice())
+                .map_err(map_redb_err)?;
+            by_note_table
+                .insert(
+                    (old.id.as_str(), history.id.as_str()),
+                    &1u8,
+                )
+                .map_err(map_redb_err)?;
+        }
+
+        let edited_bytes = encode_json(&edited)?;
+        notes_table
+            .insert(edited.id.as_str(), edited_bytes.as_slice())
+            .map_err(map_redb_err)?;
+        drop(notes_table);
+        drop(accounts_table);
+        drop(media_table);
+        drop(polls_table);
+
+        self.enqueue_jobs_in_txn(write_txn, jobs, None)?;
+        Ok(edited)
     }
 
     fn delete_note_in_txn(
@@ -817,6 +1479,218 @@ impl RedbStore {
         Ok(existed)
     }
 
+    /// Read-only block-edge probe inside an open write transaction (§0A).
+    fn blocking_exists_in_txn(
+        &self,
+        write_txn: &WriteTransaction,
+        blocker_id: &str,
+        blockee_id: &str,
+    ) -> Result<bool, PortError> {
+        let table = write_txn.open_table(BLOCKINGS_FORWARD).map_err(map_redb_err)?;
+        Ok(table
+            .get((blocker_id, blockee_id))
+            .map_err(map_redb_err)?
+            .is_some())
+    }
+
+    /// Follow-gate block enforcement inside an open write transaction (§0A;
+    /// Misskey `UserFollowingService.follow` parity): the follower blocking
+    /// the followee is `BLOCKING` ("You are blocking that user."), the
+    /// followee blocking the follower is `BLOCKED` ("You are blocked by
+    /// that user.").
+    fn reject_when_blocked_in_txn(
+        &self,
+        write_txn: &WriteTransaction,
+        follower_id: &str,
+        followee_id: &str,
+    ) -> Result<(), PortError> {
+        if self.blocking_exists_in_txn(write_txn, follower_id, followee_id)? {
+            return Err(PortError::Validation("BLOCKING".to_string()));
+        }
+        if self.blocking_exists_in_txn(write_txn, followee_id, follower_id)? {
+            return Err(PortError::Validation("BLOCKED".to_string()));
+        }
+        Ok(())
+    }
+
+    /// Drop one follow edge (both index rows) and adjust counters, silently
+    /// when no edge exists. Shared by `unfollow_in_txn` (which reports
+    /// `NOT_FOLLOWING`) and the atomic `block` (which must not fail when
+    /// there is nothing to tear down).
+    fn drop_follow_edge_in_txn(
+        &self,
+        write_txn: &WriteTransaction,
+        follower_id: &str,
+        followee_id: &str,
+    ) -> Result<bool, PortError> {
+        let mut accounts_table = write_txn.open_table(ACCOUNTS).map_err(map_redb_err)?;
+        let mut fwd_table = write_txn.open_table(FOLLOWS_FORWARD).map_err(map_redb_err)?;
+        let mut rev_table = write_txn.open_table(FOLLOWS_REVERSE).map_err(map_redb_err)?;
+        if fwd_table
+            .remove((follower_id, followee_id))
+            .map_err(map_redb_err)?
+            .is_none()
+        {
+            return Ok(false);
+        }
+        rev_table
+            .remove((followee_id, follower_id))
+            .map_err(map_redb_err)?;
+        // Decode-then-write: the read guard must drop before the mutable
+        // insert (redb borrow rules).
+        let follower_bytes: Option<Vec<u8>> = accounts_table
+            .get(follower_id)
+            .map_err(map_redb_err)?
+            .map(|g| g.value().to_vec());
+        if let Some(raw) = follower_bytes {
+            let mut follower: Account = decode_json(&raw)?;
+            follower.following_count = follower.following_count.saturating_sub(1);
+            let b = encode_json(&follower)?;
+            accounts_table
+                .insert(follower.id.as_str(), b.as_slice())
+                .map_err(map_redb_err)?;
+        }
+        let followee_bytes: Option<Vec<u8>> = accounts_table
+            .get(followee_id)
+            .map_err(map_redb_err)?
+            .map(|g| g.value().to_vec());
+        if let Some(raw) = followee_bytes {
+            let mut followee: Account = decode_json(&raw)?;
+            followee.followers_count = followee.followers_count.saturating_sub(1);
+            let b = encode_json(&followee)?;
+            accounts_table
+                .insert(followee.id.as_str(), b.as_slice())
+                .map_err(map_redb_err)?;
+        }
+        Ok(true)
+    }
+
+    /// Atomic block insert + bidirectional follow/request teardown inside an
+    /// ambient write transaction (§0A; Misskey
+    /// `UserBlockingService.block()` parity). Shared by `BlockStore::block`
+    /// and the inbound-`Block` dedup record path so both commit state+jobs
+    /// atomically with no second logic path.
+    fn block_in_txn(
+        &self,
+        write_txn: &WriteTransaction,
+        blocking: &Blocking,
+        jobs: Vec<NewJob>,
+    ) -> Result<Blocking, PortError> {
+        blocking.validate()?;
+        for job in &jobs {
+            job.validate()?;
+        }
+        let (blocker_id, blockee_id) = (blocking.blocker_id.as_str(), blocking.blockee_id.as_str());
+        {
+            let accounts_table = write_txn.open_table(ACCOUNTS).map_err(map_redb_err)?;
+            for id in [blocker_id, blockee_id] {
+                if accounts_table.get(id).map_err(map_redb_err)?.is_none() {
+                    return Err(PortError::NotFound("NO_SUCH_USER".to_string()));
+                }
+            }
+            drop(accounts_table);
+            let mut fwd_table = write_txn.open_table(BLOCKINGS_FORWARD).map_err(map_redb_err)?;
+            if fwd_table
+                .get((blocker_id, blockee_id))
+                .map_err(map_redb_err)?
+                .is_some()
+            {
+                return Err(PortError::Conflict("ALREADY_BLOCKING".to_string()));
+            }
+            let bytes = encode_json(&blocking)?;
+            fwd_table
+                .insert((blocker_id, blockee_id), bytes.as_slice())
+                .map_err(map_redb_err)?;
+            drop(fwd_table);
+            let mut rev_table = write_txn.open_table(BLOCKINGS_REVERSE).map_err(map_redb_err)?;
+            rev_table
+                .insert((blockee_id, blocker_id), bytes.as_slice())
+                .map_err(map_redb_err)?;
+            drop(rev_table);
+        }
+        let _ = self.delete_follow_request_rows(&write_txn, blocker_id, blockee_id)?;
+        let _ = self.delete_follow_request_rows(&write_txn, blockee_id, blocker_id)?;
+        let _ = self.drop_follow_edge_in_txn(&write_txn, blocker_id, blockee_id)?;
+        let _ = self.drop_follow_edge_in_txn(&write_txn, blockee_id, blocker_id)?;
+        self.enqueue_jobs_in_txn(write_txn, jobs, None)?;
+        Ok(blocking.clone())
+    }
+
+    /// Atomic block removal inside an ambient write transaction (§0A).
+    /// `NotFound(NOT_BLOCKING)` when no row exists.
+    fn unblock_in_txn(
+        &self,
+        write_txn: &WriteTransaction,
+        blocker_id: &str,
+        blockee_id: &str,
+        jobs: Vec<NewJob>,
+    ) -> Result<(), PortError> {
+        for job in &jobs {
+            job.validate()?;
+        }
+        {
+            let mut fwd_table = write_txn.open_table(BLOCKINGS_FORWARD).map_err(map_redb_err)?;
+            let mut rev_table = write_txn.open_table(BLOCKINGS_REVERSE).map_err(map_redb_err)?;
+            if fwd_table
+                .remove((blocker_id, blockee_id))
+                .map_err(map_redb_err)?
+                .is_none()
+            {
+                return Err(PortError::NotFound("NOT_BLOCKING".to_string()));
+            }
+            rev_table
+                .remove((blockee_id, blocker_id))
+                .map_err(map_redb_err)?;
+        }
+        self.enqueue_jobs_in_txn(write_txn, jobs, None)?;
+        Ok(())
+    }
+
+    /// Newest-first id-cursor paging shared by the block/mute/renote-mute
+    /// listers (§0A; Misskey `makePaginationQuery` parity over aidx ids,
+    /// which are time-ordered).
+    fn apply_id_cursor<T>(
+        &self,
+        mut rows: Vec<T>,
+        cursor: &TimelineCursor,
+        id_of: impl Fn(&T) -> &str,
+    ) -> Vec<T> {
+        rows.sort_by(|a, b| id_of(b).cmp(id_of(a)));
+        let mut out = Vec::with_capacity(rows.len().min(cursor.limit.max(1)));
+        for row in rows {
+            let id = id_of(&row);
+            if let Some(since_id) = cursor.since_id.as_deref() {
+                if id <= since_id {
+                    continue;
+                }
+            }
+            if let Some(until_id) = cursor.until_id.as_deref() {
+                if id >= until_id {
+                    continue;
+                }
+            }
+            if cursor.since_date.is_some() || cursor.until_date.is_some() {
+                if let Ok(ts) = self.ids.parse_time(id) {
+                    if let Some(since_date) = cursor.since_date {
+                        if ts <= since_date {
+                            continue;
+                        }
+                    }
+                    if let Some(until_date) = cursor.until_date {
+                        if ts >= until_date {
+                            continue;
+                        }
+                    }
+                }
+            }
+            out.push(row);
+            if out.len() >= cursor.limit {
+                break;
+            }
+        }
+        out
+    }
+
     fn request_follow_in_txn(
         &self,
         write_txn: &WriteTransaction,
@@ -829,6 +1703,11 @@ impl RedbStore {
         if follower_id == followee_id {
             return Err(PortError::Validation("FOLLOWEE_IS_YOURSELF".to_string()));
         }
+        // §0A: block enforcement, both directions (Misskey
+        // `UserFollowingService.follow` parity). Runs inside the same
+        // transaction as the request insert, so a concurrent block cannot
+        // slip through. Covers local and inbound follows alike.
+        self.reject_when_blocked_in_txn(write_txn, follower_id, followee_id)?;
         for job in &jobs {
             job.validate()?;
         }
@@ -885,6 +1764,9 @@ impl RedbStore {
         if follower_id == followee_id {
             return Err(PortError::Validation("FOLLOWEE_IS_YOURSELF".to_string()));
         }
+        // §0A: block enforcement, both directions (see
+        // `request_follow_in_txn`).
+        self.reject_when_blocked_in_txn(write_txn, follower_id, followee_id)?;
         for job in &jobs {
             job.validate()?;
         }
@@ -1058,6 +1940,16 @@ impl RedbStore {
             if note.is_deleted {
                 return Err(PortError::NotFound("NO_SUCH_NOTE".to_string()));
             }
+            // §0A: reacting to an author who blocks the reactor is rejected
+            // (Misskey `ReactionService.create` parity: block check first,
+            // then visibility). Self-reactions are exempt.
+            if note.author_id != user_id
+                && self.blocking_exists_in_txn(write_txn, &note.author_id, user_id)?
+            {
+                return Err(PortError::Validation(
+                    "YOU_HAVE_BEEN_BLOCKED".to_string(),
+                ));
+            }
 
             let existing_opt: Option<Reaction> = match reactions_table
                 .get((user_id, note_id))
@@ -1161,17 +2053,29 @@ impl RedbStore {
             if let Some(v) = patch.description {
                 acc.description = v;
             }
+            if let Some(v) = patch.followed_message {
+                acc.followed_message = v;
+            }
             if let Some(v) = patch.location {
                 acc.location = v;
             }
             if let Some(v) = patch.birthday {
                 acc.birthday = v;
             }
+            if let Some(v) = patch.lang {
+                acc.lang = v;
+            }
             if let Some(v) = patch.avatar_id {
                 acc.avatar_id = v;
             }
+            if let Some(v) = patch.avatar_decorations {
+                acc.avatar_decorations = v;
+            }
             if let Some(v) = patch.banner_id {
                 acc.banner_id = v;
+            }
+            if let Some(v) = patch.fields {
+                acc.fields = v;
             }
             if let Some(v) = patch.is_locked {
                 acc.is_locked = v;
@@ -1184,6 +2088,95 @@ impl RedbStore {
             }
             if let Some(v) = patch.is_explorable {
                 acc.is_explorable = v;
+            }
+            if let Some(v) = patch.hide_online_status {
+                acc.hide_online_status = v;
+            }
+            if let Some(v) = patch.public_reactions {
+                acc.public_reactions = v;
+            }
+            if let Some(v) = patch.careful_bot {
+                acc.careful_bot = v;
+            }
+            if let Some(v) = patch.auto_accept_followed {
+                acc.auto_accept_followed = v;
+            }
+            if let Some(v) = patch.follow_approval_local_seconds {
+                acc.follow_approval_local_seconds = v;
+            }
+            if let Some(v) = patch.follow_approval_remote_seconds {
+                acc.follow_approval_remote_seconds = v;
+            }
+            if let Some(v) = patch.no_crawle {
+                acc.no_crawle = v;
+            }
+            if let Some(v) = patch.prevent_ai_learning {
+                acc.prevent_ai_learning = v;
+            }
+            if let Some(v) = patch.require_signin_to_view_contents {
+                acc.require_signin_to_view_contents = v;
+            }
+            if let Some(v) = patch.make_notes_followers_only_before {
+                acc.make_notes_followers_only_before = v;
+            }
+            if let Some(v) = patch.make_notes_hidden_before {
+                acc.make_notes_hidden_before = v;
+            }
+            if let Some(v) = patch.inject_featured_note {
+                acc.inject_featured_note = v;
+            }
+            if let Some(v) = patch.receive_announcement_email {
+                acc.receive_announcement_email = v;
+            }
+            if let Some(v) = patch.always_mark_nsfw {
+                acc.always_mark_nsfw = v;
+            }
+            if let Some(v) = patch.auto_sensitive {
+                acc.auto_sensitive = v;
+            }
+            if let Some(v) = patch.following_visibility {
+                acc.following_visibility = v;
+            }
+            if let Some(v) = patch.followers_visibility {
+                acc.followers_visibility = v;
+            }
+            if let Some(v) = patch.chat_scope {
+                acc.chat_scope = v;
+            }
+            if let Some(v) = patch.pinned_page_id {
+                acc.pinned_page_id = v;
+            }
+            if let Some(v) = patch.muted_words {
+                acc.enable_word_mute = !v.is_empty();
+                acc.muted_words = v;
+            }
+            if let Some(v) = patch.hard_muted_words {
+                acc.hard_muted_words = v;
+            }
+            if let Some(v) = patch.muted_instances {
+                acc.muted_instances = v;
+            }
+            if let Some(v) = patch.notification_recieve_config {
+                acc.notification_recieve_config = v;
+            }
+            if let Some(v) = patch.email_notification_types {
+                acc.email_notification_types = v;
+            }
+            if let Some(v) = patch.also_known_as {
+                acc.also_known_as = v;
+            }
+            if let Some(v) = patch.reject_quotes {
+                acc.reject_quotes = v;
+            }
+            if let Some(v) = patch.default_reaction {
+                acc.default_reaction = v;
+            }
+            // `update.ts` resets `verifiedLinks` on every profile update;
+            // re-verification happens off-request (see `verifyLink`).
+            // Only applied when the caller sets the field (profile updates);
+            // remote-actor refreshes leave it untouched.
+            if let Some(v) = patch.verified_links {
+                acc.verified_links = v;
             }
             acc.validate()?;
             let bytes = encode_json(&acc)?;
@@ -1321,6 +2314,32 @@ fn decode_json<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, PortEr
         .map_err(|e| PortError::StorageUnavailable(format!("json decode: {e}")))
 }
 
+/// Trim `raw` and truncate to `max_chars`; empty-after-trim maps to `None`
+/// (Sharkey service trim parity for `notes/edit`).
+fn trim_to_none(raw: Option<&str>, max_chars: usize) -> Option<String> {
+    let trimmed = raw.unwrap_or("").trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let truncated: String = trimmed.chars().take(max_chars).collect();
+    Some(truncated)
+}
+
+/// Case-insensitive substring match of any non-empty word in any haystack
+/// (prohibited-words check shared by the create and edit transactions).
+fn contains_any_word(haystacks: &[&str], words: &[String]) -> bool {
+    for text in haystacks {
+        let lower = text.to_lowercase();
+        for word in words {
+            let w = word.trim().to_lowercase();
+            if !w.is_empty() && lower.contains(w.as_str()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn matches_cursor(note_id: &str, cursor: &TimelineCursor) -> bool {
     if let Some(since_id) = &cursor.since_id {
         if note_id <= since_id.as_str() {
@@ -1390,6 +2409,43 @@ impl AccountStore for RedbStore {
             is_explorable: true,
             is_deleted: false,
             is_cat: input.is_cat,
+            // §0B: fresh accounts start at the upstream column defaults.
+            hide_online_status: false,
+            avatar_decorations: Vec::new(),
+            also_known_as: None,
+            require_signin_to_view_contents: false,
+            make_notes_followers_only_before: None,
+            make_notes_hidden_before: None,
+            chat_scope: crate::domain::account::ChatScope::default(),
+            followed_message: None,
+            lang: None,
+            fields: Vec::new(),
+            verified_links: Vec::new(),
+            public_reactions: true,
+            following_visibility: crate::domain::account::FollowVisibility::default(),
+            followers_visibility: crate::domain::account::FollowVisibility::default(),
+            auto_accept_followed: false,
+            follow_approval_local_seconds: None,
+            follow_approval_remote_seconds: None,
+            no_crawle: false,
+            prevent_ai_learning: true,
+            always_mark_nsfw: false,
+            auto_sensitive: false,
+            careful_bot: false,
+            inject_featured_note: true,
+            receive_announcement_email: true,
+            pinned_page_id: None,
+            enable_word_mute: false,
+            muted_words: Vec::new(),
+            hard_muted_words: Vec::new(),
+            muted_instances: Vec::new(),
+            notification_recieve_config: std::collections::BTreeMap::new(),
+            email_notification_types: vec![
+                "follow".to_string(),
+                "receiveFollowRequest".to_string(),
+            ],
+            reject_quotes: false,
+            default_reaction: None,
         };
         account.validate()?;
 
@@ -1666,6 +2722,40 @@ impl NoteStore for RedbStore {
         let note = self.create_note_in_txn(&write_txn, input, jobs)?;
         self.commit_write(write_txn)?;
         Ok(note)
+    }
+
+    fn apply_note_edit(&self, edit: EditNoteInput, jobs: Vec<NewJob>) -> Result<Note, PortError> {
+        let write_txn = self.begin_write()?;
+        let result = self.apply_note_edit_in_txn(&write_txn, edit, jobs);
+        match result {
+            Ok(note) => self.commit_write(write_txn).map(|_| note),
+            Err(e) => {
+                let _ = write_txn.abort();
+                Err(e)
+            }
+        }
+    }
+
+    fn note_edits(&self, note_id: &str) -> Result<Vec<NoteEdit>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let by_note = read_txn
+            .open_table(NOTE_EDITS_BY_NOTE)
+            .map_err(map_redb_err)?;
+        let edits_table = read_txn.open_table(NOTE_EDITS).map_err(map_redb_err)?;
+        // `(note_id, edit_id)` range reads oldest-first: edit ids are
+        // time-ordered, so index order is history order.
+        let range = by_note
+            .range((note_id, "")..=(note_id, "\u{10ffff}"))
+            .map_err(map_redb_err)?;
+        let mut out = Vec::new();
+        for entry in range {
+            let (k, _) = entry.map_err(map_redb_err)?;
+            let (_, edit_id) = k.value();
+            if let Some(g) = edits_table.get(edit_id).map_err(map_redb_err)? {
+                out.push(decode_json(g.value())?);
+            }
+        }
+        Ok(out)
     }
 
     fn get_note(&self, id: &str) -> Result<Option<Note>, PortError> {
@@ -2319,6 +3409,237 @@ impl NoteStore for RedbStore {
         self.commit_write(write_txn)?;
         Ok(meta)
     }
+
+    // --- Note drafts (§5) -------------------------------------------------
+
+    fn create_draft(&self, draft: NoteDraft, jobs: Vec<NewJob>) -> Result<NoteDraft, PortError> {
+        draft
+            .validate_shape()
+            .map_err(|e| PortError::Validation(format!("{e:?}")))?;
+        let write_txn = self.begin_write()?;
+        {
+            let mut drafts_table = write_txn.open_table(NOTE_DRAFTS).map_err(map_redb_err)?;
+            let mut by_user_table = write_txn
+                .open_table(NOTE_DRAFTS_BY_USER)
+                .map_err(map_redb_err)?;
+            let encoded = encode_json(&draft)?;
+            drafts_table
+                .insert(draft.id.as_str(), encoded.as_slice())
+                .map_err(map_redb_err)?;
+            by_user_table
+                .insert((draft.user_id.as_str(), draft.id.as_str()), &1u8)
+                .map_err(map_redb_err)?;
+        }
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)?;
+        Ok(draft)
+    }
+
+    fn get_draft(&self, id: &str) -> Result<Option<NoteDraft>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(NOTE_DRAFTS).map_err(map_redb_err)?;
+        match table.get(id).map_err(map_redb_err)? {
+            Some(guard) => Ok(Some(decode_json(guard.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn update_draft(&self, draft: NoteDraft, jobs: Vec<NewJob>) -> Result<NoteDraft, PortError> {
+        draft
+            .validate_shape()
+            .map_err(|e| PortError::Validation(format!("{e:?}")))?;
+        // Existence + ownership pre-check in a read txn (the write txn
+        // below must not abort while table guards are live).
+        let existing: NoteDraft = match self.get_draft(&draft.id)? {
+            Some(existing) => existing,
+            None => return Err(PortError::NotFound("NO_SUCH_NOTE_DRAFT".to_string())),
+        };
+        if existing.user_id != draft.user_id {
+            return Err(PortError::Validation("ACCESS_DENIED".to_string()));
+        }
+        let write_txn = self.begin_write()?;
+        {
+            let mut drafts_table = write_txn.open_table(NOTE_DRAFTS).map_err(map_redb_err)?;
+            let encoded = encode_json(&draft)?;
+            drafts_table
+                .insert(draft.id.as_str(), encoded.as_slice())
+                .map_err(map_redb_err)?;
+        }
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)?;
+        Ok(draft)
+    }
+
+    fn delete_draft(&self, id: &str, jobs: Vec<NewJob>) -> Result<(), PortError> {
+        // Resolve the owner first (read txn) so the write txn below never
+        // aborts while table guards are live.
+        let existing = self.get_draft(id)?;
+        let write_txn = self.begin_write()?;
+        {
+            let mut drafts_table = write_txn.open_table(NOTE_DRAFTS).map_err(map_redb_err)?;
+            let mut by_user_table = write_txn
+                .open_table(NOTE_DRAFTS_BY_USER)
+                .map_err(map_redb_err)?;
+            if let Some(draft) = existing {
+                drafts_table.remove(id).map_err(map_redb_err)?;
+                let _ = by_user_table.remove((draft.user_id.as_str(), id));
+            }
+        }
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)?;
+        Ok(())
+    }
+
+    fn drafts_by_user(
+        &self,
+        user_id: &str,
+        cursor: &TimelineCursor,
+        scheduled: Option<bool>,
+    ) -> Result<Vec<NoteDraft>, PortError> {
+        let limit = if cursor.limit == 0 { 30 } else { cursor.limit };
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let by_user = read_txn
+            .open_table(NOTE_DRAFTS_BY_USER)
+            .map_err(map_redb_err)?;
+        let drafts_table = read_txn.open_table(NOTE_DRAFTS).map_err(map_redb_err)?;
+        let mut out = Vec::new();
+        for entry in by_user
+            .range((user_id, "")..=(user_id, "\u{10ffff}"))
+            .map_err(map_redb_err)?
+            .rev()
+        {
+            let (k, _) = entry.map_err(map_redb_err)?;
+            let (_, draft_id) = k.value();
+            if !matches_cursor(draft_id, cursor) {
+                continue;
+            }
+            if let Some(guard) = drafts_table.get(draft_id).map_err(map_redb_err)? {
+                let draft: NoteDraft = decode_json(guard.value())?;
+                if let Some(want_scheduled) = scheduled {
+                    if draft.is_actually_scheduled != want_scheduled {
+                        continue;
+                    }
+                }
+                out.push(draft);
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn count_drafts(&self, user_id: &str) -> Result<usize, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let by_user = read_txn
+            .open_table(NOTE_DRAFTS_BY_USER)
+            .map_err(map_redb_err)?;
+        Ok(by_user
+            .range((user_id, "")..=(user_id, "\u{10ffff}"))
+            .map_err(map_redb_err)?
+            .count())
+    }
+
+    fn count_scheduled_drafts(&self, user_id: &str) -> Result<usize, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let by_user = read_txn
+            .open_table(NOTE_DRAFTS_BY_USER)
+            .map_err(map_redb_err)?;
+        let drafts_table = read_txn.open_table(NOTE_DRAFTS).map_err(map_redb_err)?;
+        let mut count = 0usize;
+        for entry in by_user
+            .range((user_id, "")..=(user_id, "\u{10ffff}"))
+            .map_err(map_redb_err)?
+        {
+            let (k, _) = entry.map_err(map_redb_err)?;
+            let (_, draft_id) = k.value();
+            if let Some(guard) = drafts_table.get(draft_id).map_err(map_redb_err)? {
+                let draft: NoteDraft = decode_json(guard.value())?;
+                if draft.is_actually_scheduled {
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    // --- Note pinnings (§7) -----------------------------------------------
+
+    fn add_pinning(
+        &self,
+        pinning: UserNotePining,
+        jobs: Vec<NewJob>,
+    ) -> Result<UserNotePining, PortError> {
+        pinning
+            .validate()
+            .map_err(|e| PortError::Validation(format!("{e:?}")))?;
+        // Duplicate pre-check in a read txn (the write txn below must not
+        // abort while table guards are live). The unique key makes the
+        // residual race converge to the same `ALREADY_PINNED`.
+        if self
+            .pinnings_for_user(&pinning.user_id)?
+            .iter()
+            .any(|p| p.note_id == pinning.note_id)
+        {
+            return Err(PortError::Conflict("ALREADY_PINNED".to_string()));
+        }
+        let write_txn = self.begin_write()?;
+        {
+            let mut pinnings_table = write_txn.open_table(PINNINGS).map_err(map_redb_err)?;
+            if pinnings_table
+                .get((pinning.user_id.as_str(), pinning.note_id.as_str()))
+                .map_err(map_redb_err)?
+                .is_some()
+            {
+                drop(pinnings_table);
+                let _ = write_txn.abort();
+                return Err(PortError::Conflict("ALREADY_PINNED".to_string()));
+            }
+            let encoded = encode_json(&pinning)?;
+            pinnings_table
+                .insert(
+                    (pinning.user_id.as_str(), pinning.note_id.as_str()),
+                    encoded.as_slice(),
+                )
+                .map_err(map_redb_err)?;
+        }
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)?;
+        Ok(pinning)
+    }
+
+    fn remove_pinning(
+        &self,
+        user_id: &str,
+        note_id: &str,
+        jobs: Vec<NewJob>,
+    ) -> Result<(), PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            let mut pinnings_table = write_txn.open_table(PINNINGS).map_err(map_redb_err)?;
+            let _ = pinnings_table.remove((user_id, note_id));
+        }
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)?;
+        Ok(())
+    }
+
+    fn pinnings_for_user(&self, user_id: &str) -> Result<Vec<UserNotePining>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let pinnings_table = read_txn.open_table(PINNINGS).map_err(map_redb_err)?;
+        let mut out = Vec::new();
+        for entry in pinnings_table
+            .range((user_id, "")..=(user_id, "\u{10ffff}"))
+            .map_err(map_redb_err)?
+        {
+            let (_, v) = entry.map_err(map_redb_err)?;
+            out.push(decode_json(v.value())?);
+        }
+        // Oldest pin first (pinning-id order; aidx ids are time-ordered),
+        // matching the upstream `pins.map(...)` pin order.
+        out.sort_by(|a: &UserNotePining, b: &UserNotePining| a.id.cmp(&b.id));
+        Ok(out)
+    }
 }
 
 impl JobQueue for RedbStore {
@@ -2581,6 +3902,54 @@ impl JobQueue for RedbStore {
         }
         Ok(count)
     }
+
+    fn remove_scheduled_draft_jobs(&self, draft_id: &str) -> Result<usize, PortError> {
+        // `clearSchedule` parity (linear scan, like the upstream
+        // delayed/waiting/active queue scan): remove every non-terminal
+        // `PostScheduledDraft` job armed for `draft_id`, including leased
+        // ones (a worker holding a removed job converges quietly at
+        // settlement: `complete` on a missing row is a no-op, and the
+        // handler re-checks the draft's arming before posting).
+        use crate::application::ports::{JobKind, ScheduledDraftPayload};
+        let targets: Vec<(String, i64, Option<i64>)> = {
+            let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+            let table = read_txn.open_table(JOBS).map_err(map_redb_err)?;
+            let mut out = Vec::new();
+            for entry in table.iter().map_err(map_redb_err)? {
+                let (k, v) = entry.map_err(map_redb_err)?;
+                let job: Job = decode_json(v.value())?;
+                if job.failed || job.kind != JobKind::PostScheduledDraft {
+                    continue;
+                }
+                let payload: ScheduledDraftPayload = match serde_json::from_slice(&job.payload) {
+                    Ok(payload) => payload,
+                    Err(_) => continue,
+                };
+                if payload.draft_id == draft_id {
+                    out.push((k.value().to_string(), job.not_before, job.lease_expires));
+                }
+            }
+            out
+        };
+        if targets.is_empty() {
+            return Ok(0);
+        }
+        let write_txn = self.begin_write()?;
+        {
+            let mut jobs_table = write_txn.open_table(JOBS).map_err(map_redb_err)?;
+            let mut due_table = write_txn.open_table(JOBS_DUE_INDEX).map_err(map_redb_err)?;
+            for (job_id, not_before, lease_expires) in &targets {
+                jobs_table.remove(job_id.as_str()).map_err(map_redb_err)?;
+                let _ = due_table.remove((*not_before, job_id.as_str()));
+                if let Some(exp) = lease_expires {
+                    let _ = due_table.remove((*exp, job_id.as_str()));
+                }
+            }
+        }
+        let removed = targets.len();
+        self.commit_write(write_txn)?;
+        Ok(removed)
+    }
 }
 
 /// Cap a quarantine reason so an unbounded remote response body can never
@@ -2814,6 +4183,370 @@ impl FollowStore for RedbStore {
     }
 }
 
+impl BlockStore for RedbStore {
+    fn block(&self, blocking: Blocking, jobs: Vec<NewJob>) -> Result<Blocking, PortError> {
+        let write_txn = self.begin_write()?;
+        let stored = self.block_in_txn(&write_txn, &blocking, jobs)?;
+        self.commit_write(write_txn)?;
+        Ok(stored)
+    }
+
+    fn unblock(
+        &self,
+        blocker_id: &str,
+        blockee_id: &str,
+        jobs: Vec<NewJob>,
+    ) -> Result<(), PortError> {
+        let write_txn = self.begin_write()?;
+        self.unblock_in_txn(&write_txn, blocker_id, blockee_id, jobs)?;
+        self.commit_write(write_txn)?;
+        Ok(())
+    }
+
+    fn get_blocking(
+        &self,
+        blocker_id: &str,
+        blockee_id: &str,
+    ) -> Result<Option<Blocking>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(BLOCKINGS_FORWARD).map_err(map_redb_err)?;
+        match table.get((blocker_id, blockee_id)).map_err(map_redb_err)? {
+            Some(g) => Ok(Some(decode_json(g.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn is_blocking(&self, blocker_id: &str, blockee_id: &str) -> Result<bool, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(BLOCKINGS_FORWARD).map_err(map_redb_err)?;
+        Ok(table
+            .get((blocker_id, blockee_id))
+            .map_err(map_redb_err)?
+            .is_some())
+    }
+
+    fn blocking_ids_for(&self, blocker_id: &str) -> Result<Vec<String>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(BLOCKINGS_FORWARD).map_err(map_redb_err)?;
+        let mut out = Vec::new();
+        for entry in table.iter().map_err(map_redb_err)? {
+            let (k, v) = entry.map_err(map_redb_err)?;
+            let (blocker, _) = k.value();
+            if blocker != blocker_id {
+                continue;
+            }
+            let row: Blocking = decode_json(v.value())?;
+            out.push(row.blockee_id);
+        }
+        Ok(out)
+    }
+
+    fn blocked_by_ids_for(&self, blockee_id: &str) -> Result<Vec<String>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(BLOCKINGS_REVERSE).map_err(map_redb_err)?;
+        let mut out = Vec::new();
+        for entry in table.iter().map_err(map_redb_err)? {
+            let (k, v) = entry.map_err(map_redb_err)?;
+            let (blockee, _) = k.value();
+            if blockee != blockee_id {
+                continue;
+            }
+            let row: Blocking = decode_json(v.value())?;
+            out.push(row.blocker_id);
+        }
+        Ok(out)
+    }
+
+    fn list_blockings(
+        &self,
+        blocker_id: &str,
+        cursor: &TimelineCursor,
+    ) -> Result<Vec<Blocking>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(BLOCKINGS_FORWARD).map_err(map_redb_err)?;
+        let mut rows: Vec<Blocking> = Vec::new();
+        for entry in table.iter().map_err(map_redb_err)? {
+            let (k, v) = entry.map_err(map_redb_err)?;
+            let (blocker, _) = k.value();
+            if blocker != blocker_id {
+                continue;
+            }
+            rows.push(decode_json(v.value())?);
+        }
+        drop(table);
+        drop(read_txn);
+        Ok(self.apply_id_cursor(rows, cursor, |r| r.id.as_str()))
+    }
+}
+
+impl MuteStore for RedbStore {
+    fn mute(
+        &self,
+        muter_id: &str,
+        mutee_id: &str,
+        expires_at_ms: Option<i64>,
+        jobs: Vec<NewJob>,
+    ) -> Result<Option<Muting>, PortError> {
+        validate_mute_params(muter_id, mutee_id)?;
+        for job in &jobs {
+            job.validate()?;
+        }
+        // Misskey `mute/create` parity: a past `expiresAt` creates no mute
+        // and is not an error.
+        if let Some(exp) = expires_at_ms {
+            if exp <= self.clock.now_ms() {
+                return Ok(None);
+            }
+            validate_mute_expiry(exp, self.clock.now_ms())?;
+        }
+        let muting = Muting {
+            id: self.ids.generate(),
+            muter_id: muter_id.to_string(),
+            mutee_id: mutee_id.to_string(),
+            expires_at_ms,
+        };
+        muting.validate()?;
+        let write_txn = self.begin_write()?;
+        {
+            let accounts_table = write_txn.open_table(ACCOUNTS).map_err(map_redb_err)?;
+            for id in [muter_id, mutee_id] {
+                if accounts_table.get(id).map_err(map_redb_err)?.is_none() {
+                    return Err(PortError::NotFound("NO_SUCH_USER".to_string()));
+                }
+            }
+            drop(accounts_table);
+            let mut table = write_txn.open_table(MUTINGS_FORWARD).map_err(map_redb_err)?;
+            if table
+                .get((muter_id, mutee_id))
+                .map_err(map_redb_err)?
+                .is_some()
+            {
+                return Err(PortError::Conflict("ALREADY_MUTING".to_string()));
+            }
+            let bytes = encode_json(&muting)?;
+            table
+                .insert((muter_id, mutee_id), bytes.as_slice())
+                .map_err(map_redb_err)?;
+        }
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)?;
+        Ok(Some(muting))
+    }
+
+    fn unmute(&self, muter_id: &str, mutee_id: &str, jobs: Vec<NewJob>) -> Result<(), PortError> {
+        for job in &jobs {
+            job.validate()?;
+        }
+        let write_txn = self.begin_write()?;
+        {
+            let mut table = write_txn.open_table(MUTINGS_FORWARD).map_err(map_redb_err)?;
+            if table
+                .remove((muter_id, mutee_id))
+                .map_err(map_redb_err)?
+                .is_none()
+            {
+                return Err(PortError::NotFound("NOT_MUTING".to_string()));
+            }
+        }
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)?;
+        Ok(())
+    }
+
+    fn get_muting(
+        &self,
+        muter_id: &str,
+        mutee_id: &str,
+    ) -> Result<Option<Muting>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(MUTINGS_FORWARD).map_err(map_redb_err)?;
+        match table.get((muter_id, mutee_id)).map_err(map_redb_err)? {
+            Some(g) => Ok(Some(decode_json(g.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn is_muting(&self, muter_id: &str, mutee_id: &str) -> Result<bool, PortError> {
+        let now = self.clock.now_ms();
+        Ok(self
+            .get_muting(muter_id, mutee_id)?
+            .map(|m| m.is_active_at(now))
+            .unwrap_or(false))
+    }
+
+    fn muted_ids_for(&self, muter_id: &str) -> Result<Vec<String>, PortError> {
+        let now = self.clock.now_ms();
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(MUTINGS_FORWARD).map_err(map_redb_err)?;
+        let mut out = Vec::new();
+        for entry in table.iter().map_err(map_redb_err)? {
+            let (k, v) = entry.map_err(map_redb_err)?;
+            let (muter, _) = k.value();
+            if muter != muter_id {
+                continue;
+            }
+            let row: Muting = decode_json(v.value())?;
+            if row.is_active_at(now) {
+                out.push(row.mutee_id);
+            }
+        }
+        Ok(out)
+    }
+
+    fn list_mutings(
+        &self,
+        muter_id: &str,
+        cursor: &TimelineCursor,
+    ) -> Result<Vec<Muting>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(MUTINGS_FORWARD).map_err(map_redb_err)?;
+        let mut rows: Vec<Muting> = Vec::new();
+        for entry in table.iter().map_err(map_redb_err)? {
+            let (k, v) = entry.map_err(map_redb_err)?;
+            let (muter, _) = k.value();
+            if muter != muter_id {
+                continue;
+            }
+            rows.push(decode_json(v.value())?);
+        }
+        drop(table);
+        drop(read_txn);
+        Ok(self.apply_id_cursor(rows, cursor, |r| r.id.as_str()))
+    }
+
+    fn renote_mute(
+        &self,
+        muter_id: &str,
+        mutee_id: &str,
+        jobs: Vec<NewJob>,
+    ) -> Result<RenoteMuting, PortError> {
+        validate_mute_params(muter_id, mutee_id)?;
+        for job in &jobs {
+            job.validate()?;
+        }
+        let row = RenoteMuting {
+            id: self.ids.generate(),
+            muter_id: muter_id.to_string(),
+            mutee_id: mutee_id.to_string(),
+        };
+        row.validate()?;
+        let write_txn = self.begin_write()?;
+        {
+            let accounts_table = write_txn.open_table(ACCOUNTS).map_err(map_redb_err)?;
+            for id in [muter_id, mutee_id] {
+                if accounts_table.get(id).map_err(map_redb_err)?.is_none() {
+                    return Err(PortError::NotFound("NO_SUCH_USER".to_string()));
+                }
+            }
+            drop(accounts_table);
+            let mut table = write_txn
+                .open_table(RENOTE_MUTINGS_FORWARD)
+                .map_err(map_redb_err)?;
+            if table
+                .get((muter_id, mutee_id))
+                .map_err(map_redb_err)?
+                .is_some()
+            {
+                return Err(PortError::Conflict("ALREADY_MUTING".to_string()));
+            }
+            let bytes = encode_json(&row)?;
+            table
+                .insert((muter_id, mutee_id), bytes.as_slice())
+                .map_err(map_redb_err)?;
+        }
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)?;
+        Ok(row)
+    }
+
+    fn renote_unmute(
+        &self,
+        muter_id: &str,
+        mutee_id: &str,
+        jobs: Vec<NewJob>,
+    ) -> Result<(), PortError> {
+        for job in &jobs {
+            job.validate()?;
+        }
+        let write_txn = self.begin_write()?;
+        {
+            let mut table = write_txn
+                .open_table(RENOTE_MUTINGS_FORWARD)
+                .map_err(map_redb_err)?;
+            if table
+                .remove((muter_id, mutee_id))
+                .map_err(map_redb_err)?
+                .is_none()
+            {
+                return Err(PortError::NotFound("NOT_MUTING".to_string()));
+            }
+        }
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)?;
+        Ok(())
+    }
+
+    fn get_renote_muting(
+        &self,
+        muter_id: &str,
+        mutee_id: &str,
+    ) -> Result<Option<RenoteMuting>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn
+            .open_table(RENOTE_MUTINGS_FORWARD)
+            .map_err(map_redb_err)?;
+        match table.get((muter_id, mutee_id)).map_err(map_redb_err)? {
+            Some(g) => Ok(Some(decode_json(g.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn is_renote_muting(&self, muter_id: &str, mutee_id: &str) -> Result<bool, PortError> {
+        Ok(self.get_renote_muting(muter_id, mutee_id)?.is_some())
+    }
+
+    fn renote_muted_ids_for(&self, muter_id: &str) -> Result<Vec<String>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn
+            .open_table(RENOTE_MUTINGS_FORWARD)
+            .map_err(map_redb_err)?;
+        let mut out = Vec::new();
+        for entry in table.iter().map_err(map_redb_err)? {
+            let (k, v) = entry.map_err(map_redb_err)?;
+            let (muter, _) = k.value();
+            if muter != muter_id {
+                continue;
+            }
+            let row: RenoteMuting = decode_json(v.value())?;
+            out.push(row.mutee_id);
+        }
+        Ok(out)
+    }
+
+    fn list_renote_mutings(
+        &self,
+        muter_id: &str,
+        cursor: &TimelineCursor,
+    ) -> Result<Vec<RenoteMuting>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn
+            .open_table(RENOTE_MUTINGS_FORWARD)
+            .map_err(map_redb_err)?;
+        let mut rows: Vec<RenoteMuting> = Vec::new();
+        for entry in table.iter().map_err(map_redb_err)? {
+            let (k, v) = entry.map_err(map_redb_err)?;
+            let (muter, _) = k.value();
+            if muter != muter_id {
+                continue;
+            }
+            rows.push(decode_json(v.value())?);
+        }
+        drop(table);
+        drop(read_txn);
+        Ok(self.apply_id_cursor(rows, cursor, |r| r.id.as_str()))
+    }
+}
+
 impl ReactionStore for RedbStore {
     fn react(
         &self,
@@ -2845,6 +4578,16 @@ impl ReactionStore for RedbStore {
             };
             if note.is_deleted {
                 return Err(PortError::NotFound("NO_SUCH_NOTE".to_string()));
+            }
+            // §0A: reacting to an author who blocks the reactor is rejected
+            // (Misskey `ReactionService.create` parity: block check first,
+            // then visibility). Self-reactions are exempt.
+            if note.author_id != user_id
+                && self.blocking_exists_in_txn(&write_txn, &note.author_id, user_id)?
+            {
+                return Err(PortError::Validation(
+                    "YOU_HAVE_BEEN_BLOCKED".to_string(),
+                ));
             }
 
             let existing_opt: Option<Reaction> = match reactions_table
@@ -2940,6 +4683,207 @@ impl ReactionStore for RedbStore {
             None => Ok(None),
         }
     }
+
+    fn reactions_by_user(&self, user_id: &str) -> Result<Vec<Reaction>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(REACTIONS).map_err(map_redb_err)?;
+        let mut out = Vec::new();
+        for entry in table
+            .range((user_id, "")..=(user_id, "\u{10ffff}"))
+            .map_err(map_redb_err)?
+        {
+            let (_, v) = entry.map_err(map_redb_err)?;
+            out.push(decode_json(v.value())?);
+        }
+        Ok(out)
+    }
+
+    fn reactions_for_note(&self, note_id: &str) -> Result<Vec<Reaction>, PortError> {
+        // No by-note index exists (reactions are keyed `(user, note)` for
+        // the `users/reactions` read path), so this scans and filters. Reads
+        // are not transaction-size limited; the §8 edit fan-out is the only
+        // caller and pages its deliveries through the standard split.
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(REACTIONS).map_err(map_redb_err)?;
+        let mut out = Vec::new();
+        for entry in table.iter().map_err(map_redb_err)? {
+            let (_, v) = entry.map_err(map_redb_err)?;
+            let reaction: Reaction = decode_json(v.value())?;
+            if reaction.note_id == note_id {
+                out.push(reaction);
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl PollStore for RedbStore {
+    fn get_poll(&self, note_id: &str) -> Result<Option<Poll>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(POLLS).map_err(map_redb_err)?;
+        match table.get(note_id).map_err(map_redb_err)? {
+            Some(g) => Ok(Some(decode_json(g.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn votes_by_user_for_note(
+        &self,
+        user_id: &str,
+        note_id: &str,
+    ) -> Result<Vec<PollVote>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(POLL_VOTES).map_err(map_redb_err)?;
+        let mut out = Vec::new();
+        for entry in table
+            .range((user_id, note_id, i64::MIN)..=(user_id, note_id, i64::MAX))
+            .map_err(map_redb_err)?
+        {
+            let (_, v) = entry.map_err(map_redb_err)?;
+            out.push(decode_json(v.value())?);
+        }
+        out.sort_by_key(|v: &PollVote| v.choice);
+        Ok(out)
+    }
+
+    fn cast_vote(&self, vote: PollVote, jobs: Vec<NewJob>) -> Result<PollVote, PortError> {
+        for job in &jobs {
+            job.validate()?;
+        }
+        if vote.choice > 10_000 {
+            return Err(PortError::Validation("INVALID_CHOICE".to_string()));
+        }
+        let write_txn = self.begin_write()?;
+        {
+            let notes_table = write_txn.open_table(NOTES).map_err(map_redb_err)?;
+            let mut polls_table = write_txn.open_table(POLLS).map_err(map_redb_err)?;
+            let mut votes_table = write_txn.open_table(POLL_VOTES).map_err(map_redb_err)?;
+
+            let note: Note = match notes_table.get(vote.note_id.as_str()).map_err(map_redb_err)? {
+                Some(g) => decode_json(g.value())?,
+                None => return Err(PortError::NotFound("NO_SUCH_NOTE".to_string())),
+            };
+            if note.is_deleted {
+                return Err(PortError::NotFound("NO_SUCH_NOTE".to_string()));
+            }
+            let mut poll: Poll = match polls_table
+                .get(vote.note_id.as_str())
+                .map_err(map_redb_err)?
+            {
+                Some(g) => decode_json(g.value())?,
+                None => return Err(PortError::Validation("NO_POLL".to_string())),
+            };
+            // §0A: voting on an author who blocks the voter is rejected
+            // (Misskey `PollService.vote` block-check parity). Self-votes
+            // are exempt. Re-checked here (not only in the application
+            // layer) so the gate holds inside the atomic transaction.
+            if note.author_id != vote.user_id
+                && self.blocking_exists_in_txn(&write_txn, &note.author_id, &vote.user_id)?
+            {
+                return Err(PortError::Validation(
+                    "YOU_HAVE_BEEN_BLOCKED".to_string(),
+                ));
+            }
+            if poll.is_expired(self.clock.now_ms()) {
+                return Err(PortError::Validation("ALREADY_EXPIRED".to_string()));
+            }
+            if vote.choice >= poll.choices.len() {
+                return Err(PortError::Validation("INVALID_CHOICE".to_string()));
+            }
+            let choice_idx = vote.choice as i64;
+
+            if poll.multiple {
+                if votes_table
+                    .get((vote.user_id.as_str(), vote.note_id.as_str(), choice_idx))
+                    .map_err(map_redb_err)?
+                    .is_some()
+                {
+                    return Err(PortError::Conflict("ALREADY_VOTED".to_string()));
+                }
+            } else {
+                let already_voted = votes_table
+                    .range(
+                        (
+                            vote.user_id.as_str(),
+                            vote.note_id.as_str(),
+                            i64::MIN,
+                        )..=(
+                            vote.user_id.as_str(),
+                            vote.note_id.as_str(),
+                            i64::MAX,
+                        ),
+                    )
+                    .map_err(map_redb_err)?
+                    .next()
+                    .is_some();
+                if already_voted {
+                    return Err(PortError::Conflict("ALREADY_VOTED".to_string()));
+                }
+            }
+
+            // `UPDATE votes[i] += 1` (Misskey 1-based SQL index parity:
+            // `votes[$1]` with `index = choice + 1`; ours is 0-based).
+            if let Some(slot) = poll.votes.get_mut(vote.choice) {
+                *slot = slot.saturating_add(1);
+            } else {
+                return Err(PortError::Validation("INVALID_CHOICE".to_string()));
+            }
+            let poll_bytes = encode_json(&poll)?;
+            polls_table
+                .insert(vote.note_id.as_str(), poll_bytes.as_slice())
+                .map_err(map_redb_err)?;
+            let vote_bytes = encode_json(&vote)?;
+            votes_table
+                .insert(
+                    (
+                        vote.user_id.as_str(),
+                        vote.note_id.as_str(),
+                        choice_idx,
+                    ),
+                    vote_bytes.as_slice(),
+                )
+                .map_err(map_redb_err)?;
+        }
+        self.enqueue_jobs_in_txn(&write_txn, jobs, Some(&vote.note_id))?;
+        self.commit_write(write_txn)?;
+        Ok(vote)
+    }
+
+    fn sync_poll_votes(
+        &self,
+        note_id: &str,
+        counts_by_name: &[PollChoiceCount],
+        jobs: Vec<NewJob>,
+    ) -> Result<Poll, PortError> {
+        for job in &jobs {
+            job.validate()?;
+        }
+        let write_txn = self.begin_write()?;
+        let updated = {
+            let mut polls_table = write_txn.open_table(POLLS).map_err(map_redb_err)?;
+            let mut poll: Poll = match polls_table.get(note_id).map_err(map_redb_err)? {
+                Some(g) => decode_json(g.value())?,
+                None => return Err(PortError::NotFound("NO_POLL".to_string())),
+            };
+            // Misskey `updateQuestion` parity: match stored choices by name;
+            // unknown remote names are ignored, missing names keep counts.
+            for (i, choice) in poll.choices.iter().enumerate() {
+                if let Some(count) = counts_by_name.iter().find(|c| &c.name == choice) {
+                    if let Some(slot) = poll.votes.get_mut(i) {
+                        *slot = count.votes;
+                    }
+                }
+            }
+            let poll_bytes = encode_json(&poll)?;
+            polls_table
+                .insert(note_id, poll_bytes.as_slice())
+                .map_err(map_redb_err)?;
+            poll
+        };
+        self.enqueue_jobs_in_txn(&write_txn, jobs, Some(note_id))?;
+        self.commit_write(write_txn)?;
+        Ok(updated)
+    }
 }
 
 impl ActivityDedup for RedbStore {
@@ -3022,6 +4966,22 @@ impl ActivityDedup for RedbStore {
         self.delete_note_in_txn(&write_txn, note_id, jobs)?;
         self.commit_write(write_txn)?;
         Ok(true)
+    }
+
+    fn record_note_edit_activity(
+        &self,
+        activity_id: &str,
+        edit: EditNoteInput,
+        jobs: Vec<NewJob>,
+    ) -> Result<Option<Note>, PortError> {
+        let write_txn = self.begin_write()?;
+        if self.check_and_mark_dedup_in_txn(&write_txn, activity_id)? {
+            let _ = write_txn.abort();
+            return Ok(None);
+        }
+        let note = self.apply_note_edit_in_txn(&write_txn, edit, jobs)?;
+        self.commit_write(write_txn)?;
+        Ok(Some(note))
     }
 
     fn record_follow_activity(
@@ -3108,6 +5068,62 @@ impl ActivityDedup for RedbStore {
         match self.unfollow_in_txn(&write_txn, follower_id, followee_id, jobs) {
             Ok(()) => {}
             Err(PortError::Validation(msg)) if msg.contains("NOT_FOLLOWING") => {}
+            Err(e) => return Err(e),
+        }
+        self.commit_write(write_txn)?;
+        Ok(true)
+    }
+
+    fn record_block_activity(
+        &self,
+        activity_id: &str,
+        blocker_id: &str,
+        blockee_id: &str,
+        jobs: Vec<NewJob>,
+    ) -> Result<Option<Blocking>, PortError> {
+        let write_txn = self.begin_write()?;
+        if self.check_and_mark_dedup_in_txn(&write_txn, activity_id)? {
+            let _ = write_txn.abort();
+            return Ok(None);
+        }
+        let blocking = Blocking {
+            id: self.ids.generate(),
+            blocker_id: blocker_id.to_string(),
+            blockee_id: blockee_id.to_string(),
+        };
+        let stored = match self.block_in_txn(&write_txn, &blocking, jobs) {
+            Ok(stored) => stored,
+            // A different activity re-blocking an existing pair converges
+            // (Misskey would hit its unique constraint here; swallowing
+            // keeps redelivery from storming).
+            Err(PortError::Conflict(msg)) if msg == "ALREADY_BLOCKING" => {
+                let _ = write_txn.abort();
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        self.commit_write(write_txn)?;
+        Ok(Some(stored))
+    }
+
+    fn record_unblock_activity(
+        &self,
+        activity_id: &str,
+        blocker_id: &str,
+        blockee_id: &str,
+        jobs: Vec<NewJob>,
+    ) -> Result<bool, PortError> {
+        let write_txn = self.begin_write()?;
+        if self.check_and_mark_dedup_in_txn(&write_txn, activity_id)? {
+            let _ = write_txn.abort();
+            return Ok(false);
+        }
+        match self.unblock_in_txn(&write_txn, blocker_id, blockee_id, jobs) {
+            Ok(()) => {}
+            Err(PortError::NotFound(msg)) if msg == "NOT_BLOCKING" => {
+                let _ = write_txn.abort();
+                return Ok(false);
+            }
             Err(e) => return Err(e),
         }
         self.commit_write(write_txn)?;

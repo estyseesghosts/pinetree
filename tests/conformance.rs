@@ -28,13 +28,16 @@ use std::time::{Duration, Instant};
 
 use pinetree::application::commands::AppServices;
 use pinetree::application::ports::{
-    AccountStore, ActivityDedup, BlobStore, CreateAccountInput, CreateNoteInput, FollowStore,
-    InsertMediaInput, JobKind, JobQueue, MediaStore, NewJob, NoopStreamingSink, NoteStore,
-    NotificationStore, PortError, ReplyParentResolvePayload, StreamingSink, TimelineCursor,
+    AccountStore, ActivityDedup, BlockStore, BlobStore, CreateAccountInput, CreateNoteInput,
+    FollowStore, InsertMediaInput, JobKind, JobQueue, MediaStore, MuteStore, NewJob,
+    NoopStreamingSink, NoteStore, NotificationStore, PortError, ReactionStore,
+    ReplyParentResolvePayload, ScheduledDraftPayload, StreamingSink, TimelineCursor,
     MAX_JOBS_PER_TXN, MAX_JOB_ATTEMPTS, MAX_JOB_PAYLOAD_BYTES,
 };
 use pinetree::domain::id::{Clock, ManualClock};
+use pinetree::domain::draft::NoteDraft;
 use pinetree::domain::note::{Note, Visibility};
+use pinetree::domain::pinning::UserNotePining;
 use pinetree::domain::policy::{
     ViewerContext, is_eligible_for_federated_timeline, is_eligible_for_federation_delivery,
     is_eligible_for_local_timeline, is_visible,
@@ -52,12 +55,28 @@ use pinetree::persistence::redb::RedbStore;
 
 /// Every port the conformance suite drives.
 pub trait ConformanceStore:
-    AccountStore + NoteStore + JobQueue + FollowStore + ActivityDedup + MediaStore
+    AccountStore
+        + NoteStore
+        + JobQueue
+        + FollowStore
+        + ActivityDedup
+        + MediaStore
+        + BlockStore
+        + MuteStore
+        + ReactionStore
 {
 }
 
 impl<T> ConformanceStore for T where
-    T: AccountStore + NoteStore + JobQueue + FollowStore + ActivityDedup + MediaStore
+    T: AccountStore
+        + NoteStore
+        + JobQueue
+        + FollowStore
+        + ActivityDedup
+        + MediaStore
+        + BlockStore
+        + MuteStore
+        + ReactionStore
 {
 }
 
@@ -969,7 +988,10 @@ fn open_worker_stack(
         accounts: store.clone(),
         notes: store.clone(),
         follows: store.clone(),
+        blocks: store.clone(),
+        mutes: store.clone(),
         reactions: store.clone(),
+        polls: store.clone(),
         jobs: store.clone(),
         media: store.clone(),
         blobs: blobs.clone(),
@@ -986,6 +1008,9 @@ fn open_worker_stack(
         preserved_usernames: Vec::new(),
         prohibited_words: Vec::new(),
         sensitive_words: Vec::new(),
+        note_draft_limit: pinetree::domain::draft::DEFAULT_NOTE_DRAFT_LIMIT,
+        scheduled_note_limit: pinetree::domain::draft::DEFAULT_SCHEDULED_NOTE_LIMIT,
+        pin_limit: pinetree::domain::pinning::DEFAULT_PIN_LIMIT,
     });
     let worker = JobWorker {
         clock: clock_port,
@@ -4391,4 +4416,464 @@ fn r12_conversation_semantics_unchanged() {
         ),
         "unknown conversation target is NO_SUCH_NOTE"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Group G — §0A blocking / muting persistence contract (backend-generic;
+// Phase 4 runs these against FoundationDB unchanged)
+// ---------------------------------------------------------------------------
+
+fn full_cursor(limit: usize) -> TimelineCursor {
+    TimelineCursor {
+        since_id: None,
+        until_id: None,
+        since_date: None,
+        until_date: None,
+        limit,
+    }
+}
+
+
+fn blocking_row(seq: u64, blocker: &str, blockee: &str) -> pinetree::domain::blocking::Blocking {
+    pinetree::domain::blocking::Blocking {
+        // Zero-padded sequence: lexicographic order == creation order, so
+        // newest-first paging assertions hold without an id generator.
+        id: format!("gblock{seq:08}"),
+        blocker_id: blocker.to_string(),
+        blockee_id: blockee.to_string(),
+    }
+}
+
+/// G1: block CRUD, dup/missing codes, directional id lists, cursor paging.
+fn case_g1_block_crud<S: ConformanceStore>(store: &S) {
+    let alice = create_user(store, "g1_alice");
+    let bob = create_user(store, "g1_bob");
+    let carol = create_user(store, "g1_carol");
+    assert!(!store.is_blocking(&alice.id, &bob.id).unwrap());
+    let row = store.block(blocking_row(2, &alice.id, &bob.id), vec![]).expect("block");
+    assert_eq!((row.blocker_id.as_str(), row.blockee_id.as_str()), (alice.id.as_str(), bob.id.as_str()));
+    assert!(store.is_blocking(&alice.id, &bob.id).unwrap());
+    assert!(!store.is_blocking(&bob.id, &alice.id).unwrap());
+    assert!(matches!(
+        store.block(blocking_row(3, &alice.id, &bob.id), vec![]),
+        Err(PortError::Conflict(msg)) if msg == "ALREADY_BLOCKING"
+    ));
+    assert!(matches!(
+        store.block(blocking_row(4, &alice.id, &alice.id), vec![]),
+        Err(PortError::Validation(msg)) if msg == "BLOCKEE_IS_YOURSELF"
+    ));
+    assert!(matches!(
+        store.block(blocking_row(5, &alice.id, "missing"), vec![]),
+        Err(PortError::NotFound(msg)) if msg == "NO_SUCH_USER"
+    ));
+    assert_eq!(store.blocking_ids_for(&alice.id).unwrap(), vec![bob.id.clone()]);
+    assert_eq!(store.blocked_by_ids_for(&bob.id).unwrap(), vec![alice.id.clone()]);
+    assert!(store.blocked_by_ids_for(&alice.id).unwrap().is_empty());
+    store.block(blocking_row(6, &alice.id, &carol.id), vec![]).expect("second block");
+    let page = store.list_blockings(&alice.id, &full_cursor(1)).unwrap();
+    assert_eq!(page.len(), 1, "limit applies");
+    let all = store.list_blockings(&alice.id, &full_cursor(100)).unwrap();
+    assert_eq!(all.len(), 2);
+    assert!(all[0].id > all[1].id, "newest-first");
+    // untilId paging walks without gaps.
+    let second = store
+        .list_blockings(
+            &alice.id,
+            &TimelineCursor { until_id: Some(all[0].id.clone()), ..full_cursor(100) },
+        )
+        .unwrap();
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].id, all[1].id);
+    store.unblock(&alice.id, &bob.id, vec![]).expect("unblock");
+    assert!(!store.is_blocking(&alice.id, &bob.id).unwrap());
+    assert!(matches!(
+        store.unblock(&alice.id, &bob.id, vec![]),
+        Err(PortError::NotFound(msg)) if msg == "NOT_BLOCKING"
+    ));
+}
+
+#[test]
+fn g1_block_crud() {
+    let factory = RedbFactory::fresh("g1");
+    let store = factory.open(test_clock());
+    case_g1_block_crud(&*store);
+}
+
+/// G2: one `block` commits the row, both follow edges, both pending
+/// requests, and the jobs atomically.
+fn case_g2_block_atomicity<S: ConformanceStore>(store: &S, clock: &ManualClock) {
+    let alice = create_user(store, "g2_alice");
+    let bob = create_user(store, "g2_bob");
+    store.follow(&alice.id, &bob.id, false, None, vec![]).unwrap();
+    store.follow(&bob.id, &alice.id, false, None, vec![]).unwrap();
+    let jobs_before = store.pending_count().unwrap();
+    store
+        .block(blocking_row(1, &alice.id, &bob.id), vec![streaming_job(clock, "g2-block-job")])
+        .expect("block");
+    assert!(!store.is_following(&alice.id, &bob.id).unwrap());
+    assert!(!store.is_following(&bob.id, &alice.id).unwrap());
+    let accounts = |id: &str| store.find_by_id(id).unwrap().unwrap();
+    assert_eq!(accounts(&alice.id).following_count, 0);
+    assert_eq!(accounts(&bob.id).followers_count, 0);
+    assert_eq!(store.pending_count().unwrap(), jobs_before + 1);
+}
+
+/// G2b: `block` also cancels pending follow requests both ways.
+fn case_g2b_block_cancels_requests<S: ConformanceStore>(store: &S) {
+    let alice = create_user(store, "g2b_alice");
+    let bob = create_user(store, "g2b_bob");
+    store.request_follow(&alice.id, &bob.id, false, None, vec![]).unwrap();
+    store.request_follow(&bob.id, &alice.id, false, None, vec![]).unwrap();
+    store.block(blocking_row(1, &alice.id, &bob.id), vec![]).expect("block");
+    assert!(store.get_follow_request(&alice.id, &bob.id).unwrap().is_none());
+    assert!(store.get_follow_request(&bob.id, &alice.id).unwrap().is_none());
+}
+
+#[test]
+fn g2_block_atomicity() {
+    let factory = RedbFactory::fresh("g2");
+    let clock = test_clock();
+    let store = factory.open(clock.clone());
+    case_g2_block_atomicity(&*store, &clock);
+    let factory = RedbFactory::fresh("g2b");
+    let store = factory.open(test_clock());
+    case_g2b_block_cancels_requests(&*store);
+}
+
+/// G3: storage-level enforcement — follow both directions, react, and pure
+/// renotes are rejected; quotes pass.
+fn case_g3_enforcement<S: ConformanceStore>(store: &S) {
+    let alice = create_user(store, "g3_alice");
+    let bob = create_user(store, "g3_bob");
+    let target = note_with_job(store, &ManualClock::new(1_760_400_000_000), &bob.id, "t", "g3");
+    store.block(blocking_row(1, &bob.id, &alice.id), vec![]).expect("block");
+    assert!(matches!(
+        store.follow(&alice.id, &bob.id, false, None, vec![]),
+        Err(PortError::Validation(msg)) if msg == "BLOCKED"
+    ));
+    assert!(matches!(
+        store.follow(&bob.id, &alice.id, false, None, vec![]),
+        Err(PortError::Validation(msg)) if msg == "BLOCKING"
+    ));
+    assert!(matches!(
+        store.request_follow(&alice.id, &bob.id, false, None, vec![]),
+        Err(PortError::Validation(msg)) if msg == "BLOCKED"
+    ));
+    assert!(matches!(
+        store.react(&alice.id, &target.id, "❤", false, vec![]),
+        Err(PortError::Validation(msg)) if msg == "YOU_HAVE_BEEN_BLOCKED"
+    ));
+    let mut pure = CreateNoteInput::simple_public(&alice.id, "x");
+    pure.text = None;
+    pure.renote_of = Some(target.id.clone());
+    assert!(matches!(
+        store.create_note(pure, vec![]),
+        Err(PortError::Validation(msg)) if msg == "YOU_HAVE_BEEN_BLOCKED"
+    ));
+    let mut quote = CreateNoteInput::simple_public(&alice.id, "quoting");
+    quote.renote_of = Some(target.id.clone());
+    store.create_note(quote, vec![]).expect("quote passes the block gate");
+}
+
+#[test]
+fn g3_enforcement() {
+    let factory = RedbFactory::fresh("g3");
+    let store = factory.open(test_clock());
+    case_g3_enforcement(&*store);
+}
+
+/// G4: mute + renote-mute lifecycle, dup/missing codes, expiry filtering.
+fn case_g4_mutes<S: ConformanceStore>(store: &S, clock: &ManualClock) {
+    let alice = create_user(store, "g4_alice");
+    let bob = create_user(store, "g4_bob");
+    assert!(matches!(
+        store.mute(&alice.id, &alice.id, None, vec![]),
+        Err(PortError::Validation(msg)) if msg == "MUTEE_IS_YOURSELF"
+    ));
+    assert!(matches!(
+        store.mute(&alice.id, "missing", None, vec![]),
+        Err(PortError::NotFound(msg)) if msg == "NO_SUCH_USER"
+    ));
+    // Past expiry: no row, no error.
+    assert_eq!(store.mute(&alice.id, &bob.id, Some(clock.now_ms() - 1), vec![]).unwrap(), None);
+    assert!(!store.is_muting(&alice.id, &bob.id).unwrap());
+    assert!(store.muted_ids_for(&alice.id).unwrap().is_empty());
+    let future = clock.now_ms() + 60_000;
+    assert!(store.mute(&alice.id, &bob.id, Some(future), vec![]).unwrap().is_some());
+    assert!(store.is_muting(&alice.id, &bob.id).unwrap());
+    assert_eq!(store.muted_ids_for(&alice.id).unwrap(), vec![bob.id.clone()]);
+    assert!(matches!(
+        store.mute(&alice.id, &bob.id, None, vec![]),
+        Err(PortError::Conflict(msg)) if msg == "ALREADY_MUTING"
+    ));
+    clock.set_ms(future + 1);
+    assert!(!store.is_muting(&alice.id, &bob.id).unwrap());
+    assert!(store.muted_ids_for(&alice.id).unwrap().is_empty());
+    // The expired row still unmutes cleanly (existence, not activity).
+    store.unmute(&alice.id, &bob.id, vec![]).expect("unmute expired row");
+    assert!(matches!(
+        store.unmute(&alice.id, &bob.id, vec![]),
+        Err(PortError::NotFound(msg)) if msg == "NOT_MUTING"
+    ));
+    // Renote-mutes: no expiry, same codes.
+    store.renote_mute(&alice.id, &bob.id, vec![]).expect("renote mute");
+    assert!(store.is_renote_muting(&alice.id, &bob.id).unwrap());
+    assert_eq!(store.renote_muted_ids_for(&alice.id).unwrap(), vec![bob.id.clone()]);
+    assert!(matches!(
+        store.renote_mute(&alice.id, &bob.id, vec![]),
+        Err(PortError::Conflict(msg)) if msg == "ALREADY_MUTING"
+    ));
+    assert_eq!(store.list_renote_mutings(&alice.id, &full_cursor(100)).unwrap().len(), 1);
+    store.renote_unmute(&alice.id, &bob.id, vec![]).expect("renote unmute");
+    assert!(matches!(
+        store.renote_unmute(&alice.id, &bob.id, vec![]),
+        Err(PortError::NotFound(msg)) if msg == "NOT_MUTING"
+    ));
+}
+
+#[test]
+fn g4_mutes() {
+    let factory = RedbFactory::fresh("g4");
+    let clock = test_clock();
+    let store = factory.open(clock.clone());
+    case_g4_mutes(&*store, &clock);
+}
+
+// ---------------------------------------------------------------------------
+// Group S — drafts + scheduled arming (§5, `docs/misskey-parity-plan.md`)
+// ---------------------------------------------------------------------------
+
+fn draft_row(id: &str, user_id: &str, scheduled_at_ms: Option<i64>) -> NoteDraft {
+    NoteDraft {
+        id: id.to_string(),
+        user_id: user_id.to_string(),
+        text: Some("draft".to_string()),
+        cw: None,
+        visibility: Visibility::Public,
+        visible_user_ids: Vec::new(),
+        local_only: false,
+        reply_id: None,
+        renote_id: None,
+        file_ids: Vec::new(),
+        hashtag: None,
+        reaction_acceptance: None,
+        has_poll: false,
+        poll_choices: Vec::new(),
+        poll_multiple: false,
+        poll_expires_at_ms: None,
+        poll_expired_after_ms: None,
+        scheduled_at_ms,
+        is_actually_scheduled: scheduled_at_ms.is_some(),
+    }
+}
+
+fn scheduled_draft_job(key: &str, draft_id: &str, at_ms: i64) -> NewJob {
+    NewJob::new_json(
+        JobKind::PostScheduledDraft,
+        &ScheduledDraftPayload {
+            draft_id: draft_id.to_string(),
+            scheduled_at_ms: at_ms,
+        },
+        key,
+        at_ms,
+    )
+    .expect("scheduled fixture is a valid payload")
+}
+
+fn draft_cursor(limit: usize) -> TimelineCursor {
+    TimelineCursor {
+        since_id: None,
+        until_id: None,
+        since_date: None,
+        until_date: None,
+        limit,
+    }
+}
+
+/// S1: draft CRUD through the ports — create/get/update/delete, counts,
+/// newest-first paging, and the `scheduled` tri-state filter.
+fn case_s1_draft_crud<S: ConformanceStore>(store: &S) {
+    let alice = create_user(store, "s1_alice");
+    assert_eq!(store.count_drafts(&alice.id).unwrap(), 0);
+    assert_eq!(store.count_scheduled_drafts(&alice.id).unwrap(), 0);
+    let d1 = store
+        .create_draft(draft_row("s1_d1", &alice.id, None), vec![])
+        .unwrap();
+    assert_eq!(d1.user_id, alice.id);
+    let d2 = store
+        .create_draft(draft_row("s1_d2", &alice.id, Some(BASE_MS + 60_000)), vec![])
+        .unwrap();
+    assert_eq!(store.count_drafts(&alice.id).unwrap(), 2);
+    assert_eq!(store.count_scheduled_drafts(&alice.id).unwrap(), 1);
+
+    // Newest-first; `scheduled` tri-state.
+    let all = store.drafts_by_user(&alice.id, &draft_cursor(10), None).unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].id, d2.id, "newest first");
+    assert_eq!(
+        store
+            .drafts_by_user(&alice.id, &draft_cursor(10), Some(true))
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .drafts_by_user(&alice.id, &draft_cursor(10), Some(false))
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Update replaces the row; missing rows are NotFound.
+    let mut merged = d1.clone();
+    merged.text = Some("edited".to_string());
+    let updated = store.update_draft(merged, vec![]).unwrap();
+    assert_eq!(updated.text.as_deref(), Some("edited"));
+    assert!(matches!(
+        store.update_draft(draft_row("s1_nope", &alice.id, None), vec![]),
+        Err(PortError::NotFound(msg)) if msg == "NO_SUCH_NOTE_DRAFT"
+    ));
+
+    // Delete drops the row + index; missing rows are a no-op success.
+    let before = store.pending_count().unwrap();
+    store
+        .delete_draft(&d1.id, vec![streaming_job(&test_clock(), "s1-del-job")])
+        .unwrap();
+    assert!(store.get_draft(&d1.id).unwrap().is_none());
+    assert_eq!(store.count_drafts(&alice.id).unwrap(), 1);
+    assert_eq!(store.pending_count().unwrap(), before + 1);
+    store.delete_draft(&d1.id, vec![]).unwrap();
+}
+
+#[test]
+fn s1_draft_crud() {
+    let factory = RedbFactory::fresh("s1");
+    let store = factory.open(test_clock());
+    case_s1_draft_crud(&*store);
+}
+
+/// S2: scheduled arming lifecycle — `create_draft` arms a `PostScheduledDraft`
+/// job (`not_before` = `scheduled_at`), and `remove_scheduled_draft_jobs`
+/// clears every arming for the draft (update/delete `clearSchedule` parity),
+/// including repeated clears.
+fn case_s2_scheduled_arming<S: ConformanceStore>(store: &S, clock: &ManualClock) {
+    let alice = create_user(store, "s2_alice");
+    let at = BASE_MS + 60_000;
+    store
+        .create_draft(
+            draft_row("s2_d1", &alice.id, Some(at)),
+            vec![scheduled_draft_job("s2-arm", "s2_d1", at)],
+        )
+        .unwrap();
+    assert_eq!(store.pending_count().unwrap(), 1);
+    // Not due before `scheduled_at`: the armed job is not claimable yet.
+    assert!(store.claim_next(30_000).unwrap().is_none());
+    clock.advance_ms(61_000);
+    let claimed = store.claim_next(30_000).unwrap().expect("due job claims");
+    assert_eq!(claimed.kind, JobKind::PostScheduledDraft);
+    assert_eq!(claimed.not_before, at);
+    let payload: ScheduledDraftPayload = serde_json::from_slice(&claimed.payload).unwrap();
+    assert_eq!(payload.draft_id, "s2_d1");
+    assert_eq!(payload.scheduled_at_ms, at);
+    store.complete(&claimed.id).unwrap();
+
+    // Two armings for one draft (update re-arms after clearing): the clear
+    // removes both, and repeats are no-ops.
+    store
+        .create_draft(
+            draft_row("s2_d2", &alice.id, Some(at)),
+            vec![
+                scheduled_draft_job("s2-arm-a", "s2_d2", at),
+                scheduled_draft_job("s2-arm-b", "s2_d2", at + 1),
+            ],
+        )
+        .unwrap();
+    // Clearing an unrelated draft removes nothing.
+    assert_eq!(store.remove_scheduled_draft_jobs("s2_nope").unwrap(), 0);
+    assert_eq!(store.remove_scheduled_draft_jobs("s2_d2").unwrap(), 2);
+    assert_eq!(store.remove_scheduled_draft_jobs("s2_d2").unwrap(), 0);
+    assert_eq!(store.pending_count().unwrap(), 0);
+}
+
+#[test]
+fn s2_scheduled_arming() {
+    let factory = RedbFactory::fresh("s2");
+    let clock = test_clock();
+    let store = factory.open(clock.clone());
+    case_s2_scheduled_arming(&*store, &clock);
+}
+
+// ---------------------------------------------------------------------------
+// Group P — pinnings (§7, `docs/misskey-parity-plan.md`)
+// ---------------------------------------------------------------------------
+
+fn pinning_row(id: &str, user_id: &str, note_id: &str) -> UserNotePining {
+    UserNotePining {
+        id: id.to_string(),
+        user_id: user_id.to_string(),
+        note_id: note_id.to_string(),
+    }
+}
+
+/// P1: pinning CRUD through the ports — unique `(user, note)` pairs
+/// (`ALREADY_PINNED` on dup), oldest-first listing, no-op remove.
+fn case_p1_pinning_crud<S: ConformanceStore>(store: &S) {
+    let alice = create_user(store, "p1_alice");
+    assert!(store.pinnings_for_user(&alice.id).unwrap().is_empty());
+    store
+        .add_pinning(pinning_row("p1_b", &alice.id, "n2"), vec![])
+        .unwrap();
+    store
+        .add_pinning(pinning_row("p1_a", &alice.id, "n1"), vec![])
+        .unwrap();
+    assert!(matches!(
+        store.add_pinning(pinning_row("p1_dup", &alice.id, "n1"), vec![]),
+        Err(PortError::Conflict(msg)) if msg == "ALREADY_PINNED"
+    ));
+    // Oldest pin first (by pinning id).
+    let listed = store.pinnings_for_user(&alice.id).unwrap();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].id, "p1_a");
+    assert_eq!(listed[1].id, "p1_b");
+    // Remove drops the pair; repeats are no-op successes.
+    store.remove_pinning(&alice.id, "n1", vec![]).unwrap();
+    let listed = store.pinnings_for_user(&alice.id).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].note_id, "n2");
+    store.remove_pinning(&alice.id, "n1", vec![]).unwrap();
+    store.remove_pinning(&alice.id, "n_missing", vec![]).unwrap();
+}
+
+#[test]
+fn p1_pinning_crud() {
+    let factory = RedbFactory::fresh("p1");
+    let store = factory.open(test_clock());
+    case_p1_pinning_crud(&*store);
+}
+
+/// P2: pinning + jobs commit atomically.
+fn case_p2_pinning_atomicity<S: ConformanceStore>(store: &S, clock: &ManualClock) {
+    let alice = create_user(store, "p2_alice");
+    let before = store.pending_count().unwrap();
+    store
+        .add_pinning(
+            pinning_row("p2_a", &alice.id, "n1"),
+            vec![streaming_job(clock, "p2-pin-job")],
+        )
+        .unwrap();
+    assert_eq!(store.pending_count().unwrap(), before + 1);
+    store
+        .remove_pinning(&alice.id, "n1", vec![streaming_job(clock, "p2-unpin-job")])
+        .unwrap();
+    assert_eq!(store.pending_count().unwrap(), before + 2);
+    assert!(store.pinnings_for_user(&alice.id).unwrap().is_empty());
+}
+
+#[test]
+fn p2_pinning_atomicity() {
+    let factory = RedbFactory::fresh("p2");
+    let clock = test_clock();
+    let store = factory.open(clock.clone());
+    case_p2_pinning_atomicity(&*store, &clock);
 }

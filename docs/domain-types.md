@@ -1,7 +1,7 @@
 # Core domain types
 
 **Status:** Frozen (Phase 0 freeze review 2026-10-14), extended by
-superseding quote-posts and branched-replies decisions below (2026-10-16)
+superseding §0A/§0B/§4/§5/§7/§10, quote-posts and branched-replies decisions below (2026-10-16)
 **Sources:** `sns-server-proposal.md` §4; `docs/identity-rules.md`; `docs/visibility-policy.md`; Misskey checkout (read-only): `models/User.ts`, `models/Note.ts`, `models/Following.ts`, `models/NoteReaction.ts`, `models/DriveFile.ts`, `models/util/id.ts:6-9`, `types.ts:59-61` (all key claims re-verified locally this session).
 
 Pure data + validation. No I/O, no HTTP, no per-adapter variants. Field bounds are client-compatibility surface: clients read these shapes, so narrowing a bound later is a breaking change — the values below are fixed at freeze.
@@ -84,6 +84,8 @@ One reaction per user per note (M `models/NoteReaction.ts`):
 
 Rules: reacting requires the note visible to the reactor (M `ReactionService.ts:116` pattern); re-reacting replaces (upsert on the unique pair), never duplicates; `reactions` counts on the note update in the same transaction. `_misskey_reaction` AP metadata is carried on the federation path (proposal §7); legacy `_misskey_content` is never produced.
 
+**Note — §6 wire compat (2026-10-16, `docs/misskey-parity-plan.md`):** the stored fallback is the bare heart `❤` (U+2764, no VS16; M `ReactionService.ts` `FALLBACK`). `likeOnly` (and `likeOnlyForRemote`-from-remote) forces the fallback; every other reaction is normalized (`legacies` map, FE0F stripped unless the grapheme contains ZWJ, anything else → fallback). DIVERGENCE: `:name:`/`:name@host:` custom-emoji shapes pass through unchanged — pinetree has no custom-emoji registry, so the upstream permission/sensitivity/role/media-silenced-host checks have nothing to check against.
+
 ## 5. Media metadata
 
 Must-carry subset of `MiDriveFile` (M `models/DriveFile.ts`). Bytes are never here (`BlobStore`, ports contract §9). Out of scope: folders, access keys, webpublic machinery, request forensics (`request_headers`, `request_ip`).
@@ -119,3 +121,38 @@ Blob content address is SHA-256 (decision D6). `MediaMeta` gains `blob_key` (SHA
 ## Superseding note — Phase 2.6 slice 7 (2026-10-15)
 
 `MediaMeta` gains nullable `source_url` (remote origin URL for cache rows; `None` for local uploads). With the owning note's `file_ids` it is the idempotent-insert key that keeps inbox replays and job retries from orphaning rows. MIME rule tightened: the stored `mime` comes from magic-byte sniffing only (allowlist `image/png|jpeg|gif|webp|avif`, `video/mp4|webm|mpeg`, `audio/mpeg|ogg|wav`, `text/plain` for non-markup UTF-8 only, else `application/octet-stream`); declared `mediaType` and response `Content-Type` never influence it. Never `text/html`, `image/svg+xml`, `application/xhtml+xml`, `text/xml`. See `state/logs/2026-10-15-phase2-6-slice7-media-safety.md`.
+
+## Superseding note — §0A blocking / muting (2026-10-16, `docs/misskey-parity-plan.md`)
+
+New pure-domain types (`src/domain/blocking.rs`, `src/domain/muting.rs`; no HTTP/DB imports):
+
+- `Blocking { id, blocker_id, blockee_id }`: unique pair; self-block rejected as `BLOCKEE_IS_YOURSELF`.
+- `Muting { id, muter_id, mutee_id, expires_at_ms? }`: self-mute rejected as `MUTEE_IS_YOURSELF`; `expires_at_ms` must lie in the future (`EXPIRES_AT_MUST_BE_IN_FUTURE`); `is_active_at(now)` gates read-time filtering (expired rows filter nothing).
+- `RenoteMuting { id, muter_id, mutee_id }`: same self-mute rule, no expiry.
+
+## Superseding note — §4 polls (2026-10-16, `docs/misskey-parity-plan.md`)
+
+New pure-domain types (`src/domain/poll.rs`; no HTTP/DB imports):
+
+- `Poll { note_id, choices, votes, multiple, expires_at_ms? }`: `votes[i]` counts `choices[i]`; `is_expired(now)` is strict less-than (`expiresAt < now`), `None` never expires.
+- `PollVote { id, note_id, user_id, choice }`: unique `(user, note, choice)`.
+- `PollInput { choices, multiple, expires_at_ms? }`: `choices[2..10]` unique, each 1..=50 chars; expiry strictly future else `CANNOT_CREATE_ALREADY_EXPIRED_POLL`.
+
+Note text rule (§2): a poll stands in for `text` — `validate_api_create_with_poll(true)` / `validate_storage_with_poll(true)` accept text-less/blank-text notes carrying a poll (Misskey `(re)note with text, files and poll are optional` parity).
+
+## Superseding note — §5 drafts + scheduling (2026-10-16, `docs/misskey-parity-plan.md`)
+
+New pure-domain type (`src/domain/draft.rs`; no HTTP/DB imports):
+
+- `NoteDraft { id, user_id, text?, cw?, visibility, visible_user_ids, local_only, reply_id?, renote_id?, file_ids, hashtag?, reaction_acceptance?, has_poll, poll_choices, poll_multiple, poll_expires_at_ms?, poll_expired_after_ms?, scheduled_at_ms?, is_actually_scheduled }`: mirrors the `Note` create fields plus poll columns and the scheduling columns (Misskey `NoteDraft.ts:18-167` parity). Relaxed validation: empty or missing text/files are allowed (upstream `minItems: 0` parity); `cw` 1..=100, `hashtag` ≤200, `file_ids` ≤16 unique, poll `choices` ≤10 unique 1..=50, `expiredAfter` ≥1.
+- `validate_draft_schedule(scheduled_at_ms, is_actually_scheduled, now_ms)`: scheduled without a time → `SCHEDULED_AT_REQUIRED`; non-future time → `SCHEDULED_AT_MUST_BE_IN_FUTURE` (exact upstream codes).
+- `validate_draft_poll_expiry(...)`: already-expired draft polls carry the exact `CANNOT_CREATE_ALREADY_EXPIRED_POLL` ident.
+- Scheduling policy defaults (upstream `RoleService` values): `DEFAULT_NOTE_DRAFT_LIMIT = 10`, `DEFAULT_SCHEDULED_NOTE_LIMIT = 1` — instance-configurable through `Config` (`note_draft_limit`, `scheduled_note_limit`) and enforced by the application layer.
+
+## Superseding note — §7 pinnings (2026-10-16, `docs/misskey-parity-plan.md`)
+
+New pure-domain type (`src/domain/pinning.rs`; no HTTP/DB imports):
+
+- `UserNotePining { id, user_id, note_id }`: unique pair `(user_id, note_id)` (Misskey `UserNotePining.ts` parity). Pin limit default `DEFAULT_PIN_LIMIT = 5` (upstream `RoleService.pinLimit`), instance-configurable through `Config.pin_limit`.
+
+`NotificationKind` gains `ScheduledNotePosted` / `ScheduledNotePostFailed` (wire `scheduledNotePosted` / `scheduledNotePostFailed`); `Notification` gains nullable `draft_id` (`#[serde(default)]`, legacy rows decode draft-less) carrying the failed draft for `ScheduledNotePostFailed`.

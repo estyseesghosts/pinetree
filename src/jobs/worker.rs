@@ -190,6 +190,30 @@ impl JobWorker {
                     Err(_) => Ok(Disposition::Retry { retry_after_ms: None }),
                 }
             }
+            // Poll expiry (§4): publish the `pollEnded` streaming event
+            // once the poll has expired. Bad payloads quarantine; a gone
+            // note/poll or a not-yet-expired poll completes quietly (a
+            // re-armed job covers clock skew). Only storage faults retry.
+            JobKind::PollExpiry => match self.handle_poll_expiry(&job.payload) {
+                Ok(_) => Ok(Disposition::Done),
+                Err(PortError::Validation(reason)) => {
+                    Ok(Disposition::Quarantine(format!("bad-payload: {reason}")))
+                }
+                Err(_) => Ok(Disposition::Retry { retry_after_ms: None }),
+            },
+            // Scheduled drafts (§5): post the draft through the full
+            // note-create path once its time arrives. Bad payloads
+            // quarantine; a gone/unscheduled/rescheduled draft converges
+            // quietly (Done — the re-armed job covers it when one exists).
+            // Only storage faults retry. A failed post is itself a
+            // successful run (`ScheduledNotePostFailed` is emitted inside).
+            JobKind::PostScheduledDraft => match self.handle_post_scheduled_draft(&job.payload) {
+                Ok(_) => Ok(Disposition::Done),
+                Err(PortError::Validation(reason)) => {
+                    Ok(Disposition::Quarantine(format!("bad-payload: {reason}")))
+                }
+                Err(_) => Ok(Disposition::Retry { retry_after_ms: None }),
+            },
         }
     }
 
@@ -204,6 +228,20 @@ impl JobWorker {
     fn handle_notify(&self, payload: &[u8], idempotency_key: &str) -> Result<(), PortError> {
         let notify: NotifyJobPayload = serde_json::from_slice(payload)
             .map_err(|e| PortError::Validation(format!("notify payload invalid: {e}")))?;
+        // §11 creation-time receive gate (Misskey `NotificationService`
+        // `#createNotificationInternal` parity): self-notify, active mutes,
+        // and `notificationRecieveConfig` drop the notification here — the
+        // single choke point every local and inbound `Notify` job flows
+        // through. Drops converge quietly (job completes, no row, no hints);
+        // storage faults still retry. Scheduler-direct inserts bypass this
+        // gate like upstream notifier-less notifications do.
+        if !self.services.notification_delivery_allowed(
+            &notify.notifiee_id,
+            notify.kind,
+            &notify.notifier_id,
+        )? {
+            return Ok(());
+        }
         let id = if idempotency_key.trim().is_empty() {
             self.ids.generate()
         } else {
@@ -216,6 +254,7 @@ impl JobWorker {
             kind: notify.kind,
             note_id: notify.note_id.clone(),
             reaction: notify.reaction.clone(),
+            draft_id: None,
             is_read: false,
         };
         let stored = match self.notifications.insert_notification(notification) {
@@ -270,10 +309,14 @@ impl JobWorker {
                 }
             };
         match notify.kind {
-            NotificationKind::Mention | NotificationKind::Reply | NotificationKind::Renote => {
+            NotificationKind::Mention
+            | NotificationKind::Reply
+            | NotificationKind::Renote
+            | NotificationKind::Edited => {
                 let kind = match notify.kind {
                     NotificationKind::Mention => MainEventKind::Mention,
                     NotificationKind::Reply => MainEventKind::Reply,
+                    NotificationKind::Edited => MainEventKind::Edited,
                     _ => MainEventKind::Renote,
                 };
                 if let Some(note_id) = notify.note_id.as_deref() {
@@ -312,6 +355,10 @@ impl JobWorker {
                 }
             }
             NotificationKind::Reaction => {}
+            // Scheduling notifications (§5) fan out as the plain
+            // `notification` hint above (no note/user side-channel: the
+            // posted note / failed draft rides in the packed body).
+            NotificationKind::ScheduledNotePosted | NotificationKind::ScheduledNotePostFailed => {}
         }
         Ok(())
     }
@@ -364,6 +411,30 @@ impl JobWorker {
             Err(PortError::NotFound(_)) => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    /// Run one `PollExpiry` job (§4): publish the `pollEnded` streaming
+    /// event when the poll has expired. Gone notes/polls and premature
+    /// runs complete quietly.
+    fn handle_poll_expiry(&self, payload: &[u8]) -> Result<(), PortError> {
+        use crate::application::ports::PollExpiryPayload;
+        let parsed: PollExpiryPayload = serde_json::from_slice(payload)
+            .map_err(|e| PortError::Validation(format!("poll-expiry payload invalid: {e}")))?;
+        self.services
+            .handle_poll_expiry(&parsed.note_id)
+            .map(|_| ())
+    }
+
+    /// Run one `PostScheduledDraft` job (§5): post the draft when its
+    /// scheduled time has arrived. Gone, unscheduled, rescheduled, and
+    /// not-yet-due drafts converge quietly; only storage faults retry.
+    fn handle_post_scheduled_draft(&self, payload: &[u8]) -> Result<(), PortError> {
+        use crate::application::ports::ScheduledDraftPayload;
+        let parsed: ScheduledDraftPayload = serde_json::from_slice(payload)
+            .map_err(|e| PortError::Validation(format!("scheduled-draft payload invalid: {e}")))?;
+        self.services
+            .post_scheduled_draft(&parsed.draft_id, parsed.scheduled_at_ms)
+            .map(|_| ())
     }
 
     /// Run one `QuoteStampReverify` job: re-dereference the stamp offered by

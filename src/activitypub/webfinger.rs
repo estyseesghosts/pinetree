@@ -543,16 +543,20 @@ mod tests {
 
     use super::*;
     use crate::application::ports::{
-        AccountStore, ActivityDedup, ApiTokenRecord, AuthStore, BlobStore, CreateAccountInput,
-        CreateNoteInput, FollowStore, InsertMediaInput, JobQueue, LegacyAuthSessionRecord,
-        MediaStore, MiAuthSessionRecord, NewJob, NoteStore, NotificationStore, PortError,
-        ReactionStore, StreamingSink, TimelineCursor, UpdateAccountPatch,
+        AccountStore, ActivityDedup, ApiTokenRecord, AuthStore, BlobStore, BlockStore,
+        CreateAccountInput, CreateNoteInput, FollowStore, InsertMediaInput, JobQueue,
+        LegacyAuthSessionRecord, MediaStore, MiAuthSessionRecord, MuteStore, NewJob, NoteStore,
+        NotificationStore, PollChoiceCount, PollStore, PortError, ReactionStore, StreamingSink, TimelineCursor,
+        UpdateAccountPatch,
     };
+    use crate::domain::blocking::Blocking;
+    use crate::domain::muting::{Muting, RenoteMuting};
     use crate::domain::follow::{Follow, FollowNotify};
     use crate::domain::id::{AidxGenerator, ManualClock};
     use crate::domain::note::{Note, Visibility};
     use crate::domain::notification::{Notification, NotificationKind};
     use crate::domain::reaction::Reaction;
+    use crate::domain::poll::{Poll, PollVote};
     use crate::federation::delivery::{SafeHttpClient, SafeHttpConfig};
 
     struct Mem {
@@ -721,6 +725,92 @@ mod tests {
         }
     }
 
+    impl BlockStore for Mem {
+        fn block(&self, _blocking: Blocking, _jobs: Vec<NewJob>) -> Result<Blocking, PortError> {
+            unavailable("block")
+        }
+        fn unblock(&self, _a: &str, _b: &str, _jobs: Vec<NewJob>) -> Result<(), PortError> {
+            unavailable("unblock")
+        }
+        fn get_blocking(&self, _a: &str, _b: &str) -> Result<Option<Blocking>, PortError> {
+            Ok(None)
+        }
+        fn is_blocking(&self, _a: &str, _b: &str) -> Result<bool, PortError> {
+            Ok(false)
+        }
+        fn blocking_ids_for(&self, _id: &str) -> Result<Vec<String>, PortError> {
+            Ok(Vec::new())
+        }
+        fn blocked_by_ids_for(&self, _id: &str) -> Result<Vec<String>, PortError> {
+            Ok(Vec::new())
+        }
+        fn list_blockings(
+            &self,
+            _id: &str,
+            _cursor: &TimelineCursor,
+        ) -> Result<Vec<Blocking>, PortError> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl MuteStore for Mem {
+        fn mute(
+            &self,
+            _a: &str,
+            _b: &str,
+            _expires: Option<i64>,
+            _jobs: Vec<NewJob>,
+        ) -> Result<Option<Muting>, PortError> {
+            unavailable("mute")
+        }
+        fn unmute(&self, _a: &str, _b: &str, _jobs: Vec<NewJob>) -> Result<(), PortError> {
+            unavailable("unmute")
+        }
+        fn get_muting(&self, _a: &str, _b: &str) -> Result<Option<Muting>, PortError> {
+            Ok(None)
+        }
+        fn is_muting(&self, _a: &str, _b: &str) -> Result<bool, PortError> {
+            Ok(false)
+        }
+        fn muted_ids_for(&self, _id: &str) -> Result<Vec<String>, PortError> {
+            Ok(Vec::new())
+        }
+        fn list_mutings(
+            &self,
+            _id: &str,
+            _cursor: &TimelineCursor,
+        ) -> Result<Vec<Muting>, PortError> {
+            Ok(Vec::new())
+        }
+        fn renote_mute(
+            &self,
+            _a: &str,
+            _b: &str,
+            _jobs: Vec<NewJob>,
+        ) -> Result<RenoteMuting, PortError> {
+            unavailable("renote_mute")
+        }
+        fn renote_unmute(&self, _a: &str, _b: &str, _jobs: Vec<NewJob>) -> Result<(), PortError> {
+            unavailable("renote_unmute")
+        }
+        fn get_renote_muting(&self, _a: &str, _b: &str) -> Result<Option<RenoteMuting>, PortError> {
+            Ok(None)
+        }
+        fn is_renote_muting(&self, _a: &str, _b: &str) -> Result<bool, PortError> {
+            Ok(false)
+        }
+        fn renote_muted_ids_for(&self, _id: &str) -> Result<Vec<String>, PortError> {
+            Ok(Vec::new())
+        }
+        fn list_renote_mutings(
+            &self,
+            _id: &str,
+            _cursor: &TimelineCursor,
+        ) -> Result<Vec<RenoteMuting>, PortError> {
+            Ok(Vec::new())
+        }
+    }
+
     impl ReactionStore for Mem {
         fn react(
             &self,
@@ -737,6 +827,9 @@ mod tests {
         }
         fn get_reaction(&self, _user: &str, _note: &str) -> Result<Option<Reaction>, PortError> {
             Ok(None)
+        }
+        fn reactions_by_user(&self, _user: &str) -> Result<Vec<Reaction>, PortError> {
+            Ok(Vec::new())
         }
     }
 
@@ -774,6 +867,30 @@ mod tests {
         }
         fn pending_count(&self) -> Result<usize, PortError> {
             Ok(0)
+        }
+    }
+
+    impl PollStore for Mem {
+        fn get_poll(&self, _note_id: &str) -> Result<Option<Poll>, PortError> {
+            Ok(None)
+        }
+        fn votes_by_user_for_note(
+            &self,
+            _user_id: &str,
+            _note_id: &str,
+        ) -> Result<Vec<PollVote>, PortError> {
+            Ok(Vec::new())
+        }
+        fn cast_vote(&self, _vote: PollVote, _jobs: Vec<NewJob>) -> Result<PollVote, PortError> {
+            unavailable("cast_vote")
+        }
+        fn sync_poll_votes(
+            &self,
+            _note_id: &str,
+            _counts_by_name: &[PollChoiceCount],
+            _jobs: Vec<NewJob>,
+        ) -> Result<Poll, PortError> {
+            unavailable("sync_poll_votes")
         }
     }
 
@@ -937,7 +1054,10 @@ mod tests {
             accounts: mem.clone(),
             notes: mem.clone(),
             follows: mem.clone(),
+            blocks: mem.clone(),
+            mutes: mem.clone(),
             reactions: mem.clone(),
+            polls: mem.clone(),
             jobs: mem.clone(),
             media: mem.clone(),
             blobs: mem.clone(),
@@ -954,6 +1074,9 @@ mod tests {
             preserved_usernames: Vec::new(),
             prohibited_words: Vec::new(),
             sensitive_words: Vec::new(),
+            note_draft_limit: crate::domain::draft::DEFAULT_NOTE_DRAFT_LIMIT,
+            scheduled_note_limit: crate::domain::draft::DEFAULT_SCHEDULED_NOTE_LIMIT,
+            pin_limit: crate::domain::pinning::DEFAULT_PIN_LIMIT,
         });
         (services, mem)
     }

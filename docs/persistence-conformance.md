@@ -96,3 +96,32 @@ Backend-agnostic, same cases both adapters (FDB inherits once implemented):
 - **R12 conversation unchanged**: `notes/conversation` still returns the visible ancestor chain oldest-first with the cycle/depth guard.
 
 Execution status (honest): R1–R12 are green on redb only (`tests/conformance.rs`); the FDB adapter is still a stub and has not run them. The cases are backend-generic, so FDB inherits them when implemented.
+
+## 12. Group G — blocking / muting (`docs/misskey-parity-plan.md` §0A)
+
+Backend-agnostic, same cases both adapters (FDB inherits once implemented):
+
+- **G1 block CRUD**: unique pair, `Conflict(ALREADY_BLOCKING)` on dup, `Validation(BLOCKEE_IS_YOURSELF)` on self, `NotFound(NO_SUCH_USER)` on unknown, directional id lists (`blocking_ids_for` / `blocked_by_ids_for`), newest-first cursor paging (`sinceId`/`untilId`/`sinceDate`/`untilDate`, `limit`), `NotFound(NOT_BLOCKING)` on missing unblock.
+- **G2 block atomicity**: one `block` commits the row, both follow edges (counters adjusted), both pending follow requests, and the jobs in a single transaction.
+- **G3 enforcement**: storage-level `BLOCKING`/`BLOCKED` on follow/request-follow in both directions, `YOU_HAVE_BEEN_BLOCKED` on react and pure-renote create; quotes pass the block gate.
+- **G4 mutes**: mute/renote-mute lifecycle with `ALREADY_MUTING`/`NOT_MUTING`/`MUTEE_IS_YOURSELF`/`NO_SUCH_USER`; past `expiresAt` creates nothing (no error); `is_muting`/`muted_ids_for` report only active (unexpired) rows.
+
+Execution status (honest): G1–G4 are green on redb only (`tests/conformance.rs`); the FDB adapter is still a stub and has not run them. The cases are backend-generic, so FDB inherits them when implemented.
+
+## 13. Group S — drafts + scheduled arming (`docs/misskey-parity-plan.md` §5)
+
+Backend-agnostic, same cases both adapters (FDB inherits once implemented):
+
+- **S1 draft CRUD**: create/get/update/delete through the ports; `get_draft` on unknown ids is `None`; `update_draft` on unknown rows is `NotFound(NO_SUCH_NOTE_DRAFT)`; `delete_draft` on unknown rows is a no-op success; `count_drafts` / `count_scheduled_drafts` track the rows; `drafts_by_user` reads newest-first with the `scheduled` tri-state filter; delete commits the row/index removal and the jobs atomically.
+- **S2 scheduled arming**: `create_draft` with a `PostScheduledDraft` job leaves it pending but unclaimable before `not_before` (`scheduled_at`); claiming past due returns the job with the armed time in the payload; `remove_scheduled_draft_jobs` clears every arming for the draft (repeat clears are no-ops returning 0; unrelated drafts untouched).
+
+Execution status (honest): S1–S2 are green on redb only (`tests/conformance.rs`); the FDB adapter is still a stub and has not run them.
+
+## 14. Group P — pinnings (`docs/misskey-parity-plan.md` §7)
+
+Backend-agnostic, same cases both adapters (FDB inherits once implemented):
+
+- **P1 pinning CRUD**: `add_pinning` inserts the pair; duplicates are `Conflict(ALREADY_PINNED)`; `pinnings_for_user` lists oldest-first (pinning-id order); `remove_pinning` drops the pair and repeats/missing pairs are no-op successes.
+- **P2 pinning atomicity**: add/remove commit the row change and the jobs in a single transaction (`pending_count` deltas).
+
+Execution status (honest): P1–P2 are green on redb only (`tests/conformance.rs`); the FDB adapter is still a stub and has not run them.

@@ -18,11 +18,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::activitypub::objects::{
-    render_accept_follow_activity, render_create_or_announce_for_note,
+    render_accept_follow_activity, render_block_activity, render_create_or_announce_for_note,
     render_delete_note_activity, render_delete_stamp_activity, render_follow_activity,
-    render_like_activity, render_note_object, render_quote_request_activity,
-    render_quote_response_activity, render_reject_follow_activity, render_undo_activity,
-    render_update_actor_activity, PUBLIC_COLLECTION_URI,
+    render_like_activity, render_note_audience, render_note_object, render_note_update_activity,
+    render_quote_request_activity, render_quote_response_activity, render_reject_follow_activity,
+    render_undo_activity, render_update_actor_activity, PUBLIC_COLLECTION_URI,
 };
 use crate::application::commands::AppServices;
 use crate::application::ports::{JobKind, NewJob, PortError};
@@ -87,6 +87,21 @@ pub enum FederateDeliverPayload {
         inbox_url: String,
         follow_activity: Value,
     },
+    /// Deliver `Block` from a local blocker to a remote blockee's inbox (§0A).
+    Block {
+        block_id: String,
+        blocker_id: String,
+        blockee_id: String,
+        inbox_url: String,
+    },
+    /// Deliver `Undo(Block)` from a local blocker to a remote blockee's inbox.
+    UndoBlock {
+        undo_id: String,
+        block_id: String,
+        blocker_id: String,
+        blockee_id: String,
+        inbox_url: String,
+    },
     /// Deliver `Like` (with `_misskey_reaction`) to a remote note author's inbox.
     Like {
         reaction_id: String,
@@ -104,10 +119,35 @@ pub enum FederateDeliverPayload {
         reaction: String,
         inbox_url: String,
     },
+    /// Deliver a `Create` vote activity to a remote poll owner's inbox
+    /// (§4; Misskey `ApRendererService.renderVote` parity).
+    PollVote {
+        vote_id: String,
+        voter_id: String,
+        target_note_uri: String,
+        choice_name: String,
+        inbox_url: String,
+    },
+    /// Deliver `Update(Question)` with fresh tallies to followers + relays
+    /// (§4; Misskey `PollService.deliverQuestionUpdate` parity).
+    /// `note_id` may be `"__PENDING_NOTE_ID__"` at enqueue time.
+    QuestionUpdated {
+        note_id: String,
+        author_id: String,
+        inbox_override: Option<String>,
+    },
     /// Deliver `Update(Person)` to remote follower inboxes.
     ActorUpdated {
         update_id: String,
         account_id: String,
+        inbox_override: Option<String>,
+    },
+    /// Deliver `Update(Note)` after a local `notes/edit` (§8; Sharkey
+    /// `postNoteEdited` AP-deliver parity). `note_id` is the edited note
+    /// (always known — no `__PENDING__` substitution needed).
+    NoteUpdated {
+        note_id: String,
+        author_id: String,
         inbox_override: Option<String>,
     },
     /// Deliver a FEP-044f `QuoteRequest` to the quoted author's inbox.
@@ -138,6 +178,17 @@ pub enum FederateDeliverPayload {
         actor_id: String,
         stamp_uri: String,
         quote_note_id: String,
+        inbox_override: Option<String>,
+    },
+    /// Deliver `Add`/`Remove` of a pinned note to/from the actor's
+    /// featured collection (`{actor}/collections/featured`) to remote
+    /// follower inboxes (pinning §7; Misskey
+    /// `NotePiningService.deliverPinnedChange` parity, minus relays:
+    /// pinetree has no relay infra, so delivery covers followers only).
+    FeaturedChanged {
+        actor_id: String,
+        note_id: String,
+        added: bool,
         inbox_override: Option<String>,
     },
 }
@@ -240,6 +291,64 @@ pub fn collect_recipient_inboxes_for_author(
     }
 
     Ok(inboxes)
+}
+
+/// Account ids that interacted with `note` (§8 edit fan-out: Sharkey
+/// `postNoteEdited` delivers the `Update` to remote users who replied to,
+/// renoted, or reacted to the note, plus the reply/renote authors). Reads
+/// only; the caller pages deliveries through the standard split, and remote
+/// filtering happens in `collect_recipient_inboxes_for_author`.
+fn collect_note_interacted_ids(
+    services: &AppServices,
+    note: &crate::domain::note::Note,
+) -> Result<Vec<String>, PortError> {
+    use crate::application::ports::TimelineCursor;
+    let mut ids: Vec<String> = Vec::new();
+    let mut push = |id: &str| {
+        if id != note.author_id.as_str() && !ids.iter().any(|known| known == id) {
+            ids.push(id.to_string());
+        }
+    };
+    if let Some(uid) = note.reply_user_id.as_deref() {
+        push(uid);
+    }
+    if let Some(rid) = note.renote_id.as_deref() {
+        if let Some(target) = services.notes.get_note(rid)? {
+            push(target.author_id.as_str());
+        }
+    }
+    // Repliers: newest-first pages until exhausted.
+    let mut cursor = TimelineCursor {
+        limit: 100,
+        ..Default::default()
+    };
+    loop {
+        let batch = services.notes.notes_by_reply(&note.id, &cursor)?;
+        if batch.is_empty() {
+            break;
+        }
+        for reply in &batch {
+            push(reply.author_id.as_str());
+        }
+        if batch.len() < 100 {
+            break;
+        }
+        cursor.until_id = batch.last().map(|n| n.id.clone());
+    }
+    // Renoters: bounded scan (same 10k bound as the `notes/renotes` read).
+    for candidate in services
+        .notes
+        .list_all_notes(&TimelineCursor::with_limit(10_000))?
+    {
+        if candidate.renote_id.as_deref() == Some(note.id.as_str()) {
+            push(candidate.author_id.as_str());
+        }
+    }
+    // Reactors.
+    for reaction in services.reactions.reactions_for_note(&note.id)? {
+        push(reaction.user_id.as_str());
+    }
+    Ok(ids)
 }
 
 /// Whether a fan-out with `inbox_count` destinations is split into per-inbox
@@ -460,6 +569,58 @@ pub fn execute_federate_deliver(
             deliver_single(services, client, tracker, &actor_id, &inbox_url, &activity)
         }
 
+        FederateDeliverPayload::Block {
+            block_id,
+            blocker_id,
+            blockee_id,
+            inbox_url,
+        } => {
+            let (Some(blocker), Some(blockee)) = (
+                services.accounts.find_by_id(&blocker_id)?,
+                services.accounts.find_by_id(&blockee_id)?,
+            ) else {
+                return Ok(DeliveryOutcome::Delivered);
+            };
+            if !blocker.is_local() {
+                return Ok(DeliveryOutcome::Delivered);
+            }
+            let activity = render_block_activity(
+                base,
+                &block_id,
+                &blocker.actor_url(base),
+                &blockee.actor_url(base),
+            );
+            deliver_single(services, client, tracker, &blocker_id, &inbox_url, &activity)
+        }
+
+        FederateDeliverPayload::UndoBlock {
+            undo_id,
+            block_id,
+            blocker_id,
+            blockee_id,
+            inbox_url,
+        } => {
+            let (Some(blocker), Some(blockee)) = (
+                services.accounts.find_by_id(&blocker_id)?,
+                services.accounts.find_by_id(&blockee_id)?,
+            ) else {
+                return Ok(DeliveryOutcome::Delivered);
+            };
+            if !blocker.is_local() {
+                return Ok(DeliveryOutcome::Delivered);
+            }
+            let blocker_uri = blocker.actor_url(base);
+            let inner = render_block_activity(
+                base,
+                &block_id,
+                &blocker_uri,
+                &blockee.actor_url(base),
+            );
+            let activity =
+                render_undo_activity(base, &undo_id, &blocker_uri, &inner, None, None);
+            deliver_single(services, client, tracker, &blocker_id, &inbox_url, &activity)
+        }
+
         FederateDeliverPayload::Like {
             reaction_id,
             actor_id,
@@ -501,6 +662,103 @@ pub fn execute_federate_deliver(
             deliver_single(services, client, tracker, &actor_id, &inbox_url, &activity)
         }
 
+        FederateDeliverPayload::PollVote {
+            vote_id,
+            voter_id,
+            target_note_uri,
+            choice_name,
+            inbox_url,
+        } => {
+            let voter = match services.accounts.find_by_id(&voter_id)? {
+                Some(a) => a,
+                None => return Ok(DeliveryOutcome::Delivered),
+            };
+            // The poll owner is the audience: resolve their actor URI from
+            // the cached note (fall back to the addressed inbox host).
+            let poll_owner_uri = match services.notes.find_by_uri(&target_note_uri)? {
+                Some(note) => match services.accounts.find_by_id(&note.author_id)? {
+                    Some(owner) => owner.uri.clone().unwrap_or_else(|| owner.actor_url(base)),
+                    None => return Ok(DeliveryOutcome::Delivered),
+                },
+                None => return Ok(DeliveryOutcome::Delivered),
+            };
+            let activity = crate::activitypub::objects::render_vote_activity(
+                base,
+                &vote_id,
+                &voter.actor_url(base),
+                &poll_owner_uri,
+                &target_note_uri,
+                &choice_name,
+                services.clock.now_ms(),
+            );
+            deliver_single(services, client, tracker, &voter_id, &inbox_url, &activity)
+        }
+
+        FederateDeliverPayload::QuestionUpdated {
+            note_id,
+            author_id,
+            inbox_override,
+        } => {
+            let author = match services.accounts.find_by_id(&author_id)? {
+                Some(a) if a.is_local() => a,
+                _ => return Ok(DeliveryOutcome::Delivered),
+            };
+            let Some(note) = services.notes.get_note(&note_id)? else {
+                return Ok(DeliveryOutcome::Delivered);
+            };
+            if note.is_deleted || note.local_only {
+                return Ok(DeliveryOutcome::Delivered);
+            }
+            let Some(poll) = services.polls.get_poll(&note_id)? else {
+                return Ok(DeliveryOutcome::Delivered);
+            };
+            let author_uri = author.actor_url(base);
+            let question = crate::activitypub::objects::render_question(
+                base,
+                &author_uri,
+                &note.id,
+                note.text.as_deref(),
+                &poll,
+                services.clock.now_ms(),
+            );
+            let update_id = format!("updates/{}", services.ids.generate());
+            let to = match note.visibility {
+                Visibility::Public => vec![PUBLIC_COLLECTION_URI.to_string()],
+                _ => vec![format!("{author_uri}/followers")],
+            };
+            let activity = crate::activitypub::objects::render_question_update_activity(
+                base,
+                &update_id,
+                &author_uri,
+                question,
+                to,
+                services.clock.now_ms(),
+            );
+            match inbox_override {
+                Some(inbox) => {
+                    deliver_single(services, client, tracker, &author_id, &inbox, &activity)
+                }
+                None => {
+                    let inboxes =
+                        collect_recipient_inboxes_for_author(services, &author_id, &[], true)?;
+                    fan_out(
+                        services,
+                        client,
+                        tracker,
+                        job_key,
+                        &author_id,
+                        &inboxes,
+                        &activity,
+                        &|inbox: &str| FederateDeliverPayload::QuestionUpdated {
+                            note_id: note_id.clone(),
+                            author_id: author_id.clone(),
+                            inbox_override: Some(inbox.to_string()),
+                        },
+                    )
+                }
+            }
+        }
+
         FederateDeliverPayload::ActorUpdated {
             update_id,
             account_id,
@@ -529,6 +787,78 @@ pub fn execute_federate_deliver(
                         &|inbox: &str| FederateDeliverPayload::ActorUpdated {
                             update_id: update_id.clone(),
                             account_id: account_id.clone(),
+                            inbox_override: Some(inbox.to_string()),
+                        },
+                    )
+                }
+            }
+        }
+
+        FederateDeliverPayload::NoteUpdated {
+            note_id,
+            author_id,
+            inbox_override,
+        } => {
+            let author = match services.accounts.find_by_id(&author_id)? {
+                Some(a) if a.is_local() => a,
+                _ => return Ok(DeliveryOutcome::Delivered),
+            };
+            let Some(note) = services.notes.get_note(&note_id)? else {
+                return Ok(DeliveryOutcome::Delivered);
+            };
+            if note.author_id != author_id || note.is_deleted {
+                return Ok(DeliveryOutcome::Delivered);
+            }
+            if !is_eligible_for_federation_delivery(&note) {
+                return Ok(DeliveryOutcome::Delivered);
+            }
+            let author_uri = author.actor_url(base);
+            let object = render_note_object(services, &note, true)?;
+            let (to, cc) = render_note_audience(services, &author, &note);
+            let update_id = format!("updates/{}", services.ids.generate());
+            let activity = render_note_update_activity(
+                base,
+                &update_id,
+                &author_uri,
+                object,
+                to,
+                cc,
+                services.clock.now_ms(),
+            );
+            match inbox_override {
+                Some(inbox) => {
+                    deliver_single(services, client, tracker, &author_id, &inbox, &activity)
+                }
+                None => {
+                    let mut extras = note.mentions.clone();
+                    for uid in &note.visible_user_ids {
+                        if !extras.contains(uid) {
+                            extras.push(uid.clone());
+                        }
+                    }
+                    for uid in collect_note_interacted_ids(services, &note)? {
+                        if !extras.contains(&uid) {
+                            extras.push(uid);
+                        }
+                    }
+                    let include_followers = note.visibility != Visibility::Specified;
+                    let inboxes = collect_recipient_inboxes_for_author(
+                        services,
+                        &author_id,
+                        &extras,
+                        include_followers,
+                    )?;
+                    fan_out(
+                        services,
+                        client,
+                        tracker,
+                        job_key,
+                        &author_id,
+                        &inboxes,
+                        &activity,
+                        &|inbox: &str| FederateDeliverPayload::NoteUpdated {
+                            note_id: note_id.clone(),
+                            author_id: author_id.clone(),
                             inbox_override: Some(inbox.to_string()),
                         },
                     )
@@ -655,6 +985,58 @@ pub fn execute_federate_deliver(
                             actor_id: actor_id.clone(),
                             stamp_uri: stamp_uri.clone(),
                             quote_note_id: quote_note_id.clone(),
+                            inbox_override: Some(inbox.to_string()),
+                        },
+                    )
+                }
+            }
+        }
+
+        FederateDeliverPayload::FeaturedChanged {
+            actor_id,
+            note_id,
+            added,
+            inbox_override,
+        } => {
+            let actor = match services.accounts.find_by_id(&actor_id)? {
+                Some(a) if a.is_local() => a,
+                _ => return Ok(DeliveryOutcome::Delivered),
+            };
+            let Some(note) = services.notes.get_note(&note_id)? else {
+                return Ok(DeliveryOutcome::Delivered);
+            };
+            if note.author_id != actor_id || note.is_deleted {
+                return Ok(DeliveryOutcome::Delivered);
+            }
+            let actor_uri = actor.actor_url(base);
+            let note_uri = note.uri.clone().unwrap_or_else(|| format!("{base}/notes/{}", note.id));
+            let change_id = format!("featured-{}-{note_id}", if added { "add" } else { "remove" });
+            let activity = crate::activitypub::objects::render_featured_change_activity(
+                base,
+                &change_id,
+                &actor_uri,
+                &note_uri,
+                added,
+            );
+            match inbox_override {
+                Some(inbox) => {
+                    deliver_single(services, client, tracker, &actor_id, &inbox, &activity)
+                }
+                None => {
+                    let inboxes =
+                        collect_recipient_inboxes_for_author(services, &actor_id, &[], true)?;
+                    fan_out(
+                        services,
+                        client,
+                        tracker,
+                        job_key,
+                        &actor_id,
+                        &inboxes,
+                        &activity,
+                        &|inbox: &str| FederateDeliverPayload::FeaturedChanged {
+                            actor_id: actor_id.clone(),
+                            note_id: note_id.clone(),
+                            added,
                             inbox_override: Some(inbox.to_string()),
                         },
                     )

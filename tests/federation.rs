@@ -134,7 +134,10 @@ async fn boot_node(tag: &'static str) -> FedNode {
         accounts: store.clone(),
         notes: store.clone(),
         follows: store.clone(),
+        blocks: store.clone(),
+        mutes: store.clone(),
         reactions: store.clone(),
+        polls: store.clone(),
         jobs: store.clone(),
         media: store.clone(),
         blobs,
@@ -151,6 +154,9 @@ async fn boot_node(tag: &'static str) -> FedNode {
         preserved_usernames: Vec::new(),
         prohibited_words: Vec::new(),
         sensitive_words: Vec::new(),
+        note_draft_limit: pinetree::domain::draft::DEFAULT_NOTE_DRAFT_LIMIT,
+        scheduled_note_limit: pinetree::domain::draft::DEFAULT_SCHEDULED_NOTE_LIMIT,
+        pin_limit: pinetree::domain::pinning::DEFAULT_PIN_LIMIT,
     });
     let worker = Arc::new(JobWorker {
         clock: store.clock().clone(),
@@ -175,6 +181,7 @@ async fn boot_node(tag: &'static str) -> FedNode {
         upload_slots: Arc::new(UploadSlots::with_defaults()),
         hub: pinetree::streaming::hub::Hub::new(1024),
         trusted_proxies: Arc::new(Vec::new()),
+        featured_cache: std::sync::Arc::new(pinetree::application::commands::pins::FeaturedCache::default()),
     };
     let app = federation_router(state.clone());
     let serve_handle = tokio::spawn(async move {
@@ -1338,7 +1345,10 @@ fn federation_remote_media_cache() {
         accounts: store.clone(),
         notes: store.clone(),
         follows: store.clone(),
+        blocks: store.clone(),
+        mutes: store.clone(),
         reactions: store.clone(),
+        polls: store.clone(),
         jobs: store.clone(),
         media: store.clone(),
         blobs: blobs.clone(),
@@ -1355,6 +1365,9 @@ fn federation_remote_media_cache() {
         preserved_usernames: Vec::new(),
         prohibited_words: Vec::new(),
         sensitive_words: Vec::new(),
+        note_draft_limit: pinetree::domain::draft::DEFAULT_NOTE_DRAFT_LIMIT,
+        scheduled_note_limit: pinetree::domain::draft::DEFAULT_SCHEDULED_NOTE_LIMIT,
+        pin_limit: pinetree::domain::pinning::DEFAULT_PIN_LIMIT,
     };
     let client = SafeHttpClient::new(SafeHttpConfig {
         allow_private_ips: true,

@@ -132,3 +132,46 @@ Reads never need transactions spanning writes. Initial read surface (fan-out-on-
 ## Superseding note — branched replies (2026-10-16, `docs/replies.md`)
 
 `CreateNoteInput` gains `reply_parent_uri: Option<String>` (inbox-only; the local `create_note` path rejects it, and the store rejects input with both `reply_to` and `reply_parent_uri` set). `NoteStore` gains `notes_by_reply(reply_id, cursor)` (newest-first direct children, deleted excluded, cursor bounds applied; `limit` is a candidate scan limit, 0 = backend default 50), `pending_reply_children(parent_uri, limit)` (children waiting on an unresolved parent URI), `link_pending_reply(child, parent, canonical_uri)` (atomic link + re-narrow + parent counter increment + index swap; idempotent `Ok(None)` on replay; `Validation` on URI mismatch or cycle), and `set_pending_reply_parent(child, uri, jobs)` (atomic pending mark + resolver job; idempotent bool). `JobKind` gains `ReplyParentResolve` with `ReplyParentResolvePayload { parent_uri }` (URI-keyed idempotency key `reply-resolve:{uri}`; the worker retries unavailable parents with standard backoff and quarantines past budget with the entry kept; full batches fan out a continuation). Opt-in repair: `repair_unresolved_reply_parents(services, limit)` (clamped 1..=5000) plus the `PINETREE_REPLY_REPAIR_LIMIT` startup env gate (off by default). Conformance Group R in `tests/conformance.rs` (R1–R12; FDB inherits them).
+
+## Superseding note — §0A blocking / muting (2026-10-16, `docs/misskey-parity-plan.md`)
+
+New ports (same atomicity rules as §2: state + jobs in one txn; FDB inherits the signatures):
+
+- `BlockStore`: `block(Blocking, jobs)` (caller builds the row so the federated `Block` activity id `{url}/blocks/{id}` equals the stored row id), `unblock` (`NotFound(NOT_BLOCKING)`), `get_blocking`, `is_blocking`, `blocking_ids_for`, `blocked_by_ids_for`, `list_blockings(blocker, TimelineCursor)`. `block` validates the pair (`BLOCKEE_IS_YOURSELF`), rejects dups (`ALREADY_BLOCKING`), requires both accounts (`NO_SUCH_USER`), removes both follow edges and both pending requests, and enqueues jobs — atomically.
+- `MuteStore`: `mute` (`Ok(None)` on past `expiresAt`, `ALREADY_MUTING` on dup), `unmute` / `renote_mute` / `renote_unmute` (`NOT_MUTING` when missing), `get_muting`, `is_muting` (active rows only), `muted_ids_for`, `list_mutings`, `get_renote_muting`, `is_renote_muting`, `renote_muted_ids_for`, `list_renote_mutings`.
+- `ActivityDedup` gains `record_block_activity` (replay and re-block converge to `None`) and `record_unblock_activity` (`false` on replay or missing row).
+- Follow/react/note-create entry points enforce blocks inside their own transactions (`BLOCKING`/`BLOCKED` on follow both directions, `YOU_HAVE_BEEN_BLOCKED` on react and pure-renote/reply create), so local and inbound paths share one check. Conformance cells G1–G4 in `tests/conformance.rs`.
+
+## Superseding note — §4 polls (2026-10-16, `docs/misskey-parity-plan.md`)
+
+New port (same atomicity rules as §2: state + jobs in one txn; FDB inherits the signatures):
+
+- `PollStore`: `get_poll(note_id)` (`None` when the note carries no poll), `votes_by_user_for_note(user_id, note_id)` (choice-ordered; drives `isVoted` packing and dup detection), `cast_vote(vote, jobs)` (re-checks note-live → `NO_SUCH_NOTE`, poll-present → `NO_POLL`, §0A block → `YOU_HAVE_BEEN_BLOCKED`, expiry → `ALREADY_EXPIRED`, choice range → `INVALID_CHOICE`, dup → `ALREADY_VOTED` — then bumps `votes[choice]` and inserts the vote row atomically), `sync_poll_votes(note_id, counts_by_name, jobs)` (inbound `Question` tally refresh by choice-name match; `NO_POLL` when absent).
+- `CreateNoteInput` gains `poll: Option<PollInput>` (`has_poll` must agree; storage validates choices/expiry in-txn) and inbox-only `poll_initial_votes: Option<Vec<u64>>` (origin-reported tallies for cached remote polls; the local path rejects it, storage enforces seed length).
+- `JobKind` gains `PollExpiry` with `PollExpiryPayload { note_id }` (`not_before` armed at `expiresAt`; the worker publishes the `pollEnded` streaming event; gone/not-yet-expired polls complete quietly).
+- `FederateDeliver` payloads gain `PollVote` (`Create`-vote activity to the poll owner's inbox) and `QuestionUpdated` (`Update(Question)` fan-out to followers + relays; skipped for local-only/deleted/poll-less notes at execution).
+
+## Superseding note — §5 drafts + scheduling (2026-10-16, `docs/misskey-parity-plan.md`)
+
+New application operations (`src/application/commands/drafts.rs`; Misskey API + ActivityPub adapters call these same ops; the worker calls `post_scheduled_draft`):
+
+- `CreateDraftInput` (every `NoteDraft` column except `id`/`user`) + `UpdateDraftPatch` (`None` = absent, `Some(None)` = clear, `Some(Some(_))` = set).
+- `create_draft` (draft-limit → scheduled-limit → schedule/poll-expiry validation → referential checks → store + arm in one txn), `update_draft` (partial-shape validation upstream parity; clears every arming then re-arms from the merged row in the same txn), `delete_draft` (clears armings, then deletes), `list_drafts` (cursor + `scheduled` tri-state), `count_drafts`.
+- `post_scheduled_draft(draft_id, scheduled_at_ms)`: converges quietly on missing/unscheduled/rescheduled/not-yet-due drafts; posts through the full note-create path, deletes the draft on success and emits `ScheduledNotePosted` (carries the note), or keeps the draft and emits `ScheduledNotePostFailed` (carries the draft) on post failure.
+- `NoteStore` gains `create_draft` / `get_draft` / `update_draft` (`NotFound(NO_SUCH_NOTE_DRAFT)`) / `delete_draft` (missing = no-op) / `drafts_by_user(user, cursor, scheduled?)` (newest-first) / `count_drafts` / `count_scheduled_drafts` — each committing the row, its by-user index row, and `jobs` in one transaction (FDB inherits; no second path).
+- `JobKind` gains `PostScheduledDraft` with `ScheduledDraftPayload { draft_id, scheduled_at_ms }` (`not_before` armed at `scheduled_at`; bad payloads quarantine, gone/unscheduled/rescheduled drafts complete quietly, only storage faults retry; a failed post is itself a successful run).
+- `JobQueue` gains `remove_scheduled_draft_jobs(draft_id)` (`clearSchedule` linear-scan parity: removes every arming including leased ones; the worker converges quietly on removed jobs).
+- Limits live on `AppServices` (`note_draft_limit`, `scheduled_note_limit`, wired from `Config`) and surface in `policies` (`noteDraftLimit`, `scheduledNoteLimit`). Conformance Group S in `tests/conformance.rs` (S1–S2; FDB inherits them).
+
+## Superseding note — §7 pinned / featured (2026-10-16, `docs/misskey-parity-plan.md`)
+
+New application operations (`src/application/commands/pins.rs`):
+
+- `pin_note` (ownership → `NO_SUCH_NOTE`; limit → `PIN_LIMIT_EXCEEDED`; duplicate → `ALREADY_PINNED`, enforced atomically by the unique store index; row + federation jobs in one txn), `unpin_note` (same ownership gate; missing pinning rows are no-op successes), `pinned_note_ids` (oldest-first).
+- `NoteStore` gains `add_pinning` (`Conflict(ALREADY_PINNED)`), `remove_pinning` (missing = no-op), `pinnings_for_user` (oldest-first) — each with `jobs` in one transaction (FDB inherits; no second path).
+- `FederateDeliver` payloads gain `FeaturedChanged { actor_id, note_id, added, inbox_override }` (followers fan-out of `Add`/`Remove` to `{actor}/collections/featured`; relays deferred — no relay infra exists).
+- Featured ranking (compatible-simplified, NOT upstream-identical): `rank_featured_global` / `rank_featured_for_user` select by `reactions + renotes` over the trailing window (3d global / 7d per-user, the upstream window lengths) from recent non-sensitive public notes (no CW, no sensitive files — missing rows fail closed; no channels exist), ordered newest-first; `featured_notes_visible` applies `untilId`, visibility, and mute/block post-filters plus the page limit. `FeaturedCache` (3600s TTL, per-`ApiState`) backs both endpoints. Conformance Group P in `tests/conformance.rs` (P1–P2; FDB inherits them).
+
+## Superseding note — §10 notification grouping (2026-10-16, `docs/misskey-parity-plan.md`)
+
+Pure pack-layer change — no port or storage change. `pack_grouped_notifications` (packers) implements the upstream `i/notifications-grouped.ts:106-153` merge over the same flat newest-first page `i/notifications` fetches; the endpoint shares `parse_notification_query` with `i/notifications` and truncates the grouped page to `limit` after packing.

@@ -1,11 +1,19 @@
 use serde::{Deserialize, Serialize};
 
-use crate::domain::account::Account;
+use crate::domain::account::{
+    Account, AvatarDecoration, ChatScope, FollowVisibility, MutedWord,
+    NotificationRecieveConfig, ProfileField,
+};
+use crate::domain::blocking::Blocking;
+use crate::domain::draft::NoteDraft;
 use crate::domain::follow::{Follow, FollowNotify, FollowRequest};
+use crate::domain::muting::{Muting, RenoteMuting};
 pub use crate::domain::id::{Clock, DomainError, IdGenerator, PortError};
 use crate::domain::media::{MediaMeta, MediaProperties};
-use crate::domain::note::{Note, ReactionAcceptance, Visibility};
+use crate::domain::note::{Note, NoteEdit, ReactionAcceptance, Visibility};
 use crate::domain::notification::{Notification, NotificationKind};
+use crate::domain::pinning::UserNotePining;
+use crate::domain::poll::{Poll, PollInput, PollVote};
 use crate::domain::quote::{QuoteAuthorizationState, QuoteReference, QuoteStamp};
 use crate::domain::reaction::Reaction;
 
@@ -48,18 +56,69 @@ impl CreateAccountInput {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// `i/update` patch: `None` = param absent (leave unchanged),
+/// `Some(None)` = explicit `null` (clear), `Some(Some(_))` = set.
+/// Covers all 39 `i/update.ts` params plus the DIVERGENCE `rejectQuotes`
+/// (§3) and `defaultReaction` (§6) params. Serialized into federated
+/// `Update(Person)` jobs, so every field must stay small and bounded
+/// (64KiB job payload cap; large lists are validated before enqueue).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct UpdateAccountPatch {
     pub display_name: Option<Option<String>>,
     pub description: Option<Option<String>>,
+    pub followed_message: Option<Option<String>>,
     pub location: Option<Option<String>>,
     pub birthday: Option<Option<String>>,
+    pub lang: Option<Option<String>>,
     pub avatar_id: Option<Option<String>>,
+    pub avatar_decorations: Option<Vec<AvatarDecoration>>,
     pub banner_id: Option<Option<String>>,
+    pub fields: Option<Vec<ProfileField>>,
     pub is_locked: Option<bool>,
     pub is_bot: Option<bool>,
     pub is_cat: Option<bool>,
     pub is_explorable: Option<bool>,
+    pub hide_online_status: Option<bool>,
+    pub public_reactions: Option<bool>,
+    pub careful_bot: Option<bool>,
+    pub auto_accept_followed: Option<bool>,
+    pub follow_approval_local_seconds: Option<Option<i64>>,
+    pub follow_approval_remote_seconds: Option<Option<i64>>,
+    pub no_crawle: Option<bool>,
+    pub prevent_ai_learning: Option<bool>,
+    pub require_signin_to_view_contents: Option<bool>,
+    pub make_notes_followers_only_before: Option<Option<i64>>,
+    pub make_notes_hidden_before: Option<Option<i64>>,
+    pub inject_featured_note: Option<bool>,
+    pub receive_announcement_email: Option<bool>,
+    pub always_mark_nsfw: Option<bool>,
+    pub auto_sensitive: Option<bool>,
+    pub following_visibility: Option<FollowVisibility>,
+    pub followers_visibility: Option<FollowVisibility>,
+    pub chat_scope: Option<ChatScope>,
+    pub pinned_page_id: Option<Option<String>>,
+    pub muted_words: Option<Vec<MutedWord>>,
+    pub hard_muted_words: Option<Vec<MutedWord>>,
+    pub muted_instances: Option<Vec<String>>,
+    pub notification_recieve_config:
+        Option<std::collections::BTreeMap<String, NotificationRecieveConfig>>,
+    pub email_notification_types: Option<Vec<String>>,
+    pub also_known_as: Option<Option<Vec<String>>>,
+    /// `verifiedLinks` reset (`update.ts` clears on every profile update;
+    /// re-verification happens off-request). Set by `update_profile`, not by
+    /// the endpoint: remote-actor refreshes must not wipe anything.
+    pub verified_links: Option<Vec<String>>,
+    /// DIVERGENCE (§3 Sharkey-style quote rejection, user-facing toggle).
+    pub reject_quotes: Option<bool>,
+    /// DIVERGENCE (§6 per-user default reaction, 1..=260 chars).
+    pub default_reaction: Option<Option<String>>,
+}
+
+impl UpdateAccountPatch {
+    /// True when no param was supplied (no-op update).
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 pub trait AccountStore: Send + Sync {
@@ -117,6 +176,16 @@ pub struct CreateNoteInput {
     pub no_extract_hashtags: bool,
     pub no_extract_emojis: bool,
     pub has_poll: bool,
+    /// Validated poll definition for this note (`None` = no poll).
+    /// `#[serde(default)]` keeps in-flight job payloads decodable.
+    /// `has_poll` is kept as the cheap flag (storage asserts the two agree).
+    #[serde(default)]
+    pub poll: Option<PollInput>,
+    /// Inbound-only seed tallies for a cached remote poll (`None` = zeroed;
+    /// the local path always leaves this `None`). `Some` must carry exactly
+    /// one count per choice; storage enforces the length.
+    #[serde(default)]
+    pub poll_initial_votes: Option<Vec<u64>>,
     pub has_channel: bool,
     pub prohibited_words: Vec<String>,
     pub sensitive_words: Vec<String>,
@@ -156,6 +225,8 @@ impl CreateNoteInput {
             no_extract_hashtags: false,
             no_extract_emojis: false,
             has_poll: false,
+            poll: None,
+            poll_initial_votes: None,
             has_channel: false,
             prohibited_words: Vec::new(),
             sensitive_words: Vec::new(),
@@ -166,6 +237,84 @@ impl CreateNoteInput {
             quote: None,
         }
     }
+}
+
+/// Input for creating one note draft (§5; Misskey `NoteDraftOptions`
+/// parity: every `MiNoteDraft` column except `id`/`user`). The author id
+/// travels separately (the storage row is built by the application op).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateDraftInput {
+    pub text: Option<String>,
+    pub cw: Option<String>,
+    pub visibility: Visibility,
+    pub visible_users: Vec<String>,
+    pub local_only: bool,
+    pub reply_to: Option<String>,
+    pub renote_of: Option<String>,
+    pub file_ids: Vec<String>,
+    pub hashtag: Option<String>,
+    pub reaction_acceptance: Option<ReactionAcceptance>,
+    pub has_poll: bool,
+    pub poll_choices: Vec<String>,
+    pub poll_multiple: bool,
+    pub poll_expires_at_ms: Option<i64>,
+    pub poll_expired_after_ms: Option<i64>,
+    pub scheduled_at_ms: Option<i64>,
+    pub is_actually_scheduled: bool,
+}
+
+/// Patch for updating one note draft (§5; Misskey `update.ts` partial
+/// `NoteDraftOptions` parity). `None` = param absent (leave unchanged);
+/// `Some(None)` = explicit `null` (clear, where nullable);
+/// `Some(Some(_))` = set. Non-nullable scalars use plain `Option`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateDraftPatch {
+    pub text: Option<Option<String>>,
+    pub cw: Option<Option<String>>,
+    pub visibility: Option<Visibility>,
+    pub visible_users: Option<Vec<String>>,
+    pub local_only: Option<bool>,
+    pub reply_to: Option<Option<String>>,
+    pub renote_of: Option<Option<String>>,
+    pub file_ids: Option<Vec<String>>,
+    pub hashtag: Option<Option<String>>,
+    pub reaction_acceptance: Option<Option<ReactionAcceptance>>,
+    pub poll_choices: Option<Vec<String>>,
+    pub poll_multiple: Option<bool>,
+    pub poll_expires_at_ms: Option<Option<i64>>,
+    pub poll_expired_after_ms: Option<Option<i64>>,
+    pub scheduled_at_ms: Option<Option<i64>>,
+    pub is_actually_scheduled: Option<bool>,
+}
+
+/// Input for editing one note (§8; Sharkey `notes/edit` + `NoteEditService`
+/// parity). `editor_id` must own the note; `reply_id` is immutable (the
+/// original parent is kept — no field carries a new one); `visibility` and
+/// `local_only` are forced back to the original note's values (the endpoint
+/// still parses the requested visibility for the specified-reply check, but
+/// it never reaches storage). `renote_of`: `None` detaches the renote,
+/// `Some(id)` attaches/keeps it. `poll`: `None` removes the poll,
+/// `Some` adds/replaces it (votes reset). `text`/`cw`: `None` clears.
+/// `visible_users` is honored only when the (original) visibility is
+/// `specified` (upstream wipes the audience when the param is omitted —
+/// copied faithfully).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditNoteInput {
+    pub editor_id: String,
+    pub note_id: String,
+    pub text: Option<String>,
+    pub cw: Option<String>,
+    pub renote_of: Option<String>,
+    pub file_ids: Vec<String>,
+    pub poll: Option<PollInput>,
+    pub reaction_acceptance: Option<ReactionAcceptance>,
+    pub visible_users: Vec<String>,
+    pub prohibited_words: Vec<String>,
+    pub sensitive_words: Vec<String>,
+    /// Public URL base (`https://domain`, no trailing slash) for deriving
+    /// a local renote target's canonical URI when the target stores none
+    /// (quote-relation maintenance only; never used for addressing).
+    pub uri_base: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -357,6 +506,151 @@ pub trait NoteStore: Send + Sync {
         let _ = stamp_id;
         Ok(None)
     }
+
+    // --- Note drafts (§5) -------------------------------------------------
+    //
+    // Drafts + scheduling (`docs/misskey-parity-plan.md` §5). One storage
+    // transaction commits the draft row, its by-user index row, and `jobs`
+    // atomically. FDB inherits this path (no second path).
+    /// Insert one draft row with its by-user index row and enqueue `jobs`
+    /// (the `PostScheduledDraft` arming when scheduled) in ONE write
+    /// transaction. `Conflict(TOO_MANY_DRAFTS)` / ... are enforced by the
+    /// application op before this call; storage only enforces shape.
+    fn create_draft(&self, draft: NoteDraft, jobs: Vec<NewJob>) -> Result<NoteDraft, PortError> {
+        let _ = (draft, jobs);
+        Err(PortError::StorageUnavailable(
+            "NoteStore::create_draft not implemented".to_string(),
+        ))
+    }
+    /// The live draft `id`, if any. No ownership check (the application op
+    /// enforces it so the error precedence matches upstream).
+    fn get_draft(&self, id: &str) -> Result<Option<NoteDraft>, PortError> {
+        let _ = id;
+        Err(PortError::StorageUnavailable(
+            "NoteStore::get_draft not implemented".to_string(),
+        ))
+    }
+    /// Replace the stored row for `draft.id` (which must exist:
+    /// `NotFound(NO_SUCH_NOTE_DRAFT)` otherwise) and enqueue `jobs` in ONE
+    /// write transaction.
+    fn update_draft(&self, draft: NoteDraft, jobs: Vec<NewJob>) -> Result<NoteDraft, PortError> {
+        let _ = (draft, jobs);
+        Err(PortError::StorageUnavailable(
+            "NoteStore::update_draft not implemented".to_string(),
+        ))
+    }
+    /// Delete the draft row + index row and enqueue `jobs` in ONE write
+    /// transaction. Missing rows are a no-op success (the application op
+    /// checks existence first for the `NO_SUCH_NOTE_DRAFT` error).
+    fn delete_draft(&self, id: &str, jobs: Vec<NewJob>) -> Result<(), PortError> {
+        let _ = (id, jobs);
+        Err(PortError::StorageUnavailable(
+            "NoteStore::delete_draft not implemented".to_string(),
+        ))
+    }
+    /// Drafts by `user_id`, newest-first, cursor-paged (`notes/drafts/list`
+    /// read path). `scheduled == Some(true)` keeps only actually-scheduled
+    /// drafts, `Some(false)` only unscheduled ones, `None` keeps both
+    /// (Misskey `scheduled` param parity).
+    fn drafts_by_user(
+        &self,
+        user_id: &str,
+        cursor: &TimelineCursor,
+        scheduled: Option<bool>,
+    ) -> Result<Vec<NoteDraft>, PortError> {
+        let _ = (user_id, cursor, scheduled);
+        Err(PortError::StorageUnavailable(
+            "NoteStore::drafts_by_user not implemented".to_string(),
+        ))
+    }
+    /// Total drafts by `user_id` (`notes/drafts/count` + the
+    /// `noteDraftLimit` gate).
+    fn count_drafts(&self, user_id: &str) -> Result<usize, PortError> {
+        let _ = user_id;
+        Err(PortError::StorageUnavailable(
+            "NoteStore::count_drafts not implemented".to_string(),
+        ))
+    }
+    /// Actually-scheduled drafts by `user_id` (the `scheduledNoteLimit`
+    /// gate).
+    fn count_scheduled_drafts(&self, user_id: &str) -> Result<usize, PortError> {
+        let _ = user_id;
+        Err(PortError::StorageUnavailable(
+            "NoteStore::count_scheduled_drafts not implemented".to_string(),
+        ))
+    }
+
+    // --- Note pinnings (§7) ------------------------------------------------
+    //
+    // `pinnings UNIQUE(user, note)` (Misskey `MiUserNotePining` parity).
+    // One storage transaction commits the pinning row and `jobs`
+    // (federated `Add`/`Remove` of the featured collection) atomically.
+    // FDB inherits this path (no second path).
+    /// Insert one pinning row and enqueue `jobs` in ONE write transaction.
+    /// `Conflict(ALREADY_PINNED)` on a duplicate pair.
+    fn add_pinning(
+        &self,
+        pinning: UserNotePining,
+        jobs: Vec<NewJob>,
+    ) -> Result<UserNotePining, PortError> {
+        let _ = (pinning, jobs);
+        Err(PortError::StorageUnavailable(
+            "NoteStore::add_pinning not implemented".to_string(),
+        ))
+    }
+    /// Delete the `(user_id, note_id)` pinning row and enqueue `jobs` in
+    /// ONE write transaction. A missing row is a no-op success (upstream
+    /// `removePinned` deletes unconditionally).
+    fn remove_pinning(
+        &self,
+        user_id: &str,
+        note_id: &str,
+        jobs: Vec<NewJob>,
+    ) -> Result<(), PortError> {
+        let _ = (user_id, note_id, jobs);
+        Err(PortError::StorageUnavailable(
+            "NoteStore::remove_pinning not implemented".to_string(),
+        ))
+    }
+    /// Every pinning row by `user_id`, oldest-first (Misskey
+    /// `UserEntityService` `pins.map(...)` order parity: pinning rows read
+    /// in id order).
+    fn pinnings_for_user(&self, user_id: &str) -> Result<Vec<UserNotePining>, PortError> {
+        let _ = user_id;
+        Err(PortError::StorageUnavailable(
+            "NoteStore::pinnings_for_user not implemented".to_string(),
+        ))
+    }
+
+    // --- Note editing (§8) ------------------------------------------------
+    //
+    // `notes/edit` (Sharkey parity). One storage transaction commits the
+    // updated note row, the `note_edits` history row (only on effective
+    // edits), the poll add/remove/replace (with vote reset), and `jobs`
+    // atomically. FDB inherits this path (no second path).
+    /// Apply an edit: author-only (`Validation(YOU_ARE_NOT_THE_AUTHOR)` when
+    /// `edit.editor_id` does not own the note), `NotFound(NO_SUCH_NOTE)`
+    /// when the note is missing or deleted. `reply_id`, `visibility`, and
+    /// `local_only` stay at their original values; poll add/remove/replace
+    /// resets votes; text/cw arrive pre-trimmed by the caller (storage
+    /// re-trims defensively to the storage bounds). A no-change edit
+    /// returns the original note and writes no history row (and enqueues no
+    /// jobs). Returns the edited (re-read) note.
+    fn apply_note_edit(&self, edit: EditNoteInput, jobs: Vec<NewJob>) -> Result<Note, PortError> {
+        let _ = (edit, jobs);
+        Err(PortError::StorageUnavailable(
+            "NoteStore::apply_note_edit not implemented".to_string(),
+        ))
+    }
+    /// Version history for `note_id`, oldest-first (empty when never
+    /// edited). Read path for tests and future history surfaces; there is
+    /// no Misskey endpoint reading it.
+    fn note_edits(&self, note_id: &str) -> Result<Vec<NoteEdit>, PortError> {
+        let _ = note_id;
+        Err(PortError::StorageUnavailable(
+            "NoteStore::note_edits not implemented".to_string(),
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -389,6 +683,23 @@ pub enum JobKind {
     /// quarantines but the pending index entry is kept, so a later parent
     /// arrival (which enqueues a fresh job for the same URI) can still link.
     ReplyParentResolve,
+    /// Poll expiry (`docs/misskey-parity-plan.md` §4; Misskey
+    /// `endedPollNotificationQueue` parity, sans notifications): fires once
+    /// at `expires_at` and publishes the `pollEnded` streaming event. The
+    /// payload is [`PollExpiryPayload`]. Idempotent: a missing note/poll or
+    /// a not-yet-expired poll completes quietly (a re-armed job covers
+    /// clock skew). Reuses the worker's standard lease/backoff.
+    PollExpiry,
+    /// Scheduled-draft post (`docs/misskey-parity-plan.md` §5; Misskey
+    /// `postScheduledNoteQueue` parity): fires once at the draft's
+    /// `scheduled_at` and posts the draft as a note. The payload is
+    /// [`ScheduledDraftPayload`]. Idempotent: a missing draft, an
+    /// unscheduled draft, or a time mismatch (the draft was updated and
+    /// re-armed) completes quietly. Success deletes the draft and emits
+    /// `ScheduledNotePosted`; post failure keeps the draft and emits
+    /// `ScheduledNotePostFailed`. Reuses the worker's standard
+    /// lease/backoff.
+    PostScheduledDraft,
 }
 
 /// Maximum `fail()` retries before a job is auto-quarantined as
@@ -515,6 +826,18 @@ pub trait JobQueue: Send + Sync {
     fn defer(&self, job_id: &str, not_before_ms: i64) -> Result<(), PortError>;
     fn get_job(&self, job_id: &str) -> Result<Option<Job>, PortError>;
     fn pending_count(&self) -> Result<usize, PortError>;
+    /// Remove every pending `PostScheduledDraft` job armed for `draft_id`
+    /// (§5 `clearSchedule` parity: Misskey scans its delayed/waiting/active
+    /// queues linearly — `TODO: 線形探索なのをどうにかする`). Called when a
+    /// draft is updated or deleted so a stale arming can never post a
+    /// superseded draft; the update path re-arms when the merged draft is
+    /// still scheduled. Returns the number of jobs removed. The default is
+    /// a no-op success so in-memory test doubles keep compiling; durable
+    /// backends must override it.
+    fn remove_scheduled_draft_jobs(&self, draft_id: &str) -> Result<usize, PortError> {
+        let _ = draft_id;
+        Ok(0)
+    }
 }
 
 pub trait FollowStore: Send + Sync {
@@ -610,6 +933,115 @@ pub trait FollowStore: Send + Sync {
     }
 }
 
+/// Directed blocks (`docs/misskey-parity-plan.md` §0A; Misskey
+/// `MiBlocking{blocker,blockee}` unique).
+///
+/// `block` is the atomic unit: it validates the pair, rejects duplicates
+/// with `Conflict(ALREADY_BLOCKING)`, removes both follow edges and both
+/// pending follow requests (adjusting counters), inserts the block row, and
+/// enqueues `jobs` — all in ONE storage transaction. The caller builds the
+/// [`Blocking`] row (including its id) so the federated `Block` activity id
+/// (`{url}/blocks/{id}`, Misskey `ApRendererService.renderBlock` parity) is
+/// identical to the stored row id — and to the id a later `Undo(Block)`
+/// references. Backends implement the whole method; the application op only
+/// builds jobs (federated `Block` for local→remote, streaming hints). The
+/// same method serves local `blocking/create` and inbound `Block`
+/// (remote→local never federates, so no loop is possible).
+pub trait BlockStore: Send + Sync {
+    fn block(&self, blocking: Blocking, jobs: Vec<NewJob>) -> Result<Blocking, PortError>;
+    /// Remove the block. `NotFound(NOT_BLOCKING)` when no row exists
+    /// (Misskey `unblock` warns and returns; the endpoint checks first, so
+    /// the application op surfaces the error).
+    fn unblock(
+        &self,
+        blocker_id: &str,
+        blockee_id: &str,
+        jobs: Vec<NewJob>,
+    ) -> Result<(), PortError>;
+    fn get_blocking(
+        &self,
+        blocker_id: &str,
+        blockee_id: &str,
+    ) -> Result<Option<Blocking>, PortError>;
+    /// True when `blocker_id` blocks `blockee_id`.
+    fn is_blocking(&self, blocker_id: &str, blockee_id: &str) -> Result<bool, PortError>;
+    /// Ids `blocker_id` blocks (read-time feed filter input).
+    fn blocking_ids_for(&self, blocker_id: &str) -> Result<Vec<String>, PortError>;
+    /// Ids blocking `blockee_id` (read-time feed filter input).
+    fn blocked_by_ids_for(&self, blockee_id: &str) -> Result<Vec<String>, PortError>;
+    /// Blocks created by `blocker_id`, newest-first, cursor-paged.
+    fn list_blockings(
+        &self,
+        blocker_id: &str,
+        cursor: &TimelineCursor,
+    ) -> Result<Vec<Blocking>, PortError>;
+}
+
+/// Mutes and renote-mutes (`docs/misskey-parity-plan.md` §0A; Misskey
+/// `MiMuting{muter,mutee,expiresAt?}` and `MiRenoteMuting{muter,mutee}`).
+///
+/// Mutes never touch follow edges. `is_muting`/`muted_ids_for` report only
+/// *active* mutes (`expires_at_ms` absent or in the future); `get_muting`
+/// reports row existence (so `unmute` of an expired-but-present row still
+/// resolves to `NOT_MUTING`-free deletion, mirroring Misskey's endpoint
+/// existence check).
+pub trait MuteStore: Send + Sync {
+    /// `Ok(None)` when `expires_at_ms` is past (Misskey `mute/create`
+    /// returns early without creating); `Conflict(ALREADY_MUTING)` on dup.
+    fn mute(
+        &self,
+        muter_id: &str,
+        mutee_id: &str,
+        expires_at_ms: Option<i64>,
+        jobs: Vec<NewJob>,
+    ) -> Result<Option<Muting>, PortError>;
+    /// `NotFound(NOT_MUTING)` when no row exists.
+    fn unmute(&self, muter_id: &str, mutee_id: &str, jobs: Vec<NewJob>) -> Result<(), PortError>;
+    fn get_muting(
+        &self,
+        muter_id: &str,
+        mutee_id: &str,
+    ) -> Result<Option<Muting>, PortError>;
+    /// True when an *active* mute row exists.
+    fn is_muting(&self, muter_id: &str, mutee_id: &str) -> Result<bool, PortError>;
+    /// Active mutee ids for `muter_id` (read-time feed filter input).
+    fn muted_ids_for(&self, muter_id: &str) -> Result<Vec<String>, PortError>;
+    /// Mute rows by `muter_id` (including expired), newest-first,
+    /// cursor-paged (drives `mute/list`).
+    fn list_mutings(
+        &self,
+        muter_id: &str,
+        cursor: &TimelineCursor,
+    ) -> Result<Vec<Muting>, PortError>;
+    /// `Conflict(ALREADY_MUTING)` on dup.
+    fn renote_mute(
+        &self,
+        muter_id: &str,
+        mutee_id: &str,
+        jobs: Vec<NewJob>,
+    ) -> Result<RenoteMuting, PortError>;
+    /// `NotFound(NOT_MUTING)` when no row exists.
+    fn renote_unmute(
+        &self,
+        muter_id: &str,
+        mutee_id: &str,
+        jobs: Vec<NewJob>,
+    ) -> Result<(), PortError>;
+    fn get_renote_muting(
+        &self,
+        muter_id: &str,
+        mutee_id: &str,
+    ) -> Result<Option<RenoteMuting>, PortError>;
+    fn is_renote_muting(&self, muter_id: &str, mutee_id: &str) -> Result<bool, PortError>;
+    /// Mutee ids whose pure renotes `muter_id` hides.
+    fn renote_muted_ids_for(&self, muter_id: &str) -> Result<Vec<String>, PortError>;
+    fn list_renote_mutings(
+        &self,
+        muter_id: &str,
+        cursor: &TimelineCursor,
+    ) -> Result<Vec<RenoteMuting>, PortError>;
+}
+
 pub trait ReactionStore: Send + Sync {
     fn react(
         &self,
@@ -630,6 +1062,19 @@ pub trait ReactionStore: Send + Sync {
         user_id: &str,
         note_id: &str,
     ) -> Result<Option<Reaction>, PortError>;
+    /// Every reaction row by `user_id` (`users/reactions` read path;
+    /// Misskey `NoteReactionsRepository` query parity). Backends return
+    /// rows in any order; the application op sorts newest-first and pages.
+    fn reactions_by_user(&self, user_id: &str) -> Result<Vec<Reaction>, PortError>;
+    /// Every reaction row on `note_id` (§8 edit fan-out: remote reactors
+    /// join the `Update(Note)` audience). Backends may scan; rows in any
+    /// order.
+    fn reactions_for_note(&self, note_id: &str) -> Result<Vec<Reaction>, PortError> {
+        let _ = note_id;
+        Err(PortError::StorageUnavailable(
+            "ReactionStore::reactions_for_note not implemented".to_string(),
+        ))
+    }
 }
 
 pub trait ActivityDedup: Send + Sync {
@@ -722,6 +1167,35 @@ pub trait ActivityDedup: Send + Sync {
         followee_id: &str,
         jobs: Vec<NewJob>,
     ) -> Result<bool, PortError>;
+    /// Dedup + record an inbound `Block` (remote `blocker_id` blocks local
+    /// `blockee_id`): the same atomic teardown as a local `block` (both
+    /// follow edges, both pending requests) plus `jobs`, committed with the
+    /// dedup mark in one transaction. `Ok(None)` when the activity id was
+    /// already seen. A *different* activity re-blocking an existing pair
+    /// converges to `Ok(None)` instead of erroring (no retry storm).
+    fn record_block_activity(
+        &self,
+        activity_id: &str,
+        blocker_id: &str,
+        blockee_id: &str,
+        jobs: Vec<NewJob>,
+    ) -> Result<Option<Blocking>, PortError> {
+        let _ = (activity_id, blocker_id, blockee_id, jobs);
+        unimplemented!("ActivityDedup::record_block_activity not implemented")
+    }
+    /// Dedup + remove the block for an inbound `Undo(Block)`.
+    /// `Ok(false)` on replay or when no block row exists (Misskey `unblock`
+    /// warns and returns in that case).
+    fn record_unblock_activity(
+        &self,
+        activity_id: &str,
+        blocker_id: &str,
+        blockee_id: &str,
+        jobs: Vec<NewJob>,
+    ) -> Result<bool, PortError> {
+        let _ = (activity_id, blocker_id, blockee_id, jobs);
+        unimplemented!("ActivityDedup::record_unblock_activity not implemented")
+    }
     fn record_react_activity(
         &self,
         activity_id: &str,
@@ -811,6 +1285,20 @@ pub trait ActivityDedup: Send + Sync {
         let _ = (activity_id, note_id, jobs);
         unimplemented!("ActivityDedup::record_quote_stamp_delete not implemented")
     }
+    /// Dedup + apply a federated note edit (inbound `Update(Note)`, §8):
+    /// the same [`NoteStore::apply_note_edit`] storage path (no-change
+    /// edits converge to the original), committed with the dedup mark in
+    /// one transaction. `Ok(None)` on replay. `NotFound(NO_SUCH_NOTE)` when
+    /// the cached copy is missing or deleted (callers map it to accept).
+    fn record_note_edit_activity(
+        &self,
+        activity_id: &str,
+        edit: EditNoteInput,
+        jobs: Vec<NewJob>,
+    ) -> Result<Option<Note>, PortError> {
+        let _ = (activity_id, edit, jobs);
+        unimplemented!("ActivityDedup::record_note_edit_activity not implemented")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -882,6 +1370,71 @@ pub struct QuoteStampReverifyPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplyParentResolvePayload {
     pub parent_uri: String,
+}
+
+/// Payload of a `JobKind::PollExpiry` job: the note whose poll may have
+/// expired. `not_before` is armed at the poll's `expires_at`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PollExpiryPayload {
+    pub note_id: String,
+}
+
+/// Payload of a `JobKind::PostScheduledDraft` job: the draft to post.
+/// `scheduled_at_ms` is the `scheduled_at` the job was armed for — the
+/// handler converges quietly when the stored draft no longer matches
+/// (updated/rescheduled or unscheduled meanwhile). `not_before` is armed
+/// at `scheduled_at_ms` (Misskey `postScheduledNoteQueue` delay parity).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduledDraftPayload {
+    pub draft_id: String,
+    pub scheduled_at_ms: i64,
+}
+
+/// Polls and poll votes (`docs/misskey-parity-plan.md` §4; Misskey `MiPoll`
+/// + `MiPollVote`). Poll rows are created atomically with their note in
+/// `NoteStore::create_note`; this trait covers reads, voting, and inbound
+/// `Question` vote-count sync. One storage transaction commits the vote +
+/// counter bump + jobs atomically; FDB inherits this path (no second path).
+pub trait PollStore: Send + Sync {
+    /// The poll attached to `note_id`, if any.
+    fn get_poll(&self, note_id: &str) -> Result<Option<Poll>, PortError>;
+    /// Every vote by `user_id` on `note_id` (drives `isVoted` packing and
+    /// duplicate-vote detection). Empty when the user never voted.
+    fn votes_by_user_for_note(
+        &self,
+        user_id: &str,
+        note_id: &str,
+    ) -> Result<Vec<PollVote>, PortError>;
+    /// Atomically record one vote and bump `votes[choice]` (Misskey
+    /// `PollService.vote` parity). The backend re-checks, in order:
+    /// note exists and is live (`NotFound(NO_SUCH_NOTE)`), poll exists
+    /// (`Validation(NO_POLL)`), voter not blocked by the author
+    /// (`Validation(YOU_HAVE_BEEN_BLOCKED)`; self-votes exempt), poll live
+    /// (`Validation(ALREADY_EXPIRED)`), choice in range
+    /// (`Validation(INVALID_CHOICE)`), no duplicate (`Conflict(ALREADY_VOTED)`
+    /// — for `multiple` polls only the same choice conflicts). `jobs`
+    /// commit in the same transaction.
+    fn cast_vote(&self, vote: PollVote, jobs: Vec<NewJob>) -> Result<PollVote, PortError>;
+    /// Overwrite a poll's vote counts by choice name (inbound `Question`
+    /// update, Misskey `ApQuestionService.updateQuestion` parity): counts
+    /// for stored choices present in `counts_by_name` are replaced, unknown
+    /// names are ignored, stored choices missing from the update keep their
+    /// counts. `NotFound(NO_POLL)` when the note has no poll.
+    fn sync_poll_votes(
+        &self,
+        note_id: &str,
+        counts_by_name: &[PollChoiceCount],
+        jobs: Vec<NewJob>,
+    ) -> Result<Poll, PortError>;
+}
+
+/// One choice's remotely reported vote count (inbound `Question` sync input;
+/// mirrors the ActivityPub `oneOf`/`anyOf` entry shape in contract-stable
+/// form so the application layer never imports ActivityPub types).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PollChoiceCount {
+    pub name: String,
+    pub votes: u64,
 }
 
 pub trait MediaStore: Send + Sync {
@@ -1066,6 +1619,26 @@ impl ActivityDedup for NoopActivityDedup {
         _activity_id: &str,
         _follower_id: &str,
         _followee_id: &str,
+        _jobs: Vec<NewJob>,
+    ) -> Result<bool, PortError> {
+        Ok(false)
+    }
+
+    fn record_block_activity(
+        &self,
+        _activity_id: &str,
+        _blocker_id: &str,
+        _blockee_id: &str,
+        _jobs: Vec<NewJob>,
+    ) -> Result<Option<crate::domain::blocking::Blocking>, PortError> {
+        Ok(None)
+    }
+
+    fn record_unblock_activity(
+        &self,
+        _activity_id: &str,
+        _blocker_id: &str,
+        _blockee_id: &str,
         _jobs: Vec<NewJob>,
     ) -> Result<bool, PortError> {
         Ok(false)

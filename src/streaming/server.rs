@@ -500,6 +500,59 @@ async fn dispatch_hub_message(
             );
             let _ = sender.send(frame).await;
         }
+        HubMessage::PollVoted {
+            note_id,
+            user_id,
+            choice,
+        } => {
+            push_note_updated(
+                state, viewer_id, captures, &note_id, "pollVoted",
+                serde_json::json!({ "choice": choice, "userId": user_id }),
+                sender,
+            )
+            .await;
+        }
+        HubMessage::PollEnded { note_id } => {
+            push_note_updated(
+                state,
+                viewer_id,
+                captures,
+                &note_id,
+                "pollEnded",
+                serde_json::json!({}),
+                sender,
+            )
+            .await;
+        }
+        HubMessage::NoteUpdated { note_id } => {
+            // Sharkey `publishNoteStream(note.id, 'updated', ...)` parity:
+            // the frame carries the current text/cw (a gone note loads as
+            // no frame; `push_note_updated` skips uncaptured or invisible
+            // notes anyway).
+            let services = state.services.clone();
+            let note_id_owned = note_id.clone();
+            let loaded = tokio::task::spawn_blocking(move || {
+                services.notes.get_note(&note_id_owned)
+            })
+            .await
+            .unwrap_or(Ok(None))
+            .unwrap_or(None);
+            if let Some(note) = loaded {
+                push_note_updated(
+                    state,
+                    viewer_id,
+                    captures,
+                    &note_id,
+                    "updated",
+                    serde_json::json!({
+                        "cw": note.cw,
+                        "text": note.text.unwrap_or_default(),
+                    }),
+                    sender,
+                )
+                .await;
+            }
+        }
         HubMessage::Main(msg) => {
             let me = match viewer_id {
                 Some(v) => v,
