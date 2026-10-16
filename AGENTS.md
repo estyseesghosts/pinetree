@@ -12,7 +12,7 @@ Source of truth: `sns-server-proposal.md`. If this file and the proposal disagre
 
 Contracts are frozen (see `docs/README.md`); Phase 1 may scaffold the Rust crate from them. The throwaway conformance harness lives outside the repo at `/tmp/opencode/phase0-harness` — do not move it into `src/`.
 
-## Current phase: Phase 3 — Client compatibility and streaming (Phase 2 exited 2026-10-14; Phase 2.5 cleanup slices 0–9 complete and gate-green 2026-10-15)
+## Current phase: Phase 4 — FoundationDB multi-node (Phase 3 exited 2026-10-16; exit review `docs/phase-3-exit-criteria.md`)
 
 Phase 0 exit: all boxes checked in `docs/phase-0-exit-criteria.md` — contracts frozen, note+job atomicity proven on an in-memory harness (15/15 green), FDB client verified live (7.3.77 cluster, crate 0.11.0/`fdb-7_3`, atomic pair + latencies + failure surface; see `docs/fdb-verification.md` §6).
 
@@ -41,6 +41,6 @@ Phase 3 scope (proposal §9): client compatibility and streaming. Known gaps car
 
 ## Verification
 
-- Verify by execution: run tests/prototypes and paste or reference real output in the state log. Do not mark work done on reasoning alone.
+- Verify by execution: run tests/prototypes and paste or reference real output in the state log. Do not mark work done on reasoning alone. The full gate is `bash scripts/smoke-all.sh` (see `docs/testing.md`); use it before claiming phase-level completion.
 - Both storage backends must pass the same persistence contract tests (`docs/` defines them; redb adapter comes in Phase 1, FDB in Phase 4 — Phase 0 needs only the interface + conformance test suite + prototype proof).
 - Compatibility claims require tests against real Misskey/Sharkey checkouts or target client versions, not internal mocks.

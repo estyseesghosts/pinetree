@@ -2402,7 +2402,7 @@ fn f5_locked_account_service_flow() {
     let bob = create_user(&*store, "f5_bob");
     let carol = create_user(&*store, "f5_carol");
     store
-        .update_account(&bob.id, UpdateAccountPatch { is_locked: Some(true), ..Default::default() })
+        .update_account(&bob.id, UpdateAccountPatch { is_locked: Some(true), ..Default::default() }, Vec::new())
         .unwrap();
     let mut input = CreateNoteInput::simple_public(&bob.id, "followers only");
     input.visibility = Visibility::Followers;

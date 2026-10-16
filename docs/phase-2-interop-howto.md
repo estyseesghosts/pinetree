@@ -1,5 +1,10 @@
 # Phase 2 interop — how to run each server yourself
 
+> For the single entry point covering all suites and browser topologies
+> (pinetree+keystone, pinetree+misskey, misskey+keystone, sharkey-native),
+> see `docs/testing.md`. This file remains the deep reference for the
+> four-server interop rig itself.
+
 Status: Draft (2026-10-14). Companion to `scripts/smoke-phase2.sh` and
 `tests/federation_interop.rs`. Everything binds to loopback only; nothing talks
 to the public internet.

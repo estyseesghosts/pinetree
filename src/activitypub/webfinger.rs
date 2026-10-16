@@ -546,12 +546,12 @@ mod tests {
         AccountStore, ActivityDedup, ApiTokenRecord, AuthStore, BlobStore, CreateAccountInput,
         CreateNoteInput, FollowStore, InsertMediaInput, JobQueue, LegacyAuthSessionRecord,
         MediaStore, MiAuthSessionRecord, NewJob, NoteStore, NotificationStore, PortError,
-        ReactionStore, StreamingSink, UpdateAccountPatch,
+        ReactionStore, StreamingSink, TimelineCursor, UpdateAccountPatch,
     };
     use crate::domain::follow::{Follow, FollowNotify};
     use crate::domain::id::{AidxGenerator, ManualClock};
     use crate::domain::note::{Note, Visibility};
-    use crate::domain::notification::Notification;
+    use crate::domain::notification::{Notification, NotificationKind};
     use crate::domain::reaction::Reaction;
     use crate::federation::delivery::{SafeHttpClient, SafeHttpConfig};
 
@@ -623,6 +623,7 @@ mod tests {
             &self,
             _id: &str,
             _patch: UpdateAccountPatch,
+            _jobs: Vec<NewJob>,
         ) -> Result<Account, PortError> {
             unavailable("update_account")
         }
@@ -826,6 +827,13 @@ mod tests {
         fn delete_metadata(&self, _id: &str) -> Result<(), PortError> {
             unavailable("delete_metadata")
         }
+        fn list_by_owner(
+            &self,
+            _owner_id: &str,
+        ) -> Result<Vec<crate::domain::media::MediaMeta>, PortError> {
+            // Test double stores no media rows.
+            Ok(Vec::new())
+        }
     }
 
     impl BlobStore for Mem {
@@ -851,6 +859,18 @@ mod tests {
         ) -> Result<Vec<Notification>, PortError> {
             Ok(Vec::new())
         }
+        fn mark_all_read(&self, _notifiee: &str) -> Result<u64, PortError> {
+            Ok(0)
+        }
+        fn list_notifications_filtered(
+            &self,
+            _notifiee: &str,
+            _cursor: &TimelineCursor,
+            _include: &[NotificationKind],
+            _exclude: &[NotificationKind],
+        ) -> Result<Vec<Notification>, PortError> {
+            Ok(Vec::new())
+        }
     }
 
     impl AuthStore for Mem {
@@ -865,6 +885,9 @@ mod tests {
         }
         fn get_token_by_hash(&self, _hash: &str) -> Result<Option<ApiTokenRecord>, PortError> {
             Ok(None)
+        }
+        fn delete_token_by_hash(&self, _token_hash: &str) -> Result<(), PortError> {
+            Ok(())
         }
         fn save_miauth_session(&self, _s: MiAuthSessionRecord) -> Result<(), PortError> {
             Ok(())

@@ -53,6 +53,12 @@ impl AppServices {
         // AccountStore trait cannot carry jobs, so the federated path commits
         // state+jobs atomically through the dedup record path with a fresh
         // activity id (replay is impossible; the dedup row itself is harmless).
+        let mut jobs = vec![self.streaming_job(
+            &crate::application::events::StreamingEvent::MeUpdated {
+                account_id: account_id.to_string(),
+            },
+            format!("profile:{account_id}:{}", self.ids.generate()),
+        )?];
         let mut federate_job = None;
         for f in self.follows.followers_of(account_id, None, 10_000)? {
             if let Some(follower) = self.accounts.find_by_id(&f.follower_id)? {
@@ -76,10 +82,11 @@ impl AppServices {
             }
         }
         if let Some(job) = federate_job {
+            jobs.push(job);
             let activity_id = format!("local-update-{account_id}-{}", self.ids.generate());
             match self
                 .dedup
-                .record_update_account_activity(&activity_id, account_id, patch, vec![job])?
+                .record_update_account_activity(&activity_id, account_id, patch, jobs)?
             {
                 Some(account) => return Ok(account),
                 // Dedup replay is impossible with a fresh activity id; refetch
@@ -91,7 +98,7 @@ impl AppServices {
                 }
             }
         }
-        self.accounts.update_account(account_id, patch)
+        self.accounts.update_account(account_id, patch, jobs)
     }
 
     /// Re-export for callers that only need token bookkeeping through commands.

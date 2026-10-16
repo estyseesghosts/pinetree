@@ -199,6 +199,32 @@ impl AppServices {
         self.notes.delete_note(note_id, jobs)
     }
 
+    pub fn unrenote(&self, actor_id: &str, note_id: &str) -> Result<usize, PortError> {
+        self.accounts.get_owner(actor_id)?;
+        let target = match self.notes.get_note(note_id)? {
+            None => return Err(PortError::NotFound("NO_SUCH_NOTE".to_string())),
+            Some(note) => note,
+        };
+        // All of the caller's live renotes of the target (pure renotes and
+        // quotes alike, mirroring Misskey `notes/unrenote`).
+        let own_renotes: Vec<Note> = self
+            .notes
+            .list_all_notes(&crate::application::ports::TimelineCursor::with_limit(10_000))?
+            .into_iter()
+            .filter(|note| {
+                note.author_id == actor_id
+                    && !note.is_deleted
+                    && note.renote_id.as_deref() == Some(target.id.as_str())
+            })
+            .collect();
+        let count = own_renotes.len();
+        for renote in own_renotes {
+            // The existing delete path keeps streaming + federation jobs.
+            self.delete_note(actor_id, &renote.id)?;
+        }
+        Ok(count)
+    }
+
     pub fn react(
         &self,
         user_id: &str,

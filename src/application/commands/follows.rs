@@ -207,7 +207,13 @@ impl AppServices {
 
     pub fn unfollow(&self, follower_id: &str, followee_id: &str) -> Result<(), PortError> {
         self.accounts.get_owner(follower_id)?;
-        let mut jobs = Vec::new();
+        let mut jobs = vec![self.streaming_job(
+            &StreamingEvent::Unfollowed {
+                follower_id: follower_id.to_string(),
+                followee_id: followee_id.to_string(),
+            },
+            format!("unfollow:{follower_id}:{followee_id}:{}", self.ids.generate()),
+        )?];
         if let (Some(follower), Some(followee)) = (
             self.accounts.find_by_id(follower_id)?,
             self.accounts.find_by_id(followee_id)?,

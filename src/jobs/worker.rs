@@ -1,12 +1,15 @@
 use std::sync::Arc;
 
+use crate::api::misskey::packers::{
+    pack_note, pack_notification, pack_user_detailed_not_me,
+};
 use crate::application::commands::AppServices;
-use crate::application::events::NotifyJobPayload;
+use crate::application::events::{MainEventKind, MainMessage, NotifyJobPayload, StreamingEvent};
 use crate::application::ports::{
     Clock, IdGenerator, Job, JobKind, JobQueue, NewJob, NotificationStore, PortError,
     RemoteMediaFetchPayload, StreamingSink, MAX_JOBS_PER_TXN, MAX_JOB_ATTEMPTS,
 };
-use crate::domain::notification::Notification;
+use crate::domain::notification::{Notification, NotificationKind};
 use crate::federation::retry::{DeliveryOutcome, DestinationTracker};
 
 /// In-process durable-job worker (Phase 1, single node).
@@ -122,9 +125,10 @@ impl JobWorker {
                 }
                 Err(_) => Ok(Disposition::Retry { retry_after_ms: None }),
             },
-            JobKind::StreamingPublish => match self.streaming.publish("streaming", &job.payload)
+            JobKind::StreamingPublish => match self.handle_streaming_publish(&job.payload)
             {
                 Ok(()) => Ok(Disposition::Done),
+                // Unparseable payloads can never succeed on retry.
                 Err(PortError::Validation(reason)) => {
                     Ok(Disposition::Quarantine(format!("bad-payload: {reason}")))
                 }
@@ -165,20 +169,147 @@ impl JobWorker {
         };
         let notification = Notification {
             id,
-            notifiee_id: notify.notifiee_id,
-            notifier_id: notify.notifier_id,
+            notifiee_id: notify.notifiee_id.clone(),
+            notifier_id: notify.notifier_id.clone(),
             kind: notify.kind,
-            note_id: notify.note_id,
-            reaction: notify.reaction,
+            note_id: notify.note_id.clone(),
+            reaction: notify.reaction.clone(),
             is_read: false,
         };
-        match self.notifications.insert_notification(notification) {
-            Ok(_) => Ok(()),
-            // Already inserted under this idempotency key: treat as success
-            // so the job completes instead of retrying forever.
-            Err(PortError::Conflict(_)) => Ok(()),
-            Err(e) => Err(e),
+        let stored = match self.notifications.insert_notification(notification) {
+            Ok(stored) => stored,
+            // Already inserted under this idempotency key: the live hints
+            // below already went out on the first pass, so a replay only
+            // completes instead of duplicating them.
+            Err(PortError::Conflict(_)) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        // Fresh insert only: fan the `main`-channel hints out through the
+        // streaming sink (a no-op when streaming is disabled). Hints are
+        // at-most-once per connection by design (see `streaming::hub`).
+        self.push_notify_mains(&notify, &stored)
+    }
+
+    /// Expand one stored notification into `main`-channel events (Misskey
+    /// `NotificationService` + `UserFollowingService` parity): every kind
+    /// emits `notification`; Mention/Reply/Renote also emit the packed note
+    /// under their own event name; Follow emits `follow` (to the follower,
+    /// packed followee) and `followed` (to the followee, packed follower);
+    /// ReceiveFollowRequest emits `receiveFollowRequest` (packed follower).
+    fn push_notify_mains(
+        &self,
+        notify: &NotifyJobPayload,
+        stored: &Notification,
+    ) -> Result<(), PortError> {
+        let services = &self.services;
+        let notifiee = notify.notifiee_id.as_str();
+        let notifier = notify.notifier_id.as_str();
+        let packed_notification = pack_notification(stored, services);
+        services.streaming.push_main(MainMessage {
+            user_id: notifiee.to_string(),
+            kind: MainEventKind::Notification,
+            body: packed_notification,
+        })?;
+        let packed_note = |note_id: &str| -> Result<Option<serde_json::Value>, PortError> {
+            match services.notes.get_note(note_id)? {
+                Some(note) => Ok(Some(pack_note(&note, Some(notifiee), services, 0)?)),
+                None => Ok(None),
+            }
+        };
+        let packed_user =
+            |account_id: &str, viewer: &str| -> Result<Option<serde_json::Value>, PortError> {
+                match services.accounts.find_by_id(account_id)? {
+                    Some(account) => Ok(Some(pack_user_detailed_not_me(
+                        &account,
+                        Some(viewer),
+                        services,
+                    )?)),
+                    None => Ok(None),
+                }
+            };
+        match notify.kind {
+            NotificationKind::Mention | NotificationKind::Reply | NotificationKind::Renote => {
+                let kind = match notify.kind {
+                    NotificationKind::Mention => MainEventKind::Mention,
+                    NotificationKind::Reply => MainEventKind::Reply,
+                    _ => MainEventKind::Renote,
+                };
+                if let Some(note_id) = notify.note_id.as_deref() {
+                    if let Some(packed) = packed_note(note_id)? {
+                        services.streaming.push_main(MainMessage {
+                            user_id: notifiee.to_string(),
+                            kind,
+                            body: packed,
+                        })?;
+                    }
+                }
+            }
+            NotificationKind::Follow => {
+                if let Some(packed) = packed_user(notifiee, notifier)? {
+                    services.streaming.push_main(MainMessage {
+                        user_id: notifier.to_string(),
+                        kind: MainEventKind::Follow,
+                        body: packed,
+                    })?;
+                }
+                if let Some(packed) = packed_user(notifier, notifiee)? {
+                    services.streaming.push_main(MainMessage {
+                        user_id: notifiee.to_string(),
+                        kind: MainEventKind::Followed,
+                        body: packed,
+                    })?;
+                }
+            }
+            NotificationKind::ReceiveFollowRequest => {
+                if let Some(packed) = packed_user(notifier, notifiee)? {
+                    services.streaming.push_main(MainMessage {
+                        user_id: notifiee.to_string(),
+                        kind: MainEventKind::ReceiveFollowRequest,
+                        body: packed,
+                    })?;
+                }
+            }
+            NotificationKind::Reaction => {}
         }
+        Ok(())
+    }
+
+    /// Expand one `StreamingPublish` job. `Unfollowed` needs packed bodies
+    /// (worker-side, like notifications); every other payload flows
+    /// straight into the sink untouched — including payloads this worker
+    /// cannot parse (the sink validates on its own terms, so a legacy or
+    /// foreign payload keeps the sink's retry/quarantine behavior instead
+    /// of being reclassified here).
+    fn handle_streaming_publish(&self, payload: &[u8]) -> Result<(), PortError> {
+        if let Ok(StreamingEvent::Unfollowed {
+            follower_id,
+            followee_id,
+        }) = serde_json::from_slice::<StreamingEvent>(payload)
+        {
+            // Only local followers hold sockets; the followee pack is for
+            // the follower's `main` channel (Misskey parity).
+            let local_follower = self
+                .services
+                .accounts
+                .find_by_id(&follower_id)?
+                .is_some_and(|a| a.is_local());
+            if local_follower {
+                if let Some(followee) = self.services.accounts.find_by_id(&followee_id)? {
+                    let packed = pack_user_detailed_not_me(
+                        &followee,
+                        Some(&follower_id),
+                        &self.services,
+                    )?;
+                    self.services.streaming.push_main(MainMessage {
+                        user_id: follower_id,
+                        kind: MainEventKind::Unfollow,
+                        body: packed,
+                    })?;
+                }
+            }
+            return Ok(());
+        }
+        self.streaming.publish("streaming", payload)
     }
 
     /// Slice 7: run one `RemoteMediaFetch` job. A note deleted between

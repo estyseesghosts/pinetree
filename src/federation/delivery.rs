@@ -1305,6 +1305,7 @@ pub fn upsert_remote_actor_from_doc(
                 is_cat: Some(parsed.is_cat),
                 is_explorable: Some(parsed.discoverable),
             },
+            Vec::new(),
         )?
     } else {
         services.accounts.create_account(CreateAccountInput {

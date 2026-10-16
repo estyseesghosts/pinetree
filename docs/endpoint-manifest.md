@@ -1,6 +1,7 @@
 # Misskey endpoint + streaming manifest (initial — Phase 0)
 
-**Status:** Frozen (Phase 0 freeze review 2026-10-14)
+**Status:** Frozen (Phase 0 freeze review 2026-10-14), extended by
+superseding Phase 3 decision below (2026-10-16)
 **Sources:** `sns-server-proposal.md` §6; Misskey checkout (read-only), verified this session: `endpoints/notes/create.ts:19-214`, `const.ts:6,20`, `ApiServerService.ts:157`, endpoint survey (meta, auth, accounts, follows, timelines) and streaming survey (`StreamingApiServerService.ts:42-159`, `stream/Connection.ts`, `stream/channel.ts`, timeline channels).
 
 Phase 0 scope = proposal §6 step 1 (core account/note flows) + step 2 basics (auth'd sockets, timeline channels, note capture). Richer fields, remaining channels, and polls/quotes arrive in Phase 3 driven by real client tests. Anything not listed here is **unsupported**: the server answers it per §8, never with an accidental shape.
@@ -77,6 +78,11 @@ Timelines (all → `Note[]`, cursor pagination via `sinceId`/`untilId` + `sinceD
 | `notes/timeline` (home) | `read:account` | `withFiles = false`, `withRenotes = true`, `includeMyRenotes/includeRenotedMyNotes/includeLocalRenotes = true`, `allowPartial = false` |
 | `notes/local-timeline` | none | `withFiles = false`, `withRenotes = true`, `withReplies = false` |
 | `notes/hybrid-timeline` | `read:account` | union of the above |
+| `notes/global-timeline` | none | `withFiles = false`, `withRenotes = true` (no `withReplies` — replies included, per M `global-timeline.ts` paramDef; `allowPartial` accepted and ignored) |
+
+## Superseding note — global timeline (2026-10-15)
+
+`notes/global-timeline` joins the frozen surface: no auth, `public` + non-`local_only` notes local and remote (visibility-policy §5, `is_eligible_for_federated_timeline`), newest-first with the standard cursor params. Unknown params (e.g. `withReplies`) → 400 `UNSUPPORTED_FIELD` per §8.
 
 ## 5. Response shapes (fixed field sets)
 
@@ -108,3 +114,29 @@ Timelines (all → `Note[]`, cursor pagination via `sinceId`/`untilId` + `sinceD
 ## 8. Unsupported behavior (documented responses)
 
 - Unlisted endpoint → 404. Unlisted channel → `UNSUPPORTED_CHANNEL`. Unlisted param on a listed endpoint → 400 `UNSUPPORTED_FIELD` naming it. Polls, quotes (Phase 3+), channels, OAuth, Mastodon REST API → the corresponding documented error, never partial behavior.
+
+## 9. Superseding note — Phase 3 compatibility profile (2026-10-16)
+
+The declared profile lives in `docs/phase-3-profile.md` (frozen); it
+extends this manifest without contradicting it:
+
+- Streaming §6 is now implemented per profile §2 (authenticated WS
+  `/streaming`, the five channels, note capture, notification events fed
+  from `StreamingSink` jobs). Wire definition: unknown channel on connect
+  → `{"type":"error","body":{"code":"UNSUPPORTED_CHANNEL","channel":name,
+  "id":id}}`, channel not added. Auth-refused credential channels are
+  silently ignored (Misskey `Connection.connectChannel` parity).
+  `pollVoted` is not emitted (polls remain deferred); `updated` is not
+  emitted (no note-editing operation exists).
+- New endpoints per profile §3: `users/notes`, `notes/replies`,
+  `notes/renotes`, `notes/children`, `notes/conversation`,
+  `notes/unrenote`, `users/followers`, `users/following`
+  (`Following[]` with `follower`/`followee` populated — Misskey shape),
+  `drive/files`, `drive/files/show|update|delete`, extended
+  `i/notifications` (cursor, `markAsRead`, type filters, default limit 10),
+  `notifications/mark-all-as-read`, `i/revoke-token`, `notes/search`,
+  `notes/search-by-tag`.
+- Explicitly out (profile §5): antennas, polls/vote, drive folders,
+  clips, channels, chat, pages, Reversi, lists, `notifications-grouped`,
+  featured/mentions/user-list timelines, `notes/reactions` (list),
+  `signin-flow`, OAuth, Mastodon API.

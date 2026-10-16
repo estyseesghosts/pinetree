@@ -33,12 +33,14 @@ use crate::application::ports::{
 };
 use crate::domain::account::Account;
 use crate::domain::note::{ReactionAcceptance, Visibility};
-use crate::domain::notification::Notification;
+use crate::domain::notification::NotificationKind;
 use crate::federation::delivery::{
     fetch_and_upsert_remote_actor, fetch_remote_note, webfinger_discover_actor_uri,
 };
 use crate::federation::inbox as fed_inbox;
 use crate::jobs::worker::JobWorker;
+use crate::streaming::hub::Hub;
+use crate::streaming::server::streaming_handler;
 
 use super::auth::{
     authenticate, extract_raw_token, generate_random_token, hash_password_async, hash_token,
@@ -47,21 +49,23 @@ use super::auth::{
 };
 use super::errors::ApiError;
 use super::packers::{
-    format_millis, pack_drive_file, pack_me_detailed, pack_meta, pack_note,
-    pack_user_detailed_not_me, pack_user_lite,
+    pack_drive_file, pack_following, pack_me_detailed, pack_meta, pack_note,
+    pack_notification, pack_user_detailed_not_me, pack_user_lite,
 };
 use super::request::check_allowed_fields;
 use super::response::{RateLimiter, UploadSlots};
 
 /// Shared API state: application services, the durable-job worker, the
-/// Misskey rate limiter, the concurrent-upload slots, and the reverse
-/// proxies whose `X-Forwarded-For` is honored ([`client_ip`]).
+/// Misskey rate limiter, the concurrent-upload slots, the live-streaming
+/// broadcast hub, and the reverse proxies whose `X-Forwarded-For` is
+/// honored ([`client_ip`]).
 #[derive(Clone)]
 pub struct ApiState {
     pub services: Arc<AppServices>,
     pub worker: Arc<JobWorker>,
     pub rate_limiter: Arc<RateLimiter>,
     pub upload_slots: Arc<UploadSlots>,
+    pub hub: Hub,
     pub trusted_proxies: Arc<Vec<IpAddr>>,
 }
 
@@ -127,6 +131,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/api/signin", post(signin))
         .route("/api/drive/files/create", post(drive_files_create))
         .route("/api/{*endpoint}", post(api_dispatch))
+        .route("/streaming", get(streaming_handler))
         // No `DefaultBodyLimit::disable()`: the Misskey JSON dispatcher
         // enforces its own 1 MiB cap in `api_dispatch_blocking` (testable
         // without router layers), `drive/files/create` enforces its own
@@ -456,6 +461,68 @@ fn parse_cursor(obj: &Map<String, Value>) -> Result<TimelineCursor, ApiError> {
     })
 }
 
+/// Misskey notification types (misskey `types.ts` `notificationTypes`) that
+/// are valid `i/notifications` `includeTypes`/`excludeTypes` entries but can
+/// never match a local row: pinetree only emits the six kinds of
+/// [`NotificationKind`].
+fn is_unemitted_notification_type(name: &str) -> bool {
+    matches!(
+        name,
+        "note"
+            | "pollEnded"
+            | "scheduledNotePosted"
+            | "scheduledNotePostFailed"
+            | "followRequestAccepted"
+            | "roleAssigned"
+            | "chatRoomInvitationReceived"
+            | "achievementEarned"
+            | "exportCompleted"
+            | "login"
+            | "createToken"
+            | "app"
+            | "test"
+    )
+}
+
+/// Misskey obsolete notification types (`types.ts`
+/// `obsoleteNotificationTypes`): accepted for backwards compatibility and
+/// silently dropped from filters.
+fn is_obsolete_notification_type(name: &str) -> bool {
+    matches!(name, "pollVote" | "groupInvited")
+}
+
+/// Map one `includeTypes`/`excludeTypes` entry to the local kind.
+/// `Ok(None)` = valid but locally unemitted (matches nothing); obsolete
+/// types never reach here (the caller drops them first).
+fn notification_kind_for(field: &str, name: &str) -> Result<Option<NotificationKind>, ApiError> {
+    match name {
+        "follow" => Ok(Some(NotificationKind::Follow)),
+        "mention" => Ok(Some(NotificationKind::Mention)),
+        "reply" => Ok(Some(NotificationKind::Reply)),
+        // Quotes notify as `Renote` locally (no separate quote kind), so
+        // both Misskey types select renote notifications.
+        "renote" | "quote" => Ok(Some(NotificationKind::Renote)),
+        "reaction" => Ok(Some(NotificationKind::Reaction)),
+        "receiveFollowRequest" => Ok(Some(NotificationKind::ReceiveFollowRequest)),
+        _ if is_unemitted_notification_type(name) => Ok(None),
+        _ => Err(ApiError::invalid_param(
+            field,
+            &format!("unknown notification type: {name}"),
+        )),
+    }
+}
+
+/// Every [`NotificationKind`] the local store can emit, for the
+/// exclude-everything early return (`i/notifications` Misskey parity).
+const ALL_NOTIFICATION_KINDS: [NotificationKind; 6] = [
+    NotificationKind::Follow,
+    NotificationKind::ReceiveFollowRequest,
+    NotificationKind::Mention,
+    NotificationKind::Reply,
+    NotificationKind::Renote,
+    NotificationKind::Reaction,
+];
+
 /// Pack `account` for `viewer`: the caller's own account packs as
 /// `MeDetailed`, everyone else as `UserDetailedNotMe`.
 fn pack_account_for(
@@ -471,43 +538,6 @@ fn pack_account_for(
     }
     let viewer_id = viewer.map(|caller| caller.account.id.as_str());
     pack_user_detailed_not_me(account, viewer_id, services).map_err(ApiError::from_port_error)
-}
-
-fn pack_notification(note: &Notification, services: &AppServices) -> Value {
-    let created_at = services
-        .ids
-        .parse_time(&note.id)
-        .map(format_millis)
-        .unwrap_or_else(|_| format_millis(services.clock.now_ms()));
-    let kind = serde_json::to_value(&note.kind)
-        .ok()
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or_else(|| "follow".to_string());
-    let user = match services.accounts.find_by_id(&note.notifier_id) {
-        Ok(Some(account)) => {
-            pack_user_lite(&account, &services.public_url, services.clock.now_ms())
-        }
-        _ => Value::Null,
-    };
-    let packed_note = match note.note_id.as_deref() {
-        Some(note_id) => match services.notes.get_note(note_id) {
-            Ok(Some(target)) => {
-                pack_note(&target, Some(&note.notifiee_id), services, 0).unwrap_or(Value::Null)
-            }
-            _ => Value::Null,
-        },
-        None => Value::Null,
-    };
-    serde_json::json!({
-        "id": note.id,
-        "createdAt": created_at,
-        "type": kind,
-        "isRead": note.is_read,
-        "userId": note.notifier_id,
-        "user": user,
-        "note": packed_note,
-        "reaction": note.reaction.clone().unwrap_or_default(),
-    })
 }
 
 // --- Media / identicon -----------------------------------------------------
@@ -2153,6 +2183,37 @@ fn api_dispatch_blocking(
             pack_note_list(&state.services, &notes, viewer_id)
         }
 
+        "notes/global-timeline" => {
+            // Misskey `notes/global-timeline` paramDef: withFiles,
+            // withRenotes, limit, sinceId, untilId, sinceDate, untilDate —
+            // no auth, no withReplies. `allowPartial` is accepted and
+            // ignored like on the other timeline endpoints (Misskey's ajv
+            // validation ignores unknown params; ours rejects them, so
+            // list the harmless one explicitly).
+            check_allowed_fields(
+                &obj,
+                &[
+                    "withFiles",
+                    "withRenotes",
+                    "limit",
+                    "sinceId",
+                    "untilId",
+                    "sinceDate",
+                    "untilDate",
+                    "allowPartial",
+                ],
+            )?;
+            let cursor = parse_cursor(&obj)?;
+            let with_files = opt_bool(&obj, "withFiles", false)?;
+            let with_renotes = opt_bool(&obj, "withRenotes", true)?;
+            let viewer_id = caller.as_ref().map(|caller| caller.account.id.as_str());
+            let notes = state
+                .services
+                .global_timeline(viewer_id, &cursor, with_files, with_renotes)
+                .map_err(ApiError::from_port_error)?;
+            pack_note_list(&state.services, &notes, viewer_id)
+        }
+
         "notes/hybrid-timeline" => {
             check_allowed_fields(
                 &obj,
@@ -2219,29 +2280,515 @@ fn api_dispatch_blocking(
         }
 
         "i/notifications" => {
-            check_allowed_fields(&obj, &["limit", "sinceId", "untilId"])?;
+            check_allowed_fields(
+                &obj,
+                &[
+                    "limit",
+                    "sinceId",
+                    "untilId",
+                    "sinceDate",
+                    "untilDate",
+                    "markAsRead",
+                    "includeTypes",
+                    "excludeTypes",
+                ],
+            )?;
             let caller = require_caller(caller)?;
             caller.require_permission("read:account")?;
-            let limit = match opt_usize(&obj, "limit")? {
-                None => 20,
-                Some(limit) if (1..=100).contains(&limit) => limit,
-                Some(_) => {
-                    return Err(ApiError::invalid_param(
-                        "limit",
-                        "must be an integer between 1 and 100",
-                    ));
+            let cursor = parse_cursor(&obj)?;
+            let mark_as_read = opt_bool(&obj, "markAsRead", true)?;
+            // Presence (not emptiness) of `includeTypes` decides filtering:
+            // an explicitly empty array matches nothing (Misskey parity).
+            let include_requested = obj.contains_key("includeTypes");
+            let mut include: Vec<NotificationKind> = Vec::new();
+            for name in str_list(&obj, "includeTypes")? {
+                if is_obsolete_notification_type(&name) {
+                    continue;
                 }
-            };
+                if let Some(kind) = notification_kind_for("includeTypes", &name)? {
+                    if !include.contains(&kind) {
+                        include.push(kind);
+                    }
+                }
+            }
+            let mut exclude: Vec<NotificationKind> = Vec::new();
+            for name in str_list(&obj, "excludeTypes")? {
+                if is_obsolete_notification_type(&name) {
+                    continue;
+                }
+                if let Some(kind) = notification_kind_for("excludeTypes", &name)? {
+                    if !exclude.contains(&kind) {
+                        exclude.push(kind);
+                    }
+                }
+            }
+            // Misskey parity: an explicitly empty (or never-matching)
+            // `includeTypes`, or excluding every emittable type, matches
+            // nothing — without touching the store.
+            let matches_nothing = (include_requested && include.is_empty())
+                || (!exclude.is_empty()
+                    && ALL_NOTIFICATION_KINDS
+                        .iter()
+                        .all(|kind| exclude.contains(kind)));
+            if matches_nothing {
+                if mark_as_read {
+                    state
+                        .services
+                        .mark_all_notifications_read(&caller.account.id)
+                        .map_err(ApiError::from_port_error)?;
+                }
+                return Ok(Json(Value::Array(Vec::new())).into_response());
+            }
             let notifications = state
                 .services
                 .notifications
-                .list_notifications(&caller.account.id, limit)
+                .list_notifications_filtered(&caller.account.id, &cursor, &include, &exclude)
                 .map_err(ApiError::from_port_error)?;
             let packed: Vec<Value> = notifications
                 .iter()
                 .map(|note| pack_notification(note, &state.services))
                 .collect();
+            if mark_as_read {
+                state
+                    .services
+                    .mark_all_notifications_read(&caller.account.id)
+                    .map_err(ApiError::from_port_error)?;
+            }
             Ok(Json(Value::Array(packed)).into_response())
+        }
+
+        "notifications/mark-all-as-read" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:notifications")?;
+            state
+                .services
+                .mark_all_notifications_read(&caller.account.id)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "i/revoke-token" => {
+            check_allowed_fields(&obj, &["token", "tokenId"])?;
+            let caller = require_caller(caller)?;
+            // Any credential may revoke (Misskey parity); third-party tokens
+            // are restricted to their own token below. No rate limit: token
+            // revocation is rare and must never lock a user out.
+            if obj.get("tokenId").is_some_and(|v| !v.is_null()) {
+                // Pinetree tokens are hash-addressed and no token ids are
+                // ever issued, so no `tokenId` can resolve: Misskey-parity
+                // no-op success for an unknown target (profile §3 deviation,
+                // logged in the phase-3 endpoints state log).
+                return Ok(StatusCode::NO_CONTENT.into_response());
+            }
+            let raw = match obj.get("token") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => Some(s.clone()),
+                Some(_) => {
+                    return Err(ApiError::invalid_param("token", "must be a string"));
+                }
+            };
+            match raw {
+                // Both absent: revoke the caller's own token (profile §3).
+                None => {
+                    state
+                        .services
+                        .auth
+                        .delete_token_by_hash(&hash_token(&caller.raw_token))
+                        .map_err(ApiError::from_port_error)?;
+                    Ok(StatusCode::NO_CONTENT.into_response())
+                }
+                // Misskey parity: an empty `token` is a no-op success.
+                Some(token) if token.is_empty() => Ok(StatusCode::NO_CONTENT.into_response()),
+                Some(token) => {
+                    let hash = hash_token(&token);
+                    let record = state
+                        .services
+                        .auth
+                        .get_token_by_hash(&hash)
+                        .map_err(ApiError::from_port_error)?;
+                    let Some(record) = record else {
+                        return Ok(StatusCode::NO_CONTENT.into_response());
+                    };
+                    if record.account_id != caller.account.id {
+                        return Ok(StatusCode::NO_CONTENT.into_response());
+                    }
+                    if !caller.is_first_party && hash != hash_token(&caller.raw_token) {
+                        return Err(ApiError::permission_denied());
+                    }
+                    state
+                        .services
+                        .auth
+                        .delete_token_by_hash(&hash)
+                        .map_err(ApiError::from_port_error)?;
+                    Ok(StatusCode::NO_CONTENT.into_response())
+                }
+            }
+        }
+
+        "users/notes" => {
+            check_allowed_fields(
+                &obj,
+                &[
+                    "userId",
+                    "withReplies",
+                    "withRenotes",
+                    "withChannelNotes",
+                    "limit",
+                    "sinceId",
+                    "untilId",
+                    "sinceDate",
+                    "untilDate",
+                    "allowPartial",
+                    "withFiles",
+                ],
+            )?;
+            let user_id = required_str(&obj, "userId")?;
+            let cursor = parse_cursor(&obj)?;
+            let with_replies = opt_bool(&obj, "withReplies", false)?;
+            let with_renotes = opt_bool(&obj, "withRenotes", true)?;
+            // No channels exist: `withChannelNotes` is accepted and ignored,
+            // as is `allowPartial`.
+            let with_files = opt_bool(&obj, "withFiles", false)?;
+            let viewer_id = caller.as_ref().map(|caller| caller.account.id.as_str());
+            let notes = state
+                .services
+                .user_notes(
+                    &user_id,
+                    viewer_id,
+                    &cursor,
+                    with_replies,
+                    with_renotes,
+                    with_files,
+                )
+                .map_err(ApiError::from_port_error)?;
+            pack_note_list(&state.services, &notes, viewer_id)
+        }
+
+        "notes/replies" => {
+            check_allowed_fields(
+                &obj,
+                &["noteId", "limit", "sinceId", "untilId", "sinceDate", "untilDate"],
+            )?;
+            let note_id = required_str(&obj, "noteId")?;
+            let cursor = parse_cursor(&obj)?;
+            let viewer_id = caller.as_ref().map(|caller| caller.account.id.as_str());
+            let notes = state
+                .services
+                .note_replies(&note_id, viewer_id, &cursor)
+                .map_err(ApiError::from_port_error)?;
+            pack_note_list(&state.services, &notes, viewer_id)
+        }
+
+        "notes/renotes" => {
+            check_allowed_fields(
+                &obj,
+                &["noteId", "limit", "sinceId", "untilId", "sinceDate", "untilDate"],
+            )?;
+            let note_id = required_str(&obj, "noteId")?;
+            let cursor = parse_cursor(&obj)?;
+            let viewer_id = caller.as_ref().map(|caller| caller.account.id.as_str());
+            let notes = state
+                .services
+                .note_renotes(&note_id, viewer_id, &cursor)
+                .map_err(ApiError::from_port_error)?;
+            pack_note_list(&state.services, &notes, viewer_id)
+        }
+
+        "notes/children" => {
+            check_allowed_fields(
+                &obj,
+                &["noteId", "limit", "sinceId", "untilId", "sinceDate", "untilDate"],
+            )?;
+            let note_id = required_str(&obj, "noteId")?;
+            let cursor = parse_cursor(&obj)?;
+            let viewer_id = caller.as_ref().map(|caller| caller.account.id.as_str());
+            let notes = state
+                .services
+                .note_children(&note_id, viewer_id, &cursor)
+                .map_err(ApiError::from_port_error)?;
+            pack_note_list(&state.services, &notes, viewer_id)
+        }
+
+        "notes/conversation" => {
+            check_allowed_fields(&obj, &["noteId", "limit", "offset"])?;
+            let note_id = required_str(&obj, "noteId")?;
+            let limit = get_limit(&obj)?;
+            let offset = opt_usize(&obj, "offset")?.unwrap_or(0);
+            let viewer_id = caller.as_ref().map(|caller| caller.account.id.as_str());
+            let notes = state
+                .services
+                .note_conversation(&note_id, viewer_id, limit, offset)
+                .map_err(ApiError::from_port_error)?;
+            pack_note_list(&state.services, &notes, viewer_id)
+        }
+
+        "notes/unrenote" => {
+            check_allowed_fields(&obj, &["noteId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:notes")?;
+            // Same cost class as note deletion; no dedicated bucket exists.
+            state.rate_limiter.check(&rate_key, "notes/delete")?;
+            let note_id = required_str(&obj, "noteId")?;
+            state
+                .services
+                .unrenote(&caller.account.id, &note_id)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "users/followers" | "users/following" => {
+            check_allowed_fields(
+                &obj,
+                &[
+                    "userId",
+                    "username",
+                    "host",
+                    "sinceId",
+                    "untilId",
+                    "sinceDate",
+                    "untilDate",
+                    "limit",
+                ],
+            )?;
+            let account = if let Some(user_id) = obj.get("userId").and_then(Value::as_str) {
+                state
+                    .services
+                    .users_show_by_id(user_id)
+                    .map_err(ApiError::from_port_error)?
+            } else if let Some(username) = obj.get("username").and_then(Value::as_str) {
+                let host = match obj.get("host") {
+                    None => {
+                        return Err(ApiError::invalid_param(
+                            "host",
+                            "host is required with username",
+                        ));
+                    }
+                    Some(Value::Null) => None,
+                    Some(Value::String(h)) => Some(h.as_str()),
+                    Some(_) => {
+                        return Err(ApiError::invalid_param(
+                            "host",
+                            "must be a string or null",
+                        ));
+                    }
+                };
+                state
+                    .services
+                    .users_show_by_username(username, host)
+                    .map_err(ApiError::from_port_error)?
+            } else {
+                return Err(ApiError::invalid_param(
+                    "userId",
+                    "one of userId or username is required",
+                ));
+            };
+            let cursor = parse_cursor(&obj)?;
+            let viewer_id = caller.as_ref().map(|caller| caller.account.id.as_str());
+            let follows = if endpoint == "users/followers" {
+                state
+                    .services
+                    .user_followers(&account.id, &cursor)
+                    .map_err(ApiError::from_port_error)?
+            } else {
+                state
+                    .services
+                    .user_following(&account.id, &cursor)
+                    .map_err(ApiError::from_port_error)?
+            };
+            let mut out = Vec::with_capacity(follows.len());
+            for follow in &follows {
+                out.push(
+                    pack_following(follow, viewer_id, &state.services)
+                        .map_err(ApiError::from_port_error)?,
+                );
+            }
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        "drive/files" => {
+            check_allowed_fields(
+                &obj,
+                &[
+                    "limit",
+                    "sinceId",
+                    "untilId",
+                    "sinceDate",
+                    "untilDate",
+                    "folderId",
+                    "type",
+                    "sort",
+                ],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:drive")?;
+            if let Some(folder) = obj.get("folderId") {
+                if !folder.is_null() {
+                    return Err(ApiError::invalid_param(
+                        "folderId",
+                        "folders are unsupported; folderId must be null",
+                    ));
+                }
+            }
+            let type_prefix: Option<String> = match opt_string(&obj, "type")? {
+                None => None,
+                Some(raw) => {
+                    if raw.is_empty()
+                        || !raw
+                            .chars()
+                            .all(|c| c.is_ascii_alphabetic() || c == '/' || c == '-' || c == '*')
+                    {
+                        return Err(ApiError::invalid_param(
+                            "type",
+                            "must match /^[a-zA-Z/\\-*]+$/",
+                        ));
+                    }
+                    Some(raw.strip_suffix('*').unwrap_or(&raw).to_string())
+                }
+            };
+            match opt_string(&obj, "sort")? {
+                None => {}
+                Some(sort) if sort == "-createdAt" => {}
+                Some(_) => {
+                    return Err(ApiError::invalid_param(
+                        "sort",
+                        "only \"-createdAt\" is supported",
+                    ));
+                }
+            }
+            let cursor = parse_cursor(&obj)?;
+            let files = state
+                .services
+                .list_drive_files(&caller.account.id, &cursor, type_prefix.as_deref())
+                .map_err(ApiError::from_port_error)?;
+            let packed: Vec<Value> = files
+                .iter()
+                .map(|meta| pack_drive_file(meta, &state.services))
+                .collect();
+            Ok(Json(Value::Array(packed)).into_response())
+        }
+
+        "drive/files/show" => {
+            check_allowed_fields(&obj, &["fileId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:drive")?;
+            let file_id = required_str(&obj, "fileId")?;
+            let meta = state
+                .services
+                .get_media_for(&caller.account.id, &file_id)
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(pack_drive_file(&meta, &state.services)).into_response())
+        }
+
+        "drive/files/update" => {
+            check_allowed_fields(&obj, &["fileId", "isSensitive", "comment", "name"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:drive")?;
+            // Same cost class as uploads; no dedicated bucket exists.
+            state.rate_limiter.check(&rate_key, "drive/files/create")?;
+            let file_id = required_str(&obj, "fileId")?;
+            let name = match obj.get("name") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => Some(s.clone()),
+                Some(_) => {
+                    return Err(ApiError::invalid_param("name", "must be a string"));
+                }
+            };
+            let is_sensitive = match obj.get("isSensitive") {
+                None | Some(Value::Null) => None,
+                Some(Value::Bool(b)) => Some(*b),
+                Some(_) => {
+                    return Err(ApiError::invalid_param(
+                        "isSensitive",
+                        "must be a boolean",
+                    ));
+                }
+            };
+            let comment = update_string_field(&obj, "comment")?;
+            if let Some(Some(text)) = comment.as_ref() {
+                if text.chars().count() > 512 {
+                    return Err(ApiError::invalid_param(
+                        "comment",
+                        "must be at most 512 chars",
+                    ));
+                }
+            }
+            let meta = state
+                .services
+                .update_media(
+                    &caller.account.id,
+                    &file_id,
+                    name,
+                    is_sensitive,
+                    comment,
+                )
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(pack_drive_file(&meta, &state.services)).into_response())
+        }
+
+        "drive/files/delete" => {
+            check_allowed_fields(&obj, &["fileId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:drive")?;
+            // Same cost class as uploads; no dedicated bucket exists.
+            state.rate_limiter.check(&rate_key, "drive/files/create")?;
+            let file_id = required_str(&obj, "fileId")?;
+            state
+                .services
+                .delete_media(&caller.account.id, &file_id)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "notes/search" => {
+            check_allowed_fields(
+                &obj,
+                &[
+                    "query",
+                    "limit",
+                    "sinceId",
+                    "untilId",
+                    "sinceDate",
+                    "untilDate",
+                    "userId",
+                    "host",
+                ],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:account")?;
+            let query = required_str(&obj, "query")?;
+            let cursor = parse_cursor(&obj)?;
+            let user_id = opt_string(&obj, "userId")?;
+            let host = opt_string(&obj, "host")?;
+            let viewer_id = Some(caller.account.id.as_str());
+            let notes = state
+                .services
+                .search_notes(
+                    &query,
+                    viewer_id,
+                    &cursor,
+                    user_id.as_deref(),
+                    host.as_deref(),
+                )
+                .map_err(ApiError::from_port_error)?;
+            pack_note_list(&state.services, &notes, viewer_id)
+        }
+
+        "notes/search-by-tag" => {
+            check_allowed_fields(
+                &obj,
+                &["tag", "limit", "sinceId", "untilId", "sinceDate", "untilDate"],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:account")?;
+            let tag = required_str(&obj, "tag")?;
+            let cursor = parse_cursor(&obj)?;
+            let viewer_id = Some(caller.account.id.as_str());
+            let notes = state
+                .services
+                .notes_with_tag(&tag, viewer_id, &cursor)
+                .map_err(ApiError::from_port_error)?;
+            pack_note_list(&state.services, &notes, viewer_id)
         }
 
         "ap/show" => {
@@ -2554,6 +3101,7 @@ mod tests {
                 worker,
                 rate_limiter,
                 upload_slots,
+                hub: Hub::new(1024),
                 trusted_proxies: Arc::new(Vec::new()),
             },
             clock,
@@ -3446,6 +3994,244 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn global_timeline_carries_remote_public_notes() {
+        use crate::application::ports::{
+            AccountStore, CreateAccountInput, CreateNoteInput,
+        };
+        use crate::domain::note::Visibility;
+
+        let (state, clock) = test_state();
+        let (_, alice_token) = signup_user(&state, "alice").await;
+        let (_, bob_token) = signup_user(&state, "bob").await;
+
+        // Remote actor, as cached from federation.
+        let remote = state
+            .services
+            .accounts
+            .create_account(CreateAccountInput {
+                handle: "rina".to_string(),
+                host: Some("remote.example".to_string()),
+                display_name: None,
+                description: None,
+                location: None,
+                birthday: None,
+                uri: Some("https://remote.example/users/rina".to_string()),
+                inbox: Some("https://remote.example/inbox".to_string()),
+                shared_inbox: None,
+                is_bot: false,
+                is_cat: false,
+                is_locked: false,
+                preserved_usernames: Vec::new(),
+            })
+            .expect("remote account");
+
+        async fn post(
+            state: &ApiState,
+            body: Value,
+            token: Option<&str>,
+        ) -> String {
+            let (status, value) = call(state, "notes/create", body, token).await;
+            assert_eq!(status, StatusCode::OK, "{value}");
+            value["createdNote"]["id"].as_str().unwrap().to_string()
+        }
+
+        let alice_public = post(
+            &state,
+            serde_json::json!({ "text": "alice public" }),
+            Some(&alice_token),
+        )
+        .await;
+        clock.advance_ms(1_000);
+        post(
+            &state,
+            serde_json::json!({ "text": "alice home", "visibility": "home" }),
+            Some(&alice_token),
+        )
+        .await;
+        clock.advance_ms(1_000);
+        post(
+            &state,
+            serde_json::json!({ "text": "alice local-only", "localOnly": true }),
+            Some(&alice_token),
+        )
+        .await;
+        clock.advance_ms(1_000);
+        post(
+            &state,
+            serde_json::json!({ "text": "alice followers", "visibility": "followers" }),
+            Some(&alice_token),
+        )
+        .await;
+        clock.advance_ms(1_000);
+        // A self-reply: excluded from local-timeline by default, but the
+        // global timeline has no reply filter (Misskey has no `withReplies`
+        // on `notes/global-timeline`).
+        let alice_reply = post(
+            &state,
+            serde_json::json!({ "text": "alice self-reply", "replyId": alice_public }),
+            Some(&alice_token),
+        )
+        .await;
+        clock.advance_ms(1_000);
+
+        // Remote notes arrive through the same inbound op the inbox uses.
+        let mut inbound = |activity: &str, uri: &str, text: &str, visibility: Visibility| {
+            let mut input = CreateNoteInput::simple_public(remote.id.clone(), text);
+            input.visibility = visibility;
+            input.uri = Some(uri.to_string());
+            state
+                .services
+                .handle_inbound_create_note(activity, input, Vec::new())
+                .expect("inbound note")
+                .expect("first delivery commits")
+                .id
+        };
+        let remote_public = inbound(
+            "https://remote.example/activities/1",
+            "https://remote.example/notes/1",
+            "remote public",
+            Visibility::Public,
+        );
+        clock.advance_ms(1_000);
+        inbound(
+            "https://remote.example/activities/2",
+            "https://remote.example/notes/2",
+            "remote followers",
+            Visibility::Followers,
+        );
+        clock.advance_ms(1_000);
+
+        // Anonymous global timeline: local + remote public notes (plus the
+        // self-reply, which is public), newest first. Home, local-only and
+        // followers notes never appear.
+        let (status, global) = call(
+            &state,
+            "notes/global-timeline",
+            serde_json::json!({ "limit": 10 }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{global}");
+        let ids: Vec<&str> = global
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                remote_public.as_str(),
+                alice_reply.as_str(),
+                alice_public.as_str()
+            ],
+            "{global}"
+        );
+
+        // `withReplies` is not a global-timeline param (Misskey parity).
+        let (status, value) = call(
+            &state,
+            "notes/global-timeline",
+            serde_json::json!({ "withReplies": true }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "UNSUPPORTED_FIELD");
+
+        // Authenticated reads see the same public surface.
+        let (status, authed) = call(
+            &state,
+            "notes/global-timeline",
+            serde_json::json!({ "limit": 10 }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{authed}");
+        assert_eq!(authed, global);
+
+        // Local timeline still excludes the remote note.
+        let (status, local) = call(
+            &state,
+            "notes/local-timeline",
+            serde_json::json!({ "limit": 10 }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{local}");
+        assert!(
+            local
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|n| n["id"].as_str().unwrap() != remote_public),
+            "{local}"
+        );
+
+        // `withRenotes=false` drops pure renotes; `withFiles=true` keeps
+        // only notes with attachments (none here).
+        let alice_renote = post(
+            &state,
+            serde_json::json!({ "renoteId": alice_public }),
+            Some(&alice_token),
+        )
+        .await;
+        clock.advance_ms(1_000);
+        let (status, with_renotes) = call(
+            &state,
+            "notes/global-timeline",
+            serde_json::json!({ "limit": 10 }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{with_renotes}");
+        assert_eq!(with_renotes.as_array().unwrap().len(), ids.len() + 1);
+        assert_eq!(
+            with_renotes[0]["id"].as_str().unwrap(),
+            alice_renote.as_str()
+        );
+        let (status, no_renotes) = call(
+            &state,
+            "notes/global-timeline",
+            serde_json::json!({ "withRenotes": false }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{no_renotes}");
+        assert_eq!(no_renotes.as_array().unwrap().len(), ids.len());
+        let (status, with_files) = call(
+            &state,
+            "notes/global-timeline",
+            serde_json::json!({ "withFiles": true }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{with_files}");
+        assert_eq!(with_files.as_array().unwrap().len(), 0);
+
+        // Cursor pagination over the global timeline.
+        let (status, page) = call(
+            &state,
+            "notes/global-timeline",
+            serde_json::json!({ "limit": 1 }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page.as_array().unwrap().len(), 1);
+        assert_eq!(page[0]["id"].as_str().unwrap(), alice_renote.as_str());
+        let (status, rest) = call(
+            &state,
+            "notes/global-timeline",
+            serde_json::json!({ "untilId": alice_renote }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{rest}");
+        assert_eq!(rest.as_array().unwrap().len(), ids.len());
+    }
+
+    #[tokio::test]
     async fn reactions_create_rejects_duplicates() {
         let (state, clock) = test_state();
         let (_, alice_token) = signup_user(&state, "alice").await;
@@ -3903,5 +4689,1260 @@ mod tests {
         let response = identicon(Path("alice".to_string())).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[CONTENT_TYPE], "image/svg+xml");
+    }
+
+    // --- Phase 3 REST profile ------------------------------------------------
+
+    async fn create_note(state: &ApiState, body: Value, token: &str) -> String {
+        let (status, value) = call(state, "notes/create", body, Some(token)).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        value["createdNote"]["id"].as_str().unwrap().to_string()
+    }
+
+    fn note_ids(value: &Value) -> Vec<String> {
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn phase3_users_notes_filters_and_pagination() {
+        let (state, clock) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (_, bob_token) = signup_user(&state, "bob").await;
+
+        let root = create_note(
+            &state,
+            serde_json::json!({ "text": "root note" }),
+            &alice_token,
+        )
+        .await;
+        clock.advance_ms(1_000);
+        let reply = create_note(
+            &state,
+            serde_json::json!({ "text": "a reply", "replyId": root }),
+            &alice_token,
+        )
+        .await;
+        clock.advance_ms(1_000);
+        let pure = create_note(
+            &state,
+            serde_json::json!({ "renoteId": root }),
+            &alice_token,
+        )
+        .await;
+        clock.advance_ms(1_000);
+        let quote = create_note(
+            &state,
+            serde_json::json!({ "renoteId": root, "text": "quoted" }),
+            &alice_token,
+        )
+        .await;
+        clock.advance_ms(1_000);
+
+        // Defaults: no replies, renotes included.
+        let (status, notes) = call(
+            &state,
+            "users/notes",
+            serde_json::json!({ "userId": alice_id }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{notes}");
+        assert_eq!(note_ids(&notes), vec![quote.clone(), pure.clone(), root.clone()]);
+
+        // With replies.
+        let (status, notes) = call(
+            &state,
+            "users/notes",
+            serde_json::json!({ "userId": alice_id, "withReplies": true }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{notes}");
+        assert_eq!(
+            note_ids(&notes),
+            vec![quote.clone(), pure.clone(), reply.clone(), root.clone()]
+        );
+
+        // Without renotes: the pure renote drops out, the quote stays.
+        let (status, notes) = call(
+            &state,
+            "users/notes",
+            serde_json::json!({ "userId": alice_id, "withRenotes": false }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{notes}");
+        assert_eq!(note_ids(&notes), vec![quote.clone(), root.clone()]);
+
+        // Cursor pagination.
+        let (status, page) = call(
+            &state,
+            "users/notes",
+            serde_json::json!({ "userId": alice_id, "limit": 1 }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(note_ids(&page), vec![quote.clone()]);
+        let (status, page) = call(
+            &state,
+            "users/notes",
+            serde_json::json!({ "userId": alice_id, "untilId": quote }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page.as_array().unwrap().len(), 2);
+
+        // Unknown author yields [] (Misskey has no NO_SUCH_USER here).
+        let (status, notes) = call(
+            &state,
+            "users/notes",
+            serde_json::json!({ "userId": "aid00000000000099" }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{notes}");
+        assert_eq!(notes.as_array().unwrap().len(), 0);
+
+        // Param validation.
+        let (status, value) = call(
+            &state,
+            "users/notes",
+            serde_json::json!({}),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "INVALID_PARAM");
+        let (status, value) = call(
+            &state,
+            "users/notes",
+            serde_json::json!({ "userId": alice_id, "limit": 500 }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "INVALID_PARAM");
+        let (status, value) = call(
+            &state,
+            "users/notes",
+            serde_json::json!({ "userId": alice_id, "channelId": "x" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "UNSUPPORTED_FIELD");
+    }
+
+    #[tokio::test]
+    async fn phase3_note_relations() {
+        let (state, clock) = test_state();
+        let (_, alice_token) = signup_user(&state, "alice").await;
+        let (_, bob_token) = signup_user(&state, "bob").await;
+
+        let root = create_note(
+            &state,
+            serde_json::json!({ "text": "root" }),
+            &alice_token,
+        )
+        .await;
+        clock.advance_ms(1_000);
+        let reply1 = create_note(
+            &state,
+            serde_json::json!({ "text": "reply one", "replyId": root }),
+            &bob_token,
+        )
+        .await;
+        clock.advance_ms(1_000);
+        let reply2 = create_note(
+            &state,
+            serde_json::json!({ "text": "reply two", "replyId": root }),
+            &bob_token,
+        )
+        .await;
+        clock.advance_ms(1_000);
+        let pure = create_note(
+            &state,
+            serde_json::json!({ "renoteId": root }),
+            &bob_token,
+        )
+        .await;
+        clock.advance_ms(1_000);
+        let quote = create_note(
+            &state,
+            serde_json::json!({ "renoteId": root, "text": "quoting" }),
+            &bob_token,
+        )
+        .await;
+        clock.advance_ms(1_000);
+
+        let (status, replies) = call(
+            &state,
+            "notes/replies",
+            serde_json::json!({ "noteId": root }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{replies}");
+        assert_eq!(note_ids(&replies), vec![reply2.clone(), reply1.clone()]);
+
+        let (status, renotes) = call(
+            &state,
+            "notes/renotes",
+            serde_json::json!({ "noteId": root }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{renotes}");
+        assert_eq!(note_ids(&renotes), vec![quote.clone(), pure.clone()]);
+
+        // Children: replies plus the quote, never the pure renote.
+        let (status, children) = call(
+            &state,
+            "notes/children",
+            serde_json::json!({ "noteId": root }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{children}");
+        assert_eq!(
+            note_ids(&children),
+            vec![quote.clone(), reply2.clone(), reply1.clone()]
+        );
+
+        // Pagination over children.
+        let (status, page) = call(
+            &state,
+            "notes/children",
+            serde_json::json!({ "noteId": root, "limit": 1 }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(note_ids(&page), vec![quote.clone()]);
+        let (status, page) = call(
+            &state,
+            "notes/children",
+            serde_json::json!({ "noteId": root, "untilId": quote }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(note_ids(&page), vec![reply2.clone(), reply1.clone()]);
+
+        // Unknown targets: renotes 404s (Misskey parity), replies/children
+        // answer [].
+        let (status, value) = call(
+            &state,
+            "notes/renotes",
+            serde_json::json!({ "noteId": "nid00000000000099" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_NOTE");
+        for endpoint in ["notes/replies", "notes/children"] {
+            let (status, list) = call(
+                &state,
+                endpoint,
+                serde_json::json!({ "noteId": "nid00000000000099" }),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{endpoint}: {list}");
+            assert_eq!(list.as_array().unwrap().len(), 0);
+        }
+
+        let (status, value) = call(
+            &state,
+            "notes/replies",
+            serde_json::json!({}),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "INVALID_PARAM");
+    }
+
+    #[tokio::test]
+    async fn phase3_note_conversation() {
+        let (state, clock) = test_state();
+        let (_, alice_token) = signup_user(&state, "alice").await;
+        let (_, bob_token) = signup_user(&state, "bob").await;
+
+        let a = create_note(
+            &state,
+            serde_json::json!({ "text": "first" }),
+            &alice_token,
+        )
+        .await;
+        clock.advance_ms(1_000);
+        let b = create_note(
+            &state,
+            serde_json::json!({ "text": "second", "replyId": a }),
+            &bob_token,
+        )
+        .await;
+        clock.advance_ms(1_000);
+        let c = create_note(
+            &state,
+            serde_json::json!({ "text": "third", "replyId": b }),
+            &alice_token,
+        )
+        .await;
+        clock.advance_ms(1_000);
+
+        // Oldest-first ancestor chain.
+        let (status, conv) = call(
+            &state,
+            "notes/conversation",
+            serde_json::json!({ "noteId": c }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{conv}");
+        assert_eq!(note_ids(&conv), vec![a.clone(), b.clone()]);
+
+        let (status, conv) = call(
+            &state,
+            "notes/conversation",
+            serde_json::json!({ "noteId": b }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{conv}");
+        assert_eq!(note_ids(&conv), vec![a.clone()]);
+
+        let (status, conv) = call(
+            &state,
+            "notes/conversation",
+            serde_json::json!({ "noteId": a }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{conv}");
+        assert_eq!(conv.as_array().unwrap().len(), 0);
+
+        // Offset skips from the oldest side; limit caps.
+        let (status, conv) = call(
+            &state,
+            "notes/conversation",
+            serde_json::json!({ "noteId": c, "offset": 1 }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{conv}");
+        assert_eq!(note_ids(&conv), vec![b.clone()]);
+        let (status, conv) = call(
+            &state,
+            "notes/conversation",
+            serde_json::json!({ "noteId": c, "limit": 1 }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{conv}");
+        assert_eq!(note_ids(&conv), vec![a.clone()]);
+
+        let (status, value) = call(
+            &state,
+            "notes/conversation",
+            serde_json::json!({ "noteId": "nid00000000000099" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_NOTE");
+    }
+
+    #[tokio::test]
+    async fn phase3_unrenote() {
+        let (state, clock) = test_state();
+        let (_, alice_token) = signup_user(&state, "alice").await;
+        let (_, bob_token) = signup_user(&state, "bob").await;
+
+        let root = create_note(
+            &state,
+            serde_json::json!({ "text": "renote me" }),
+            &alice_token,
+        )
+        .await;
+        clock.advance_ms(1_000);
+        let pure = create_note(
+            &state,
+            serde_json::json!({ "renoteId": root }),
+            &bob_token,
+        )
+        .await;
+        clock.advance_ms(1_000);
+        let quote = create_note(
+            &state,
+            serde_json::json!({ "renoteId": root, "text": "quoting" }),
+            &bob_token,
+        )
+        .await;
+        clock.advance_ms(1_000);
+
+        // Unauthenticated callers are rejected before any state change.
+        let (status, value) = call(
+            &state,
+            "notes/unrenote",
+            serde_json::json!({ "noteId": root }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{value}");
+
+        let (status, _) = call(
+            &state,
+            "notes/unrenote",
+            serde_json::json!({ "noteId": root }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // Both of Bob's renotes are gone; Alice's root survives.
+        for gone in [pure, quote] {
+            let (status, value) = call(
+                &state,
+                "notes/show",
+                serde_json::json!({ "noteId": gone }),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+            assert_eq!(value["code"], "NO_SUCH_NOTE");
+        }
+        let (status, _) = call(
+            &state,
+            "notes/show",
+            serde_json::json!({ "noteId": root }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Idempotent: nothing left to delete is still success. (The shared
+        // notes/delete bucket enforces a 1 s minimum interval, so the clock
+        // moves past it first.)
+        clock.advance_ms(1_000);
+        let (status, _) = call(
+            &state,
+            "notes/unrenote",
+            serde_json::json!({ "noteId": root }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        clock.advance_ms(1_000);
+        let (status, value) = call(
+            &state,
+            "notes/unrenote",
+            serde_json::json!({ "noteId": "nid00000000000099" }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_NOTE");
+    }
+
+    #[tokio::test]
+    async fn phase3_follow_lists() {
+        let (state, clock) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (bob_id, _) = signup_user(&state, "bob").await;
+        let (carol_id, carol_token) = signup_user(&state, "carol").await;
+
+        let (status, _) = call(
+            &state,
+            "following/create",
+            serde_json::json!({ "userId": bob_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        clock.advance_ms(1_000);
+        let (status, _) = call(
+            &state,
+            "following/create",
+            serde_json::json!({ "userId": bob_id }),
+            Some(&carol_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        clock.advance_ms(1_000);
+
+        // Followers of Bob: Following[] with the follower side populated.
+        let (status, followers) = call(
+            &state,
+            "users/followers",
+            serde_json::json!({ "userId": bob_id }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{followers}");
+        let followers = followers.as_array().unwrap();
+        assert_eq!(followers.len(), 2);
+        // Newest first: Carol followed after Alice.
+        assert_eq!(followers[0]["follower"]["id"], carol_id);
+        assert_eq!(followers[1]["follower"]["id"], alice_id);
+        for entry in followers {
+            assert_eq!(entry["followeeId"], bob_id);
+            assert_eq!(entry["followee"]["id"], bob_id);
+            assert!(entry["id"].as_str().is_some());
+            assert!(entry["createdAt"].as_str().is_some());
+            assert_eq!(entry["followerId"], entry["follower"]["id"]);
+        }
+
+        // Following of Alice: the followee side populated.
+        let (status, following) = call(
+            &state,
+            "users/following",
+            serde_json::json!({ "userId": alice_id }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{following}");
+        let following = following.as_array().unwrap();
+        assert_eq!(following.len(), 1);
+        assert_eq!(following[0]["followee"]["id"], bob_id);
+        assert_eq!(following[0]["follower"]["id"], alice_id);
+
+        // username+host resolution (null host = local).
+        let (status, via_name) = call(
+            &state,
+            "users/followers",
+            serde_json::json!({ "username": "bob", "host": null }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{via_name}");
+        assert_eq!(via_name.as_array().unwrap().len(), 2);
+        assert_eq!(via_name[0]["follower"]["id"], carol_id);
+
+        // Cursor pagination.
+        let (status, page) = call(
+            &state,
+            "users/followers",
+            serde_json::json!({ "userId": bob_id, "limit": 1 }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page.as_array().unwrap().len(), 1);
+        assert_eq!(page[0]["follower"]["id"], carol_id);
+
+        // Errors.
+        let (status, value) = call(
+            &state,
+            "users/followers",
+            serde_json::json!({ "userId": "aid00000000000099" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_USER");
+        let (status, value) = call(
+            &state,
+            "users/following",
+            serde_json::json!({}),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "INVALID_PARAM");
+        let (status, value) = call(
+            &state,
+            "users/followers",
+            serde_json::json!({ "username": "bob" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "INVALID_PARAM");
+    }
+
+    #[tokio::test]
+    async fn phase3_drive_files() {
+        let (state, clock) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (_, bob_token) = signup_user(&state, "bob").await;
+
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        png.extend_from_slice(&[9, 9, 9]);
+        let png_id = state
+            .services
+            .upload_media(&alice_id, "pic.png".to_string(), &png, None, false, true)
+            .unwrap()
+            .id;
+        clock.advance_ms(1_000);
+        let txt_id = state
+            .services
+            .upload_media(
+                &alice_id,
+                "hi.txt".to_string(),
+                b"hello world",
+                None,
+                false,
+                true,
+            )
+            .unwrap()
+            .id;
+        clock.advance_ms(1_000);
+
+        // Newest first.
+        let (status, files) = call(
+            &state,
+            "drive/files",
+            serde_json::json!({}),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{files}");
+        assert_eq!(
+            files
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|f| f["id"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>(),
+            vec![txt_id.clone(), png_id.clone()]
+        );
+
+        // MIME prefix filtering.
+        let (status, images) = call(
+            &state,
+            "drive/files",
+            serde_json::json!({ "type": "image/*" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{images}");
+        assert_eq!(images.as_array().unwrap().len(), 1);
+        assert_eq!(images[0]["id"], png_id);
+        let (status, exact) = call(
+            &state,
+            "drive/files",
+            serde_json::json!({ "type": "text/plain" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{exact}");
+        assert_eq!(exact.as_array().unwrap().len(), 1);
+        assert_eq!(exact[0]["id"], txt_id);
+
+        // Pagination.
+        let (status, page) = call(
+            &state,
+            "drive/files",
+            serde_json::json!({ "limit": 1, "untilId": txt_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page.as_array().unwrap().len(), 1);
+        assert_eq!(page[0]["id"], png_id);
+
+        // Only the caller's own files.
+        let (status, bobs) = call(
+            &state,
+            "drive/files",
+            serde_json::json!({}),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{bobs}");
+        assert_eq!(bobs.as_array().unwrap().len(), 0);
+
+        // Param validation.
+        for (body, param) in [
+            (serde_json::json!({ "sort": "+name" }), "sort"),
+            (serde_json::json!({ "folderId": "did00000000000001" }), "folderId"),
+            (serde_json::json!({ "type": "not a mime!!" }), "type"),
+            (serde_json::json!({ "limit": 0 }), "limit"),
+        ] {
+            let (status, value) = call(&state, "drive/files", body, Some(&alice_token)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+            assert_eq!(value["code"], "INVALID_PARAM", "param {param}");
+        }
+        let (status, value) = call(
+            &state,
+            "drive/files",
+            serde_json::json!({ "sort": "-createdAt" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let (status, value) = call(
+            &state,
+            "drive/files",
+            serde_json::json!({ "bogus": true }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "UNSUPPORTED_FIELD");
+
+        // Auth: anonymous callers are rejected.
+        let (status, _) = call(&state, "drive/files", serde_json::json!({}), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn phase3_drive_file_show_update_delete() {
+        let (state, clock) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (_, bob_token) = signup_user(&state, "bob").await;
+        let file_id = state
+            .services
+            .upload_media(
+                &alice_id,
+                "doc.txt".to_string(),
+                b"file bytes",
+                Some("original".to_string()),
+                false,
+                true,
+            )
+            .unwrap()
+            .id;
+        clock.advance_ms(1_000);
+
+        let (status, shown) = call(
+            &state,
+            "drive/files/show",
+            serde_json::json!({ "fileId": file_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{shown}");
+        assert_eq!(shown["name"], "doc.txt");
+        assert_eq!(shown["comment"], "original");
+
+        // Non-owners (and unknown ids) see NO_SUCH_FILE, never the row.
+        for (token, fid) in [
+            (bob_token.clone(), file_id.clone()),
+            (alice_token.clone(), "mid00000000000099".to_string()),
+        ] {
+            let (status, value) = call(
+                &state,
+                "drive/files/show",
+                serde_json::json!({ "fileId": fid }),
+                Some(&token),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+            assert_eq!(value["code"], "NO_SUCH_FILE");
+        }
+
+        // Update metadata.
+        let (status, updated) = call(
+            &state,
+            "drive/files/update",
+            serde_json::json!({
+                "fileId": file_id,
+                "name": "renamed.txt",
+                "isSensitive": true,
+                "comment": "edited",
+            }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{updated}");
+        assert_eq!(updated["name"], "renamed.txt");
+        assert_eq!(updated["isSensitive"], true);
+        assert_eq!(updated["comment"], "edited");
+
+        // Invalid names are INVALID_FILE_NAME; overlong comments INVALID_PARAM.
+        let long_name = "n".repeat(201);
+        for bad in ["", "a/b", "a\\b", "..", long_name.as_str()] {
+            let (status, value) = call(
+                &state,
+                "drive/files/update",
+                serde_json::json!({ "fileId": file_id, "name": bad }),
+                Some(&alice_token),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {value}");
+            assert_eq!(value["code"], "INVALID_FILE_NAME");
+        }
+        let (status, value) = call(
+            &state,
+            "drive/files/update",
+            serde_json::json!({ "fileId": file_id, "comment": "c".repeat(513) }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "INVALID_PARAM");
+
+        // Bob cannot update or delete Alice's file.
+        for endpoint in ["drive/files/update", "drive/files/delete"] {
+            let (status, value) = call(
+                &state,
+                endpoint,
+                serde_json::json!({ "fileId": file_id }),
+                Some(&bob_token),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{endpoint}: {value}");
+            assert_eq!(value["code"], "NO_SUCH_FILE");
+        }
+
+        // Delete removes metadata; the row is gone afterwards.
+        let (status, _) = call(
+            &state,
+            "drive/files/delete",
+            serde_json::json!({ "fileId": file_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, value) = call(
+            &state,
+            "drive/files/show",
+            serde_json::json!({ "fileId": file_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_FILE");
+        // Deleting again is NO_SUCH_FILE (the row is already gone).
+        let (status, value) = call(
+            &state,
+            "drive/files/delete",
+            serde_json::json!({ "fileId": file_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_FILE");
+    }
+
+    #[tokio::test]
+    async fn phase3_notifications_list_and_mark_all() {
+        use crate::domain::notification::{Notification, NotificationKind};
+
+        let (state, clock) = test_state();
+        let (alice_id, _) = signup_user(&state, "alice").await;
+        let (bob_id, bob_token) = signup_user(&state, "bob").await;
+
+        // Twelve notifications for Bob (direct store inserts, deterministic
+        // ids): even indexes are follows, odd are mentions.
+        for n in 0..12 {
+            let kind = if n % 2 == 0 {
+                NotificationKind::Follow
+            } else {
+                NotificationKind::Mention
+            };
+            state
+                .services
+                .notifications
+                .insert_notification(Notification {
+                    id: state.services.ids.generate(),
+                    notifiee_id: bob_id.clone(),
+                    notifier_id: alice_id.clone(),
+                    kind,
+                    note_id: None,
+                    reaction: None,
+                    is_read: false,
+                })
+                .unwrap();
+            clock.advance_ms(1_000);
+        }
+
+        // Default limit is 10 (Misskey-aligned), newest first.
+        let (status, first) = call(
+            &state,
+            "i/notifications",
+            serde_json::json!({ "markAsRead": false }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        let first = first.as_array().unwrap();
+        assert_eq!(first.len(), 10);
+        assert_eq!(first[0]["isRead"], false);
+
+        // Cursor pagination reaches the remainder without overlap.
+        let oldest_seen = first[9]["id"].as_str().unwrap().to_string();
+        let (status, second) = call(
+            &state,
+            "i/notifications",
+            serde_json::json!({ "markAsRead": false, "untilId": oldest_seen }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        assert_eq!(second.as_array().unwrap().len(), 2);
+
+        // includeTypes filters by kind.
+        let (status, follows) = call(
+            &state,
+            "i/notifications",
+            serde_json::json!({ "markAsRead": false, "includeTypes": ["follow"] }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{follows}");
+        assert_eq!(follows.as_array().unwrap().len(), 6);
+        assert!(
+            follows
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|n| n["type"] == "follow")
+        );
+        // Excluding everything matches nothing.
+        let (status, none) = call(
+            &state,
+            "i/notifications",
+            serde_json::json!({
+                "markAsRead": false,
+                "excludeTypes": ["follow", "mention", "reply", "renote", "reaction", "receiveFollowRequest"],
+            }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{none}");
+        assert_eq!(none.as_array().unwrap().len(), 0);
+        // Explicitly empty includeTypes matches nothing (Misskey parity).
+        let (status, none) = call(
+            &state,
+            "i/notifications",
+            serde_json::json!({ "markAsRead": false, "includeTypes": [] }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{none}");
+        assert_eq!(none.as_array().unwrap().len(), 0);
+        // Unknown type strings are INVALID_PARAM; obsolete ones are dropped.
+        let (status, value) = call(
+            &state,
+            "i/notifications",
+            serde_json::json!({ "includeTypes": ["bogus"] }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "INVALID_PARAM");
+        let (status, none) = call(
+            &state,
+            "i/notifications",
+            serde_json::json!({ "markAsRead": false, "includeTypes": ["pollVote"] }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{none}");
+        assert_eq!(none.as_array().unwrap().len(), 0);
+
+        // Default markAsRead=true flips everything to read.
+        let (status, _) = call(
+            &state,
+            "i/notifications",
+            serde_json::json!({}),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, after) = call(
+            &state,
+            "i/notifications",
+            serde_json::json!({ "markAsRead": false }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{after}");
+        assert!(
+            after.as_array().unwrap().iter().all(|n| n["isRead"] == true),
+            "{after}"
+        );
+
+        // notifications/mark-all-as-read marks unread rows read.
+        state
+            .services
+            .notifications
+            .insert_notification(Notification {
+                id: state.services.ids.generate(),
+                notifiee_id: bob_id.clone(),
+                notifier_id: alice_id.clone(),
+                kind: NotificationKind::Reaction,
+                note_id: None,
+                reaction: Some("❤".to_string()),
+                is_read: false,
+            })
+            .unwrap();
+        let (status, _) = call(
+            &state,
+            "notifications/mark-all-as-read",
+            serde_json::json!({}),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, after) = call(
+            &state,
+            "i/notifications",
+            serde_json::json!({ "markAsRead": false, "limit": 1 }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{after}");
+        assert_eq!(after[0]["isRead"], true);
+
+        // Auth + param validation.
+        let (status, _) = call(&state, "i/notifications", serde_json::json!({}), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = call(
+            &state,
+            "notifications/mark-all-as-read",
+            serde_json::json!({}),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, value) = call(
+            &state,
+            "i/notifications",
+            serde_json::json!({ "limit": 101 }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "INVALID_PARAM");
+    }
+
+    #[tokio::test]
+    async fn phase3_revoke_token() {
+        let (state, _) = test_state();
+        let (_, token_a) = signup_user(&state, "alice").await;
+
+        // Baseline: the token authenticates.
+        let (status, _) = call(&state, "i", serde_json::json!({}), Some(&token_a)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // No params revokes the caller's own token.
+        let (status, _) = call(
+            &state,
+            "i/revoke-token",
+            serde_json::json!({}),
+            Some(&token_a),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = call(&state, "i", serde_json::json!({}), Some(&token_a)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // Explicit token revocation.
+        let (_, token_b) = signup_user(&state, "bob").await;
+        let (status, _) = call(
+            &state,
+            "i/revoke-token",
+            serde_json::json!({ "token": token_b }),
+            Some(&token_b),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = call(&state, "i", serde_json::json!({}), Some(&token_b)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // Unknown tokens and tokenIds are no-op successes.
+        let (_, token_c) = signup_user(&state, "carol").await;
+        let (status, _) = call(
+            &state,
+            "i/revoke-token",
+            serde_json::json!({ "token": "deadbeefdeadbeefdeadbeefdeadbeef" }),
+            Some(&token_c),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = call(
+            &state,
+            "i/revoke-token",
+            serde_json::json!({ "tokenId": "tid00000000000001" }),
+            Some(&token_c),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        // Carol's own token still works.
+        let (status, _) = call(&state, "i", serde_json::json!({}), Some(&token_c)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // A third-party token cannot revoke a different token.
+        let third_party = generate_random_token();
+        state
+            .services
+            .auth
+            .store_token(ApiTokenRecord {
+                token_hash: hash_token(&third_party),
+                account_id: {
+                    let (status, me) =
+                        call(&state, "i", serde_json::json!({}), Some(&token_c)).await;
+                    assert_eq!(status, StatusCode::OK, "{me}");
+                    me["id"].as_str().unwrap().to_string()
+                },
+                permissions: vec!["read:account".to_string()],
+                is_first_party: false,
+                name: None,
+                description: None,
+                icon_url: None,
+                created_at_ms: state.services.clock.now_ms(),
+            })
+            .unwrap();
+        let (status, value) = call(
+            &state,
+            "i/revoke-token",
+            serde_json::json!({ "token": token_c }),
+            Some(&third_party),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{value}");
+        assert_eq!(value["code"], "PERMISSION_DENIED");
+        // ...but it can revoke itself.
+        let (status, _) = call(
+            &state,
+            "i/revoke-token",
+            serde_json::json!({ "token": third_party }),
+            Some(&third_party),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // No credential at all is rejected.
+        let (status, _) = call(&state, "i/revoke-token", serde_json::json!({}), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn phase3_notes_search() {
+        let (state, clock) = test_state();
+        let (_, alice_token) = signup_user(&state, "alice").await;
+        let (bob_id, bob_token) = signup_user(&state, "bob").await;
+
+        create_note(
+            &state,
+            serde_json::json!({ "text": "hello rust world #rust" }),
+            &alice_token,
+        )
+        .await;
+        clock.advance_ms(1_000);
+        create_note(
+            &state,
+            serde_json::json!({ "text": "goodbye moon" }),
+            &alice_token,
+        )
+        .await;
+        clock.advance_ms(1_000);
+        let bob_rust = create_note(
+            &state,
+            serde_json::json!({ "text": "hello rust again" }),
+            &bob_token,
+        )
+        .await;
+        clock.advance_ms(1_000);
+        create_note(
+            &state,
+            serde_json::json!({ "text": "secret rust", "visibility": "followers" }),
+            &alice_token,
+        )
+        .await;
+        clock.advance_ms(1_000);
+
+        // Substring match over local notes; Bob cannot see Alice's
+        // followers-only note.
+        let (status, hits) = call(
+            &state,
+            "notes/search",
+            serde_json::json!({ "query": "rust" }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{hits}");
+        assert_eq!(hits.as_array().unwrap().len(), 2);
+
+        // Alice sees her own followers-only note too.
+        let (status, hits) = call(
+            &state,
+            "notes/search",
+            serde_json::json!({ "query": "rust" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{hits}");
+        assert_eq!(hits.as_array().unwrap().len(), 3);
+
+        // userId + host filters.
+        let (status, hits) = call(
+            &state,
+            "notes/search",
+            serde_json::json!({ "query": "rust", "userId": bob_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{hits}");
+        assert_eq!(note_ids(&hits), vec![bob_rust.clone()]);
+        let (status, hits) = call(
+            &state,
+            "notes/search",
+            serde_json::json!({ "query": "rust", "host": "." }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{hits}");
+        assert_eq!(hits.as_array().unwrap().len(), 3);
+        let (status, hits) = call(
+            &state,
+            "notes/search",
+            serde_json::json!({ "query": "rust", "host": "remote.example" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{hits}");
+        assert_eq!(hits.as_array().unwrap().len(), 0);
+
+        // search-by-tag: case-insensitive.
+        let (status, hits) = call(
+            &state,
+            "notes/search-by-tag",
+            serde_json::json!({ "tag": "RUST" }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{hits}");
+        assert_eq!(hits.as_array().unwrap().len(), 1);
+
+        // Auth + param validation.
+        let (status, _) = call(
+            &state,
+            "notes/search",
+            serde_json::json!({ "query": "rust" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, value) = call(
+            &state,
+            "notes/search",
+            serde_json::json!({}),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "INVALID_PARAM");
+        for (endpoint, body) in [
+            ("notes/search", serde_json::json!({ "query": "x", "offset": 0 })),
+            ("notes/search", serde_json::json!({ "query": "x", "channelId": "y" })),
+            ("notes/search-by-tag", serde_json::json!({ "tag": "rust", "query": [] })),
+        ] {
+            let (status, value) = call(&state, endpoint, body, Some(&alice_token)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{endpoint}: {value}");
+            assert_eq!(value["code"], "UNSUPPORTED_FIELD");
+        }
     }
 }

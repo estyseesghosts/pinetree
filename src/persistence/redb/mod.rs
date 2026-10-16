@@ -17,7 +17,7 @@ use crate::domain::follow::{Follow, FollowNotify, FollowRequest};
 use crate::domain::id::{parse_aidx_time, AidxGenerator};
 use crate::domain::media::MediaMeta;
 use crate::domain::note::{extract_hashtags, extract_mentions, Note, MAX_FILE_IDS};
-use crate::domain::notification::Notification;
+use crate::domain::notification::{Notification, NotificationKind};
 use crate::domain::policy::{narrow_on_create, NarrowingInput};
 use crate::domain::reaction::Reaction;
 
@@ -1151,51 +1151,9 @@ impl AccountStore for RedbStore {
         Ok(true)
     }
 
-    fn update_account(&self, id: &str, patch: UpdateAccountPatch) -> Result<Account, PortError> {
+    fn update_account(&self, id: &str, patch: UpdateAccountPatch, jobs: Vec<NewJob>) -> Result<Account, PortError> {
         let write_txn = self.begin_write()?;
-        let updated = {
-            let mut accounts_table = write_txn.open_table(ACCOUNTS).map_err(map_redb_err)?;
-            let mut acc: Account = match accounts_table.get(id).map_err(map_redb_err)? {
-                Some(g) => decode_json(g.value())?,
-                None => return Err(PortError::NotFound(format!("account {id} not found"))),
-            };
-            if let Some(v) = patch.display_name {
-                acc.display_name = v;
-            }
-            if let Some(v) = patch.description {
-                acc.description = v;
-            }
-            if let Some(v) = patch.location {
-                acc.location = v;
-            }
-            if let Some(v) = patch.birthday {
-                acc.birthday = v;
-            }
-            if let Some(v) = patch.avatar_id {
-                acc.avatar_id = v;
-            }
-            if let Some(v) = patch.banner_id {
-                acc.banner_id = v;
-            }
-            if let Some(v) = patch.is_locked {
-                acc.is_locked = v;
-            }
-            if let Some(v) = patch.is_bot {
-                acc.is_bot = v;
-            }
-            if let Some(v) = patch.is_cat {
-                acc.is_cat = v;
-            }
-            if let Some(v) = patch.is_explorable {
-                acc.is_explorable = v;
-            }
-            acc.validate()?;
-            let bytes = encode_json(&acc)?;
-            accounts_table
-                .insert(acc.id.as_str(), bytes.as_slice())
-                .map_err(map_redb_err)?;
-            acc
-        };
+        let updated = self.update_account_in_txn(&write_txn, id, patch, jobs)?;
         self.commit_write(write_txn)?;
         Ok(updated)
     }
@@ -2603,6 +2561,21 @@ impl MediaStore for RedbStore {
         }
         self.commit_write(write_txn)
     }
+
+    fn list_by_owner(&self, owner_id: &str) -> Result<Vec<MediaMeta>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(MEDIA_META).map_err(map_redb_err)?;
+        let mut out = Vec::new();
+        for entry in table.iter().map_err(map_redb_err)? {
+            let (_, v) = entry.map_err(map_redb_err)?;
+            let meta: MediaMeta = decode_json(v.value())?;
+            if meta.owner_id.as_deref() == Some(owner_id) {
+                out.push(meta);
+            }
+        }
+        out.sort_by(|a, b| b.id.cmp(&a.id));
+        Ok(out)
+    }
 }
 
 impl NotificationStore for RedbStore {
@@ -2657,6 +2630,87 @@ impl NotificationStore for RedbStore {
         }
         Ok(out)
     }
+
+    fn list_notifications_filtered(
+        &self,
+        notifiee_id: &str,
+        cursor: &TimelineCursor,
+        include: &[NotificationKind],
+        exclude: &[NotificationKind],
+    ) -> Result<Vec<Notification>, PortError> {
+        let limit = if cursor.limit == 0 { 10 } else { cursor.limit };
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let notif_table = read_txn.open_table(NOTIFICATIONS).map_err(map_redb_err)?;
+        let by_user = read_txn
+            .open_table(NOTIFICATIONS_BY_USER)
+            .map_err(map_redb_err)?;
+
+        let mut out = Vec::new();
+        for entry in by_user
+            .range((notifiee_id, "")..=(notifiee_id, "\u{10ffff}"))
+            .map_err(map_redb_err)?
+            .rev()
+        {
+            let (k, _) = entry.map_err(map_redb_err)?;
+            let (_, nid) = k.value();
+            if !matches_cursor(nid, cursor) {
+                continue;
+            }
+            let Some(g) = notif_table.get(nid).map_err(map_redb_err)? else {
+                continue;
+            };
+            let stored: Notification = decode_json(g.value())?;
+            if !include.is_empty() && !include.contains(&stored.kind) {
+                continue;
+            }
+            if exclude.contains(&stored.kind) {
+                continue;
+            }
+            out.push(stored);
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    fn mark_all_read(&self, notifiee_id: &str) -> Result<u64, PortError> {
+        let write_txn = self.begin_write()?;
+        let flipped = {
+            let mut notif_table = write_txn.open_table(NOTIFICATIONS).map_err(map_redb_err)?;
+            let by_user = write_txn
+                .open_table(NOTIFICATIONS_BY_USER)
+                .map_err(map_redb_err)?;
+            let mut flipped: u64 = 0;
+            let ids: Vec<String> = by_user
+                .range((notifiee_id, "")..=(notifiee_id, "\u{10ffff}"))
+                .map_err(map_redb_err)?
+                .filter_map(|entry| {
+                    entry.ok().map(|(k, _)| k.value().1.to_string())
+                })
+                .collect();
+            for nid in ids {
+                let raw: Option<Vec<u8>> = notif_table
+                    .get(nid.as_str())
+                    .map_err(map_redb_err)?
+                    .map(|g| g.value().to_vec());
+                let Some(raw) = raw else { continue };
+                let mut stored: Notification = decode_json(&raw)?;
+                if stored.is_read {
+                    continue;
+                }
+                stored.is_read = true;
+                let encoded = encode_json(&stored)?;
+                notif_table
+                    .insert(nid.as_str(), encoded.as_slice())
+                    .map_err(map_redb_err)?;
+                flipped += 1;
+            }
+            flipped
+        };
+        self.commit_write(write_txn)?;
+        Ok(flipped)
+    }
 }
 
 impl AuthStore for RedbStore {
@@ -2699,6 +2753,15 @@ impl AuthStore for RedbStore {
             Some(g) => Ok(Some(decode_json(g.value())?)),
             None => Ok(None),
         }
+    }
+
+    fn delete_token_by_hash(&self, token_hash: &str) -> Result<(), PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            let mut table = write_txn.open_table(API_TOKENS).map_err(map_redb_err)?;
+            table.remove(token_hash).map_err(map_redb_err)?;
+        }
+        self.commit_write(write_txn)
     }
 
     fn save_miauth_session(&self, session: MiAuthSessionRecord) -> Result<(), PortError> {

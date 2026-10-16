@@ -19,7 +19,7 @@ serde_bytes = "0.11.19"
 regex = "1.13.1"
 rand = "0.10.3"
 uuid = { version = "1.28.0", features = ["v4"] }
-axum = { version = "0.8", features = ["multipart"] }
+axum = { version = "0.8", features = ["multipart", "ws"] }
 http-body-util = "0.1"
 sha2 = "0.10"
 rsa = { version = "0.9", features = ["sha2"] }
@@ -34,6 +34,9 @@ foundationdb = { version = "0.11.0", features = ["fdb-7_3"], optional = true }
 foundationdb-sys = { version = "0.11.0", features = ["fdb-7_3"], optional = true }
 argon2 = "0.5"
 ring = "0.17"
+futures-util = "0.3"
 
 [dev-dependencies]
 futures-core = "0.3"
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+reqwest = { version = "0.12", features = ["json"] }

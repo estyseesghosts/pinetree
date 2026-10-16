@@ -8,8 +8,9 @@ use pinetree::api::misskey::{ApiState, build_router};
 use pinetree::application::commands::AppServices;
 use pinetree::application::ports::{
     AccountStore, ActivityDedup, AuthStore, BlobStore, FollowStore, JobQueue, MediaStore,
-    NoopStreamingSink, NoteStore, NotificationStore, ReactionStore, StreamingSink,
+    NoteStore, NotificationStore, ReactionStore, StreamingSink,
 };
+use pinetree::streaming::hub::hub_and_sink;
 use pinetree::application::ports::{Clock, IdGenerator};
 use pinetree::config::{Config, DeploymentMode};
 use pinetree::domain::id::{AidxGenerator, SystemClock};
@@ -19,7 +20,7 @@ use pinetree::jobs::worker::JobWorker;
 use pinetree::media::storage::FsBlobStore;
 use pinetree::persistence::redb::RedbStore;
 
-fn build_services(cfg: &Config) -> Result<Arc<AppServices>, String> {
+fn build_services(cfg: &Config) -> Result<(Arc<AppServices>, pinetree::streaming::hub::Hub), String> {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let ids: Arc<dyn IdGenerator> = Arc::new(AidxGenerator::new(clock.clone()));
     let store = RedbStore::open(cfg.data_dir.join("pinetree.redb"), clock.clone(), ids.clone())
@@ -27,8 +28,10 @@ fn build_services(cfg: &Config) -> Result<Arc<AppServices>, String> {
     let blobs: Arc<dyn BlobStore> = Arc::new(
         FsBlobStore::new(cfg.data_dir.join("blobs")).map_err(|err| format!("init blob store: {err}"))?,
     );
-    let streaming: Arc<dyn StreamingSink> = Arc::new(NoopStreamingSink);
-    Ok(Arc::new(AppServices {
+    let streaming: Arc<dyn StreamingSink>;
+    let hub: pinetree::streaming::hub::Hub;
+    (hub, streaming) = hub_and_sink(1024);
+    let services = Arc::new(AppServices {
         clock: clock.clone(),
         ids: ids.clone(),
         accounts: store.clone() as Arc<dyn AccountStore>,
@@ -48,7 +51,8 @@ fn build_services(cfg: &Config) -> Result<Arc<AppServices>, String> {
         preserved_usernames: cfg.preserved_usernames.clone(),
         prohibited_words: cfg.prohibited_words.clone(),
         sensitive_words: cfg.sensitive_words.clone(),
-    }))
+    });
+    Ok((services, hub))
 }
 
 /// `create-account --username=<name> --password=<pw>`: create a local
@@ -79,7 +83,7 @@ fn run_create_account(args: &[String], cfg: &Config) -> ! {
     let services = build_services(cfg).unwrap_or_else(|err| {
         eprintln!("{err}");
         std::process::exit(1);
-    });
+    }).0;
     match services.create_account(&username, Some(&hash_password(&password))) {
         Ok(account) => {
             println!("created account {} id={}", account.username, account.id);
@@ -139,7 +143,7 @@ async fn main() {
         std::process::exit(2);
     }
 
-    let services = build_services(&cfg).unwrap_or_else(|err| {
+    let (services, hub) = build_services(&cfg).unwrap_or_else(|err| {
         eprintln!("{err}");
         std::process::exit(1);
     });
@@ -161,6 +165,7 @@ async fn main() {
         worker,
         rate_limiter,
         upload_slots: Arc::new(UploadSlots::with_defaults()),
+        hub,
         trusted_proxies: Arc::new(cfg.trusted_proxies.clone()),
     };
     let app = build_router(api_state);

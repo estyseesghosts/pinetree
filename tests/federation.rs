@@ -173,6 +173,7 @@ async fn boot_node(tag: &'static str) -> FedNode {
         worker: worker.clone(),
         rate_limiter,
         upload_slots: Arc::new(UploadSlots::with_defaults()),
+        hub: pinetree::streaming::hub::Hub::new(1024),
         trusted_proxies: Arc::new(Vec::new()),
     };
     let app = federation_router(state.clone());

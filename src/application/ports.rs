@@ -5,7 +5,7 @@ use crate::domain::follow::{Follow, FollowNotify, FollowRequest};
 pub use crate::domain::id::{Clock, DomainError, IdGenerator, PortError};
 use crate::domain::media::{MediaMeta, MediaProperties};
 use crate::domain::note::{Note, ReactionAcceptance, Visibility};
-use crate::domain::notification::Notification;
+use crate::domain::notification::{Notification, NotificationKind};
 use crate::domain::reaction::Reaction;
 
 pub const MAX_JOB_PAYLOAD_BYTES: usize = 65_536;
@@ -75,7 +75,7 @@ pub trait AccountStore: Send + Sync {
         username: &str,
         preserved_usernames: &[String],
     ) -> Result<bool, PortError>;
-    fn update_account(&self, id: &str, patch: UpdateAccountPatch) -> Result<Account, PortError>;
+    fn update_account(&self, id: &str, patch: UpdateAccountPatch, jobs: Vec<NewJob>) -> Result<Account, PortError>;
     fn rename(&self, id: &str, new_handle: &str) -> Result<Account, PortError>;
     fn get_owner(&self, id: &str) -> Result<String, PortError>;
     fn set_owner(&self, id: &str, node: &str, migration_proof: &str) -> Result<(), PortError>;
@@ -645,6 +645,9 @@ pub trait MediaStore: Send + Sync {
     /// already-attached URLs without any network fetch.
     fn find_by_source_url(&self, source_url: &str) -> Result<Vec<MediaMeta>, PortError>;
     fn delete_metadata(&self, id: &str) -> Result<(), PortError>;
+    /// Newest-first metadata rows owned by `owner_id` (Phase 3
+    /// `drive/files`). Ordering is by row id (aidx ids are time-ordered).
+    fn list_by_owner(&self, owner_id: &str) -> Result<Vec<MediaMeta>, PortError>;
 }
 
 pub trait BlobStore: Send + Sync {
@@ -659,6 +662,21 @@ pub trait NotificationStore: Send + Sync {
         &self,
         notifiee_id: &str,
         limit: usize,
+    ) -> Result<Vec<Notification>, PortError>;
+    /// Mark every notification of `notifiee_id` read. Returns the count
+    /// flipped. Used by `notifications/mark-all-as-read` and the streaming
+    /// `readNotification` message (Phase 3).
+    fn mark_all_read(&self, notifiee_id: &str) -> Result<u64, PortError>;
+    /// Newest-first page of `notifiee_id`'s notifications filtered by
+    /// `cursor` (ids + dates, limit) and kind allow/deny lists (Phase 3
+    /// `i/notifications`). An empty `include` matches every kind; kinds in
+    /// `exclude` never match.
+    fn list_notifications_filtered(
+        &self,
+        notifiee_id: &str,
+        cursor: &TimelineCursor,
+        include: &[NotificationKind],
+        exclude: &[NotificationKind],
     ) -> Result<Vec<Notification>, PortError>;
 }
 
@@ -722,6 +740,9 @@ pub trait AuthStore: Send + Sync {
     fn get_password_hash(&self, account_id: &str) -> Result<Option<String>, PortError>;
     fn store_token(&self, record: ApiTokenRecord) -> Result<(), PortError>;
     fn get_token_by_hash(&self, token_hash: &str) -> Result<Option<ApiTokenRecord>, PortError>;
+    /// Delete the token row addressed by `token_hash` (Phase 3
+    /// `i/revoke-token`). A missing row is a no-op success.
+    fn delete_token_by_hash(&self, token_hash: &str) -> Result<(), PortError>;
     fn save_miauth_session(&self, session: MiAuthSessionRecord) -> Result<(), PortError>;
     fn get_miauth_session(&self, session_id: &str) -> Result<Option<MiAuthSessionRecord>, PortError>;
     fn consume_miauth_session(
@@ -760,6 +781,11 @@ pub trait AuthStore: Send + Sync {
 
 pub trait StreamingSink: Send + Sync {
     fn publish(&self, event_type: &str, payload: &[u8]) -> Result<(), PortError>;
+    /// Fan out one `main`-channel event. The default is a no-op so
+    /// test doubles keep working; the broadcast hub overrides it.
+    fn push_main(&self, _msg: crate::application::events::MainMessage) -> Result<(), PortError> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default, Clone)]

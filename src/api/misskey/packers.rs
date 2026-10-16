@@ -12,8 +12,10 @@ use serde_json::{Map, Value};
 use crate::application::commands::AppServices;
 use crate::application::ports::PortError;
 use crate::domain::account::Account;
+use crate::domain::follow::Follow;
 use crate::domain::media::MediaMeta;
 use crate::domain::note::{Note, Visibility};
+use crate::domain::notification::Notification;
 use crate::domain::visibility::{ViewerContext, is_visible};
 
 /// Misskey server version we claim compatibility with.
@@ -200,6 +202,40 @@ pub fn pack_user_detailed_not_me(
     obj.insert("isMuted".to_string(), Value::Bool(false));
     obj.insert("isRenoteMuted".to_string(), Value::Bool(false));
     Ok(Value::Object(obj))
+}
+
+/// `Following` (`following.ts` `packedFollowingSchema`):
+/// `{id, createdAt, followerId, followeeId, follower, followee}` with both
+/// sides packed as `UserDetailedNotMe` (`Null` when the account row is
+/// gone). `createdAt` derives from the follow-record id timestamp (aidx ids
+/// are time-ordered; profile §3).
+pub fn pack_following(
+    follow: &Follow,
+    viewer_id: Option<&str>,
+    services: &AppServices,
+) -> Result<Value, PortError> {
+    let created_at = format_millis(
+        services
+            .ids
+            .parse_time(&follow.id)
+            .unwrap_or_else(|_| services.clock.now_ms()),
+    );
+    let follower = match services.accounts.find_by_id(&follow.follower_id)? {
+        Some(account) => pack_user_detailed_not_me(&account, viewer_id, services)?,
+        None => Value::Null,
+    };
+    let followee = match services.accounts.find_by_id(&follow.followee_id)? {
+        Some(account) => pack_user_detailed_not_me(&account, viewer_id, services)?,
+        None => Value::Null,
+    };
+    Ok(serde_json::json!({
+        "id": follow.id,
+        "createdAt": created_at,
+        "followerId": follow.follower_id,
+        "followeeId": follow.followee_id,
+        "follower": follower,
+        "followee": followee,
+    }))
 }
 
 fn default_policies() -> Value {
@@ -537,10 +573,50 @@ pub fn pack_note(
     Ok(Value::Object(obj))
 }
 
+/// `Notification` pack shared by `i/notifications` and the streaming
+/// worker's `main` fan-out (moved from the endpoint module in Phase 3 so
+/// both adapters pack identically).
+pub fn pack_notification(notification: &Notification, services: &AppServices) -> Value {
+    let created_at = services
+        .ids
+        .parse_time(&notification.id)
+        .map(format_millis)
+        .unwrap_or_else(|_| format_millis(services.clock.now_ms()));
+    let kind = serde_json::to_value(&notification.kind)
+        .ok()
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| "follow".to_string());
+    let user = match services.accounts.find_by_id(&notification.notifier_id) {
+        Ok(Some(account)) => {
+            pack_user_lite(&account, &services.public_url, services.clock.now_ms())
+        }
+        _ => Value::Null,
+    };
+    let packed_note = match notification.note_id.as_deref() {
+        Some(note_id) => match services.notes.get_note(note_id) {
+            Ok(Some(target)) => {
+                pack_note(&target, Some(&notification.notifiee_id), services, 0)
+                    .unwrap_or(Value::Null)
+            }
+            _ => Value::Null,
+        },
+        None => Value::Null,
+    };
+    serde_json::json!({
+        "id": notification.id,
+        "createdAt": created_at,
+        "type": kind,
+        "isRead": notification.is_read,
+        "userId": notification.notifier_id,
+        "user": user,
+        "note": packed_note,
+        "reaction": notification.reaction.clone().unwrap_or_default(),
+    })
+}
+
 /// Instance metadata: `MetaLite` always, plus `MetaDetailedOnly` when
 /// `detail` is true (`meta.ts`).
-pub fn pack_meta(services: &AppServices, detail: bool) -> Value {
-    let uri = services.public_url.trim_end_matches('/').to_string();
+pub fn pack_meta(services: &AppServices, detail: bool) -> Value {    let uri = services.public_url.trim_end_matches('/').to_string();
     let mut obj = Map::new();
     obj.insert("maintainerName".to_string(), Value::Null);
     obj.insert("maintainerEmail".to_string(), Value::Null);
@@ -719,7 +795,7 @@ mod tests {
         ) -> Result<bool, PortError> {
             Ok(true)
         }
-        fn update_account(&self, _id: &str, _patch: UpdateAccountPatch) -> Result<Account, PortError> {
+        fn update_account(&self, _id: &str, _patch: UpdateAccountPatch, _jobs: Vec<NewJob>) -> Result<Account, PortError> {
             unavailable("update_account")
         }
         fn rename(&self, _id: &str, _new_handle: &str) -> Result<Account, PortError> {
@@ -934,6 +1010,18 @@ mod tests {
         fn delete_metadata(&self, _id: &str) -> Result<(), PortError> {
             unavailable("delete_metadata")
         }
+        fn list_by_owner(&self, owner_id: &str) -> Result<Vec<MediaMeta>, PortError> {
+            let mut out: Vec<MediaMeta> = self
+                .media
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|m| m.owner_id.as_deref() == Some(owner_id))
+                .cloned()
+                .collect();
+            out.sort_by(|a, b| b.id.cmp(&a.id));
+            Ok(out)
+        }
     }
 
     impl BlobStore for Mem {
@@ -959,6 +1047,18 @@ mod tests {
         ) -> Result<Vec<Notification>, PortError> {
             Ok(Vec::new())
         }
+        fn mark_all_read(&self, _notifiee: &str) -> Result<u64, PortError> {
+            Ok(0)
+        }
+        fn list_notifications_filtered(
+            &self,
+            _notifiee: &str,
+            _cursor: &crate::application::ports::TimelineCursor,
+            _include: &[crate::domain::notification::NotificationKind],
+            _exclude: &[crate::domain::notification::NotificationKind],
+        ) -> Result<Vec<Notification>, PortError> {
+            Ok(Vec::new())
+        }
     }
 
     impl AuthStore for Mem {
@@ -973,6 +1073,9 @@ mod tests {
         }
         fn get_token_by_hash(&self, _hash: &str) -> Result<Option<ApiTokenRecord>, PortError> {
             Ok(None)
+        }
+        fn delete_token_by_hash(&self, _token_hash: &str) -> Result<(), PortError> {
+            Ok(())
         }
         fn save_miauth_session(&self, _s: MiAuthSessionRecord) -> Result<(), PortError> {
             Ok(())
@@ -1366,6 +1469,32 @@ mod tests {
         assert_eq!(packed["md5"], "d41d8cd98f00b204e9800998ecf8427e");
         assert!(packed.get("blob_key").is_none());
         assert!(packed.get("sha256").is_none());
+    }
+
+    #[test]
+    fn pack_following_carries_both_sides_and_id_time() {
+        use crate::domain::follow::Follow;
+        let (services, mem, _) = test_services(1_700_000_000_000);
+        let alice = test_account("aid00000000000001", "alice");
+        let bob = test_account("aid00000000000002", "bob");
+        mem.accounts.lock().unwrap().insert(alice.id.clone(), alice.clone());
+        mem.accounts.lock().unwrap().insert(bob.id.clone(), bob.clone());
+        let follow = Follow {
+            id: "fid00000000000001".to_string(),
+            follower_id: alice.id.clone(),
+            followee_id: bob.id.clone(),
+            with_replies: true,
+            notify: None,
+        };
+        let packed = pack_following(&follow, None, &services).unwrap();
+        assert_eq!(packed["id"], "fid00000000000001");
+        assert_eq!(packed["followerId"], alice.id);
+        assert_eq!(packed["followeeId"], bob.id);
+        assert_eq!(packed["follower"]["id"], alice.id);
+        assert_eq!(packed["followee"]["id"], bob.id);
+        assert_eq!(packed["follower"]["username"], "alice");
+        assert_eq!(packed["followee"]["username"], "bob");
+        assert!(packed["createdAt"].as_str().is_some());
     }
 
     #[test]
