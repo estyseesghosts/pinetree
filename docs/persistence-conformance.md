@@ -125,3 +125,18 @@ Backend-agnostic, same cases both adapters (FDB inherits once implemented):
 - **P2 pinning atomicity**: add/remove commit the row change and the jobs in a single transaction (`pending_count` deltas).
 
 Execution status (honest): P1–P2 are green on redb only (`tests/conformance.rs`); the FDB adapter is still a stub and has not run them.
+
+## 15. Group E — note edits (§8) + quote-disable storage (§3)
+
+Backend-agnostic, same cases both adapters (FDB inherits once implemented).
+
+Naming note: this storage group reuses the `E1`–`E6` case labels from `docs/misskey-parity-plan.md` §§3/8; it is unrelated to the Phase-0 visibility Group E in §6 above. Test functions use distinct `note_edit_*` / `quote_disable_*` names.
+
+- **E1 edit lifecycle**: create note (with poll), `apply_note_edit` with changed text+cw → returned + stored note updated, `updated_at_ms` Some, `note_edits(note_id)` has one row with `old_text` = original, `new_text`/`cw` set. Author mismatch → `Validation(YOU_ARE_NOT_THE_AUTHOR)`; unknown/deleted note → `NotFound(NO_SUCH_NOTE)`. Reply-parent immutability is structural (`EditNoteInput` has no reply field) — a reply note's `reply_id` survives an effective edit.
+- **E2 no-op**: edit with identical effective text/cw/poll/files/renote/acceptance → returns the ORIGINAL note (`updated_at_ms` stays `None`), writes no history row, enqueues no jobs (`pending_count` unchanged, even when jobs are passed).
+- **E3 poll replace resets votes**: create note with poll, add vote rows (`PollStore` vote API), edit with a different poll definition → poll row replaced with zeroed tallies, all `POLL_VOTES` rows for that note dropped (re-vote succeeds; tallies restart), one history row, and the passed jobs (including the poll-expiry re-arm) committed.
+- **E4 history chaining**: two effective edits → `note_edits` returns 2 rows oldest-first; row2.`old_text` == row1.`new_text`; row1.`old_date_ms` == creation time (parsed from the time-ordered note id, stamped by the same clock the factory's id generator reads) and row2.`old_date_ms` == row1.`updated_at_ms`.
+- **E5 inbound dedup**: `record_note_edit_activity` first call → `Some(note)` + history row + jobs committed; replay same activity id → `None`, no second history row, no extra jobs.
+- **E6 quote-disable storage (§3)**: (a) remote author (`host` set) with `reject_quotes=true` (set via `AccountStore::update_account` patch) creates a quote → stored note is PLAIN (`renote_id` None, `quote` None, `process_errors` contains `"quoteUnavailable"`), no `renote_count` bump on target; (b) local author with `reject_quotes=true` → `Validation(QUOTE_DISABLED_FOR_USER)`; (c) remote author with flag false → quote stored normally (control).
+
+Execution status (honest): E1–E6 are green on redb only (`tests/conformance.rs`: `note_edit_lifecycle`, `note_edit_noop_writes_nothing`, `note_edit_poll_replace_resets_votes`, `note_edit_history_chaining`, `note_edit_inbound_dedup`, `quote_disable_storage`); the FDB adapter is still a stub and has not run them.

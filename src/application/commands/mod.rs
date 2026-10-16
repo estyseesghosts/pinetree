@@ -20,7 +20,7 @@ pub mod notes;
 pub mod pins;
 pub mod polls;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Application services: the use-case layer over the storage ports.
 ///

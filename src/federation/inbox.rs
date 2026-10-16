@@ -2879,3 +2879,211 @@ mod reply_resolution_tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// `Update(Note)` round-trip (§8; Sharkey `notes/edit` federation parity)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod update_note_tests {
+    use super::*;
+    use serde_json::json;
+
+    use crate::activitypub::objects::{render_note_object, render_note_update_activity};
+    use crate::application::ports::CreateAccountInput;
+
+    const CAROL_URI: &str = "https://remote.example/users/carol";
+    const NOTE_URI: &str = "https://remote.example/notes/n1";
+
+    fn services() -> AppServices {
+        crate::application::commands::tests::test_services("update-note")
+    }
+
+    fn remote_carol(services: &AppServices) -> Account {
+        services
+            .accounts
+            .create_account(CreateAccountInput {
+                handle: "carol".to_string(),
+                host: Some("remote.example".to_string()),
+                display_name: None,
+                description: None,
+                location: None,
+                birthday: None,
+                uri: Some(CAROL_URI.to_string()),
+                inbox: Some("https://remote.example/inbox".to_string()),
+                shared_inbox: None,
+                is_bot: false,
+                is_cat: false,
+                is_locked: false,
+                preserved_usernames: Vec::new(),
+            })
+            .expect("remote author")
+    }
+
+    /// Cached remote copy with a resolvable `uri`, through the inbound
+    /// (deduping) create path.
+    fn cached_note(services: &AppServices, author_id: &str, uri: &str, text: &str) -> Note {
+        let mut input = CreateNoteInput::simple_public(author_id, text);
+        input.uri = Some(uri.to_string());
+        services
+            .dedup
+            .record_note_activity("update-note-tests:seed", input, Vec::new())
+            .expect("seed cached copy")
+            .expect("first seed applies")
+    }
+
+    #[test]
+    fn update_note_round_trip_and_replay_converge() {
+        let services = services();
+        let carol = remote_carol(&services);
+        let cached = cached_note(&services, &carol.id, NOTE_URI, "v1");
+
+        // The embedded doc the remote server would send for the edited
+        // note (rendered with our own renderer, as the peer would).
+        let mut edited = cached.clone();
+        edited.text = Some("v2".to_string());
+        let doc = render_note_object(&services, &edited, true).expect("render edited note");
+        assert_eq!(doc["id"], json!(NOTE_URI));
+        assert_eq!(doc["attributedTo"], json!(CAROL_URI));
+
+        let resp = handle_update_note(&services, &doc, "upd-1", CAROL_URI).expect("handle");
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let stored = services
+            .notes
+            .get_note(&cached.id)
+            .unwrap()
+            .expect("cached note");
+        assert_eq!(stored.text.as_deref(), Some("v2"));
+        let updated_at = stored.updated_at_ms.expect("edit stamps updated_at");
+        assert_eq!(services.notes.note_edits(&cached.id).unwrap().len(), 1);
+
+        // Replay of the same activity id: accepted, converged, no change.
+        let resp = handle_update_note(&services, &doc, "upd-1", CAROL_URI).expect("replay");
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let stored = services
+            .notes
+            .get_note(&cached.id)
+            .unwrap()
+            .expect("cached note");
+        assert_eq!(
+            stored.updated_at_ms,
+            Some(updated_at),
+            "replay changes nothing"
+        );
+        assert_eq!(
+            services.notes.note_edits(&cached.id).unwrap().len(),
+            1,
+            "still one history row after replay"
+        );
+    }
+
+    #[test]
+    fn update_note_authority_gates() {
+        let services = services();
+        let carol = remote_carol(&services);
+        let cached = cached_note(&services, &carol.id, NOTE_URI, "v1");
+        let mut edited = cached.clone();
+        edited.text = Some("v2".to_string());
+        let base_doc = render_note_object(&services, &edited, true).expect("render");
+
+        // (a) Attribution mismatch: `attributedTo` names someone else while
+        // the signer is carol → accepted, no change.
+        let mut forged = base_doc.clone();
+        forged["attributedTo"] = json!("https://remote.example/users/mallory");
+        let resp = handle_update_note(&services, &forged, "upd-forged", CAROL_URI)
+            .expect("handle forged");
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let stored = services
+            .notes
+            .get_note(&cached.id)
+            .unwrap()
+            .expect("cached note");
+        assert_eq!(
+            stored.text.as_deref(),
+            Some("v1"),
+            "mismatched attribution changes nothing"
+        );
+        assert!(stored.updated_at_ms.is_none());
+        assert!(services.notes.note_edits(&cached.id).unwrap().is_empty());
+
+        // (b) Signer is not the author: `handle_inbound_update_note` with a
+        // foreign actor uri converges to `Ok(None)`.
+        let none = services
+            .handle_inbound_update_note(
+                "upd-foreign",
+                NOTE_URI,
+                "https://remote.example/users/mallory",
+                Some("v2".to_string()),
+                None,
+                None,
+                None,
+            )
+            .expect("foreign signer converges");
+        assert!(none.is_none());
+        let stored = services
+            .notes
+            .get_note(&cached.id)
+            .unwrap()
+            .expect("cached note");
+        assert_eq!(stored.text.as_deref(), Some("v1"));
+
+        // (c) Local-author protection: a cached copy owned locally is never
+        // rewritten from federation input.
+        let local = services.create_account("local", None).expect("local account");
+        let local_uri = "https://example.local/notes/local-1".to_string();
+        let mut local_input = CreateNoteInput::simple_public(&local.id, "local v1");
+        local_input.uri = Some(local_uri.clone());
+        let local_note = services
+            .dedup
+            .record_note_activity("update-note-tests:seed-local", local_input, Vec::new())
+            .expect("seed local copy")
+            .expect("local seed applies");
+        let mut local_edited = local_note.clone();
+        local_edited.text = Some("local v2".to_string());
+        let local_doc =
+            render_note_object(&services, &local_edited, true).expect("render local");
+        let base = services.public_url.trim_end_matches('/').to_string();
+        let local_actor = local.actor_url(&base);
+        let resp =
+            handle_update_note(&services, &local_doc, "upd-local", &local_actor).expect("handle");
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let stored = services
+            .notes
+            .get_note(&local_note.id)
+            .unwrap()
+            .expect("local note");
+        assert_eq!(
+            stored.text.as_deref(),
+            Some("local v1"),
+            "local notes are never rewritten from federation"
+        );
+        assert!(stored.updated_at_ms.is_none());
+        assert!(services.notes.note_edits(&local_note.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn update_activity_shape_pins() {
+        let services = services();
+        let carol = remote_carol(&services);
+        let cached = cached_note(&services, &carol.id, NOTE_URI, "v1");
+        let doc = render_note_object(&services, &cached, true).expect("render");
+        let base = services.public_url.trim_end_matches('/').to_string();
+        let activity = render_note_update_activity(
+            &base,
+            "w1",
+            CAROL_URI,
+            doc.clone(),
+            vec![format!("{base}/followers/{}", carol.id)],
+            vec!["https://www.w3.org/ns/activitystreams#Public".to_string()],
+            services.clock.now_ms(),
+        );
+        assert_eq!(activity["type"], json!("Update"));
+        assert_eq!(activity["object"], doc);
+        assert_eq!(activity["actor"], json!(CAROL_URI));
+        let id = activity["id"].as_str().expect("activity id");
+        assert!(
+            id.starts_with(&format!("{base}/activities/")),
+            "update id lives under the public base URL, got {id}"
+        );
+    }
+}
