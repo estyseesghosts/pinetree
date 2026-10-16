@@ -110,16 +110,25 @@ impl AppServices {
     }
 
     /// Record an inbound `Undo(Follow)`. A missing follow edge surfaces as
-    /// `Validation(NOT_FOLLOWING)` and maps to `Ok(false)`.
+    /// `Validation(NOT_FOLLOWING)` and maps to `Ok(false)`. Mirrors the
+    /// local `unfollow` streaming hint so a local follower's `main` channel
+    /// still sees `unfollow` (packed worker-side).
     pub fn handle_inbound_unfollow(
         &self,
         activity_id: &str,
         follower_id: &str,
         followee_id: &str,
     ) -> Result<bool, PortError> {
+        let jobs = vec![self.streaming_job(
+            &StreamingEvent::Unfollowed {
+                follower_id: follower_id.to_string(),
+                followee_id: followee_id.to_string(),
+            },
+            format!("inbound-unfollow:{follower_id}:{followee_id}:{}", self.ids.generate()),
+        )?];
         match self
             .dedup
-            .record_unfollow_activity(activity_id, follower_id, followee_id, vec![])
+            .record_unfollow_activity(activity_id, follower_id, followee_id, jobs)
         {
             Ok(v) => Ok(v),
             Err(PortError::Validation(msg)) if msg.contains("NOT_FOLLOWING") => Ok(false),
@@ -129,7 +138,8 @@ impl AppServices {
 
     /// Record an inbound `Accept(Follow)`. The Accept's own id dedups; the
     /// underlying follow row insert is idempotent (`Conflict` maps to
-    /// `Ok(None)`).
+    /// `Ok(None)`). Mirrors the local accept path (`MeUpdated` for the
+    /// followee).
     pub fn handle_inbound_accept_follow(
         &self,
         activity_id: &str,
@@ -137,13 +147,22 @@ impl AppServices {
         followee_id: &str,
         with_replies: bool,
     ) -> Result<Option<Follow>, PortError> {
+        let jobs = vec![self.streaming_job(
+            &StreamingEvent::MeUpdated {
+                account_id: followee_id.to_string(),
+            },
+            format!(
+                "inbound-accept:{follower_id}:{followee_id}:{}",
+                self.ids.generate()
+            ),
+        )?];
         match self.dedup.record_follow_activity(
             activity_id,
             follower_id,
             followee_id,
             with_replies,
             None,
-            vec![],
+            jobs,
         ) {
             Ok(v) => Ok(v),
             Err(PortError::Conflict(_)) => Ok(None),

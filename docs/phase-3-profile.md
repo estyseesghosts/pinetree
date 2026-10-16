@@ -101,3 +101,37 @@ Keystone `routes/Profile.tsx:38-39` types `users/followers|following` as
 Keystone must map `x.follower!` / `x.followee!` (same as Misskey
 `follow-list.vue`) in its own repo. Until then Keystone follow lists
 will render follow-record rows. Logged, not fixed here.
+
+## 7. Superseding audit fixes (2026-10-17)
+
+Five-finder audit (`state/logs/2026-10-16-audit-fixes.md`) verified the
+profile against Misskey `2026.10.1-alpha.0` and tightened these rows
+(behavior changes vs §§2–4 above; rationale in each case is Misskey
+client parity):
+
+- `notes/search`, `notes/search-by-tag`: public (no credential), per
+  Misskey `requireCredential: false`. Anonymous viewers see only what
+  the visibility policy allows.
+- `notes/search` corpus: no `host` filter means the global scope (all
+  cached hosts); `host: "."` stays local-only. New params `offset`
+  (applies before `limit`), `rangeStartAt`/`rangeEndAt` (ms timestamps,
+  same bounds as `sinceDate`/`untilDate`). `channelId` still rejected
+  (no channels exist).
+- `users/notes`: `withReplies` + `withFiles` together is now
+  `BOTH_WITH_REPLIES_AND_WITH_FILES` (Misskey code + id); unknown
+  `userId` is `NO_SUCH_USER` (was `[]`).
+- `drive/files` `sort`: all six Misskey variants honored
+  (`+createdAt` newest-first through `-size`); non-null `folderId`
+  still rejected (no folder model).
+- `Note` gains optional `uri`/`url` (+ always-null `channel`).
+  `Notification` emits `note` only on note-bearing variants and
+  `reaction` only on the reaction variant.
+- `i/notifications` requires `read:notifications` (was `read:account`).
+
+Kept as documented deviations (audited, accepted): public follow lists
+(no visibility fields exist to gate on and no client can set
+non-public); `tokenId` revoke no-op; empty search `query` rejected;
+`search-by-tag` `tag`-only (no target client sends the `query[][]`
+form); read rate-limit buckets and timeline/scan indexes (Phase 5
+scale work); `notes/renotes` + conversation `NO_SUCH_NOTE`/empty
+semantics are Misskey-exact and unchanged.

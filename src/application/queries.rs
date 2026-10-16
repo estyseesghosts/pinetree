@@ -438,8 +438,7 @@ impl AppServices {
     }
 
     /// `users/notes`: one author's notes, newest-first, visibility-filtered.
-    /// An unknown `user_id` yields `[]` (Misskey `users/notes` has no
-    /// `NO_SUCH_USER` error).
+    /// Unknown `user_id` is `NO_SUCH_USER` (Misskey parity).
     pub fn user_notes(
         &self,
         user_id: &str,
@@ -449,6 +448,7 @@ impl AppServices {
         with_renotes: bool,
         with_files: bool,
     ) -> Result<Vec<Note>, PortError> {
+        self.users_show_by_id(user_id)?;
         let all = self.all_notes_bounded()?;
         self.visible_page(viewer_id, all, cursor, |note| {
             if note.author_id.as_str() != user_id {
@@ -558,9 +558,9 @@ impl AppServices {
     }
 
     /// `notes/search`: case-insensitive substring match over `text`+`cw`,
-    /// visibility-filtered. The corpus is local notes only (profile §3);
-    /// `host == "."` is the same local-only scope, while any other `host`
-    /// value selects cached authors with exactly that host.
+    /// visibility-filtered. Misskey parity: no `host` filter means the
+    /// global scope (all cached hosts); `host == "."` is local-only, any
+    /// other `host` value selects cached authors with exactly that host.
     pub fn search_notes(
         &self,
         query: &str,
@@ -584,7 +584,8 @@ impl AppServices {
                 None => continue,
             };
             match host {
-                None | Some(".") => {
+                None => {}
+                Some(".") => {
                     if !author.is_local() {
                         continue;
                     }

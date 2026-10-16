@@ -2294,7 +2294,8 @@ fn api_dispatch_blocking(
                 ],
             )?;
             let caller = require_caller(caller)?;
-            caller.require_permission("read:account")?;
+            // Misskey kind is `read:notifications` (not `read:account`).
+            caller.require_permission("read:notifications")?;
             let cursor = parse_cursor(&obj)?;
             let mark_as_read = opt_bool(&obj, "markAsRead", true)?;
             // Presence (not emptiness) of `includeTypes` decides filtering:
@@ -2450,6 +2451,12 @@ fn api_dispatch_blocking(
             // No channels exist: `withChannelNotes` is accepted and ignored,
             // as is `allowPartial`.
             let with_files = opt_bool(&obj, "withFiles", false)?;
+            // Misskey parity: the combination is rejected, not applied.
+            if with_replies && with_files {
+                return Err(ApiError::from_port_error(PortError::Validation(
+                    "BOTH_WITH_REPLIES_AND_WITH_FILES".to_string(),
+                )));
+            }
             let viewer_id = caller.as_ref().map(|caller| caller.account.id.as_str());
             let notes = state
                 .services
@@ -2648,18 +2655,33 @@ fn api_dispatch_blocking(
             };
             match opt_string(&obj, "sort")? {
                 None => {}
-                Some(sort) if sort == "-createdAt" => {}
+                Some(sort)
+                    if [
+                        "+createdAt",
+                        "-createdAt",
+                        "+name",
+                        "-name",
+                        "+size",
+                        "-size",
+                    ]
+                    .contains(&sort.as_str()) => {}
                 Some(_) => {
                     return Err(ApiError::invalid_param(
                         "sort",
-                        "only \"-createdAt\" is supported",
+                        "must be one of +createdAt, -createdAt, +name, -name, +size, -size",
                     ));
                 }
             }
+            let sort = opt_string(&obj, "sort")?;
             let cursor = parse_cursor(&obj)?;
             let files = state
                 .services
-                .list_drive_files(&caller.account.id, &cursor, type_prefix.as_deref())
+                .list_drive_files(
+                    &caller.account.id,
+                    &cursor,
+                    type_prefix.as_deref(),
+                    sort.as_deref(),
+                )
                 .map_err(ApiError::from_port_error)?;
             let packed: Vec<Value> = files
                 .iter()
@@ -2752,16 +2774,31 @@ fn api_dispatch_blocking(
                     "untilDate",
                     "userId",
                     "host",
+                    "offset",
+                    "rangeStartAt",
+                    "rangeEndAt",
                 ],
             )?;
-            let caller = require_caller(caller)?;
-            caller.require_permission("read:account")?;
+            // Misskey parity: public endpoint (`requireCredential: false`).
+            // Anonymous viewers only see what `is_visible` allows.
+            let viewer_id = caller.as_ref().map(|caller| caller.account.id.as_str());
             let query = required_str(&obj, "query")?;
-            let cursor = parse_cursor(&obj)?;
+            let mut cursor = parse_cursor(&obj)?;
+            // `rangeStartAt/EndAt` are ms timestamps bounding note creation,
+            // like `sinceDate/untilDate` (Misskey maps them through id gen).
+            if cursor.since_date.is_none() {
+                cursor.since_date = opt_i64(&obj, "rangeStartAt")?;
+            }
+            if cursor.until_date.is_none() {
+                cursor.until_date = opt_i64(&obj, "rangeEndAt")?;
+            }
+            // `offset` applies before `limit` (Misskey parity): widen the
+            // window, then skip.
+            let offset = opt_usize(&obj, "offset")?.unwrap_or(0);
+            cursor.limit = cursor.limit.saturating_add(offset);
             let user_id = opt_string(&obj, "userId")?;
             let host = opt_string(&obj, "host")?;
-            let viewer_id = Some(caller.account.id.as_str());
-            let notes = state
+            let mut notes = state
                 .services
                 .search_notes(
                     &query,
@@ -2771,6 +2808,9 @@ fn api_dispatch_blocking(
                     host.as_deref(),
                 )
                 .map_err(ApiError::from_port_error)?;
+            if offset > 0 {
+                notes.drain(..offset.min(notes.len()));
+            }
             pack_note_list(&state.services, &notes, viewer_id)
         }
 
@@ -2779,11 +2819,10 @@ fn api_dispatch_blocking(
                 &obj,
                 &["tag", "limit", "sinceId", "untilId", "sinceDate", "untilDate"],
             )?;
-            let caller = require_caller(caller)?;
-            caller.require_permission("read:account")?;
+            // Misskey parity: public endpoint (no `requireCredential`).
+            let viewer_id = caller.as_ref().map(|caller| caller.account.id.as_str());
             let tag = required_str(&obj, "tag")?;
             let cursor = parse_cursor(&obj)?;
-            let viewer_id = Some(caller.account.id.as_str());
             let notes = state
                 .services
                 .notes_with_tag(&tag, viewer_id, &cursor)
@@ -4799,16 +4838,16 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{page}");
         assert_eq!(page.as_array().unwrap().len(), 2);
 
-        // Unknown author yields [] (Misskey has no NO_SUCH_USER here).
-        let (status, notes) = call(
+        // Unknown author is NO_SUCH_USER (Misskey parity).
+        let (status, value) = call(
             &state,
             "users/notes",
             serde_json::json!({ "userId": "aid00000000000099" }),
             Some(&bob_token),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{notes}");
-        assert_eq!(notes.as_array().unwrap().len(), 0);
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_USER");
 
         // Param validation.
         let (status, value) = call(
@@ -4820,6 +4859,20 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
         assert_eq!(value["code"], "INVALID_PARAM");
+        // Misskey parity: withReplies + withFiles is rejected, not applied.
+        let (status, value) = call(
+            &state,
+            "users/notes",
+            serde_json::json!({
+                "userId": "aid00000000000001",
+                "withReplies": true,
+                "withFiles": true,
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "BOTH_WITH_REPLIES_AND_WITH_FILES");
         let (status, value) = call(
             &state,
             "users/notes",
@@ -5363,7 +5416,7 @@ mod tests {
 
         // Param validation.
         for (body, param) in [
-            (serde_json::json!({ "sort": "+name" }), "sort"),
+            (serde_json::json!({ "sort": "newest" }), "sort"),
             (serde_json::json!({ "folderId": "did00000000000001" }), "folderId"),
             (serde_json::json!({ "type": "not a mime!!" }), "type"),
             (serde_json::json!({ "limit": 0 }), "limit"),
@@ -5371,6 +5424,17 @@ mod tests {
             let (status, value) = call(&state, "drive/files", body, Some(&alice_token)).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
             assert_eq!(value["code"], "INVALID_PARAM", "param {param}");
+        }
+        // All six Misskey sort variants are honored (inverted mapping).
+        for sort in ["+createdAt", "-createdAt", "+name", "-name", "+size", "-size"] {
+            let (status, value) = call(
+                &state,
+                "drive/files",
+                serde_json::json!({ "sort": sort }),
+                Some(&alice_token),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "sort {sort}: {value}");
         }
         let (status, value) = call(
             &state,
@@ -5917,15 +5981,17 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{hits}");
         assert_eq!(hits.as_array().unwrap().len(), 1);
 
-        // Auth + param validation.
-        let (status, _) = call(
+        // Misskey parity: public endpoint — anonymous search works and
+        // sees exactly the public notes (not the followers-only one).
+        let (status, hits) = call(
             &state,
             "notes/search",
             serde_json::json!({ "query": "rust" }),
             None,
         )
         .await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(status, StatusCode::OK, "{hits}");
+        assert_eq!(hits.as_array().unwrap().len(), 2);
         let (status, value) = call(
             &state,
             "notes/search",
@@ -5935,8 +6001,18 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
         assert_eq!(value["code"], "INVALID_PARAM");
+        // `offset` is accepted (applies before `limit`); `channelId` and
+        // the `query[][]` tag form stay rejected (no channels here; the
+        // profile is `tag`-only).
+        let (status, _) = call(
+            &state,
+            "notes/search",
+            serde_json::json!({ "query": "x", "offset": 0 }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
         for (endpoint, body) in [
-            ("notes/search", serde_json::json!({ "query": "x", "offset": 0 })),
             ("notes/search", serde_json::json!({ "query": "x", "channelId": "y" })),
             ("notes/search-by-tag", serde_json::json!({ "tag": "rust", "query": [] })),
         ] {

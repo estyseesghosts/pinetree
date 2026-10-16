@@ -427,35 +427,25 @@ async fn dispatch_hub_message(
                     Ok(Some(note)) => note,
                     _ => return None,
                 };
-                let mut eligible = false;
-                for (_, kind, params) in &timeline {
+                // Single eligibility pass: collect every eligible channel,
+                // then pack once per viewer for all of them.
+                let mut ids: Vec<String> = Vec::new();
+                for (id, kind, params) in &timeline {
                     if let ChannelKind::Timeline(which) = kind {
                         if services
                             .note_eligible_for_channel(*which, viewer.as_deref(), &note, params)
                             .unwrap_or(false)
                         {
-                            eligible = true;
-                            break;
+                            ids.push(id.clone());
                         }
                     }
                 }
-                if !eligible {
+                if ids.is_empty() {
                     return None;
                 }
-                // One pack per viewer serves every eligible channel.
                 let packed =
                     crate::api::misskey::packers::pack_note(&note, viewer.as_deref(), &services, 0)
                         .ok()?;
-                let ids: Vec<String> = timeline
-                    .iter()
-                    .filter_map(|(id, kind, params)| match kind {
-                        ChannelKind::Timeline(which) => services
-                            .note_eligible_for_channel(*which, viewer.as_deref(), &note, params)
-                            .unwrap_or(false)
-                            .then(|| id.clone()),
-                        _ => None,
-                    })
-                    .collect();
                 Some((ids, packed))
             })
             .await
@@ -528,6 +518,28 @@ async fn dispatch_hub_message(
             }
             let event = msg.kind.wire_name().to_string();
             let body = match msg.kind {
+                MainEventKind::Mention | MainEventKind::Reply | MainEventKind::Renote => {
+                    // Re-gate at socket time: the note may have been deleted
+                    // or narrowed between enqueue and delivery (the timeline
+                    // path re-checks eligibility; main events must too).
+                    let note_id = msg
+                        .body
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let services = state.services.clone();
+                    let viewer = me.to_string();
+                    let visible = tokio::task::spawn_blocking(move || {
+                        services.notes_show(&note_id, Some(&viewer)).is_ok()
+                    })
+                    .await
+                    .unwrap_or(false);
+                    if !visible {
+                        return;
+                    }
+                    msg.body
+                }
                 // Packed on receipt so `MeDetailed` honors this
                 // connection's own token (first-party secrets stay scoped).
                 MainEventKind::MeUpdated => {

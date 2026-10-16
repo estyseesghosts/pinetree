@@ -176,7 +176,7 @@ function step(name: string): void {
 }
 
 const PERMS =
-  "read:account,write:account,write:notes,write:following,write:reactions,write:drive";
+  "read:account,write:account,write:notes,write:following,write:reactions,write:drive,read:notifications,write:notifications";
 // 1x1 transparent PNG fixture shared with part 2 for byte comparison.
 const PNG_B64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";

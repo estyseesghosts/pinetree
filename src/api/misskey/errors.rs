@@ -43,6 +43,7 @@ pub const ALREADY_REACTED_ID: &str = "71efcf98-86d6-4e2b-b2ad-9d032369366b";
 pub const NOT_REACTED_ID: &str = "7f6e1c2d-9f9b-4c1a-9e2a-9b9b9b9b9b02";
 pub const CANNOT_REACT_TO_RENOTE_ID: &str = "eaccdc08-ddef-43fe-908f-d108faad57f5";
 pub const CANNOT_RENOTE_ID: &str = "be9529e9-fe72-4de0-ae43-0b363c4938af";
+pub const BOTH_WITH_REPLIES_AND_WITH_FILES_ID: &str = "91c8cb9f-36ed-46e7-9ca2-7df96ed6e222";
 pub const YOU_HAVE_BEEN_BLOCKED_ID: &str = "b390d7e1-8a5e-46ed-b625-06271cafd3d3";
 pub const MAX_FILE_SIZE_EXCEEDED_ID: &str = "7f6e1c2d-9f9b-4c1a-9e2a-9b9b9b9b9b03";
 pub const INTERNAL_ERROR_ID: &str = "5d37dbcb-891e-41ca-a3d6-e690c97775ac";
@@ -346,6 +347,7 @@ fn is_known_client_code(code: &str) -> bool {
             | "CANNOT_RENOTE"
             | "CANNOT_RENOTE_TO_A_PURE_RENOTE"
             | "CANNOT_RENOTE_DUE_TO_VISIBILITY"
+            | "BOTH_WITH_REPLIES_AND_WITH_FILES"
             | "CANNOT_REPLY_TO_AN_INVISIBLE_NOTE"
             | "CANNOT_REPLY_TO_A_PURE_RENOTE"
             | "YOU_HAVE_BEEN_BLOCKED"
@@ -457,6 +459,12 @@ fn lookup_known_code(code: &str) -> Option<(&'static str, &'static str, u16, &'s
                 "client",
             )
         }
+        "BOTH_WITH_REPLIES_AND_WITH_FILES" => (
+            "Specifying both withReplies and withFiles is not supported.",
+            BOTH_WITH_REPLIES_AND_WITH_FILES_ID,
+            400,
+            "client",
+        ),
         "YOU_HAVE_BEEN_BLOCKED" => (
             "You have been blocked by this user.",
             YOU_HAVE_BEEN_BLOCKED_ID,

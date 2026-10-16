@@ -570,6 +570,17 @@ pub fn pack_note(
     );
     obj.insert("emojis".to_string(), Value::Object(Map::new()));
     obj.insert("myReaction".to_string(), my_reaction);
+    // Optional AP identity fields (Misskey `note.ts` `uri`/`url`); `channel`
+    // is always null — channels do not exist here.
+    obj.insert(
+        "uri".to_string(),
+        note.uri.clone().map(Value::String).unwrap_or(Value::Null),
+    );
+    obj.insert(
+        "url".to_string(),
+        note.url.clone().map(Value::String).unwrap_or(Value::Null),
+    );
+    obj.insert("channel".to_string(), Value::Null);
     Ok(Value::Object(obj))
 }
 
@@ -602,16 +613,25 @@ pub fn pack_notification(notification: &Notification, services: &AppServices) ->
         },
         None => Value::Null,
     };
-    serde_json::json!({
+    // Misskey `notification.ts` is a per-type union: `note` exists only on
+    // note-bearing variants, `reaction` only on the reaction variant.
+    let mut obj = serde_json::json!({
         "id": notification.id,
         "createdAt": created_at,
         "type": kind,
         "isRead": notification.is_read,
         "userId": notification.notifier_id,
         "user": user,
-        "note": packed_note,
-        "reaction": notification.reaction.clone().unwrap_or_default(),
-    })
+    });
+    if let Some(map) = obj.as_object_mut() {
+        if notification.note_id.is_some() {
+            map.insert("note".to_string(), packed_note);
+        }
+        if let Some(reaction) = notification.reaction.clone() {
+            map.insert("reaction".to_string(), Value::String(reaction));
+        }
+    }
+    obj
 }
 
 /// Instance metadata: `MetaLite` always, plus `MetaDetailedOnly` when

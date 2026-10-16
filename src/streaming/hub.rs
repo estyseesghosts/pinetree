@@ -112,11 +112,8 @@ impl StreamingSink for BroadcastStreamingSink {
                 user_id,
                 reaction,
             }),
-            // The worker expands follows into packed `MainMessage`s when it
-            // handles the sibling `Notify` job; the bare `MeUpdated` /
-            // `Unfollowed` markers here only wake `main` channels that pack
-            // on receipt. `Unfollowed` carries both ids so the worker-free
-            // path below can route it.
+            // The bare `MeUpdated` marker wakes `main` channels, which pack
+            // `MeDetailed` on receipt (per-connection token scoping).
             StreamingEvent::MeUpdated { account_id } => {
                 self.hub.send(HubMessage::Main(MainMessage {
                     user_id: account_id,
@@ -124,11 +121,19 @@ impl StreamingSink for BroadcastStreamingSink {
                     body: serde_json::Value::Null,
                 }));
             }
+            // `Unfollowed` never reaches the hub through the worker: the
+            // worker intercepts it first to pack the followee (it needs
+            // `AppServices`, which the sink does not have). This arm exists
+            // only so a direct `publish` cannot vanish silently — it is
+            // diagnosed instead of delivered.
             StreamingEvent::Unfollowed {
                 follower_id,
                 followee_id,
             } => {
-                let _ = (follower_id, followee_id);
+                eprintln!(
+                    "streaming: Unfollowed reached the hub without worker expansion \
+                     (follower {follower_id}, followee {followee_id}); dropping"
+                );
             }
         }
         Ok(())

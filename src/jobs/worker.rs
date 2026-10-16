@@ -84,7 +84,7 @@ impl JobWorker {
                 self.jobs.complete(&job.id)?;
             }
             Disposition::Retry { retry_after_ms } => {
-                if job.attempts + 1 >= MAX_JOB_ATTEMPTS {
+                if job.attempts.saturating_add(1) >= MAX_JOB_ATTEMPTS {
                     // Retry budget exhausted for any kind: quarantine with a
                     // recorded reason instead of retrying forever.
                     self.quarantine(&job, "retry-exhausted")?;
@@ -135,6 +135,9 @@ impl JobWorker {
                 Err(_) => Ok(Disposition::Retry { retry_after_ms: None }),
             },
             JobKind::FederateDeliver => self.dispatch_federate(job),
+            // No materialized-timeline fan-out exists (fan-out-on-read);
+            // the kind is reserved so enqueued rows complete instead of
+            // wedging the worker.
             JobKind::TimelineMaterialize => Ok(Disposition::Done),
             // Slice 7 (H2+C3, decision D-d): remote media fetched
             // off-request. Bad payloads quarantine; per-attachment fetch

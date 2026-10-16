@@ -151,14 +151,16 @@ impl AppServices {
         Ok(())
     }
 
-    /// Owner's files, newest-first, with `drive/files` list filtering
-    /// (Phase 3): optional MIME prefix (`type_prefix`, e.g. `"image/"`) and
-    /// the shared id/date cursor.
+    /// Owner's files with `drive/files` list filtering (Phase 3): optional
+    /// MIME prefix (`type_prefix`, e.g. `"image/"`), the shared id/date
+    /// cursor, and Misskey `sort` (default newest-first; note the Misskey
+    /// inversion: `+createdAt` is newest-first, `-createdAt` oldest-first).
     pub fn list_drive_files(
         &self,
         owner_id: &str,
         cursor: &TimelineCursor,
         type_prefix: Option<&str>,
+        sort: Option<&str>,
     ) -> Result<Vec<MediaMeta>, PortError> {
         self.accounts.get_owner(owner_id)?;
         let mut files = self.media.list_by_owner(owner_id)?;
@@ -191,6 +193,16 @@ impl AppServices {
             true
         });
         files.sort_by(|a, b| b.id.cmp(&a.id));
+        match sort {
+            None | Some("-createdAt") => {}
+            Some("+createdAt") => files.sort_by(|a, b| b.id.cmp(&a.id)),
+            Some("-name") => files.sort_by(|a, b| a.name.cmp(&b.name)),
+            Some("+name") => files.sort_by(|a, b| b.name.cmp(&a.name)),
+            Some("-size") => files.sort_by(|a, b| a.size_bytes.cmp(&b.size_bytes)),
+            Some("+size") => files.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes)),
+            // Any other value is rejected by the endpoint before this runs.
+            Some(_) => {}
+        }
         files.truncate(cursor.limit);
         Ok(files)
     }

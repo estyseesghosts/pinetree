@@ -20,9 +20,14 @@ impl AppServices {
         extra_jobs: Vec<NewJob>,
     ) -> Result<Option<Note>, PortError> {
         let mut jobs = Vec::new();
+        // One `Notify` per user (mirrors the local `create_note` dedup):
+        // a remote note that is both a reply and a mention must not emit
+        // two `notification` frames.
+        let mut already_notified: HashSet<String> = HashSet::new();
         if let Some(reply_id) = input.reply_to.as_deref() {
             if let Ok(Some(target)) = self.notes.get_note(reply_id) {
                 if target.author_id != input.author_id {
+                    already_notified.insert(target.author_id.clone());
                     if let Ok(job) = self.notify_job(
                         &target.author_id,
                         &input.author_id,
@@ -38,7 +43,10 @@ impl AppServices {
         }
         if let Some(renote_id) = input.renote_of.as_deref() {
             if let Ok(Some(target)) = self.notes.get_note(renote_id) {
-                if target.author_id != input.author_id {
+                if target.author_id != input.author_id
+                    && !already_notified.contains(&target.author_id)
+                {
+                    already_notified.insert(target.author_id.clone());
                     if let Ok(job) = self.notify_job(
                         &target.author_id,
                         &input.author_id,
@@ -65,7 +73,10 @@ impl AppServices {
                     continue;
                 }
                 if let Ok(Some(mentioned)) = self.accounts.find_by_handle(&lower) {
-                    if mentioned.id != input.author_id {
+                    if mentioned.id != input.author_id
+                        && !already_notified.contains(&mentioned.id)
+                    {
+                        already_notified.insert(mentioned.id.clone());
                         if let Ok(job) = self.notify_job(
                             &mentioned.id,
                             &input.author_id,
