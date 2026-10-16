@@ -19,8 +19,10 @@ use serde_json::Value;
 
 use crate::activitypub::objects::{
     render_accept_follow_activity, render_create_or_announce_for_note,
-    render_delete_note_activity, render_follow_activity, render_like_activity,
-    render_reject_follow_activity, render_undo_activity, render_update_actor_activity,
+    render_delete_note_activity, render_delete_stamp_activity, render_follow_activity,
+    render_like_activity, render_note_object, render_quote_request_activity,
+    render_quote_response_activity, render_reject_follow_activity, render_undo_activity,
+    render_update_actor_activity, PUBLIC_COLLECTION_URI,
 };
 use crate::application::commands::AppServices;
 use crate::application::ports::{JobKind, NewJob, PortError};
@@ -106,6 +108,36 @@ pub enum FederateDeliverPayload {
     ActorUpdated {
         update_id: String,
         account_id: String,
+        inbox_override: Option<String>,
+    },
+    /// Deliver a FEP-044f `QuoteRequest` to the quoted author's inbox.
+    /// `quote_note_id` may be `"__PENDING_NOTE_ID__"` at enqueue time.
+    QuoteRequest {
+        request_id: String,
+        quote_note_id: String,
+        quoter_account_id: String,
+        quoted_uri: String,
+        target_actor_uri: String,
+        inbox_url: String,
+    },
+    /// Deliver a FEP-044f `Accept` (with stamp `result`) or `Reject`
+    /// answering a `QuoteRequest` to the quoter's inbox.
+    QuoteResponse {
+        response_id: String,
+        accept: bool,
+        decider_account_id: String,
+        request_activity_uri: String,
+        stamp_uri: Option<String>,
+        quoter_actor_uri: String,
+        inbox_url: String,
+    },
+    /// Deliver a FEP-044f stamp revocation (`Delete` of the
+    /// `QuoteAuthorization`) to the quoting note's audience.
+    QuoteStampDeleted {
+        delete_id: String,
+        actor_id: String,
+        stamp_uri: String,
+        quote_note_id: String,
         inbox_override: Option<String>,
     },
 }
@@ -503,7 +535,162 @@ pub fn execute_federate_deliver(
                 }
             }
         }
+
+        FederateDeliverPayload::QuoteRequest {
+            request_id,
+            quote_note_id,
+            quoter_account_id,
+            quoted_uri,
+            target_actor_uri,
+            inbox_url,
+        } => {
+            let quoter = match services.accounts.find_by_id(&quoter_account_id)? {
+                Some(a) if a.is_local() => a,
+                _ => return Ok(DeliveryOutcome::Delivered),
+            };
+            let Some(note) = services.notes.get_note(&quote_note_id)? else {
+                return Ok(DeliveryOutcome::Delivered);
+            };
+            if note.author_id != quoter_account_id || !note.is_quote() {
+                return Ok(DeliveryOutcome::Delivered);
+            }
+            let inline = render_note_object(services, &note, true)?;
+            let activity = render_quote_request_activity(
+                base,
+                &request_id,
+                &quoter.actor_url(base),
+                &quoted_uri,
+                &target_actor_uri,
+                inline,
+            );
+            deliver_single(
+                services,
+                client,
+                tracker,
+                &quoter_account_id,
+                &inbox_url,
+                &activity,
+            )
+        }
+
+        FederateDeliverPayload::QuoteResponse {
+            response_id,
+            accept,
+            decider_account_id,
+            request_activity_uri,
+            stamp_uri,
+            quoter_actor_uri,
+            inbox_url,
+        } => {
+            let decider = match services.accounts.find_by_id(&decider_account_id)? {
+                Some(a) if a.is_local() => a,
+                _ => return Ok(DeliveryOutcome::Delivered),
+            };
+            let activity = render_quote_response_activity(
+                base,
+                &response_id,
+                accept,
+                &decider.actor_url(base),
+                &request_activity_uri,
+                stamp_uri.as_deref(),
+                &quoter_actor_uri,
+            );
+            deliver_single(
+                services,
+                client,
+                tracker,
+                &decider_account_id,
+                &inbox_url,
+                &activity,
+            )
+        }
+
+        FederateDeliverPayload::QuoteStampDeleted {
+            delete_id,
+            actor_id,
+            stamp_uri,
+            quote_note_id,
+            inbox_override,
+        } => {
+            let actor = match services.accounts.find_by_id(&actor_id)? {
+                Some(a) if a.is_local() => a,
+                _ => return Ok(DeliveryOutcome::Delivered),
+            };
+            let actor_uri = actor.actor_url(base);
+            // Fan out to the quoting note's audience (everyone who may have
+            // seen the Create carrying the stamp).
+            let extras = match services.notes.get_note(&quote_note_id)? {
+                Some(note) => quote_note_extras(services, &note)?,
+                None => Vec::new(),
+            };
+            let to_public = vec![PUBLIC_COLLECTION_URI.to_string()];
+            let activity = render_delete_stamp_activity(
+                base,
+                &delete_id,
+                &actor_uri,
+                &stamp_uri,
+                to_public,
+            );
+            match inbox_override {
+                Some(inbox) => {
+                    deliver_single(services, client, tracker, &actor_id, &inbox, &activity)
+                }
+                None => {
+                    let inboxes = collect_recipient_inboxes_for_author(
+                        services,
+                        &actor_id,
+                        &extras,
+                        true,
+                    )?;
+                    fan_out(
+                        services,
+                        client,
+                        tracker,
+                        job_key,
+                        &actor_id,
+                        &inboxes,
+                        &activity,
+                        &|inbox: &str| FederateDeliverPayload::QuoteStampDeleted {
+                            delete_id: delete_id.clone(),
+                            actor_id: actor_id.clone(),
+                            stamp_uri: stamp_uri.clone(),
+                            quote_note_id: quote_note_id.clone(),
+                            inbox_override: Some(inbox.to_string()),
+                        },
+                    )
+                }
+            }
+        }
     }
+}
+
+/// Extra recipient account ids for quote-stamp revocation fan-out: mirrors
+/// the `NoteCreated` audience (mentions, specified users, reply author, and
+/// the quoted note's author) so every party that saw the stamp learns of
+/// the revocation.
+fn quote_note_extras(
+    services: &AppServices,
+    note: &crate::domain::note::Note,
+) -> Result<Vec<String>, PortError> {
+    let mut extras = note.mentions.clone();
+    for uid in &note.visible_user_ids {
+        if !extras.contains(uid) {
+            extras.push(uid.clone());
+        }
+    }
+    if let Some(ruid) = &note.reply_user_id {
+        if !extras.contains(ruid) {
+            extras.push(ruid.clone());
+        }
+    }
+    if let Some(renote_id) = &note.renote_id {
+        if let Some(target) = services.notes.get_note(renote_id)? {
+            if !extras.contains(&target.author_id) {
+                extras.push(target.author_id);
+            }
+        }
+    }
+    Ok(extras)
 }
 
 /// Deliver one fan-out activity to `inboxes`. The calling job has no

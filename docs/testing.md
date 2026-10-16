@@ -32,6 +32,9 @@ Environment:
 - `SHARKEY_NODE_BIN=<dir with a Node 22 `node`>` — required for the
   federation step (default `node` must be 24.x for Misskey's `re2`).
 - `PINETREE_BIN=...` / `BUN_BIN=...` — override auto-detected binaries.
+- `PINETREE_ELIXIR_INTEROP=1` — runs `tests/federation_elixir.rs::elixir_quote_federation` (Pinetree↔Pleroma↔Akkoma triangle: baseline posts/replies/renotes/media/follows + quote interop both directions; needs the `local-federation` rig + `pinetree.test` node up, otherwise skips).
+- `PINETREE_ELIXIR_STRESS=1` — runs `tests/federation_elixir.rs::elixir_quote_stress` (sustained quote+post fan-out with follow churn, then convergence + no-duplicate assertions; same rig, throwaway users/ports/DBs). The stress matrix now includes a reply burst with exact-match convergence.
+- `PINETREE_REPLY_REPAIR_LIMIT=<n>` — bounds the opt-in unresolved-reply-parent repair at startup (`repair_unresolved_reply_parents`, clamped 1..=5000); off by default (unset = no startup repair).
 
 The federation step reports `SKIP` (not failure) when docker, Node 24,
 Node 22, or the built `./misskey` + `./sharkey` checkouts are absent:

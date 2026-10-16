@@ -49,6 +49,8 @@ Frozen Phase 0/1 surface (manifest §§1–5) plus:
 | `notes/replies` | none | `noteId*`, cursor + `limit` 1–100 (=10) | direct replies (`reply_id == noteId`), `Note[]` |
 | `notes/renotes` | none | `noteId*`, cursor + `limit` 1–100 (=10) | all renotes incl. quotes, `Note[]` |
 | `notes/children` | none | `noteId*`, `limit` 1–100 (=10), cursor | replies + quote-renotes (renotes with text/files), `Note[]` |
+
+Superseding note — quote posts (2026-10-16, `docs/quote-posts.md`): quote notes project through the same `renote`/`renoteId` shape plus Pinetree extensions `quoteAuthorizationStatus` (`pending|approved|rejected|revoked|unapproved|unknown`), `quoteTargetUri` (unresolved-but-disclosable target), and `quoteTargetUnavailable` (protected/invisible target, `renote` null, no URI leak). Extensions appear on quotes only, never on pure renotes; authorization never overrides visibility; rejected/unapproved quotes still render.
 | `notes/conversation` | none | `noteId*`, `limit` 1–100 (=10), `offset=0` | ancestor chain via `replyId`, oldest-first, `Note[]` |
 | `notes/unrenote` | credential `write:notes` | `noteId*` | void; deletes all caller's renotes of the note (`NO_SUCH_NOTE` when unknown) |
 | `users/followers` | none | `userId` xor (`username`+`host`) `*`, cursor + `limit` 1–100 (=10) | `Following[]` (`{id,createdAt,followerId,followeeId,follower, followee?}` — follower populated; Misskey shape) |

@@ -263,6 +263,41 @@ mod tests {
         }
     }
 
+    /// Slice B fail-closed: a note with an unresolved reply parent is
+    /// withheld from every viewer — author, follower, mentioned,
+    /// replied-to, stranger, anonymous, and remote — until the resolver
+    /// links it. Public visibility of the note itself does not matter:
+    /// parent-derived restrictions cannot be checked yet.
+    #[test]
+    fn pending_reply_parent_withholds_from_all_viewers() {
+        use Visibility::Public;
+        let mut note = make_note(
+            "author",
+            Public,
+            false,
+            vec![],
+            vec!["mentioned"],
+            None,
+            Some("remote.example"),
+            false,
+        );
+        note.reply_parent_uri = Some("https://remote.example/notes/1".to_string());
+        for viewer in local_viewers() {
+            assert!(
+                !is_visible(&note, &viewer),
+                "pending reply must be hidden from {viewer:?}"
+            );
+        }
+        assert!(!is_visible(&note, &ViewerContext::anonymous()));
+        assert!(!is_visible(
+            &note,
+            &ViewerContext::remote_user("stranger", "other.example", false)
+        ));
+        // Control: the same note without a pending parent is visible.
+        note.reply_parent_uri = None;
+        assert!(is_visible(&note, &ViewerContext::local_user("stranger", false)));
+    }
+
     /// E1 (timelines): only local public notes are local-timeline eligible;
     /// only non-local_only public notes are federated-timeline eligible.
     #[test]

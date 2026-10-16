@@ -147,6 +147,31 @@ async fn main() {
         eprintln!("{err}");
         std::process::exit(1);
     });
+    // Opt-in bounded repair for pre-Slice-B historical remote notes whose
+    // original `inReplyTo` was discarded (`docs/replies.md` §6.1). Off by
+    // default (no network I/O at startup); set
+    // `PINETREE_REPLY_REPAIR_LIMIT=<1..=5000>` to re-fetch at most that many
+    // of the newest stored notes' origin documents and mark the ones that
+    // still declare a parent. Sequential, restartable, and safe to re-run.
+    if let Some(limit_raw) = std::env::var("PINETREE_REPLY_REPAIR_LIMIT").ok().filter(|v| !v.trim().is_empty()) {
+        match limit_raw.trim().parse::<usize>() {
+            Ok(limit) if limit > 0 => {
+                eprintln!("reply repair: scanning up to {limit} stored notes");
+                match pinetree::application::commands::inbound::replies::repair_unresolved_reply_parents(
+                    &services, limit,
+                ) {
+                    Ok(report) => eprintln!(
+                        "reply repair: scanned={} marked={} (resolver jobs enqueued)",
+                        report.scanned, report.marked
+                    ),
+                    Err(err) => eprintln!("reply repair failed (continuing to serve): {err}"),
+                }
+            }
+            _ => eprintln!(
+                "invalid PINETREE_REPLY_REPAIR_LIMIT={limit_raw:?} (want 1..=5000); skipping reply repair"
+            ),
+        }
+    }
     let worker = Arc::new(JobWorker {
         clock: services.clock.clone(),
         ids: services.ids.clone(),

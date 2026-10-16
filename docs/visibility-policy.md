@@ -69,3 +69,7 @@ The ports contract (`docs/application-ports.md` §5) deferred `visible_users` to
 ## Superseding note — Phase 2.6 slice 4 (2026-10-15)
 
 `follows_author` is true only for accepted follow edges. A pending `FollowRequest` grants no followers-only read access and no federation fan-out until accepted (conformance F5). Locked accounts: inbound Follow and local `following/create` create a request; no auto-Accept.
+
+## Superseding note — branched replies (2026-10-16, `docs/replies.md`)
+
+Fail-closed pending rule: while a note's `reply_parent_uri` is set, `is_visible(note, viewer)` returns false for every viewer, because parent-derived restrictions cannot yet be checked. The note is withheld from note detail, profiles, search, timelines, feeds, ActivityPub object responses, and streaming; it is never treated as a root note. Store-level reads are unaffected, and linking clears the pending state and restores the normal §3 predicate (with reply narrowing per §2).

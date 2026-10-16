@@ -56,9 +56,11 @@ pub fn is_ap_accept(headers: &HeaderMap) -> bool {
 }
 
 /// Canonical `@context` array matching Misskey/Sharkey (`context.ts`),
-/// omitting deprecated `_misskey_content`.
+/// omitting deprecated `_misskey_content`, plus FEP-044f quote terms
+/// (canonical `quote`/`quoteAuthorization`, Fedibird `quoteUri`, GoToSocial
+/// interaction-policy terms) and the `quoteUrl` convention.
 pub fn ap_context() -> Value {
-    json!([
+    let mut ctx = json!([
         "https://www.w3.org/ns/activitystreams",
         "https://w3id.org/security/v1",
         {
@@ -86,7 +88,22 @@ pub fn ap_context() -> Value {
             "isCat": "misskey:isCat",
             "vcard": "http://www.w3.org/2006/vcard/ns#"
         }
-    ])
+    ]);
+    // Merge the FEP-044f / compatibility quote terms into the trailing
+    // context object (never the deprecated `_misskey_content`).
+    if let Some(entries) = ctx.as_array_mut()
+        .and_then(|arr| arr.last_mut())
+        .and_then(|v| v.as_object_mut())
+    {
+        for (k, v) in super::quotes::quote_context_entries()
+            .as_object()
+            .cloned()
+            .unwrap_or_default()
+        {
+            entries.insert(k, v);
+        }
+    }
+    ctx
 }
 
 /// Return true if `uri` is one of the ActivityStreams Public collection URIs.
@@ -543,16 +560,24 @@ pub fn render_note_object(
     );
     let (to, cc) = render_note_audience(services, &author, note);
 
+    // Slice B: a pending (unresolved-parent) reply never leaks its
+    // `reply_parent_uri` — neither as `inReplyTo` here nor through the
+    // Misskey packer. Such notes are withheld from the AP object endpoints
+    // by `is_visible` anyway; this keeps the renderer total even if one
+    // ever reaches it (e.g. outbound delivery of a note linked between
+    // packing and rendering cannot happen, but defense in depth is cheap).
     let in_reply_to = match &note.reply_id {
-        Some(rid) => match services.notes.get_note(rid)? {
-            Some(parent) => Some(
-                parent
-                    .uri
-                    .unwrap_or_else(|| format!("{base}/notes/{}", parent.id)),
-            ),
-            None => None,
-        },
-        None => None,
+        Some(rid) if note.reply_parent_uri.is_none() => {
+            match services.notes.get_note(rid)? {
+                Some(parent) => Some(
+                    parent
+                        .uri
+                        .unwrap_or_else(|| format!("{base}/notes/{}", parent.id)),
+                ),
+                None => None,
+            }
+        }
+        _ => None,
     };
 
     let content_html = note.text.as_deref().map(|t| mfm_to_html(t, base));
@@ -562,7 +587,6 @@ pub fn render_note_object(
             "mediaType": "text/x.misskeymarkdown",
         })
     });
-
     // Attachments from `file_ids`
     let mut attachments = Vec::new();
     let mut any_sensitive_file = false;
@@ -599,6 +623,78 @@ pub fn render_note_object(
         }));
     }
 
+    // Structured quote (FEP-044f canonical + legacy aliases + policy +
+    // single textual fallback). The stored body is never mutated: the
+    // fallback is generated on the serialized `content` only, and only
+    // when the target is safe to disclose to this post's audience.
+    let mut content_html = content_html;
+    let mut quote_extra = serde_json::Map::new();
+    if let Some(quote) = note.quote.as_ref() {
+        use crate::activitypub::quotes::{
+            has_terminal_re_fallback, render_quote_fields, render_quote_link_tag,
+            render_quote_policy,
+        };
+        use crate::domain::quote::QuoteAuthorizationState;
+        // `quoteAuthorization` only with a valid stamp (Approved carries
+        // one; exceptions and all other states serialize no stamp).
+        let stamp = match quote.authorization {
+            QuoteAuthorizationState::Approved => quote.authorization_uri.as_deref(),
+            _ => None,
+        };
+        for (k, v) in render_quote_fields(&quote.target_uri, stamp)
+            .as_object()
+            .cloned()
+            .unwrap_or_default()
+        {
+            quote_extra.insert(k, v);
+        }
+        // Advisory quoting policy for this object (never proof of approval,
+        // and never `manualApproval`: no review workflow exists).
+        let quoting_public_audience =
+            matches!(note.visibility, Visibility::Public | Visibility::Home);
+        for (k, v) in render_quote_policy(quoting_public_audience, &author_uri)
+            .as_object()
+            .cloned()
+            .unwrap_or_default()
+        {
+            quote_extra.insert(k, v);
+        }
+        // FEP-e232 compatibility Link tag (single, non-duplicated).
+        tags.push(render_quote_link_tag(&quote.target_uri));
+        // Textual `RE:` fallback: public quoting posts only, known-public
+        // targets only, never twice. Unresolved targets get no fallback:
+        // their visibility is unknown (possibly private) and a public
+        // `RE:` would leak existence.
+        let target_public = match quote.target_note_id.as_deref() {
+            Some(tid) => match services.notes.get_note(tid)? {
+                Some(target) => {
+                    matches!(target.visibility, Visibility::Public | Visibility::Home)
+                        && !target.local_only
+                        && !target.is_deleted
+                }
+                None => false,
+            },
+            None => false,
+        };
+        if quoting_public_audience
+            && target_public
+            && !has_terminal_re_fallback(note.text.as_deref(), &quote.target_uri)
+        {
+            let escaped = html_escape(&quote.target_uri);
+            let suffix = format!(
+                "<br><br><span class=\"quote-inline\">RE: <a href=\"{escaped}\">{escaped}</a></span>"
+            );
+            match content_html.as_mut() {
+                Some(html) => html.push_str(&suffix),
+                None => {
+                    content_html = Some(format!(
+                        "<p><span class=\"quote-inline\">RE: <a href=\"{escaped}\">{escaped}</a></span></p>"
+                    ));
+                }
+            }
+        }
+    }
+
     let mut obj = json!({
         "id": note_uri,
         "type": "Note",
@@ -614,6 +710,9 @@ pub fn render_note_object(
         "attachment": attachments,
         "sensitive": note.cw.is_some() || any_sensitive_file,
     });
+    for (k, v) in quote_extra {
+        obj[k] = v;
+    }
     if include_context {
         if let Some(map) = obj.as_object_mut() {
             map.insert("@context".to_string(), ap_context());
@@ -824,6 +923,101 @@ pub fn render_delete_note_activity(
     })
 }
 
+// ---------------------------------------------------------------------------
+// FEP-044f quote workflow activities + stamp documents
+// ---------------------------------------------------------------------------
+
+/// Render a FEP-044f `QuoteRequest`: `object` is the quoted Note URI,
+/// `instrument` is the quoting Note (inlined per the FEP's SHOULD, never
+/// swapped). `to` addresses the quoted author only.
+pub fn render_quote_request_activity(
+    public_url: &str,
+    request_id: &str,
+    quoter_actor_uri: &str,
+    quoted_uri: &str,
+    quoted_author_actor_uri: &str,
+    inline_quote_note: Value,
+) -> Value {
+    let base = public_url.trim_end_matches('/');
+    json!({
+        "@context": ap_context(),
+        "id": format!("{base}/activities/{request_id}"),
+        "type": "QuoteRequest",
+        "actor": quoter_actor_uri,
+        "to": [quoted_author_actor_uri],
+        "object": quoted_uri,
+        "instrument": inline_quote_note,
+    })
+}
+
+/// Render an `Accept` (with `result` = stamp IRI) or `Reject` answering a
+/// `QuoteRequest`. The `object` is the request activity IRI; a bare `Accept`
+/// without a stamp `result` never counts as approval.
+pub fn render_quote_response_activity(
+    public_url: &str,
+    response_id: &str,
+    accept: bool,
+    decider_actor_uri: &str,
+    request_activity_uri: &str,
+    stamp_uri: Option<&str>,
+    quoter_actor_uri: &str,
+) -> Value {
+    let base = public_url.trim_end_matches('/');
+    let mut doc = json!({
+        "@context": ap_context(),
+        "id": format!("{base}/activities/{response_id}"),
+        "type": if accept { "Accept" } else { "Reject" },
+        "actor": decider_actor_uri,
+        "to": [quoter_actor_uri],
+        "object": request_activity_uri,
+    });
+    if accept {
+        if let Some(stamp) = stamp_uri {
+            doc["result"] = Value::String(stamp.to_string());
+        }
+    }
+    doc
+}
+
+/// Render a dereferenceable `QuoteAuthorization` stamp document. The stamp
+/// carries only URIs: it never embeds the quote Note, and the target is
+/// referenced by URI (callers gate serving on target visibility).
+pub fn render_quote_stamp_document(
+    stamp_id: &str,
+    author_actor_uri: &str,
+    interacting_object_uri: &str,
+    interaction_target_uri: &str,
+) -> Value {
+    json!({
+        "@context": ap_context(),
+        "id": stamp_id,
+        "type": "QuoteAuthorization",
+        "attributedTo": author_actor_uri,
+        "interactingObject": interacting_object_uri,
+        "interactionTarget": interaction_target_uri,
+    })
+}
+
+/// Render a `Delete` revoking a `QuoteAuthorization` stamp (FEP-044f
+/// revocation). The `object` is the stamp IRI.
+pub fn render_delete_stamp_activity(
+    public_url: &str,
+    delete_id: &str,
+    actor_uri: &str,
+    stamp_uri: &str,
+    to: Vec<String>,
+) -> Value {
+    let base = public_url.trim_end_matches('/');
+    json!({
+        "@context": ap_context(),
+        "id": format!("{base}/activities/{delete_id}"),
+        "type": "Delete",
+        "actor": actor_uri,
+        "to": to,
+        "object": stamp_uri,
+    })
+}
+
 /// Render a `Tombstone` JSON-LD document for `GET /notes/{id}` when deleted.
 pub fn render_tombstone(note_uri: &str) -> Value {
     json!({
@@ -882,6 +1076,18 @@ pub struct ParsedRemoteNote {
     pub hashtags: Vec<String>,
     pub attachments: Vec<ParsedAttachment>,
     pub sensitive: bool,
+    /// Normalized structured quote target (any of the five carriers), if any.
+    /// Quote detection is independent of authorization metadata.
+    #[serde(default)]
+    pub quote_target_uri: Option<String>,
+    /// Raw `quoteAuthorization` IRI, if present. Presence alone never proves
+    /// approval — the stamp must be dereferenced and verified.
+    #[serde(default)]
+    pub quote_authorization_uri: Option<String>,
+    /// True when several carriers disagreed on the target (canonical `quote`
+    /// won). Diagnostic only; the winning target is in `quote_target_uri`.
+    #[serde(default)]
+    pub quote_has_conflict: bool,
 }
 
 /// Parse an ActivityPub `Note` JSON object into [`ParsedRemoteNote`].
@@ -1068,6 +1274,7 @@ pub fn parse_remote_note(obj_val: &Value) -> Result<ParsedRemoteNote, String> {
         }
     }
 
+    let normalized = super::quotes::normalize_inbound_quote(obj_val);
     Ok(ParsedRemoteNote {
         uri,
         url,
@@ -1081,6 +1288,12 @@ pub fn parse_remote_note(obj_val: &Value) -> Result<ParsedRemoteNote, String> {
         hashtags,
         attachments,
         sensitive,
+        quote_target_uri: normalized.as_ref().map(|q| q.target_uri.clone()),
+        quote_authorization_uri: super::quotes::inbound_authorization_iri(obj_val),
+        quote_has_conflict: normalized
+            .as_ref()
+            .map(|q| !q.conflicting_aliases.is_empty())
+            .unwrap_or(false),
     })
 }
 
@@ -1169,6 +1382,57 @@ pub async fn get_note_ap(
         Ok(doc) => ap_response(StatusCode::OK, &doc),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
+}
+
+/// `GET /users/{id}/stamps/{stamp}` — serves a FEP-044f
+/// `QuoteAuthorization` stamp document authored by a local user.
+///
+/// - Unknown or revoked stamps → `404` (a deleted stamp must not
+///   dereference; verifiers treat fetch failure as inconclusive, never as
+///   approval).
+/// - Stamps for non-public targets → `404` (the stamp must be
+///   dereferenceable by parties allowed to view the original post; the doc
+///   carries URIs only, but nothing is served for protected targets).
+/// - The stamp never embeds the quote Note.
+pub async fn get_quote_stamp(
+    State(services): State<Arc<AppServices>>,
+    Path((id, stamp)): Path<(String, String)>,
+) -> Response {
+    let base = services.public_url.trim_end_matches('/');
+    let account = match services.accounts.find_by_id(&id) {
+        Ok(Some(acc)) if acc.is_local() => acc,
+        Ok(_) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let stamp_uri = format!("{base}/users/{}/stamps/{stamp}", account.id);
+    let record = match services.notes.get_quote_stamp(&stamp_uri) {
+        Ok(Some(r)) if !r.revoked => r,
+        Ok(_) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    // Gate on the quoted post's actual visibility.
+    let target = match services.notes.get_note(&record.interaction_target_note_id) {
+        Ok(Some(n)) => n,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    if target.is_deleted
+        || target.local_only
+        || !matches!(target.visibility, Visibility::Public | Visibility::Home)
+        || !is_visible(&target, &ViewerContext::anonymous())
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let target_uri = target
+        .uri
+        .unwrap_or_else(|| format!("{base}/notes/{}", target.id));
+    let doc = render_quote_stamp_document(
+        &stamp_uri,
+        &account.actor_url(base),
+        &record.interacting_object_uri,
+        &target_uri,
+    );
+    ap_response(StatusCode::OK, &doc)
 }
 
 /// `GET /notes/{id}/activity` — serves the `Create(Note)` or `Announce`
@@ -1343,5 +1607,263 @@ mod tests {
         let parsed_note = parse_remote_note(&note_doc).unwrap();
         assert_eq!(parsed_note.text.as_deref(), Some("hello #test"));
         assert_eq!(parsed_note.hashtags, vec!["test".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod quote_render_tests {
+    use super::*;
+    use crate::application::ports::{ActivityDedup, CreateNoteInput, NoopStreamingSink};
+    use crate::domain::id::{AidxGenerator, Clock, IdGenerator, ManualClock};
+    use crate::domain::quote::{QuoteAuthorizationState, QuoteReference};
+    use crate::federation::delivery::{SafeHttpClient, SafeHttpConfig};
+    use crate::media::storage::FsBlobStore;
+    use crate::persistence::redb::RedbStore;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn test_services(prefix: &str) -> AppServices {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "pinetree-quote-render-{}-{prefix}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_760_400_000_000));
+        let ids: Arc<dyn IdGenerator> = Arc::new(AidxGenerator::new(clock.clone()));
+        let store = RedbStore::open(dir.join("test.redb"), clock.clone(), ids.clone()).unwrap();
+        let blobs = Arc::new(FsBlobStore::new(dir.join("blobs")).unwrap());
+        AppServices {
+            clock,
+            ids,
+            accounts: store.clone(),
+            notes: store.clone(),
+            follows: store.clone(),
+            reactions: store.clone(),
+            jobs: store.clone(),
+            media: store.clone(),
+            blobs,
+            notifications: store.clone(),
+            auth: store.clone(),
+            streaming: Arc::new(NoopStreamingSink),
+            dedup: store.clone() as Arc<dyn ActivityDedup>,
+            federation_http: SafeHttpClient::new(SafeHttpConfig {
+                allow_private_ips: true,
+                ..Default::default()
+            }),
+            public_url: "https://pinetree.local".to_string(),
+            max_file_size: 10 * 1024 * 1024,
+            preserved_usernames: Vec::new(),
+            prohibited_words: Vec::new(),
+            sensitive_words: Vec::new(),
+        }
+    }
+
+    fn quote_of(services: &AppServices, quoter: &str, target: &Note, text: &str) -> Note {
+        let mut input = CreateNoteInput::simple_public(quoter, text);
+        input.renote_of = Some(target.id.clone());
+        services.create_note(input).unwrap()
+    }
+
+    #[test]
+    fn quote_renders_canonical_plus_aliases_policy_and_single_fallback() {
+        let services = test_services("full");
+        let alice = services.create_account("alice", None).unwrap();
+        let bob = services.create_account("bob", None).unwrap();
+        let target = services
+            .create_note(CreateNoteInput::simple_public(&alice.id, "original"))
+            .unwrap();
+        let target_uri = format!("https://pinetree.local/notes/{}", target.id);
+        let quote = quote_of(&services, &bob.id, &target, "commentary");
+
+        let doc = render_note_object(&services, &quote, true).unwrap();
+        // Canonical FEP-044f + legacy compatibility aliases.
+        assert_eq!(doc["quote"], target_uri.as_str());
+        assert_eq!(doc["_misskey_quote"], target_uri.as_str());
+        assert_eq!(doc["quoteUrl"], target_uri.as_str());
+        assert_eq!(doc["quoteUri"], target_uri.as_str());
+        // No stamp, no authorization field.
+        assert!(doc.get("quoteAuthorization").is_none());
+        // Advisory policy, never manualApproval (no review workflow exists).
+        assert!(doc["interactionPolicy"]["canQuote"]["automaticApproval"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "https://www.w3.org/ns/activitystreams#Public"));
+        assert!(doc["interactionPolicy"]["canQuote"].get("manualApproval").is_none());
+        // Exactly one FEP-e232 Link tag.
+        let links: Vec<&Value> = doc["tag"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t.get("type").and_then(Value::as_str) == Some("Link"))
+            .collect();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0]["href"], target_uri.as_str());
+        // Single textual fallback in serialized content only (the URI
+        // appears twice inside it: link href + link text).
+        let content = doc["content"].as_str().unwrap();
+        assert_eq!(content.matches("RE:").count(), 1, "exactly one fallback");
+        assert!(content.contains("quote-inline"));
+        // Stored body untouched.
+        let stored = services.notes.get_note(&quote.id).unwrap().unwrap();
+        assert_eq!(stored.text.as_deref(), Some("commentary"));
+        // Context carries the quote terms, never the deprecated field.
+        let ctx = serde_json::to_string(&doc["@context"]).unwrap();
+        assert!(ctx.contains("https://w3id.org/fep/044f#quote"));
+        assert!(!ctx.contains("_misskey_content"));
+    }
+
+    #[test]
+    fn quote_render_never_duplicates_author_fallback() {
+        let services = test_services("dup");
+        let alice = services.create_account("alice", None).unwrap();
+        let bob = services.create_account("bob", None).unwrap();
+        let target = services
+            .create_note(CreateNoteInput::simple_public(&alice.id, "original"))
+            .unwrap();
+        let target_uri = format!("https://pinetree.local/notes/{}", target.id);
+        let quote = quote_of(
+            &services,
+            &bob.id,
+            &target,
+            &format!("commentary\nRE: {target_uri}"),
+        );
+        let doc = render_note_object(&services, &quote, false).unwrap();
+        let content = doc["content"].as_str().unwrap();
+        assert_eq!(content.matches("RE:").count(), 1, "no second fallback appended");
+    }
+
+    #[test]
+    fn quote_render_restricted_post_adds_no_public_fallback() {
+        let services = test_services("restricted");
+        let alice = services.create_account("alice", None).unwrap();
+        let bob = services.create_account("bob", None).unwrap();
+        let target = services
+            .create_note(CreateNoteInput::simple_public(&alice.id, "original"))
+            .unwrap();
+        let target_uri = format!("https://pinetree.local/notes/{}", target.id);
+        // Followers-only quoting post: structured fields stay (restricted
+        // audience), but no public RE: fallback is generated.
+        let mut input = CreateNoteInput::simple_public(&bob.id, "commentary");
+        input.visibility = Visibility::Followers;
+        input.renote_of = Some(target.id.clone());
+        let quote = services.create_note(input).unwrap();
+        assert!(quote.is_quote());
+        let doc = render_note_object(&services, &quote, false).unwrap();
+        assert_eq!(doc["quote"], target_uri.as_str());
+        let content = doc["content"].as_str().unwrap_or("");
+        assert!(!content.contains("RE:"), "no fallback for restricted posts");
+    }
+
+    /// Slice C: outbound `inReplyTo` is always the DIRECT parent's canonical
+    /// URI — a reply-to-a-reply targets its immediate parent, never the
+    /// thread root. A pending (unresolved-parent) reply renders no
+    /// `inReplyTo` at all: the internal URI is never disclosed.
+    #[test]
+    fn reply_renders_direct_parent_in_reply_to() {
+        let services = test_services("reply-parent");
+        let alice = services.create_account("alice", None).unwrap();
+        let bob = services.create_account("bob", None).unwrap();
+        let root = services
+            .create_note(CreateNoteInput::simple_public(&alice.id, "root"))
+            .unwrap();
+        let mut a_input = CreateNoteInput::simple_public(&bob.id, "reply A");
+        a_input.reply_to = Some(root.id.clone());
+        let a = services.create_note(a_input).unwrap();
+        let mut a1_input = CreateNoteInput::simple_public(&alice.id, "reply A1");
+        a1_input.reply_to = Some(a.id.clone());
+        let a1 = services.create_note(a1_input).unwrap();
+
+        let root_uri = format!("https://pinetree.local/notes/{}", root.id);
+        let a_uri = format!("https://pinetree.local/notes/{}", a.id);
+        let doc_a = render_note_object(&services, &a, false).unwrap();
+        assert_eq!(doc_a["inReplyTo"], root_uri.as_str());
+        let doc_a1 = render_note_object(&services, &a1, false).unwrap();
+        assert_eq!(
+            doc_a1["inReplyTo"],
+            a_uri.as_str(),
+            "A1 targets its direct parent A, not the root"
+        );
+
+        // Pending replies disclose nothing: no inReplyTo, and the stored
+        // pending URI appears nowhere in the document.
+        let pending_uri = "https://remote.example/notes/parent";
+        let mut pending = a1.clone();
+        pending.reply_id = None;
+        pending.reply_parent_uri = Some(pending_uri.to_string());
+        let doc_pending = render_note_object(&services, &pending, true).unwrap();
+        assert!(
+            doc_pending.get("inReplyTo").is_none()
+                || doc_pending["inReplyTo"].is_null(),
+            "pending replies render no inReplyTo"
+        );
+        let serialized = serde_json::to_string(&doc_pending).unwrap();
+        assert!(
+            !serialized.contains(pending_uri),
+            "pending parent URI never leaks into the document"
+        );
+    }
+
+    #[test]
+    fn quote_render_stamp_only_with_approval() {
+        let services = test_services("stamp");
+        let alice = services.create_account("alice", None).unwrap();
+        let bob = services.create_account("bob", None).unwrap();
+        let target = services
+            .create_note(CreateNoteInput::simple_public(&alice.id, "original"))
+            .unwrap();
+        let target_uri = format!("https://pinetree.local/notes/{}", target.id);
+        let quote = quote_of(&services, &bob.id, &target, "commentary");
+
+        // Local quotes self-verify as exceptions: no stamp, no field.
+        let doc = render_note_object(&services, &quote, false).unwrap();
+        assert!(doc.get("quoteAuthorization").is_none());
+
+        // Approved with a valid stamp: the stamp IRI serializes.
+        let mut approved = quote.clone();
+        approved.quote = Some(QuoteReference {
+            target_uri: target_uri.clone(),
+            target_note_id: Some(target.id.clone()),
+            authorization: QuoteAuthorizationState::Approved,
+            authorization_uri: Some("https://remote.example/stamps/1".to_string()),
+            request_activity_uri: None,
+            last_verified_at: None,
+        });
+        let doc = render_note_object(&services, &approved, false).unwrap();
+        assert_eq!(doc["quoteAuthorization"], "https://remote.example/stamps/1");
+
+        // Rejected quotes serialize no stamp (retained relation, no approval).
+        let mut rejected = quote.clone();
+        rejected.quote = Some(QuoteReference {
+            target_uri,
+            target_note_id: Some(target.id.clone()),
+            authorization: QuoteAuthorizationState::Rejected,
+            authorization_uri: None,
+            request_activity_uri: None,
+            last_verified_at: None,
+        });
+        let doc = render_note_object(&services, &rejected, false).unwrap();
+        assert!(doc.get("quoteAuthorization").is_none(), "rejected quotes carry no stamp");
+        assert!(doc.get("quote").is_some(), "rejected quotes keep the relation");
+    }
+
+    #[test]
+    fn pure_renote_still_renders_announce_without_quote_fields() {
+        let services = test_services("announce");
+        let alice = services.create_account("alice", None).unwrap();
+        let bob = services.create_account("bob", None).unwrap();
+        let target = services
+            .create_note(CreateNoteInput::simple_public(&alice.id, "original"))
+            .unwrap();
+        let mut input = CreateNoteInput::simple_public(&bob.id, "x");
+        input.text = None;
+        input.renote_of = Some(target.id.clone());
+        let renote = services.create_note(input).unwrap();
+        assert!(!renote.is_quote());
+        let activity = render_create_or_announce_for_note(&services, &renote).unwrap();
+        assert_eq!(activity["type"], "Announce");
+        assert!(activity.get("quote").is_none());
     }
 }

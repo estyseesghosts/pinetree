@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use crate::domain::id::DomainError;
+use crate::domain::quote::QuoteReference;
 
 fn invalid(msg: String) -> DomainError {
     DomainError::Validation(msg)
@@ -73,9 +74,49 @@ pub struct Note {
     pub user_host: Option<String>,
     #[serde(default)]
     pub is_deleted: bool,
+    /// Unresolved ActivityPub reply parent (`docs/replies.md` Slice B): the
+    /// canonical `inReplyTo` URI of a remotely authored reply whose parent
+    /// was not cached at ingestion time. `None` once the parent resolves to
+    /// `reply_id` (or when there is no parent). `#[serde(default)]` keeps
+    /// rows written before this field existed decoding as resolved/roots
+    /// (migration by default). Internal only: never packed into the
+    /// Misskey-compatible API or rendered into ActivityPub documents. While
+    /// set, ordinary reads withhold the note (fail-closed); see
+    /// `domain::visibility::is_visible`.
+    #[serde(default)]
+    pub reply_parent_uri: Option<String>,
+    /// Structured quote relationship. `None` for ordinary notes and pure
+    /// renotes; `Some` marks a quote (which still carries `renote_id` for
+    /// Misskey API compatibility). `#[serde(default)]` keeps rows written
+    /// before quotes existed decoding as non-quotes (migration by default).
+    #[serde(default)]
+    pub quote: Option<QuoteReference>,
 }
 
 impl Note {
+    /// True when this note is a quote (own commentary + embedded target),
+    /// as opposed to an ordinary note or a pure renote.
+    pub fn is_quote(&self) -> bool {
+        self.quote.is_some()
+    }
+
+    /// True when this note is a reply in the threading sense: either linked
+    /// to a resolved parent (`reply_id`) or waiting on an unresolved remote
+    /// parent (`reply_parent_uri`). Read filters that exclude replies (e.g.
+    /// `withReplies = false`) must use this, not `reply_id` alone, so
+    /// unresolved replies are not misrepresented as roots. Direct-child
+    /// queries (`notes/replies`) keep matching `reply_id` only: pending
+    /// notes appear there only after linking.
+    pub fn is_reply(&self) -> bool {
+        self.reply_id.is_some() || self.reply_parent_uri.is_some()
+    }
+
+    /// True while the reply parent is unresolved: the note carries a pending
+    /// `inReplyTo` URI but no linked `reply_id` yet.
+    pub fn has_pending_reply_parent(&self) -> bool {
+        self.reply_parent_uri.is_some()
+    }
+
     /// API-create bounds: `text` 1..=3000 chars, `cw` 1..=100 chars.
     pub fn validate_api_create(&self) -> Result<(), DomainError> {
         if let Some(cw) = &self.cw {
@@ -162,6 +203,19 @@ impl Note {
                 if v.chars().count() > 512 {
                     return Err(invalid(format!("{label} exceeds 512 chars")));
                 }
+            }
+        }
+        if let Some(pending) = &self.reply_parent_uri {
+            if pending.chars().count() > 2048 {
+                return Err(invalid("reply_parent_uri exceeds 2048 chars".to_string()));
+            }
+            // A stored note is either linked (reply_id) or pending (URI),
+            // never both: the link operation sets one while clearing the
+            // other atomically.
+            if self.reply_id.is_some() {
+                return Err(invalid(
+                    "reply has both a resolved parent and a pending parent URI".to_string(),
+                ));
             }
         }
         if let Some(user_host) = &self.user_host {
@@ -301,6 +355,8 @@ mod tests {
             url: None,
             user_host: None,
             is_deleted: false,
+            reply_parent_uri: None,
+            quote: None,
         }
     }
 
@@ -373,6 +429,41 @@ mod tests {
         assert!(n.validate_api_create().is_err());
         n.visible_user_ids = vec!["aid00000000000009".to_string()];
         assert!(n.validate_api_create().is_ok());
+    }
+
+    /// Slice B: `is_reply` covers resolved and pending replies, but a root
+    /// is neither.
+    #[test]
+    fn is_reply_covers_resolved_and_pending() {
+        let root = valid_note();
+        assert!(!root.is_reply());
+        assert!(!root.has_pending_reply_parent());
+
+        let mut resolved = valid_note();
+        resolved.reply_id = Some("nid00000000000002".to_string());
+        assert!(resolved.is_reply());
+        assert!(!resolved.has_pending_reply_parent());
+
+        let mut pending = valid_note();
+        pending.reply_parent_uri = Some("https://remote.example/notes/1".to_string());
+        assert!(pending.is_reply());
+        assert!(pending.has_pending_reply_parent());
+    }
+
+    /// Slice B: a stored note is either linked or pending, never both.
+    #[test]
+    fn resolved_and_pending_parent_conflict() {
+        let mut n = valid_note();
+        n.reply_id = Some("nid00000000000002".to_string());
+        n.reply_parent_uri = Some("https://remote.example/notes/1".to_string());
+        assert!(n.validate_api_create().is_err());
+        assert!(n.validate_storage().is_err());
+
+        // Pending alone validates; overlong pending URIs do not.
+        n.reply_id = None;
+        assert!(n.validate_storage().is_ok());
+        n.reply_parent_uri = Some(format!("https://remote.example/{}", "x".repeat(2048)));
+        assert!(n.validate_storage().is_err());
     }
 
     #[test]

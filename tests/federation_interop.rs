@@ -251,6 +251,129 @@ fn federation_interop_four_servers() {
         poll(&format!("{t} sees 1 renote"), || (renote_count(&c, tn, &own_note[t]) == 1).then_some(()));
     }
 
+    // --- quotes: create/receive/render-shape + legacy fallback + auth cycle
+    // Fresh quotable notes (the renote phase above leaves its notes live,
+    // but dedicated notes keep quote assertions independent).
+    let qtag = format!("quotable {tag}");
+    let mut quotable_own = std::collections::HashMap::new();
+    for t in ORDER {
+        let tn = node(&nodes, t);
+        let (s, r) = call(&c, &tn.base, "notes/create", Some(&tn.token), &json!({"text": format!("{qtag} {t}"), "visibility": "public"}));
+        assert_eq!(s, 200, "{t} quotable notes/create: {r}");
+        quotable_own.insert(t, r["createdNote"]["id"].as_str().expect("note id").to_string());
+    }
+    let mut quotable_copy = std::collections::HashMap::new();
+    for v in ORDER {
+        for t in ORDER {
+            if v == t {
+                continue;
+            }
+            let (vn, tn) = (node(&nodes, v), node(&nodes, t));
+            let text = format!("{qtag} {t}");
+            let note = poll(&format!("{v} receives quotable of {t}"), || find_note(&c, vn, tn, &remote_id[&(v, t)], &text));
+            quotable_copy.insert((v, t), note["id"].as_str().expect("id").to_string());
+        }
+    }
+
+    // p3 (pinetree) quotes mk's note: Pending (Misskey speaks no FEP-044f),
+    // relation intact, extension present.
+    let p3 = node(&nodes, "p3");
+    let (s, r) = call(&c, &p3.base, "notes/create", Some(&p3.token), &json!({"renoteId": quotable_copy[&("p3", "mk")], "text": format!("p3 quotes mk {tag}")}));
+    assert_eq!(s, 200, "p3 quotes mk: {r}");
+    assert_eq!(r["createdNote"]["renoteId"].as_str(), Some(quotable_copy[&("p3", "mk")].as_str()));
+    assert_eq!(r["createdNote"]["quoteAuthorizationStatus"].as_str(), Some("pending"));
+
+    // mk receives p3's quote via the legacy fallback fields and renders it
+    // as a renote (pinetree -> Misskey direction).
+    let mk = node(&nodes, "mk");
+    poll("mk renders p3's quote with a renote", || {
+        let (s, r) = call(&c, &mk.base, "users/notes", Some(&mk.token), &json!({"userId": remote_id[&("mk", "p3")], "limit": 30}));
+        (s == 200).then(|| {
+            r.as_array().and_then(|a| a.iter().find(|n| {
+                n["text"].as_str().is_some_and(|t| t.contains(&format!("p3 quotes mk {tag}")))
+                    && !n["renoteId"].is_null()
+            }).cloned())
+        }).flatten()
+    });
+
+    // mk quotes p3's note through the Misskey API (legacy-only: no FEP
+    // fields, no auth artifacts). p3 must recognize it as an unapproved
+    // quote — never dropped, never rejected.
+    let (s, r) = call(&c, &mk.base, "notes/create", Some(&mk.token), &json!({"renoteId": quotable_copy[&("mk", "p3")], "text": format!("mk quotes p3 {tag}")}));
+    assert_eq!(s, 200, "mk quotes p3: {r}");
+    poll("p3 recognizes mk's legacy-only quote", || {
+        let (s, r) = call(&c, &p3.base, "notes/timeline", Some(&p3.token), &json!({"limit": 60}));
+        (s == 200).then(|| {
+            r.as_array().and_then(|a| a.iter().find(|n| {
+                n["text"].as_str().is_some_and(|t| t.contains(&format!("mk quotes p3 {tag}")))
+                    && !n["renoteId"].is_null()
+                    && n["quoteAuthorizationStatus"].as_str() == Some("unapproved")
+            }).cloned())
+        }).flatten()
+    });
+
+    // sk (Sharkey triple-emit) quotes p4's note; p4 recognizes it the same way.
+    let sk = node(&nodes, "sk");
+    let p4 = node(&nodes, "p4");
+    let (s, r) = call(&c, &sk.base, "notes/create", Some(&sk.token), &json!({"renoteId": quotable_copy[&("sk", "p4")], "text": format!("sk quotes p4 {tag}")}));
+    assert_eq!(s, 200, "sk quotes p4: {r}");
+    poll("p4 recognizes sk's legacy-only quote", || {
+        let (s, r) = call(&c, &p4.base, "notes/timeline", Some(&p4.token), &json!({"limit": 60}));
+        (s == 200).then(|| {
+            r.as_array().and_then(|a| a.iter().find(|n| {
+                n["text"].as_str().is_some_and(|t| t.contains(&format!("sk quotes p4 {tag}")))
+                    && !n["renoteId"].is_null()
+                    && n["quoteAuthorizationStatus"].as_str() == Some("unapproved")
+            }).cloned())
+        }).flatten()
+    });
+
+    // pinetree <-> pinetree full cycle: p4 quotes p3's note (Pending), p3
+    // auto-approves the public post, p4 converges to Approved with a
+    // dereferenceable stamp.
+    let (s, r) = call(&c, &p4.base, "notes/create", Some(&p4.token), &json!({"renoteId": quotable_copy[&("p4", "p3")], "text": format!("p4 quotes p3 {tag}")}));
+    assert_eq!(s, 200, "p4 quotes p3: {r}");
+    let p4_quote_id = r["createdNote"]["id"].as_str().expect("id").to_string();
+    assert_eq!(r["createdNote"]["quoteAuthorizationStatus"].as_str(), Some("pending"));
+    poll("p4's quote converges to approved", || {
+        let (s, r) = show_note(&c, p4, &p4_quote_id);
+        (s == 200 && r["quoteAuthorizationStatus"].as_str() == Some("approved")).then_some(())
+    });
+
+    // Outbound AP shape of the approved quote: canonical FEP-044f fields,
+    // legacy aliases, exactly one RE: fallback, stamp present, and an
+    // advisory policy with no manualApproval.
+    {
+        let (s, _) = show_note(&c, p4, &p4_quote_id);
+        assert_eq!(s, 200);
+        let note_uri = format!("http://127.0.1.4/notes/{p4_quote_id}");
+        let resp = c.send("GET", &note_uri, &[("Accept", "application/activity+json")], None, 65_536)
+            .expect("fetch quote AP object");
+        assert!((200..300).contains(&resp.status), "quote AP fetch: {}", resp.status);
+        let doc: Value = serde_json::from_slice(&resp.body).expect("quote AP JSON");
+        let target_uri = format!("http://127.0.1.3/notes/{}", quotable_own["p3"]);
+        // The cached copy may carry the copy id; resolve either form.
+        let target_copy_uri = format!("http://127.0.1.4/notes/{}", quotable_copy[&("p4", "p3")]);
+        let quoted = doc["quote"].as_str().unwrap_or("");
+        assert!(quoted == target_uri || quoted == target_copy_uri, "canonical quote target: {quoted}");
+        assert_eq!(doc["_misskey_quote"].as_str(), Some(quoted));
+        assert_eq!(doc["quoteUrl"].as_str(), Some(quoted));
+        assert_eq!(doc["quoteUri"].as_str(), Some(quoted));
+        assert!(doc["quoteAuthorization"].as_str().is_some_and(|s| !s.is_empty()), "stamp present once approved");
+        assert!(doc["interactionPolicy"]["canQuote"].get("manualApproval").is_none());
+        let content = doc["content"].as_str().unwrap_or("");
+        assert_eq!(content.matches("RE:").count(), 1, "single textual fallback");
+        let links = doc["tag"].as_array().map(|a| a.iter().filter(|t| t.get("type").and_then(Value::as_str) == Some("Link")).count()).unwrap_or(0);
+        assert_eq!(links, 1, "single e232 Link tag");
+        // The stamp dereferences to a QuoteAuthorization for this quote.
+        let stamp_uri = doc["quoteAuthorization"].as_str().unwrap().to_string();
+        let stamp = c.send("GET", &stamp_uri, &[("Accept", "application/activity+json")], None, 65_536)
+            .expect("fetch stamp");
+        assert!((200..300).contains(&stamp.status), "stamp fetch: {}", stamp.status);
+        let stamp_doc: Value = serde_json::from_slice(&stamp.body).expect("stamp JSON");
+        assert_eq!(stamp_doc["type"], "QuoteAuthorization");
+    }
+
     // --- undo reactions ------------------------------------------------------
     for (i, v) in ORDER.iter().enumerate() {
         let t = ORDER[(i + 1) % 4];

@@ -59,6 +59,18 @@ pub fn is_visible(note: &Note, viewer: &ViewerContext) -> bool {
     if note.is_deleted {
         return false;
     }
+    // Unresolved reply parent (`docs/replies.md` Slice B, fail-closed): a
+    // remotely authored reply whose `inReplyTo` has not resolved to a local
+    // parent cannot apply parent-derived visibility restrictions yet, so it
+    // is withheld from every ordinary read surface (detail, profiles,
+    // search, timelines, feeds, ActivityPub objects, streaming channels —
+    // all of which gate on this predicate) until the resolver links it.
+    // Keeping it pending-but-stored is preferable to misrepresenting it as
+    // a root or exposing it too broadly. Storage-level reads (`get_note`,
+    // the resolver, repair) are unaffected.
+    if note.reply_parent_uri.is_some() {
+        return false;
+    }
     // `local_only` (§4): never rendered to remote viewers or federation.
     if note.local_only && (viewer.is_remote_request || viewer.viewer_host.is_some()) {
         return false;

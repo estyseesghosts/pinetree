@@ -1,6 +1,7 @@
 pub mod id;
 pub mod account;
 pub mod note;
+pub mod quote;
 pub mod follow;
 pub mod reaction;
 pub mod media;

@@ -549,6 +549,52 @@ pub fn pack_note(
         "renote".to_string(),
         pack_nested_note(note.renote_id.as_deref(), viewer_id, services, depth)?,
     );
+    // Structured-quote extensions (Pinetree informational, non-standard).
+    // Present on quotes only — never on ordinary pure renotes. Visibility
+    // stays mandatory and separate from authorization: rejected/unapproved
+    // quotes still render their relation subject to the normal visibility
+    // rules below.
+    if let Some(quote) = note.quote.as_ref() {
+        obj.insert(
+            "quoteAuthorizationStatus".to_string(),
+            Value::String(quote.authorization.api_status().to_string()),
+        );
+        let quoting_public = matches!(
+            note.visibility,
+            Visibility::Public | Visibility::Home
+        );
+        match quote.target_note_id.as_deref() {
+            Some(tid) => {
+                let visible = match services.notes.get_note(tid)? {
+                    Some(target) => {
+                        let viewer =
+                            viewer_context_for(services, viewer_id, &target.author_id);
+                        crate::domain::visibility::is_visible(&target, &viewer)
+                    }
+                    // Deleted or missing target: stable unavailable fallback.
+                    None => false,
+                };
+                if !visible {
+                    // Never serialize the protected object or leak its URI;
+                    // the `renote` slot is already null via `pack_nested_note`.
+                    obj.insert("quoteTargetUnavailable".to_string(), Value::Bool(true));
+                }
+            }
+            // Unresolved target: preserve the relationship with its URI when
+            // safe to disclose (public quoting posts), otherwise a
+            // controlled unavailable marker. Never fabricate a `renoteId`.
+            None => {
+                if quoting_public && !note.local_only {
+                    obj.insert(
+                        "quoteTargetUri".to_string(),
+                        Value::String(quote.target_uri.clone()),
+                    );
+                } else {
+                    obj.insert("quoteTargetUnavailable".to_string(), Value::Bool(true));
+                }
+            }
+        }
+    }
     obj.insert(
         "mentions".to_string(),
         Value::Array(note.mentions.iter().map(|id| Value::String(id.clone())).collect()),
@@ -1197,6 +1243,8 @@ mod tests {
             url: None,
             user_host: None,
             is_deleted: false,
+            reply_parent_uri: None,
+            quote: None,
         }
     }
 
@@ -1609,5 +1657,156 @@ mod tests {
         let s = format_millis(1_700_000_000_123);
         assert!(s.ends_with('Z'), "must be UTC: {s}");
         assert!(s.contains('T'), "must be ISO-8601: {s}");
+    }
+
+    // --- Quote-post API projection (docs/quote-posts.md) --------------------
+
+    use crate::domain::quote::{QuoteAuthorizationState, QuoteReference};
+
+    fn quote_note(
+        id: &str,
+        author_id: &str,
+        target_note_id: Option<&str>,
+        target_uri: &str,
+        state: QuoteAuthorizationState,
+    ) -> Note {
+        let mut n = test_note(id, author_id);
+        n.renote_id = target_note_id.map(|t| t.to_string());
+        n.quote = Some(QuoteReference {
+            target_uri: target_uri.to_string(),
+            target_note_id: target_note_id.map(|t| t.to_string()),
+            authorization: state,
+            authorization_uri: None,
+            request_activity_uri: None,
+            last_verified_at: None,
+        });
+        n
+    }
+
+    fn insert_all(mem: &Mem, accounts: Vec<Account>, notes: Vec<Note>) {
+        for acc in accounts {
+            mem.accounts.lock().unwrap().insert(acc.id.clone(), acc);
+        }
+        for note in notes {
+            mem.notes.lock().unwrap().insert(note.id.clone(), note);
+        }
+    }
+
+    #[test]
+    fn pack_quote_visible_target_projects_status_and_renote() {
+        let (services, mem, _) = test_services(1_700_000_000_000);
+        let alice = test_account("aid00000000000001", "alice");
+        let bob = test_account("aid00000000000002", "bob");
+        let mut target = test_note("nid00000000000009", &bob.id);
+        target.visibility = Visibility::Public;
+        let quote = quote_note(
+            "nid00000000000010",
+            &alice.id,
+            Some(&target.id),
+            "https://example.local/notes/nid00000000000009",
+            QuoteAuthorizationState::Pending,
+        );
+        insert_all(&mem, vec![alice.clone(), bob], vec![target, quote.clone()]);
+        let packed = pack_note(&quote, Some(&alice.id), &services, 0).unwrap();
+        // Same renote shape regardless of wire format, plus the extension.
+        assert_eq!(packed["renoteId"], "nid00000000000009");
+        assert!(packed["renote"].is_object());
+        assert_eq!(packed["quoteAuthorizationStatus"], "pending");
+        assert!(packed.get("quoteTargetUri").is_none());
+        assert!(packed.get("quoteTargetUnavailable").is_none());
+    }
+
+    #[test]
+    fn pack_quote_invisible_target_marks_unavailable_never_leaks_uri() {
+        let (services, mem, _) = test_services(1_700_000_000_000);
+        let alice = test_account("aid00000000000001", "alice");
+        let bob = test_account("aid00000000000002", "bob");
+        let stranger = test_account("aid00000000000003", "stranger");
+        let mut target = test_note("nid00000000000009", &bob.id);
+        target.visibility = Visibility::Followers;
+        let quote = quote_note(
+            "nid00000000000010",
+            &alice.id,
+            Some(&target.id),
+            "https://example.local/notes/nid00000000000009",
+            QuoteAuthorizationState::Unapproved,
+        );
+        insert_all(
+            &mem,
+            vec![alice, bob, stranger.clone()],
+            vec![target, quote.clone()],
+        );
+        let packed = pack_note(&quote, Some(&stranger.id), &services, 0).unwrap();
+        // Authorization never overrides visibility; rejected/unapproved
+        // quotes still render their relation as unavailable.
+        assert_eq!(packed["quoteAuthorizationStatus"], "unapproved");
+        assert!(packed["renote"].is_null());
+        assert_eq!(packed["quoteTargetUnavailable"], true);
+        assert!(packed.get("quoteTargetUri").is_none(), "no URI leak for protected targets");
+    }
+
+    #[test]
+    fn pack_quote_unresolved_target_uri_rules() {
+        let (services, mem, _) = test_services(1_700_000_000_000);
+        let alice = test_account("aid00000000000001", "alice");
+        // Public quoting post: the relationship survives with its URI.
+        let quote = quote_note(
+            "nid00000000000010",
+            &alice.id,
+            None,
+            "https://remote.example/notes/1",
+            QuoteAuthorizationState::Unapproved,
+        );
+        assert!(quote.renote_id.is_none(), "no fabricated renoteId");
+        insert_all(&mem, vec![alice.clone()], vec![quote.clone()]);
+        let packed = pack_note(&quote, None, &services, 0).unwrap();
+        assert_eq!(packed["renoteId"], Value::Null);
+        assert_eq!(packed["quoteTargetUri"], "https://remote.example/notes/1");
+        assert_eq!(packed["quoteAuthorizationStatus"], "unapproved");
+
+        // Followers-only quoting post: conservative unavailable marker.
+        let mut restricted = quote.clone();
+        restricted.id = "nid00000000000011".to_string();
+        restricted.visibility = Visibility::Followers;
+        mem.notes.lock().unwrap().insert(restricted.id.clone(), restricted.clone());
+        let packed = pack_note(&restricted, Some(&alice.id), &services, 0).unwrap();
+        assert!(packed.get("quoteTargetUri").is_none());
+        assert_eq!(packed["quoteTargetUnavailable"], true);
+    }
+
+    #[test]
+    fn pack_pure_renote_omits_quote_keys() {
+        let (services, mem, _) = test_services(1_700_000_000_000);
+        let alice = test_account("aid00000000000001", "alice");
+        let bob = test_account("aid00000000000002", "bob");
+        let target = test_note("nid00000000000009", &bob.id);
+        let mut renote = test_note("nid00000000000010", &alice.id);
+        renote.text = None;
+        renote.renote_id = Some(target.id.clone());
+        assert!(renote.quote.is_none());
+        insert_all(&mem, vec![alice.clone(), bob], vec![target, renote.clone()]);
+        let packed = pack_note(&renote, Some(&alice.id), &services, 0).unwrap();
+        assert!(packed.get("quoteAuthorizationStatus").is_none());
+        assert!(packed.get("quoteTargetUri").is_none());
+        assert!(packed.get("quoteTargetUnavailable").is_none());
+    }
+
+    #[test]
+    fn pack_rejected_quote_still_renders_with_status() {
+        let (services, mem, _) = test_services(1_700_000_000_000);
+        let alice = test_account("aid00000000000001", "alice");
+        let bob = test_account("aid00000000000002", "bob");
+        let target = test_note("nid00000000000009", &bob.id);
+        let quote = quote_note(
+            "nid00000000000010",
+            &alice.id,
+            Some(&target.id),
+            "https://example.local/notes/nid00000000000009",
+            QuoteAuthorizationState::Rejected,
+        );
+        insert_all(&mem, vec![alice.clone(), bob], vec![target, quote.clone()]);
+        let packed = pack_note(&quote, Some(&alice.id), &services, 0).unwrap();
+        assert_eq!(packed["quoteAuthorizationStatus"], "rejected");
+        assert!(packed["renote"].is_object(), "rejected quotes keep rendering");
     }
 }

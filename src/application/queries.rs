@@ -10,6 +10,12 @@ use crate::domain::policy::{
     ViewerContext, is_eligible_for_federated_timeline, is_eligible_for_local_timeline, is_visible,
 };
 
+/// Candidates fetched per `NoteStore::notes_by_reply` call inside the
+/// `note_replies` scan loop (`docs/replies.md` §3.3): a bounded batch that
+/// keeps each storage round-trip small while refilling visible pages past
+/// hidden rows.
+const REPLY_SCAN_BATCH: usize = 50;
+
 impl AppServices {
     fn viewer_ctx(
         &self,
@@ -211,7 +217,7 @@ impl AppServices {
                 if !with_renotes && Self::is_pure_renote(note) {
                     return false;
                 }
-                if !with_replies && note.reply_id.is_some() {
+                if !with_replies && note.is_reply() {
                     return false;
                 }
                 true
@@ -281,8 +287,9 @@ impl AppServices {
         let mut merged: Vec<Note> = Vec::new();
         for note in home.into_iter().chain(local) {
             // Home notes are not subject to the reply filter; apply it here
-            // for notes that only came from the home side.
-            if !with_replies && note.reply_id.is_some() {
+            // for notes that only came from the home side. Pending
+            // (unresolved-parent) replies count as replies, never roots.
+            if !with_replies && note.is_reply() {
                 continue;
             }
             if seen.insert(note.id.clone()) {
@@ -334,7 +341,7 @@ impl AppServices {
                 if !is_eligible_for_local_timeline(note) {
                     return Ok(false);
                 }
-                if !params.with_replies && note.reply_id.is_some() {
+                if !params.with_replies && note.is_reply() {
                     return Ok(false);
                 }
                 let cache = self.follows_cache(viewer_id)?;
@@ -353,7 +360,7 @@ impl AppServices {
                     params,
                 )?;
                 if home {
-                    return Ok(!(!params.with_replies && note.reply_id.is_some()));
+                    return Ok(!(!params.with_replies && note.is_reply()));
                 }
                 self.note_eligible_for_channel(
                     TimelineChannel::Local,
@@ -437,6 +444,17 @@ impl AppServices {
         })
     }
 
+    /// True when the `note_replies` scan window moved strictly downward:
+    /// the new exclusive `untilId` sits below the previous bound, so the
+    /// next candidate batch cannot repeat rows.
+    fn scan_window_advanced(previous: Option<&str>, current: Option<&str>) -> bool {
+        match (previous, current) {
+            (_, None) => false,
+            (None, Some(_)) => true,
+            (Some(prev), Some(cur)) => cur < prev,
+        }
+    }
+
     /// `users/notes`: one author's notes, newest-first, visibility-filtered.
     /// Unknown `user_id` is `NO_SUCH_USER` (Misskey parity).
     pub fn user_notes(
@@ -460,7 +478,7 @@ impl AppServices {
             if !with_renotes && Self::is_pure_renote(note) {
                 return false;
             }
-            if !with_replies && note.reply_id.is_some() {
+            if !with_replies && note.is_reply() {
                 return false;
             }
             true
@@ -469,16 +487,74 @@ impl AppServices {
 
     /// `notes/replies`: direct replies (`reply_id == note_id`). Like Misskey,
     /// an unknown `note_id` yields `[]` (no existence check).
+    ///
+    /// Slice A (`docs/replies.md` §3.3): candidates come from the indexed
+    /// `NoteStore::notes_by_reply` in bounded batches — never a global
+    /// scan — and visibility applies per candidate. When hidden rows leave
+    /// the visible page short, the scan advances the internal exclusive
+    /// `untilId` past the last scanned child and fetches the next batch,
+    /// keeping the caller's original `sinceId`/date bounds intact. The loop
+    /// always terminates: each iteration either fills the page, exhausts
+    /// the parent range, or advances `untilId` strictly downward (a backend
+    /// that fails to advance ends the scan defensively).
     pub fn note_replies(
         &self,
         note_id: &str,
         viewer_id: Option<&str>,
         cursor: &TimelineCursor,
     ) -> Result<Vec<Note>, PortError> {
-        let all = self.all_notes_bounded()?;
-        self.visible_page(viewer_id, all, cursor, |note| {
-            note.reply_id.as_deref() == Some(note_id)
-        })
+        let page_size = match cursor.limit {
+            0 => 10,
+            n if n > 100 => 100,
+            n => n,
+        };
+        let cache = self.follows_cache(viewer_id)?;
+        let mut visible: Vec<Note> = Vec::new();
+        let mut scan = TimelineCursor {
+            since_id: cursor.since_id.clone(),
+            until_id: cursor.until_id.clone(),
+            since_date: cursor.since_date,
+            until_date: cursor.until_date,
+            limit: REPLY_SCAN_BATCH,
+        };
+        loop {
+            let window_before = scan.until_id.clone();
+            let batch = self.notes.notes_by_reply(note_id, &scan)?;
+            if batch.is_empty() {
+                break;
+            }
+            let fetched = batch.len();
+            for note in batch {
+                // Advance past every scanned child — visible or not — so a
+                // run of hidden rows cannot stall the scan.
+                scan.until_id = Some(note.id.clone());
+                let viewer = self.viewer_ctx(viewer_id, &note.author_id, &cache);
+                if is_visible(&note, &viewer) {
+                    visible.push(note);
+                    if visible.len() >= page_size {
+                        break;
+                    }
+                }
+            }
+            if visible.len() >= page_size {
+                break;
+            }
+            if fetched < REPLY_SCAN_BATCH {
+                // Short batch: the parent range is exhausted.
+                break;
+            }
+            // Defensive: the contract promises strictly-newest-first rows
+            // inside the exclusive `(sinceId, untilId)` window. If a backend
+            // ever returns a row that does not advance the window, stop
+            // rather than looping forever.
+            if !Self::scan_window_advanced(
+                window_before.as_deref(),
+                scan.until_id.as_deref(),
+            ) {
+                break;
+            }
+        }
+        Ok(self.apply_cursor(visible, cursor))
     }
 
     /// `notes/renotes`: every renote of the note, quotes included. Like

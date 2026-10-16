@@ -1,5 +1,6 @@
 pub mod actor;
 pub mod objects;
+pub mod quotes;
 pub mod webfinger;
 pub mod signatures;
 

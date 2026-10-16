@@ -11,8 +11,18 @@ use crate::domain::reaction::{Reaction, coerce_reaction};
 
 impl AppServices {
     #[allow(clippy::too_many_lines)]
-    pub fn create_note(&self, input: CreateNoteInput) -> Result<Note, PortError> {
+    pub fn create_note(&self, mut input: CreateNoteInput) -> Result<Note, PortError> {
         self.accounts.get_owner(&input.author_id)?;
+
+        // `reply_parent_uri` is inbox-only (`docs/replies.md` Slice B):
+        // local replies resolve their target synchronously (or fail with
+        // `NO_SUCH_NOTE` below), so a locally authored note is never
+        // pending on an unresolved parent.
+        if input.reply_parent_uri.is_some() {
+            return Err(PortError::Validation(
+                "reply_parent_uri is set only by inbound federation".to_string(),
+            ));
+        }
 
         // Resolve reply/renote targets so we know who to notify.
         let reply_target = match input.reply_to.as_deref() {
@@ -36,6 +46,9 @@ impl AppServices {
             None => None,
             Some(id) => match self.notes.get_note(id)? {
                 None => {
+                    return Err(PortError::NotFound("NO_SUCH_RENOTE_TARGET".to_string()));
+                }
+                Some(note) if note.is_deleted => {
                     return Err(PortError::NotFound("NO_SUCH_RENOTE_TARGET".to_string()));
                 }
                 Some(note) => Some(note),
@@ -119,20 +132,137 @@ impl AppServices {
             // inside the storage transaction (generic string replace in
             // `enqueue_jobs_in_txn`, which also covers structured payloads).
             jobs.push(
-                crate::federation::outbox::FederateDeliverPayload::NoteCreated {
-                    note_id: "__PENDING_NOTE_ID__".into(),
-                    author_id: input.author_id.clone(),
-                    inbox_override: None,
-                }
-                .into_job(
-                    format!(
-                        "federate:note:{}:{}",
-                        input.author_id,
-                        self.ids.generate()
-                    ),
-                    self.now_ms(),
-                )?,
-            );
+            crate::federation::outbox::FederateDeliverPayload::NoteCreated {
+                note_id: "__PENDING_NOTE_ID__".into(),
+                author_id: input.author_id.clone(),
+                inbox_override: None,
+            }
+            .into_job(
+                format!(
+                    "federate:note:{}:{}",
+                    input.author_id,
+                    self.ids.generate()
+                ),
+                self.now_ms(),
+            )?,
+        );
+        }
+
+        // Quote detection: a renote carrying own commentary (non-blank text,
+        // CW, or files) is a quote, semantically distinct from a pure
+        // renote. The quote relation + the `QuoteRequest` delivery job
+        // commit in the same transaction as the note below.
+        let has_commentary = input
+            .text
+            .as_deref()
+            .map(|t| !t.trim().is_empty())
+            .unwrap_or(false)
+            || input.cw.is_some()
+            || !input.file_ids.is_empty();
+        let is_quote = input.renote_of.is_some() && has_commentary;
+        if is_quote {
+            if let Some(target) = renote_target.as_ref() {
+                let base = self.public_url.trim_end_matches('/').to_string();
+                let target_uri = target
+                    .uri
+                    .clone()
+                    .unwrap_or_else(|| format!("{base}/notes/{}", target.id));
+                let target_author = self.accounts.find_by_id(&target.author_id)?;
+                let self_quote = target.author_id == input.author_id;
+                let mentioned = target.mentions.iter().any(|m| m == &input.author_id);
+                let quote = if self_quote || mentioned {
+                    // FEP-044f exceptions: self-quotes and quotes by an
+                    // author mentioned in the original post need no stamp.
+                    crate::domain::quote::QuoteReference {
+                        target_uri,
+                        target_note_id: Some(target.id.clone()),
+                        authorization:
+                            crate::domain::quote::QuoteAuthorizationState::ApprovedByException,
+                        authorization_uri: None,
+                        request_activity_uri: None,
+                        last_verified_at: Some(self.now_ms()),
+                    }
+                } else {
+                    match target_author {
+                        Some(author) if author.is_local() => {
+                            // Same-server quote: the server is authority for
+                            // both sides, so its policy decision is final.
+                            // Public/unlisted non-local-only targets
+                            // auto-approve (MVP default); anything else stays
+                            // Pending (tighter targets are already rejected
+                            // by narrowing, so this is a safe fallback,
+                            // never approval).
+                            let approved = matches!(
+                                target.visibility,
+                                crate::domain::note::Visibility::Public
+                                    | crate::domain::note::Visibility::Home
+                            ) && !target.local_only;
+                            crate::domain::quote::QuoteReference {
+                                target_uri,
+                                target_note_id: Some(target.id.clone()),
+                                authorization: if approved {
+                                    crate::domain::quote::QuoteAuthorizationState::ApprovedByException
+                                } else {
+                                    crate::domain::quote::QuoteAuthorizationState::Pending
+                                },
+                                authorization_uri: None,
+                                request_activity_uri: None,
+                                last_verified_at: if approved {
+                                    Some(self.now_ms())
+                                } else {
+                                    None
+                                },
+                            }
+                        }
+                        Some(author) => {
+                            // Remote author: Pending + QuoteRequest to their
+                            // inbox (same transaction as the note). The
+                            // request URI is stored only when a delivery job
+                            // was actually enqueued (never a dangling ID).
+                            let request_row_id = self.ids.generate();
+                            let request_uri =
+                                format!("{base}/activities/{request_row_id}");
+                            let mut enqueued = false;
+                            if !input.local_only {
+                                if let Some(inbox) =
+                                    crate::federation::outbox::preferred_inbox(&author)
+                                {
+                                    jobs.push(
+                                        crate::federation::outbox::FederateDeliverPayload::QuoteRequest {
+                                            request_id: request_row_id,
+                                            quote_note_id: "__PENDING_NOTE_ID__".into(),
+                                            quoter_account_id: input.author_id.clone(),
+                                            quoted_uri: target_uri.clone(),
+                                            target_actor_uri: author.actor_url(&base),
+                                            inbox_url: inbox,
+                                        }
+                                        .into_job(
+                                            format!(
+                                                "federate:quote-request:{}:{}",
+                                                input.author_id,
+                                                self.ids.generate()
+                                            ),
+                                            self.now_ms(),
+                                        )?,
+                                    );
+                                    enqueued = true;
+                                }
+                            }
+                            crate::domain::quote::QuoteReference::pending(
+                                target_uri,
+                                Some(target.id.clone()),
+                                enqueued.then(|| request_uri),
+                            )
+                        }
+                        None => crate::domain::quote::QuoteReference::pending(
+                            target_uri,
+                            Some(target.id.clone()),
+                            None,
+                        ),
+                    }
+                };
+                input.quote = Some(quote);
+            }
         }
 
         let mut input_with_instance_words = input;

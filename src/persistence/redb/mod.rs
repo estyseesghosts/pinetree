@@ -19,6 +19,7 @@ use crate::domain::media::MediaMeta;
 use crate::domain::note::{extract_hashtags, extract_mentions, Note, MAX_FILE_IDS};
 use crate::domain::notification::{Notification, NotificationKind};
 use crate::domain::policy::{narrow_on_create, NarrowingInput};
+use crate::domain::quote::{QuoteAuthorizationState, QuoteStamp};
 use crate::domain::reaction::Reaction;
 
 const ACCOUNTS: TableDefinition<&str, &[u8]> = TableDefinition::new("accounts");
@@ -51,6 +52,29 @@ const LEGACY_SESSIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("lega
 const ACTOR_KEYPAIRS: TableDefinition<&str, &[u8]> = TableDefinition::new("actor_keypairs");
 const REMOTE_PUBLIC_KEYS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("remote_public_keys");
+/// Locally authored `QuoteAuthorization` stamps, keyed by full stamp IRI.
+const QUOTE_STAMPS: TableDefinition<&str, &[u8]> = TableDefinition::new("quote_stamps");
+/// Direct reply edges, keyed by `(parent_note_id, child_note_id)`
+/// (`docs/replies.md` Slice A). `Note.reply_id` stays authoritative; this
+/// is rebuildable derived state, backfilled by a versioned migration for
+/// databases created before the index existed.
+const NOTES_BY_REPLY: TableDefinition<(&str, &str), u8> =
+    TableDefinition::new("notes_by_reply");
+/// Unresolved reply parents, keyed by `(parent_uri, child_note_id)`
+/// (`docs/replies.md` Slice B). One row per note waiting on an `inReplyTo`
+/// URI; removed atomically when the child links (or is deleted).
+const NOTES_BY_REPLY_PENDING: TableDefinition<(&str, &str), u8> =
+    TableDefinition::new("notes_by_reply_pending");
+/// Schema/migration markers (`docs/replies.md` §4): single-row string
+/// keys (done markers, resume cursors) for versioned backfills.
+const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
+
+/// `NOTES_BY_REPLY` backfill version marker: present with value
+/// [`REPLY_INDEX_DONE_VALUE`] once every stored note has been indexed.
+const REPLY_INDEX_DONE_KEY: &str = "migration:notes_by_reply:v1";
+const REPLY_INDEX_DONE_VALUE: &str = "done";
+/// Resume cursor for an interrupted backfill: the last scanned note id.
+const REPLY_INDEX_PROGRESS_KEY: &str = "migration:notes_by_reply:v1:progress";
 
 pub struct RedbStore {
     db: Database,
@@ -87,6 +111,11 @@ impl RedbStore {
             abort_before_commit: AtomicBool::new(false),
         });
         store.init_tables()?;
+        // Slice A migration (`docs/replies.md` §4): backfill the reply
+        // adjacency index for databases created before it existed. Runs to
+        // completion here — before this handle serves any request — in
+        // bounded crash-resumable batches (see `run_reply_index_backfill`).
+        store.run_reply_index_backfill()?;
         Ok(store)
     }
 
@@ -143,6 +172,14 @@ impl RedbStore {
         let _ = write_txn
             .open_table(REMOTE_PUBLIC_KEYS)
             .map_err(map_redb_err)?;
+        let _ = write_txn.open_table(QUOTE_STAMPS).map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(NOTES_BY_REPLY)
+            .map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(NOTES_BY_REPLY_PENDING)
+            .map_err(map_redb_err)?;
+        let _ = write_txn.open_table(META).map_err(map_redb_err)?;
         write_txn.commit().map_err(map_redb_err)?;
         Ok(())
     }
@@ -159,6 +196,126 @@ impl RedbStore {
             ));
         }
         write_txn.commit().map_err(map_redb_err)
+    }
+
+    // --- Slice A reply-index migration (`docs/replies.md` §4) ---------------
+
+    /// Notes scanned per backfill batch. Small enough to keep every batch
+    /// transaction far under the FDB ~10 MB shape this schema must also fit.
+    const REPLY_BACKFILL_BATCH: usize = 500;
+
+    /// Run the `NOTES_BY_REPLY` backfill to completion in bounded batches.
+    /// Each batch reads at most `REPLY_BACKFILL_BATCH` note rows, inserts
+    /// their `(parent, child)` index rows, and persists the resume cursor in
+    /// the SAME write transaction; the done marker commits only with the
+    /// final batch. Crash-resumable (progress survives; replays re-insert
+    /// idempotently) and a no-op when the marker is already set.
+    pub fn run_reply_index_backfill(&self) -> Result<(), PortError> {
+        loop {
+            if self.reply_index_backfill_batch(Self::REPLY_BACKFILL_BATCH)? {
+                return Ok(());
+            }
+        }
+    }
+
+    /// One backfill batch. Returns `true` when the migration is complete
+    /// (done marker observed or just written).
+    fn reply_index_backfill_batch(&self, batch_limit: usize) -> Result<bool, PortError> {
+        if self.meta_get(REPLY_INDEX_DONE_KEY)?.as_deref() == Some(REPLY_INDEX_DONE_VALUE) {
+            return Ok(true);
+        }
+        let progress = self
+            .meta_get(REPLY_INDEX_PROGRESS_KEY)?
+            .unwrap_or_default();
+        // Bounded read: at most `batch_limit` note rows past the cursor.
+        let scanned: Vec<(String, Option<String>)> = {
+            let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+            let notes_table = read_txn.open_table(NOTES).map_err(map_redb_err)?;
+            let mut out = Vec::new();
+            let range = notes_table
+                .range(progress.as_str()..)
+                .map_err(map_redb_err)?;
+            for entry in range {
+                let (k, v) = entry.map_err(map_redb_err)?;
+                let note_id: String = k.value().to_string();
+                if note_id.as_str() <= progress.as_str() {
+                    continue;
+                }
+                let note: Note = decode_json(v.value())?;
+                out.push((note_id, note.reply_id));
+                if out.len() >= batch_limit.max(1) {
+                    break;
+                }
+            }
+            out
+        };
+        let exhausted = scanned.len() < batch_limit.max(1);
+        let write_txn = self.begin_write()?;
+        {
+            let mut index_table = write_txn
+                .open_table(NOTES_BY_REPLY)
+                .map_err(map_redb_err)?;
+            let mut meta_table = write_txn.open_table(META).map_err(map_redb_err)?;
+            for (child_id, parent_opt) in &scanned {
+                if let Some(parent_id) = parent_opt {
+                    index_table
+                        .insert((parent_id.as_str(), child_id.as_str()), &1u8)
+                        .map_err(map_redb_err)?;
+                }
+            }
+            if let Some((last_id, _)) = scanned.last() {
+                meta_table
+                    .insert(REPLY_INDEX_PROGRESS_KEY, last_id.as_str())
+                    .map_err(map_redb_err)?;
+            }
+            if exhausted {
+                meta_table
+                    .insert(REPLY_INDEX_DONE_KEY, REPLY_INDEX_DONE_VALUE)
+                    .map_err(map_redb_err)?;
+            }
+        }
+        self.commit_write(write_txn)?;
+        Ok(exhausted)
+    }
+
+    fn meta_get(&self, key: &str) -> Result<Option<String>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let meta_table = read_txn.open_table(META).map_err(map_redb_err)?;
+        match meta_table.get(key).map_err(map_redb_err)? {
+            Some(guard) => Ok(Some(guard.value().to_string())),
+            None => Ok(None),
+        }
+    }
+
+    /// Test hook: drop every `NOTES_BY_REPLY` row and clear the migration
+    /// marker/cursor, simulating a database created before Slice A. The
+    /// next `run_reply_index_backfill` (or reopen) must rebuild the index
+    /// from stored notes without touching note rows, counters, or jobs.
+    pub fn remove_reply_index_for_test(&self) -> Result<(), PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            let mut index_table = write_txn
+                .open_table(NOTES_BY_REPLY)
+                .map_err(map_redb_err)?;
+            let keys: Vec<(String, String)> = {
+                let mut out = Vec::new();
+                for entry in index_table.iter().map_err(map_redb_err)? {
+                    let (k, _) = entry.map_err(map_redb_err)?;
+                    let (parent, child) = k.value();
+                    out.push((parent.to_string(), child.to_string()));
+                }
+                out
+            };
+            for (parent, child) in &keys {
+                index_table
+                    .remove((parent.as_str(), child.as_str()))
+                    .map_err(map_redb_err)?;
+            }
+            let mut meta_table = write_txn.open_table(META).map_err(map_redb_err)?;
+            let _ = meta_table.remove(REPLY_INDEX_DONE_KEY);
+            let _ = meta_table.remove(REPLY_INDEX_PROGRESS_KEY);
+        }
+        self.commit_write(write_txn)
     }
 
     fn handle_key(username_lower: &str, host: Option<&str>) -> String {
@@ -285,6 +442,12 @@ impl RedbStore {
         let mut by_author_table = write_txn
             .open_table(NOTES_BY_AUTHOR)
             .map_err(map_redb_err)?;
+        let mut by_reply_table = write_txn
+            .open_table(NOTES_BY_REPLY)
+            .map_err(map_redb_err)?;
+        let mut by_reply_pending_table = write_txn
+            .open_table(NOTES_BY_REPLY_PENDING)
+            .map_err(map_redb_err)?;
         let media_table = write_txn.open_table(MEDIA_META).map_err(map_redb_err)?;
 
         let mut author: Account = match accounts_table
@@ -300,7 +463,22 @@ impl RedbStore {
             ));
         }
 
-        // Validate reply_to and renote_of targets
+        // Validate reply_to and renote_of targets. `reply_to` and
+        // `reply_parent_uri` together are conflicting parents (Slice B):
+        // the note is either linked or pending, never both.
+        if input.reply_to.is_some() && input.reply_parent_uri.is_some() {
+            return Err(PortError::Validation(
+                "reply has both a resolved parent and a pending parent URI".to_string(),
+            ));
+        }
+        // Normalize the pending parent URI: blank strings carry no
+        // relationship and decode as no pending parent.
+        let reply_parent_uri = input
+            .reply_parent_uri
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         let mut reply_target: Option<Note> = None;
         if let Some(reply_id) = &input.reply_to {
             let n: Note = match notes_table.get(reply_id.as_str()).map_err(map_redb_err)? {
@@ -395,6 +573,29 @@ impl RedbStore {
         }
 
         let note_id = self.ids.generate();
+        // Quotes always carry `renote_id` for Misskey API compatibility, so
+        // the resolved local target id is the single source of truth: when
+        // the application resolved the target but left `target_note_id`
+        // empty, fill it from `renote_of` here so both paths converge.
+        let mut quote = input.quote;
+        if let Some(q) = quote.as_mut() {
+            if q.target_note_id.is_none() {
+                q.target_note_id = input.renote_of.clone();
+            }
+            q.validate().map_err(|e| match e {
+                crate::domain::id::DomainError::Validation(msg) => {
+                    PortError::Validation(format!("invalid quote: {msg}"))
+                }
+                other => PortError::Validation(format!("invalid quote: {other:?}")),
+            })?;
+            if let (Some(tid), Some(rid)) = (q.target_note_id.as_deref(), input.renote_of.as_deref()) {
+                if tid != rid {
+                    return Err(PortError::Validation(
+                        "quote target_note_id must match renote_of".to_string(),
+                    ));
+                }
+            }
+        }
         let note = Note {
             id: note_id.clone(),
             author_id: input.author_id.clone(),
@@ -419,6 +620,8 @@ impl RedbStore {
             url: input.url,
             user_host: author.host.clone(),
             is_deleted: false,
+            reply_parent_uri,
+            quote,
         };
         if author.host.is_some() {
             note.validate_storage()?;
@@ -434,7 +637,6 @@ impl RedbStore {
                 .insert(rt.id.as_str(), rt_bytes.as_slice())
                 .map_err(map_redb_err)?;
         }
-
         // Update renote_target.renote_count (if different from reply_target)
         if let Some(mut rnt) = renote_target {
             if note.reply_id.as_deref() == Some(rnt.id.as_str()) {
@@ -461,11 +663,27 @@ impl RedbStore {
         by_author_table
             .insert((note.author_id.as_str(), note.id.as_str()), &1u8)
             .map_err(map_redb_err)?;
+        // Slice A adjacency index: a resolved reply links its
+        // `(parent, child)` row in the same transaction as the note, the
+        // parent counter bump, and the durable jobs below. A pending
+        // (unresolved) reply instead records its `(parent_uri, child)` row
+        // so the resolver can find it when the parent arrives.
+        if let Some(parent_id) = note.reply_id.as_deref() {
+            by_reply_table
+                .insert((parent_id, note.id.as_str()), &1u8)
+                .map_err(map_redb_err)?;
+        } else if let Some(parent_uri) = note.reply_parent_uri.as_deref() {
+            by_reply_pending_table
+                .insert((parent_uri, note.id.as_str()), &1u8)
+                .map_err(map_redb_err)?;
+        }
 
         drop(accounts_table);
         drop(handle_table);
         drop(notes_table);
         drop(by_author_table);
+        drop(by_reply_table);
+        drop(by_reply_pending_table);
         drop(media_table);
 
         self.enqueue_jobs_in_txn(write_txn, jobs, Some(&note.id))?;
@@ -484,11 +702,19 @@ impl RedbStore {
         {
             let mut notes_table = write_txn.open_table(NOTES).map_err(map_redb_err)?;
             let mut accounts_table = write_txn.open_table(ACCOUNTS).map_err(map_redb_err)?;
+            let mut by_reply_table = write_txn
+                .open_table(NOTES_BY_REPLY)
+                .map_err(map_redb_err)?;
+            let mut by_reply_pending_table = write_txn
+                .open_table(NOTES_BY_REPLY_PENDING)
+                .map_err(map_redb_err)?;
             let mut note: Note = match notes_table.get(id).map_err(map_redb_err)? {
                 Some(g) => decode_json(g.value())?,
                 None => return Err(PortError::NotFound("NO_SUCH_NOTE".to_string())),
             };
             if note.is_deleted {
+                // Already-deleted guard: repeating a delete cannot decrement
+                // counters twice.
                 return Err(PortError::NotFound("NO_SUCH_NOTE".to_string()));
             }
             let was_pure_renote = note.renote_id.is_some()
@@ -496,6 +722,8 @@ impl RedbStore {
                 && note.cw.is_none()
                 && note.file_ids.is_empty();
             let renote_target_id = note.renote_id.clone();
+            let reply_parent_id = note.reply_id.clone();
+            let reply_parent_uri = note.reply_parent_uri.clone();
 
             note.is_deleted = true;
             note.text = None;
@@ -521,6 +749,36 @@ impl RedbStore {
                             .map_err(map_redb_err)?;
                     }
                 }
+            }
+
+            // Slice A counter consistency: a first-time delete of any note
+            // with a resolved reply parent decrements that parent's
+            // `replies_count` (saturating) and drops the `(parent, child)`
+            // index row; a pending child drops its `(parent_uri, child)`
+            // row. Descendants keep their own `reply_id` (no reparenting).
+            // The parent row is updated whether or not it is itself
+            // deleted — the counter counts direct replies, not visible ones.
+            if let Some(parent_id) = reply_parent_id.as_deref() {
+                let _ = by_reply_table
+                    .remove((parent_id, note.id.as_str()))
+                    .map_err(map_redb_err)?;
+                let parent_opt: Option<Note> =
+                    match notes_table.get(parent_id).map_err(map_redb_err)? {
+                        Some(pg) => Some(decode_json(pg.value())?),
+                        None => None,
+                    };
+                if let Some(mut parent) = parent_opt {
+                    parent.replies_count = parent.replies_count.saturating_sub(1);
+                    let pbytes = encode_json(&parent)?;
+                    notes_table
+                        .insert(parent.id.as_str(), pbytes.as_slice())
+                        .map_err(map_redb_err)?;
+                }
+            }
+            if let Some(parent_uri) = reply_parent_uri.as_deref() {
+                let _ = by_reply_pending_table
+                    .remove((parent_uri, note.id.as_str()))
+                    .map_err(map_redb_err)?;
             }
 
             let author_opt: Option<Account> = match accounts_table
@@ -938,6 +1196,100 @@ impl RedbStore {
         Ok(updated)
     }
 
+    /// Quote-state transition inside an ambient write transaction (shared by
+    /// `set_quote_authorization` and the `record_quote_*` dedup methods so
+    /// state changes and outbox jobs commit atomically).
+    fn set_quote_authorization_in_txn(
+        &self,
+        write_txn: &WriteTransaction,
+        note_id: &str,
+        state: QuoteAuthorizationState,
+        authorization_uri: Option<String>,
+        verified_at_ms: i64,
+        jobs: Vec<NewJob>,
+    ) -> Result<Note, PortError> {
+        for job in &jobs {
+            job.validate()?;
+        }
+        let mut notes_table = write_txn.open_table(NOTES).map_err(map_redb_err)?;
+        let mut note: Note = match notes_table.get(note_id).map_err(map_redb_err)? {
+            Some(g) => decode_json(g.value())?,
+            None => return Err(PortError::NotFound("NO_SUCH_QUOTE".to_string())),
+        };
+        if note.is_deleted {
+            return Err(PortError::NotFound("NO_SUCH_QUOTE".to_string()));
+        }
+        let Some(quote) = note.quote.as_mut() else {
+            return Err(PortError::NotFound("NO_SUCH_QUOTE".to_string()));
+        };
+        if !quote.authorization.allows_transition(state) {
+            return Err(PortError::Validation(format!(
+                "illegal quote transition {} -> {}",
+                quote.authorization.api_status(),
+                state.api_status()
+            )));
+        }
+        quote.authorization = state;
+        // A stamp URI is kept only for stamp-backed approval. A repeat
+        // `Approved` without a URI (idempotent Accept replay) retains the
+        // stored stamp; `Revoked` retains it too so later duplicate
+        // `Delete`s still match this quote and converge to no-ops instead
+        // of misses. Every other state clears it so an
+        // `Approved`-requires-stamp invariant always holds.
+        match state {
+            QuoteAuthorizationState::Approved => {
+                if authorization_uri.is_some() {
+                    quote.authorization_uri = authorization_uri;
+                }
+            }
+            QuoteAuthorizationState::Revoked => {}
+            _ => quote.authorization_uri = None,
+        }
+        if matches!(
+            state,
+            QuoteAuthorizationState::Approved | QuoteAuthorizationState::ApprovedByException
+        ) {
+            quote.last_verified_at = Some(verified_at_ms);
+        }
+        quote.validate().map_err(|e| match e {
+            crate::domain::id::DomainError::Validation(msg) => {
+                PortError::Validation(format!("invalid quote: {msg}"))
+            }
+            other => PortError::Validation(format!("invalid quote: {other:?}")),
+        })?;
+        let note_bytes = encode_json(&note)?;
+        notes_table
+            .insert(note.id.as_str(), note_bytes.as_slice())
+            .map_err(map_redb_err)?;
+        drop(notes_table);
+        self.enqueue_jobs_in_txn(write_txn, jobs, Some(&note.id))?;
+        Ok(note)
+    }
+
+    /// Stamp insert inside an ambient write transaction.
+    fn save_quote_stamp_in_txn(
+        &self,
+        write_txn: &WriteTransaction,
+        stamp: &QuoteStamp,
+        jobs: Vec<NewJob>,
+    ) -> Result<(), PortError> {
+        if stamp.id.trim().is_empty() {
+            return Err(PortError::Validation("empty stamp id".to_string()));
+        }
+        for job in &jobs {
+            job.validate()?;
+        }
+        {
+            let mut table = write_txn.open_table(QUOTE_STAMPS).map_err(map_redb_err)?;
+            let bytes = encode_json(stamp)?;
+            table
+                .insert(stamp.id.as_str(), bytes.as_slice())
+                .map_err(map_redb_err)?;
+        }
+        self.enqueue_jobs_in_txn(write_txn, jobs, None)?;
+        Ok(())
+    }
+
     fn check_and_mark_dedup_in_txn(
         &self,
         write_txn: &WriteTransaction,
@@ -1342,69 +1694,18 @@ impl NoteStore for RedbStore {
     }
 
     fn delete_note(&self, id: &str, jobs: Vec<NewJob>) -> Result<(), PortError> {
-        for job in &jobs {
-            job.validate()?;
-        }
+        // Single implementation: `delete_note_in_txn` carries the tombstone,
+        // counter, and reply-index maintenance (Slice A). Both entry points
+        // shared one copy-pasted body before; they must never drift again.
         let write_txn = self.begin_write()?;
-        {
-            let mut notes_table = write_txn.open_table(NOTES).map_err(map_redb_err)?;
-            let mut accounts_table = write_txn.open_table(ACCOUNTS).map_err(map_redb_err)?;
-            let mut note: Note = match notes_table.get(id).map_err(map_redb_err)? {
-                Some(g) => decode_json(g.value())?,
-                None => return Err(PortError::NotFound("NO_SUCH_NOTE".to_string())),
-            };
-            if note.is_deleted {
-                return Err(PortError::NotFound("NO_SUCH_NOTE".to_string()));
-            }
-            let was_pure_renote = note.renote_id.is_some()
-                && note.text.is_none()
-                && note.cw.is_none()
-                && note.file_ids.is_empty();
-            let renote_target_id = note.renote_id.clone();
-
-            note.is_deleted = true;
-            note.text = None;
-            note.cw = None;
-            note.file_ids.clear();
-            let note_bytes = encode_json(&note)?;
-            notes_table
-                .insert(note.id.as_str(), note_bytes.as_slice())
-                .map_err(map_redb_err)?;
-
-            if was_pure_renote {
-                if let Some(tid) = renote_target_id {
-                    let target_opt: Option<Note> =
-                        match notes_table.get(tid.as_str()).map_err(map_redb_err)? {
-                            Some(tg) => Some(decode_json(tg.value())?),
-                            None => None,
-                        };
-                    if let Some(mut target) = target_opt {
-                        target.renote_count = target.renote_count.saturating_sub(1);
-                        let tbytes = encode_json(&target)?;
-                        notes_table
-                            .insert(target.id.as_str(), tbytes.as_slice())
-                            .map_err(map_redb_err)?;
-                    }
-                }
-            }
-
-            let author_opt: Option<Account> = match accounts_table
-                .get(note.author_id.as_str())
-                .map_err(map_redb_err)?
-            {
-                Some(ag) => Some(decode_json(ag.value())?),
-                None => None,
-            };
-            if let Some(mut author) = author_opt {
-                author.notes_count = author.notes_count.saturating_sub(1);
-                let abytes = encode_json(&author)?;
-                accounts_table
-                    .insert(author.id.as_str(), abytes.as_slice())
-                    .map_err(map_redb_err)?;
+        let result = self.delete_note_in_txn(&write_txn, id, jobs);
+        match result {
+            Ok(()) => self.commit_write(write_txn),
+            Err(e) => {
+                let _ = write_txn.abort();
+                Err(e)
             }
         }
-        self.enqueue_jobs_in_txn(&write_txn, jobs, Some(id))?;
-        self.commit_write(write_txn)
     }
 
     fn notes_by_author(
@@ -1477,6 +1778,400 @@ impl NoteStore for RedbStore {
             }
         }
         Ok(None)
+    }
+
+    fn notes_by_reply(
+        &self,
+        reply_id: &str,
+        cursor: &TimelineCursor,
+    ) -> Result<Vec<Note>, PortError> {
+        // `limit` is a candidate scan limit for the application-level
+        // visibility scan loop, not the final visible page size.
+        let limit = if cursor.limit == 0 { 50 } else { cursor.limit };
+        if reply_id.is_empty() {
+            return Ok(Vec::new());
+        }
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let by_reply = read_txn.open_table(NOTES_BY_REPLY).map_err(map_redb_err)?;
+        let notes_table = read_txn.open_table(NOTES).map_err(map_redb_err)?;
+
+        let range = by_reply
+            .range((reply_id, "")..=(reply_id, "\u{10ffff}"))
+            .map_err(map_redb_err)?;
+        let mut out = Vec::new();
+        for entry in range.rev() {
+            let (k, _) = entry.map_err(map_redb_err)?;
+            let (_, note_id) = k.value();
+            if !matches_cursor(note_id, cursor) {
+                continue;
+            }
+            if let Some(ng) = notes_table.get(note_id).map_err(map_redb_err)? {
+                let note: Note = decode_json(ng.value())?;
+                // Deleted rows are removed at delete time; the guard stays
+                // so a torn index can never surface a tombstone.
+                if !note.is_deleted {
+                    out.push(note);
+                    if out.len() >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn pending_reply_children(
+        &self,
+        parent_uri: &str,
+        limit: usize,
+    ) -> Result<Vec<Note>, PortError> {
+        let target = parent_uri.trim();
+        if target.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let pending_table = read_txn
+            .open_table(NOTES_BY_REPLY_PENDING)
+            .map_err(map_redb_err)?;
+        let notes_table = read_txn.open_table(NOTES).map_err(map_redb_err)?;
+
+        let range = pending_table
+            .range((target, "")..=(target, "\u{10ffff}"))
+            .map_err(map_redb_err)?;
+        let mut out = Vec::new();
+        for entry in range {
+            let (k, _) = entry.map_err(map_redb_err)?;
+            let (_, note_id) = k.value();
+            if let Some(ng) = notes_table.get(note_id).map_err(map_redb_err)? {
+                let note: Note = decode_json(ng.value())?;
+                // Stale rows (child deleted meanwhile — the delete path
+                // removes them, this covers torn races) are skipped, not
+                // returned.
+                if note.is_deleted || note.reply_id.is_some() {
+                    continue;
+                }
+                if note.reply_parent_uri.as_deref() == Some(target) {
+                    out.push(note);
+                    if out.len() >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn link_pending_reply(
+        &self,
+        child_id: &str,
+        parent_id: &str,
+        parent_canonical_uri: &str,
+    ) -> Result<Option<Note>, PortError> {
+        if child_id.is_empty() || parent_id.is_empty() || parent_canonical_uri.trim().is_empty() {
+            return Err(PortError::Validation(
+                "link_pending_reply requires child, parent, and parent URI".to_string(),
+            ));
+        }
+        let expected_uri = parent_canonical_uri.trim();
+        let write_txn = self.begin_write()?;
+        let linked = {
+            let mut notes_table = write_txn.open_table(NOTES).map_err(map_redb_err)?;
+            let mut by_reply_table = write_txn
+                .open_table(NOTES_BY_REPLY)
+                .map_err(map_redb_err)?;
+            let mut by_reply_pending_table = write_txn
+                .open_table(NOTES_BY_REPLY_PENDING)
+                .map_err(map_redb_err)?;
+
+            let mut child: Note = match notes_table
+                .get(child_id)
+                .map_err(map_redb_err)?
+            {
+                Some(g) => decode_json(g.value())?,
+                None => return Ok(None),
+            };
+            if child.is_deleted {
+                return Ok(None);
+            }
+            if let Some(existing) = child.reply_id.as_deref() {
+                // Already linked: converge with no counter or index change.
+                // A torn pending row/URI left behind by a crashed link is
+                // cleaned below (committed with this transaction) so the
+                // child never appears pending again.
+                if existing == parent_id && child.reply_parent_uri.is_some() {
+                    let stale_uri = child.reply_parent_uri.clone().unwrap_or_default();
+                    child.reply_parent_uri = None;
+                    let child_bytes = encode_json(&child)?;
+                    notes_table
+                        .insert(child.id.as_str(), child_bytes.as_slice())
+                        .map_err(map_redb_err)?;
+                    let _ = by_reply_pending_table
+                        .remove((stale_uri.as_str(), child.id.as_str()))
+                        .map_err(map_redb_err)?;
+                    drop(notes_table);
+                    drop(by_reply_table);
+                    drop(by_reply_pending_table);
+                    self.commit_write(write_txn)?;
+                }
+                return Ok(None);
+            }
+            let Some(pending_uri) = child.reply_parent_uri.clone() else {
+                // Genuine root, or linked concurrently: nothing to do.
+                return Ok(None);
+            };
+            if pending_uri.as_str() != expected_uri {
+                return Err(PortError::Validation(
+                    "REPLY_PARENT_MISMATCH: child pending URI does not match parent canonical URI"
+                        .to_string(),
+                ));
+            }
+            let mut parent: Note = match notes_table
+                .get(parent_id)
+                .map_err(map_redb_err)?
+            {
+                Some(g) => decode_json(g.value())?,
+                None => return Ok(None),
+            };
+            // Cycle guard: the parent chain above the link target must not
+            // reach the child (including the trivial self-link). Deleted
+            // ancestors are walked through — they keep their `reply_id`.
+            // A deleted parent still links: the steady state matches a
+            // delete racing the resolver the other way around.
+            {
+                let mut current = Some(parent.id.clone());
+                let mut depth = 0usize;
+                while let Some(id) = current {
+                    if id.as_str() == child_id {
+                        return Err(PortError::Validation(
+                            "REPLY_CYCLE: linking would create a reply cycle".to_string(),
+                        ));
+                    }
+                    depth += 1;
+                    if depth > 512 {
+                        break;
+                    }
+                    current = match notes_table.get(id.as_str()).map_err(map_redb_err)? {
+                        Some(ag) => {
+                            let ancestor: Note = decode_json(ag.value())?;
+                            ancestor.reply_id
+                        }
+                        None => None,
+                    };
+                }
+            }
+
+            // Same parent-driven narrowing as a reply whose parent was
+            // cached at ingestion (`domain::policy::narrow_on_create` reply
+            // rules): the child's stored visibility is the request, the
+            // parent only ever tightens it.
+            let renote_target: Option<Note> = match child.renote_id.as_deref() {
+                Some(rid) => match notes_table.get(rid).map_err(map_redb_err)? {
+                    Some(rg) => Some(decode_json(rg.value())?),
+                    None => None,
+                },
+                None => None,
+            };
+            let narrowed = narrow_on_create(NarrowingInput {
+                requested_visibility: child.visibility,
+                requested_local_only: child.local_only,
+                requested_visible_user_ids: child.visible_user_ids.clone(),
+                author_id: &child.author_id,
+                text: child.text.as_deref(),
+                cw: child.cw.as_deref(),
+                renote_target: renote_target.as_ref(),
+                reply_target: Some(&parent),
+                renote_target_blocks_author: false,
+                sensitive_words: &[],
+                can_public_note: true,
+            })
+            .map_err(|e| PortError::Validation(format!("reply link narrowing: {e:?}")))?;
+
+            child.reply_id = Some(parent.id.clone());
+            child.reply_parent_uri = None;
+            child.reply_user_id = Some(parent.author_id.clone());
+            child.visibility = narrowed.visibility;
+            child.local_only = narrowed.local_only;
+            child.visible_user_ids = narrowed.visible_user_ids;
+            let child_bytes = encode_json(&child)?;
+            notes_table
+                .insert(child.id.as_str(), child_bytes.as_slice())
+                .map_err(map_redb_err)?;
+
+            parent.replies_count = parent.replies_count.saturating_add(1);
+            let parent_bytes = encode_json(&parent)?;
+            notes_table
+                .insert(parent.id.as_str(), parent_bytes.as_slice())
+                .map_err(map_redb_err)?;
+
+            by_reply_table
+                .insert((parent.id.as_str(), child.id.as_str()), &1u8)
+                .map_err(map_redb_err)?;
+            let _ = by_reply_pending_table
+                .remove((pending_uri.as_str(), child.id.as_str()))
+                .map_err(map_redb_err)?;
+            child
+        };
+        self.commit_write(write_txn)?;
+        Ok(Some(linked))
+    }
+
+    fn set_pending_reply_parent(
+        &self,
+        child_id: &str,
+        parent_uri: &str,
+        jobs: Vec<NewJob>,
+    ) -> Result<bool, PortError> {
+        let uri = parent_uri.trim();
+        if child_id.is_empty()
+            || !(uri.starts_with("http://") || uri.starts_with("https://"))
+        {
+            return Err(PortError::Validation(
+                "set_pending_reply_parent requires a note id and an absolute http(s) parent URI"
+                    .to_string(),
+            ));
+        }
+        for job in &jobs {
+            job.validate()?;
+        }
+        let write_txn = self.begin_write()?;
+        // No-op paths commit nothing: every branch below that returns
+        // `false` performs reads only, so falling through to the commit
+        // with no writes is a harmless empty transaction.
+        let changed = {
+            let mut notes_table = write_txn.open_table(NOTES).map_err(map_redb_err)?;
+            let mut by_reply_pending_table = write_txn
+                .open_table(NOTES_BY_REPLY_PENDING)
+                .map_err(map_redb_err)?;
+            let stored: Option<Note> = match notes_table
+                .get(child_id)
+                .map_err(map_redb_err)?
+            {
+                Some(g) => Some(decode_json(g.value())?),
+                None => None,
+            };
+            let mut child = match stored {
+                Some(note) => note,
+                None => return Ok(false),
+            };
+            if child.is_deleted || child.reply_id.is_some() {
+                return Ok(false);
+            }
+            if child.reply_parent_uri.as_deref() == Some(uri) {
+                return Ok(false);
+            }
+            if let Some(old_uri) = child.reply_parent_uri.clone() {
+                let _ = by_reply_pending_table
+                    .remove((old_uri.as_str(), child.id.as_str()))
+                    .map_err(map_redb_err)?;
+            }
+            child.reply_parent_uri = Some(uri.to_string());
+            let child_bytes = encode_json(&child)?;
+            notes_table
+                .insert(child.id.as_str(), child_bytes.as_slice())
+                .map_err(map_redb_err)?;
+            by_reply_pending_table
+                .insert((uri, child.id.as_str()), &1u8)
+                .map_err(map_redb_err)?;
+            true
+        };
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)?;
+        Ok(changed)
+    }
+
+    fn set_quote_authorization(
+        &self,
+        note_id: &str,
+        state: QuoteAuthorizationState,
+        authorization_uri: Option<String>,
+        verified_at_ms: i64,
+        jobs: Vec<NewJob>,
+    ) -> Result<Note, PortError> {
+        for job in &jobs {
+            job.validate()?;
+        }
+        let write_txn = self.begin_write()?;
+        let note = self.set_quote_authorization_in_txn(
+            &write_txn,
+            note_id,
+            state,
+            authorization_uri,
+            verified_at_ms,
+            jobs,
+        )?;
+        self.commit_write(write_txn)?;
+        Ok(note)
+    }
+
+    fn find_note_by_quote_request(&self, request_uri: &str) -> Result<Option<Note>, PortError> {
+        let target = request_uri.trim();
+        if target.is_empty() {
+            return Ok(None);
+        }
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let notes_table = read_txn.open_table(NOTES).map_err(map_redb_err)?;
+        for entry in notes_table.iter().map_err(map_redb_err)? {
+            let (_, v) = entry.map_err(map_redb_err)?;
+            let note: Note = decode_json(v.value())?;
+            if note.is_deleted {
+                continue;
+            }
+            if note
+                .quote
+                .as_ref()
+                .and_then(|q| q.request_activity_uri.as_deref())
+                == Some(target)
+            {
+                return Ok(Some(note));
+            }
+        }
+        Ok(None)
+    }
+
+    fn find_note_by_quote_stamp(&self, stamp_uri: &str) -> Result<Option<Note>, PortError> {
+        let target = stamp_uri.trim();
+        if target.is_empty() {
+            return Ok(None);
+        }
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let notes_table = read_txn.open_table(NOTES).map_err(map_redb_err)?;
+        for entry in notes_table.iter().map_err(map_redb_err)? {
+            let (_, v) = entry.map_err(map_redb_err)?;
+            let note: Note = decode_json(v.value())?;
+            if note.is_deleted {
+                continue;
+            }
+            if note
+                .quote
+                .as_ref()
+                .and_then(|q| q.authorization_uri.as_deref())
+                == Some(target)
+            {
+                return Ok(Some(note));
+            }
+        }
+        Ok(None)
+    }
+
+    fn save_quote_stamp(&self, stamp: QuoteStamp, jobs: Vec<NewJob>) -> Result<(), PortError> {
+        if stamp.id.trim().is_empty() {
+            return Err(PortError::Validation("empty stamp id".to_string()));
+        }
+        for job in &jobs {
+            job.validate()?;
+        }
+        let write_txn = self.begin_write()?;
+        self.save_quote_stamp_in_txn(&write_txn, &stamp, jobs)?;
+        self.commit_write(write_txn)
+    }
+
+    fn get_quote_stamp(&self, stamp_id: &str) -> Result<Option<QuoteStamp>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(QUOTE_STAMPS).map_err(map_redb_err)?;
+        match table.get(stamp_id).map_err(map_redb_err)? {
+            Some(g) => Ok(Some(decode_json(g.value())?)),
+            None => Ok(None),
+        }
     }
 
     fn attach_remote_media(
@@ -2470,6 +3165,138 @@ impl ActivityDedup for RedbStore {
         let acc = self.update_account_in_txn(&write_txn, account_id, patch, jobs)?;
         self.commit_write(write_txn)?;
         Ok(Some(acc))
+    }
+
+    fn record_quote_request_accept(
+        &self,
+        activity_id: &str,
+        stamp: QuoteStamp,
+        jobs: Vec<NewJob>,
+    ) -> Result<Option<QuoteStamp>, PortError> {
+        let write_txn = self.begin_write()?;
+        if self.check_and_mark_dedup_in_txn(&write_txn, activity_id)? {
+            let _ = write_txn.abort();
+            return Ok(None);
+        }
+        self.save_quote_stamp_in_txn(&write_txn, &stamp, jobs)?;
+        self.commit_write(write_txn)?;
+        Ok(Some(stamp))
+    }
+
+    fn record_quote_request_reject(
+        &self,
+        activity_id: &str,
+        jobs: Vec<NewJob>,
+    ) -> Result<bool, PortError> {
+        let write_txn = self.begin_write()?;
+        if self.check_and_mark_dedup_in_txn(&write_txn, activity_id)? {
+            let _ = write_txn.abort();
+            return Ok(false);
+        }
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)?;
+        Ok(true)
+    }
+
+    fn record_quote_decision_accept(
+        &self,
+        activity_id: &str,
+        note_id: &str,
+        stamp_uri: &str,
+        verified_at_ms: i64,
+        jobs: Vec<NewJob>,
+    ) -> Result<Option<Note>, PortError> {
+        let write_txn = self.begin_write()?;
+        if self.check_and_mark_dedup_in_txn(&write_txn, activity_id)? {
+            let _ = write_txn.abort();
+            return Ok(None);
+        }
+        let note = self.set_quote_authorization_in_txn(
+            &write_txn,
+            note_id,
+            QuoteAuthorizationState::Approved,
+            Some(stamp_uri.to_string()),
+            verified_at_ms,
+            jobs,
+        )?;
+        self.commit_write(write_txn)?;
+        Ok(Some(note))
+    }
+
+    fn record_quote_decision_reject(
+        &self,
+        activity_id: &str,
+        note_id: &str,
+        jobs: Vec<NewJob>,
+    ) -> Result<Option<Note>, PortError> {
+        let write_txn = self.begin_write()?;
+        if self.check_and_mark_dedup_in_txn(&write_txn, activity_id)? {
+            let _ = write_txn.abort();
+            return Ok(None);
+        }
+        // Rejection retains the relation and API projection; only the state
+        // flips. `now` is only used for Approved-family timestamps.
+        let now = self.clock.now_ms();
+        let note = self.set_quote_authorization_in_txn(
+            &write_txn,
+            note_id,
+            QuoteAuthorizationState::Rejected,
+            None,
+            now,
+            jobs,
+        )?;
+        self.commit_write(write_txn)?;
+        Ok(Some(note))
+    }
+
+    fn record_quote_stamp_delete(
+        &self,
+        activity_id: &str,
+        note_id: &str,
+        jobs: Vec<NewJob>,
+    ) -> Result<Option<Note>, PortError> {
+        let write_txn = self.begin_write()?;
+        if self.check_and_mark_dedup_in_txn(&write_txn, activity_id)? {
+            let _ = write_txn.abort();
+            return Ok(None);
+        }
+        let now = self.clock.now_ms();
+        let note = self.set_quote_authorization_in_txn(
+            &write_txn,
+            note_id,
+            QuoteAuthorizationState::Revoked,
+            None,
+            now,
+            jobs,
+        )?;
+        // Mark the backing stamp row revoked in the same transaction so it
+        // stops dereferencing (get_quote_stamp gates on !revoked).
+        if let Some(stamp_uri) = note
+            .quote
+            .as_ref()
+            .and_then(|q| q.authorization_uri.as_deref())
+            .map(ToOwned::to_owned)
+        {
+            let stamp_bytes: Option<Vec<u8>> = {
+                let stamps = write_txn.open_table(QUOTE_STAMPS).map_err(map_redb_err)?;
+                match stamps.get(stamp_uri.as_str()).map_err(map_redb_err)? {
+                    Some(g) => Some(g.value().to_vec()),
+                    None => None,
+                }
+            };
+            if let Some(raw) = stamp_bytes {
+                let mut stamp: QuoteStamp = decode_json(&raw)?;
+                stamp.revoked = true;
+                let bytes = encode_json(&stamp)?;
+                let stamp_id = stamp.id.clone();
+                let mut stamps = write_txn.open_table(QUOTE_STAMPS).map_err(map_redb_err)?;
+                stamps
+                    .insert(stamp_id.as_str(), bytes.as_slice())
+                    .map_err(map_redb_err)?;
+            }
+        }
+        self.commit_write(write_txn)?;
+        Ok(Some(note))
     }
 }
 

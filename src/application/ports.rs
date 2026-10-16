@@ -6,6 +6,7 @@ pub use crate::domain::id::{Clock, DomainError, IdGenerator, PortError};
 use crate::domain::media::{MediaMeta, MediaProperties};
 use crate::domain::note::{Note, ReactionAcceptance, Visibility};
 use crate::domain::notification::{Notification, NotificationKind};
+use crate::domain::quote::{QuoteAuthorizationState, QuoteReference, QuoteStamp};
 use crate::domain::reaction::Reaction;
 
 pub const MAX_JOB_PAYLOAD_BYTES: usize = 65_536;
@@ -100,6 +101,15 @@ pub struct CreateNoteInput {
     pub local_only: bool,
     pub reply_to: Option<String>,
     pub renote_of: Option<String>,
+    /// Unresolved ActivityPub reply parent (`docs/replies.md` Slice B):
+    /// the canonical `inReplyTo` URI of a remotely authored reply whose
+    /// parent was not cached at ingestion time. Inbox-only: the local
+    /// `create_note` path rejects this (local replies resolve their target
+    /// synchronously or fail). Must never be set together with `reply_to`
+    /// (storage rejects the combination as conflicting). `#[serde(default)]`
+    /// keeps in-flight job payloads decodable.
+    #[serde(default)]
+    pub reply_parent_uri: Option<String>,
     pub file_ids: Vec<String>,
     pub visible_users: Vec<String>,
     pub reaction_acceptance: Option<ReactionAcceptance>,
@@ -118,6 +128,14 @@ pub struct CreateNoteInput {
     pub extra_mentions: Vec<String>,
     #[serde(default)]
     pub extra_tags: Vec<String>,
+    /// Structured quote relationship being created with this note, if any.
+    /// `None` for ordinary notes and pure renotes. The application layer
+    /// builds this (local quotes: `Pending`/exception; inbound quotes:
+    /// `Unapproved`/`Approved`/exception after pre-transaction stamp
+    /// verification); storage persists it verbatim after validation.
+    /// `#[serde(default)]` keeps in-flight job payloads decodable.
+    #[serde(default)]
+    pub quote: Option<QuoteReference>,
 }
 
 impl CreateNoteInput {
@@ -130,6 +148,7 @@ impl CreateNoteInput {
             local_only: false,
             reply_to: None,
             renote_of: None,
+            reply_parent_uri: None,
             file_ids: Vec::new(),
             visible_users: Vec::new(),
             reaction_acceptance: None,
@@ -144,6 +163,7 @@ impl CreateNoteInput {
             url: None,
             extra_mentions: Vec::new(),
             extra_tags: Vec::new(),
+            quote: None,
         }
     }
 }
@@ -197,9 +217,144 @@ pub trait NoteStore: Send + Sync {
         author_id: &str,
         cursor: &TimelineCursor,
     ) -> Result<Vec<Note>, PortError>;
+    /// Direct children of one parent (`reply_id == reply_to`), newest-first,
+    /// excluding deleted notes (`docs/replies.md` Slice A). `cursor` bounds
+    /// (`since_id` exclusive, `until_id` exclusive, date bounds) apply with
+    /// the same comparison semantics as the other cursor-paged note
+    /// listings; `limit` is a **candidate scan limit** (backends return up
+    /// to `limit` raw children — the application layer applies visibility
+    /// on top and pages with its own scan loop, so short visible pages are
+    /// refilled from later batches). `limit == 0` means a backend default.
+    /// Unknown (or deleted) `reply_id` yields whatever live children still
+    /// reference it — like the pre-index scan, there is no existence check.
+    /// Backends without the parent-child index report `StorageUnavailable`
+    /// so callers fail loudly instead of serving silently empty trees.
+    fn notes_by_reply(
+        &self,
+        reply_id: &str,
+        cursor: &TimelineCursor,
+    ) -> Result<Vec<Note>, PortError> {
+        let _ = (reply_id, cursor);
+        Err(PortError::StorageUnavailable(
+            "NoteStore::notes_by_reply not implemented".to_string(),
+        ))
+    }
+    /// Live notes still waiting on the unresolved reply parent `parent_uri`
+    /// (`reply_parent_uri == parent_uri`, deleted excluded), oldest-first,
+    /// truncated to `limit` (`docs/replies.md` Slice B). Drives the
+    /// `ReplyParentResolve` worker batch and the arrival-triggered check in
+    /// the inbox. Defaults to `StorageUnavailable` like `notes_by_reply`.
+    fn pending_reply_children(
+        &self,
+        parent_uri: &str,
+        limit: usize,
+    ) -> Result<Vec<Note>, PortError> {
+        let _ = (parent_uri, limit);
+        Err(PortError::StorageUnavailable(
+            "NoteStore::pending_reply_children not implemented".to_string(),
+        ))
+    }
+    /// Atomically link a pending child to its resolved parent
+    /// (`docs/replies.md` Slice B): set `reply_id`, clear
+    /// `reply_parent_uri`, adopt the parent's author as `reply_user_id`,
+    /// re-apply parent-driven visibility narrowing (same rules as a reply
+    /// whose parent was cached at ingestion), increment the parent's
+    /// `replies_count`, insert the parent-child index row, and drop the
+    /// pending index row — all in one transaction.
+    ///
+    /// `parent_canonical_uri` is the parent's canonical URI as computed by
+    /// the caller (stored `uri` or `{base}/notes/{id}`); the link commits
+    /// only when the child's pending URI matches it exactly.
+    ///
+    /// Idempotent: an already-linked child, a repeat of the same link, or a
+    /// missing/deleted child converges to `Ok(None)` with no counter or
+    /// index change. A missing parent also yields `Ok(None)` (the pending
+    /// entry is kept for a later retry). Deterministic conflicts — a
+    /// mismatched pending URI or a reply cycle — are `Validation` errors;
+    /// the caller skips the child but keeps its pending entry.
+    fn link_pending_reply(
+        &self,
+        child_id: &str,
+        parent_id: &str,
+        parent_canonical_uri: &str,
+    ) -> Result<Option<Note>, PortError> {
+        let _ = (child_id, parent_id, parent_canonical_uri);
+        Err(PortError::StorageUnavailable(
+            "NoteStore::link_pending_reply not implemented".to_string(),
+        ))
+    }
+    /// Record an unresolved reply parent discovered later (opt-in repair,
+    /// `docs/replies.md` §6.1): set the child's `reply_parent_uri`,
+    /// maintain the pending index, and enqueue `jobs` (the resolver) — all
+    /// in one transaction. Idempotent: `Ok(false)` when the child is
+    /// missing, deleted, already linked, or already pending on the same
+    /// URI; `Ok(true)` when a pending URI was (re)assigned. Replacing a
+    /// *different* pending URI is allowed (repair refines stale data) and
+    /// fixes the index row. `Validation` on empty/non-`http(s)` URIs.
+    fn set_pending_reply_parent(
+        &self,
+        child_id: &str,
+        parent_uri: &str,
+        jobs: Vec<NewJob>,
+    ) -> Result<bool, PortError> {
+        let _ = (child_id, parent_uri, jobs);
+        Err(PortError::StorageUnavailable(
+            "NoteStore::set_pending_reply_parent not implemented".to_string(),
+        ))
+    }
     fn list_all_notes(&self, cursor: &TimelineCursor) -> Result<Vec<Note>, PortError>;
     fn find_by_uri(&self, uri: &str) -> Result<Option<Note>, PortError> {
         let _ = uri;
+        Ok(None)
+    }
+    /// Atomically set a quote note's authorization state (e.g.
+    /// `Pending` → `Approved`/`Rejected`, `Approved` → `Revoked`) and
+    /// enqueue `jobs` (delivery of `Update`/accept replies) in the same
+    /// transaction. Illegal transitions (per
+    /// [`QuoteAuthorizationState::allows_transition`]) are rejected with
+    /// `Validation`. `NotFound(NO_SUCH_QUOTE)` when the note is missing,
+    /// deleted, or not a quote. Same-state repeats succeed as no-ops
+    /// (idempotent replays) and still enqueue no jobs... callers pass jobs
+    /// explicitly, so replays should pass none.
+    fn set_quote_authorization(
+        &self,
+        note_id: &str,
+        state: QuoteAuthorizationState,
+        authorization_uri: Option<String>,
+        verified_at_ms: i64,
+        jobs: Vec<NewJob>,
+    ) -> Result<Note, PortError> {
+        let _ = (note_id, state, authorization_uri, verified_at_ms, jobs);
+        Err(PortError::StorageUnavailable(
+            "NoteStore::set_quote_authorization not implemented".to_string(),
+        ))
+    }
+    /// Find a local quote note by its outgoing `QuoteRequest` activity URI
+    /// (for matching inbound `Accept`/`Reject` to the request). `Ok(None)`
+    /// when unknown. Backends without an index may scan; the default
+    /// reports unknown so test doubles keep compiling.
+    fn find_note_by_quote_request(&self, request_uri: &str) -> Result<Option<Note>, PortError> {
+        let _ = request_uri;
+        Ok(None)
+    }
+    /// Find a local quote note by its verified stamp IRI (for matching a
+    /// stamp `Delete` to the affected quote). `Ok(None)` when unknown.
+    fn find_note_by_quote_stamp(&self, stamp_uri: &str) -> Result<Option<Note>, PortError> {
+        let _ = stamp_uri;
+        Ok(None)
+    }
+    /// Persist a locally authored `QuoteAuthorization` stamp (durable +
+    /// dereferenceable) and enqueue `jobs` (the `Accept` delivery) in the
+    /// same transaction. Overwrites on id repeat (accept replays converge).
+    fn save_quote_stamp(&self, stamp: QuoteStamp, jobs: Vec<NewJob>) -> Result<(), PortError> {
+        let _ = (stamp, jobs);
+        Err(PortError::StorageUnavailable(
+            "NoteStore::save_quote_stamp not implemented".to_string(),
+        ))
+    }
+    /// Fetch a stamp by its IRI. `Ok(None)` when unknown.
+    fn get_quote_stamp(&self, stamp_id: &str) -> Result<Option<QuoteStamp>, PortError> {
+        let _ = stamp_id;
         Ok(None)
     }
 }
@@ -217,6 +372,23 @@ pub enum JobKind {
     /// committed note id inside the storage transaction (same mechanism as
     /// the federated `NoteCreated` payload).
     RemoteMediaFetch,
+    /// Quote-post authorization: re-verify an offered `QuoteAuthorization`
+    /// stamp off the inbox request. The payload is
+    /// [`QuoteStampReverifyPayload`]. Transient fetch failures retry with
+    /// the worker's standard backoff (quarantined after
+    /// [`MAX_JOB_ATTEMPTS`]); invalid stamp content completes without
+    /// recording (a later re-delivered `Accept` can still be processed).
+    QuoteStampReverify,
+    /// Branched replies (`docs/replies.md` Slice B): resolve an unresolved
+    /// reply parent URI off the inbox request. The payload is
+    /// [`ReplyParentResolvePayload`]. The handler fetches/caches the parent
+    /// through the SSRF-protected remote-note path, then links waiting
+    /// children in bounded batches via the idempotent
+    /// `NoteStore::link_pending_reply`. Fetch failures retry with the
+    /// worker's standard backoff; after the budget is exhausted the job
+    /// quarantines but the pending index entry is kept, so a later parent
+    /// arrival (which enqueues a fresh job for the same URI) can still link.
+    ReplyParentResolve,
 }
 
 /// Maximum `fail()` retries before a job is auto-quarantined as
@@ -582,6 +754,63 @@ pub trait ActivityDedup: Send + Sync {
         let _ = (activity_id, account_id, patch, jobs);
         unimplemented!("ActivityDedup::record_update_account_activity not implemented")
     }
+    /// Dedup + persist a locally authored `QuoteAuthorization` stamp and its
+    /// `Accept` delivery job. `Ok(None)` when the activity id was already
+    /// seen (replay: no duplicate stamp row, no duplicate `Accept`).
+    fn record_quote_request_accept(
+        &self,
+        activity_id: &str,
+        stamp: QuoteStamp,
+        jobs: Vec<NewJob>,
+    ) -> Result<Option<QuoteStamp>, PortError> {
+        let _ = (activity_id, stamp, jobs);
+        unimplemented!("ActivityDedup::record_quote_request_accept not implemented")
+    }
+    /// Dedup + enqueue a `Reject(QuoteRequest)` delivery job (no stamp is
+    /// created). `Ok(false)` on replay.
+    fn record_quote_request_reject(
+        &self,
+        activity_id: &str,
+        jobs: Vec<NewJob>,
+    ) -> Result<bool, PortError> {
+        let _ = (activity_id, jobs);
+        unimplemented!("ActivityDedup::record_quote_request_reject not implemented")
+    }
+    /// Dedup + move our pending quote to `Approved` with its verified stamp
+    /// (inbound `Accept`). `Ok(None)` on replay.
+    fn record_quote_decision_accept(
+        &self,
+        activity_id: &str,
+        note_id: &str,
+        stamp_uri: &str,
+        verified_at_ms: i64,
+        jobs: Vec<NewJob>,
+    ) -> Result<Option<Note>, PortError> {
+        let _ = (activity_id, note_id, stamp_uri, verified_at_ms, jobs);
+        unimplemented!("ActivityDedup::record_quote_decision_accept not implemented")
+    }
+    /// Dedup + move our pending quote to `Rejected` (inbound `Reject`).
+    /// The relation and API projection are retained. `Ok(None)` on replay.
+    fn record_quote_decision_reject(
+        &self,
+        activity_id: &str,
+        note_id: &str,
+        jobs: Vec<NewJob>,
+    ) -> Result<Option<Note>, PortError> {
+        let _ = (activity_id, note_id, jobs);
+        unimplemented!("ActivityDedup::record_quote_decision_reject not implemented")
+    }
+    /// Dedup + move our approved quote to `Revoked` (valid `Delete` of the
+    /// stamp) and enqueue revocation-forwarding jobs. `Ok(None)` on replay.
+    fn record_quote_stamp_delete(
+        &self,
+        activity_id: &str,
+        note_id: &str,
+        jobs: Vec<NewJob>,
+    ) -> Result<Option<Note>, PortError> {
+        let _ = (activity_id, note_id, jobs);
+        unimplemented!("ActivityDedup::record_quote_stamp_delete not implemented")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -630,6 +859,29 @@ pub struct RemoteMediaAttachment {
 pub struct RemoteMediaFetchPayload {
     pub note_id: String,
     pub attachments: Vec<RemoteMediaAttachment>,
+}
+
+/// Payload of a `JobKind::QuoteStampReverify` job: re-dereference and verify
+/// the stamp offered by an inbound `Accept(QuoteRequest)` whose first fetch
+/// failed transiently. `accept_activity_id` is recorded only on successful
+/// verification (with the state change, atomically), so retries and
+/// re-deliveries converge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuoteStampReverifyPayload {
+    pub accept_activity_id: String,
+    pub request_uri: String,
+    pub stamp_uri: String,
+}
+
+/// Payload of a `JobKind::ReplyParentResolve` job: resolve one pending
+/// reply-parent URI (`docs/replies.md` Slice B). One URI-keyed job covers
+/// all children waiting on that URI; the handler processes them in bounded
+/// batches and enqueues a continuation when more remain. Duplicate jobs
+/// for the same URI are harmless: linking is idempotent, so replays and
+/// retries converge without double-counting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplyParentResolvePayload {
+    pub parent_uri: String,
 }
 
 pub trait MediaStore: Send + Sync {

@@ -1,6 +1,7 @@
 # Core domain types
 
-**Status:** Frozen (Phase 0 freeze review 2026-10-14)
+**Status:** Frozen (Phase 0 freeze review 2026-10-14), extended by
+superseding quote-posts and branched-replies decisions below (2026-10-16)
 **Sources:** `sns-server-proposal.md` §4; `docs/identity-rules.md`; `docs/visibility-policy.md`; Misskey checkout (read-only): `models/User.ts`, `models/Note.ts`, `models/Following.ts`, `models/NoteReaction.ts`, `models/DriveFile.ts`, `models/util/id.ts:6-9`, `types.ts:59-61` (all key claims re-verified locally this session).
 
 Pure data + validation. No I/O, no HTTP, no per-adapter variants. Field bounds are client-compatibility surface: clients read these shapes, so narrowing a bound later is a breaking change — the values below are fixed at freeze.
@@ -53,6 +54,10 @@ Must-carry subset of `MiNote` (M `models/Note.ts`). No channels (`channel_id` do
 | `reaction_acceptance` | enum \| null | yes | `likeOnly\|likeOnlyForRemote\|nonSensitiveOnly\|nonSensitiveOnlyForLocalLikeOnlyForRemote\|null` (M `types.ts:61`) |
 | `uri` / `url` | string ≤512 | yes | null when local (M `:138-149`); canonical forms in identity rules §4 |
 | `user_host` (denorm) | string ≤128 | yes | author's host at creation; federated filtering without join (M `:218-223`) |
+| `quote` | `QuoteReference` \| null | yes | default null (legacy rows decode absent as null; ordinary pure renotes stay null). Present = quote (own commentary + embedded target), distinct from a pure renote. Fields: `target_uri` (canonical AP object ID, `http(s)` ≤512, never the HTML `url`), `target_note_id` (resolved local Note ID, if available; retained URI when unresolved), `authorization` (`pending\|approved\|approvedByException\|rejected\|revoked\|unapproved\|unknown`), `authorization_uri` (verified `QuoteAuthorization` IRI; required when `approved`), `request_activity_uri` (local `QuoteRequest` IRI, `http(s)` when present), `last_verified_at` (ms, set on `approved` family). API projection folds `approvedByException` into `approved`. Transition table in `src/domain/quote.rs` (`allows_transition`): same-state repeats always allowed; `pending→approved/rejected/unapproved/unknown`, `unapproved/unknown→approved`, `approved→revoked`, `rejected→approved`, `revoked→approved/pending` (fresh stamp); everything else rejected. See `docs/quote-posts.md` (spec) for state meanings. |
+| `reply_parent_uri` | string ≤2048 \| null | yes | default null (legacy rows decode absent as null; `#[serde(default)]`). Internal only — never in Misskey API packs or ActivityPub documents. Pending parent: the canonical `inReplyTo` URI of a reply whose parent is not yet resolved to a local note ID. Overlong values (>2048) rejected; setting both `reply_id` and `reply_parent_uri` rejected by validation. See `docs/replies.md` (spec). |
+
+**Note — replies (2026-10-16, `docs/replies.md`):** `Note::is_reply()` is true for resolved replies (`reply_id` set) **or** pending replies (`reply_parent_uri` set); `has_pending_reply_parent()` reports the pending case alone. Fail-closed reads: while `reply_parent_uri` is set, `is_visible` returns false, so the note is withheld from note detail, profiles, search, timelines, feeds, ActivityPub object responses, and streaming — the pending URI is never a root relationship and never leaks through a read surface. Store-level reads are unaffected. See `docs/visibility-policy.md` (fail-closed pending rule).
 
 ## 3. Follow
 

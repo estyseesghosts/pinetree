@@ -1377,6 +1377,31 @@ pub fn resolve_remote_public_key(
     Ok((parsed.uri, parsed.public_key_pem))
 }
 
+/// Fetch a FEP-044f `QuoteAuthorization` stamp document by IRI (signed
+/// GET). Returns the raw JSON; verification (type, fields, authority) is
+/// the caller's job via `quotes::verify_stamp_for_quote`. Transport or
+/// parse failures are transient: the caller maps them to `Unknown`, never
+/// to rejection or revocation.
+pub fn fetch_quote_stamp_doc(
+    services: &AppServices,
+    client: &SafeHttpClient,
+    stamp_uri: &str,
+) -> Result<Value, PortError> {
+    let doc = signed_get_json(
+        services,
+        client,
+        stamp_uri,
+        "application/activity+json, application/ld+json;q=0.9, application/json;q=0.8",
+    )
+    .map_err(|e| PortError::Validation(format!("fetch stamp: {e}")))?;
+    if !doc.is_object() {
+        return Err(PortError::Validation(
+            "stamp document is not a JSON object".to_string(),
+        ));
+    }
+    Ok(doc)
+}
+
 /// Fetch and parse a remote ActivityPub `Note` by URI, verifying that its
 /// `attributedTo` actor shares the same origin host as `note_uri`.
 pub fn fetch_remote_note(

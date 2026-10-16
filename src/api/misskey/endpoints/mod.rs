@@ -114,6 +114,7 @@ pub fn build_router(state: ApiState) -> Router {
             "/notes/{id}/activity",
             get(ap_objects::get_note_activity_ap),
         )
+        .route("/users/{id}/stamps/{stamp}", get(ap_objects::get_quote_stamp))
         .route("/inbox", post(fed_inbox::inbox_handler))
         .route("/users/{id}/inbox", post(fed_inbox::user_inbox_handler))
         .with_state(services);
@@ -1976,6 +1977,7 @@ fn api_dispatch_blocking(
                 visibility: parse_visibility(obj.get("visibility"))?,
                 local_only: opt_bool(&obj, "localOnly", false)?,
                 reply_to: opt_string(&obj, "replyId")?,
+                reply_parent_uri: None,
                 renote_of: opt_string(&obj, "renoteId")?,
                 file_ids,
                 visible_users: str_list(&obj, "visibleUserIds")?,
@@ -1991,6 +1993,7 @@ fn api_dispatch_blocking(
                 url: None,
                 extra_mentions: Vec::new(),
                 extra_tags: Vec::new(),
+                quote: None,
             };
             let note = state
                 .services
@@ -2942,6 +2945,21 @@ fn api_dispatch_blocking(
                         &parsed.cc,
                         Some(&format!("{author_uri}/followers")),
                     );
+                    // Best-effort quote retention on the lookup path:
+                    // local-only target resolution, no stamp verification
+                    // (the federated inbox path remains authoritative).
+                    // Never discards a recognized quote. When the target
+                    // resolves locally, both `renote_of` and
+                    // `quote.target_note_id` point at it so the API
+                    // projection shows the relation; otherwise the URI is
+                    // retained with `renote_of: None` (no fabricated ID).
+                    let resolved_quote_target: Option<String> = parsed
+                        .quote_target_uri
+                        .as_deref()
+                        .and_then(|u| {
+                            state.services.notes.find_by_uri(u).ok().flatten()
+                        })
+                        .map(|n| n.id);
                     let input = CreateNoteInput {
                         author_id: author.id.clone(),
                         text: parsed.text.clone(),
@@ -2949,7 +2967,8 @@ fn api_dispatch_blocking(
                         visibility,
                         local_only: false,
                         reply_to: None,
-                        renote_of: None,
+                        reply_parent_uri: None,
+                        renote_of: resolved_quote_target.clone(),
                         file_ids: Vec::new(),
                         visible_users: Vec::new(),
                         reaction_acceptance: None,
@@ -2964,6 +2983,17 @@ fn api_dispatch_blocking(
                         url: parsed.url.clone(),
                         extra_mentions: Vec::new(),
                         extra_tags: Vec::new(),
+                        quote: parsed.quote_target_uri.clone().map(|target_uri| {
+                            crate::domain::quote::QuoteReference {
+                                target_uri,
+                                target_note_id: resolved_quote_target.clone(),
+                                authorization:
+                                    crate::domain::quote::QuoteAuthorizationState::Unapproved,
+                                authorization_uri: None,
+                                request_activity_uri: None,
+                                last_verified_at: None,
+                            }
+                        }),
                     };
                     // Cache under the note URI as the dedup key so concurrent
                     // fetches converge.

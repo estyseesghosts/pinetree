@@ -66,3 +66,33 @@ One predicate, three call sites (`application-ports.md` §10, `visibility-policy
 First green run achieved 2026-10-14: throwaway in-memory harness (`/tmp/opencode/phase0-harness`, std-only Rust, explicitly not product code) implements the ports over maps with commit-point fault injection and passes 15/15 suite cases plus the §8 acceptance test (`cargo test`: groups A1–A4, B1/B3/B4/B6, C1/C3, D1/D3, E1/E3, exit-box-2). Real thread-race cases (C1, D3) included. Evidence in `state/logs/2026-10-14-phase-0-freeze.md`.
 
 Honest scope: this proves suite coherence and interface viability, not a backend. First real-backend green run = redb adapter, Phase 1; both backends must still pass this exact suite before they ship.
+
+## 10. Group Q — quote posts (`docs/quote-posts.md`)
+
+Backend-agnostic, same cases both adapters (FDB inherits):
+
+- **Q1 create persists**: quote relation + resolved `target_note_id` stored with the note; pure renotes stay `quote: None`; legacy rows without a `quote` key decode as non-quotes.
+- **Q2 transitions**: `Approved` requires a stamp (no false approval); `Pending→Approved` + jobs commit together; same-state repeats succeed (replay retains the stamp); `Approved→Rejected`/`Approved→Unknown` rejected; `Approved→Revoked` valid.
+- **Q3 stamps/lookups**: unknown request/stamp lookups are `None`; request lookup finds the pending quote; stamp round-trips; stamp lookup finds the quote after approval.
+- **Q4 request dedup**: `record_quote_request_accept` commits stamp + `Accept` job atomically; replay applies nothing (no duplicate job); reject path `true` then `false` on replay.
+- **Q5 decision/revocation**: `Accept` moves `Pending→Approved` with the stamp; replay is `None`; `Reject` retains relation + projection (`renote`, text intact); `record_quote_stamp_delete` moves `Approved→Revoked` with forwarding jobs and flips the backing stamp row `revoked=true` in the same txn; replay is `None`; `Revoked→Approved` with a fresh stamp is legal (revocation is not terminal).
+- **Q6 crash consistency**: quote create-then-crash — note + quote state + outbox job survive SIGKILL after commit (redb crash harness; mirrored per backend).
+
+## 11. Group R — branched replies (`docs/replies.md`)
+
+Backend-agnostic, same cases both adapters (FDB inherits once implemented):
+
+- **R1 index+counter**: creating a reply stores the child index entry and increments the parent's `replies_count` in the same atomic commit; non-replies add neither.
+- **R2 paging+deleted**: `notes_by_reply` returns newest-first direct children only, honoring cursor bounds; deleted children are excluded without cutting the page short.
+- **R3 delete consistency**: deleting a reply decrements the parent's `replies_count` exactly once (saturating) and drops its index rows in the same transaction; descendants keep their `reply_id`.
+- **R4 visibility-aware scan**: the `note_replies` page loop skips invisible/deleted candidates and advances until the visible page is full or the range is exhausted (no short pages, no stall on hidden rows).
+- **R5 crash-before-commit**: reply create crashed before commit leaves no note, no index entry, no counter increment, no job.
+- **R6 link idempotency**: `link_pending_reply` links exactly once across retries (no double counter or index entries), re-narrows visibility, and rejects URI mismatch and cycles as `Validation`.
+- **R7 migration backfill+resume**: the versioned backfill indexes pre-existing reply links in bounded batches, resumes from its persisted cursor after an interrupted run, and writes the done marker only on completion.
+- **R8 read withholding**: pending-parent notes are invisible to ordinary reads and absent from `notes/replies` until linked; they count as replies under `withReplies=false`.
+- **R9 repair**: the opt-in repair path re-queues resolution only for stored remote notes whose fetched source still declares a resolvable `inReplyTo`; genuine roots are untouched.
+- **R10 worker resolver**: the `ReplyParentResolve` job fetches the unavailable parent, links waiting children in bounded batches, retries with backoff, and quarantines past budget with the entry kept.
+- **R11 children unchanged**: `notes/children` still returns direct replies plus eligible quote-renotes.
+- **R12 conversation unchanged**: `notes/conversation` still returns the visible ancestor chain oldest-first with the cycle/depth guard.
+
+Execution status (honest): R1–R12 are green on redb only (`tests/conformance.rs`); the FDB adapter is still a stub and has not run them. The cases are backend-generic, so FDB inherits them when implemented.

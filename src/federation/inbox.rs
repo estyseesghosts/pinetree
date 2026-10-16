@@ -29,6 +29,7 @@ use crate::application::commands::AppServices;
 use crate::application::ports::{Clock, CreateNoteInput, PortError, TimelineCursor, UpdateAccountPatch};
 use crate::domain::account::Account;
 use crate::domain::note::{Note, Visibility};
+use crate::domain::quote::QuoteReference;
 use crate::federation::delivery::{
     MAX_AP_JSON_BYTES, fetch_and_upsert_remote_actor, fetch_remote_note, resolve_remote_public_key,
 };
@@ -84,7 +85,7 @@ fn process_inbox(
         Err(_) => return bad_request(),
     };
     let activity_type = match non_empty_str(activity.get("type")) {
-        Some(t) => t,
+        Some(t) => canonical_activity_type(&t),
         None => return bad_request(),
     };
     let activity_id = match non_empty_str(activity.get("id")) {
@@ -203,17 +204,22 @@ fn host_of(uri: &str) -> Option<String> {
 /// local followee, so actor == signer is sufficient. `Announce`/`Like`
 /// targets are routinely third-party or local notes, so no object-host check
 /// applies there either; authority is established via actor == signer plus
-/// origin-checked target resolution at dispatch. `Create`/`Delete` objects
-/// are content the signer claims to own and must live on the signer's host;
-/// `Update` objects must be the signer's own actor document.
+/// origin-checked target resolution at dispatch. `Create` objects are
+/// content the signer claims to own and must live on the signer's host;
+/// `Update` objects must be the signer's own actor document. `Delete` and
+/// `QuoteRequest` pass through: dispatch re-validates (note deletes keep
+/// their author/host check; stamp deletes enforce stamp-author authority;
+/// quote requests validate instrument ownership) — a blanket host match
+/// here would 401 legitimate revocation forwards and quote requests.
 fn check_object_authority(
     activity_type: &str,
     activity: &Value,
     signer_actor: &str,
 ) -> bool {
     match activity_type {
-        "Follow" | "Accept" | "Reject" | "Undo" | "Announce" | "Like" => true,
-        "Create" | "Delete" => {
+        "Follow" | "Accept" | "Reject" | "Undo" | "Announce" | "Like" | "Delete"
+        | "QuoteRequest" => true,
+        "Create" => {
             let Some(object_uri) = extract_object_uri(activity.get("object")) else {
                 return true; // dispatch ignores activities without an object
             };
@@ -260,14 +266,15 @@ fn dispatch(
 ) -> Response {
     let outcome: Result<Response, PortError> = match activity_type {
         "Follow" => handle_follow(services, activity, activity_id, actor_uri),
-        "Accept" => handle_follow_response(services, activity, activity_id, actor_uri, true),
-        "Reject" => handle_follow_response(services, activity, activity_id, actor_uri, false),
+        "Accept" => handle_accept(services, activity, activity_id, actor_uri),
+        "Reject" => handle_reject(services, activity, activity_id, actor_uri),
         "Undo" => handle_undo(services, activity, activity_id, actor_uri),
         "Create" => handle_create(services, activity, activity_id, actor_uri),
         "Announce" => handle_announce(services, activity, activity_id, actor_uri),
         "Like" => handle_like(services, activity, activity_id, actor_uri),
         "Delete" => handle_delete(services, activity, activity_id, actor_uri),
         "Update" => handle_update(services, activity, activity_id, actor_uri),
+        "QuoteRequest" => handle_quote_request(services, activity, activity_id, actor_uri),
         _ => Ok(accepted()),
     };
     outcome.unwrap_or_else(|_| internal_error())
@@ -291,6 +298,72 @@ fn handle_follow(
     }
     services.handle_inbound_follow(activity_id, &follower.id, &followee.id, false)?;
     Ok(accepted())
+}
+
+/// `Accept` routes by object type: `Follow` (existing follow path) or
+/// `QuoteRequest` (quote authorization grant). Anything else is ignored.
+/// A bare `Accept` without a stamp `result` never approves a quote. A
+/// legitimate `Accept(Follow)` carrying a `result` field must never be
+/// misrouted: string objects resolve via the quote-request index first.
+fn handle_accept(
+    services: &AppServices,
+    activity: &Value,
+    activity_id: &str,
+    actor_uri: &str,
+) -> Result<Response, PortError> {
+    let Some(obj) = activity.get("object") else {
+        return Ok(accepted());
+    };
+    if let Some(map) = obj.as_object() {
+        if is_quote_request_shape(map) {
+            return handle_quote_accept(services, activity, activity_id, actor_uri);
+        }
+        // Embedded Follow object stays on the follow path even with `result`.
+        return handle_follow_response(services, activity, activity_id, actor_uri, true);
+    }
+    if let Some(iri) = obj.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+        // Bare-IRI Accept: quote path only when the IRI is a known
+        // QuoteRequest AND a stamp `result` is present; otherwise follow.
+        if activity.get("result").is_some()
+            && services.notes.find_note_by_quote_request(iri)?.is_some()
+        {
+            return handle_quote_accept(services, activity, activity_id, actor_uri);
+        }
+    }
+    handle_follow_response(services, activity, activity_id, actor_uri, true)
+}
+
+/// `Reject` routes the same way. Only an explicit `Reject` of our matching
+/// `QuoteRequest` sets `Rejected`; absent stamps never do. A bare-IRI
+/// object is looked up as a request id first (normal AP shape), so quote
+/// rejects are never lost to the follow path.
+fn handle_reject(
+    services: &AppServices,
+    activity: &Value,
+    activity_id: &str,
+    actor_uri: &str,
+) -> Result<Response, PortError> {
+    let Some(obj) = activity.get("object") else {
+        return Ok(accepted());
+    };
+    if let Some(map) = obj.as_object() {
+        if is_quote_request_shape(map) {
+            return handle_quote_reject(services, activity, activity_id, actor_uri);
+        }
+    } else if let Some(iri) = obj.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+        if services.notes.find_note_by_quote_request(iri)?.is_some() {
+            return handle_quote_reject(services, activity, activity_id, actor_uri);
+        }
+    }
+    handle_follow_response(services, activity, activity_id, actor_uri, false)
+}
+
+/// True when an embedded activity object is a `QuoteRequest` (short type
+/// name or the full FEP type IRI).
+fn is_quote_request_shape(map: &serde_json::Map<String, Value>) -> bool {
+    let obj_type = map.get("type").and_then(Value::as_str).unwrap_or("");
+    obj_type == "QuoteRequest"
+        || obj_type == crate::activitypub::quotes::FEP044F_QUOTE_REQUEST_TYPE
 }
 
 fn handle_follow_response(
@@ -338,6 +411,178 @@ fn handle_follow_response(
             false,
         )?;
     }
+    Ok(accepted())
+}
+
+/// Inbound FEP-044f `QuoteRequest` for a local post: validate the instrument
+/// (ownership + same target), then decide by policy (auto-approve
+/// public/unlisted + exceptions, reject tighter) with an atomic
+/// stamp+`Accept` / `Reject` commit. Replays are answered without new work.
+fn handle_quote_request(
+    services: &AppServices,
+    activity: &Value,
+    activity_id: &str,
+    actor_uri: &str,
+) -> Result<Response, PortError> {
+    // Read-only replay gate BEFORE any remote fetch (same benign-race
+    // reasoning as `handle_create`).
+    if services.dedup.is_recorded(activity_id)? {
+        return Ok(accepted());
+    }
+    let Some(quoted_uri) = extract_object_uri(activity.get("object")) else {
+        return Ok(accepted());
+    };
+    // The instrument is the quoter's quote Note: inline object or IRI.
+    let (instrument_uri, instrument) = match activity.get("instrument") {
+        Some(Value::String(uri)) => {
+            let uri = uri.trim();
+            if uri.is_empty() {
+                return Ok(accepted());
+            }
+            let client = &services.federation_http;
+            match fetch_remote_note(services, client, uri) {
+                Ok(parsed) => (parsed.uri.clone(), parsed),
+                Err(_) => return Ok(accepted()),
+            }
+        }
+        Some(obj @ Value::Object(_)) => match parse_remote_note(obj) {
+            Ok(parsed) => (parsed.uri.clone(), parsed),
+            Err(_) => return Ok(accepted()),
+        },
+        _ => return Ok(accepted()),
+    };
+    // Actor authority: the instrument must be the signer's own Note and must
+    // quote exactly the targeted post.
+    if instrument.attributed_to != actor_uri {
+        return Ok(unauthorized());
+    }
+    let Some(instrument_target) = instrument.quote_target_uri.clone() else {
+        return Ok(accepted());
+    };
+    if instrument_target != quoted_uri {
+        return Ok(accepted());
+    }
+    let quoter = resolve_remote_account(services, actor_uri)?;
+    // The quoted post must be a live local note; only its own server decides.
+    let Some(target) = find_note_by_uri(services, &quoted_uri)? else {
+        return Ok(accepted());
+    };
+    let target_author = match services.accounts.find_by_id(&target.author_id)? {
+        Some(acc) => acc,
+        None => return Ok(accepted()),
+    };
+    if !target_author.is_local() {
+        return Ok(accepted());
+    }
+    // Enforce the target's actual visibility before deciding: a request for
+    // a non-public post from an unauthorized party is rejected, never
+    // answered with data. (Policy details live in the application handler;
+    // the `Reject` itself reveals nothing beyond the request's own URIs.)
+    let inbox = services.remote_inbox_for_account(&quoter);
+    let _ = services.handle_inbound_quote_request(
+        activity_id,
+        &quoter.id,
+        actor_uri,
+        inbox.as_deref(),
+        &target.id,
+        &instrument_uri,
+        &instrument_target,
+        &instrument.attributed_to,
+    )?;
+    Ok(accepted())
+}
+
+/// Inbound `Accept(QuoteRequest)`: the signer must be the quoted post's
+/// author, and the `result` stamp must dereference and verify. An `Accept`
+/// without a valid stamp never approves.
+fn handle_quote_accept(
+    services: &AppServices,
+    activity: &Value,
+    activity_id: &str,
+    actor_uri: &str,
+) -> Result<Response, PortError> {
+    if services.dedup.is_recorded(activity_id)? {
+        return Ok(accepted());
+    }
+    let Some(request_uri) = extract_object_uri(activity.get("object")) else {
+        return Ok(accepted());
+    };
+    let Some(stamp_uri) = extract_object_uri(activity.get("result")) else {
+        return Ok(accepted());
+    };
+    // The decider must be the quoted post's author.
+    let Some(note) = services.notes.find_note_by_quote_request(&request_uri)? else {
+        return Ok(accepted());
+    };
+    let Some(quote) = note.quote.as_ref() else {
+        return Ok(accepted());
+    };
+    let Some(target_id) = quote.target_note_id.clone() else {
+        return Ok(accepted());
+    };
+    let base = services.public_url.trim_end_matches('/').to_string();
+    let target_author_uri = match services.notes.get_note(&target_id)? {
+        Some(target) => match services.accounts.find_by_id(&target.author_id)? {
+            Some(acc) => acc.actor_url(&base),
+            None => return Ok(accepted()),
+        },
+        None => return Ok(accepted()),
+    };
+    if target_author_uri != actor_uri {
+        return Ok(unauthorized());
+    }
+    // Transient stamp-fetch failure schedules a rate-limited re-verify job
+    // (quote stays Pending); every other outcome is transport-accepted.
+    if let crate::application::commands::inbound::quotes::QuoteDecisionOutcome::StampFetchPending(
+        retry,
+    ) = services.handle_inbound_quote_decision_accept(activity_id, &request_uri, &stamp_uri)?
+    {
+        services.jobs.enqueue_jobs(vec![retry])?;
+    }
+    Ok(accepted())
+}
+
+/// Inbound `Reject(QuoteRequest)`: only a matching request from the quoted
+/// post's author flips our quote to `Rejected` (relation retained).
+fn handle_quote_reject(
+    services: &AppServices,
+    activity: &Value,
+    activity_id: &str,
+    actor_uri: &str,
+) -> Result<Response, PortError> {
+    if services.dedup.is_recorded(activity_id)? {
+        return Ok(accepted());
+    }
+    // Embedded or bare-IRI object: the request activity IRI either way.
+    let request_uri = match activity.get("object") {
+        Some(Value::String(s)) if !s.trim().is_empty() => s.trim().to_string(),
+        Some(Value::Object(map)) => match map.get("id").and_then(Value::as_str) {
+            Some(id) if !id.trim().is_empty() => id.trim().to_string(),
+            _ => return Ok(accepted()),
+        },
+        _ => return Ok(accepted()),
+    };
+    let Some(note) = services.notes.find_note_by_quote_request(&request_uri)? else {
+        return Ok(accepted());
+    };
+    let Some(quote) = note.quote.as_ref() else {
+        return Ok(accepted());
+    };
+    let Some(target_id) = quote.target_note_id.clone() else {
+        return Ok(accepted());
+    };
+    let base = services.public_url.trim_end_matches('/').to_string();
+    let target_author_uri = match services.notes.get_note(&target_id)? {
+        Some(target) => match services.accounts.find_by_id(&target.author_id)? {
+            Some(acc) => acc.actor_url(&base),
+            None => return Ok(accepted()),
+        },
+        None => return Ok(accepted()),
+    };
+    if target_author_uri != actor_uri {
+        return Ok(unauthorized());
+    }
+    let _ = services.handle_inbound_quote_decision_reject(activity_id, &request_uri)?;
     Ok(accepted())
 }
 
@@ -510,6 +755,7 @@ fn handle_announce(
         visibility,
         local_only: false,
         reply_to: None,
+        reply_parent_uri: None,
         renote_of: Some(target_id),
         file_ids: Vec::new(),
         visible_users: Vec::new(),
@@ -525,6 +771,7 @@ fn handle_announce(
         url: Some(activity_id.to_string()),
         extra_mentions: Vec::new(),
         extra_tags: Vec::new(),
+        quote: None,
     };
     services.handle_inbound_create_note(activity_id, input, Vec::new())?;
     Ok(accepted())
@@ -555,36 +802,76 @@ fn handle_delete(
     activity_id: &str,
     actor_uri: &str,
 ) -> Result<Response, PortError> {
+    // Replay gate before any store lookups (mirrors QuoteRequest/Accept/Reject).
+    if services.dedup.is_recorded(activity_id)? {
+        return Ok(accepted());
+    }
     let Some(object_uri) = extract_object_uri(activity.get("object")) else {
         return Ok(accepted());
     };
-    let Some(note) = find_note_by_uri(services, &object_uri)? else {
-        return Ok(accepted());
-    };
-
-    // Authority: the deleter must be the note's author, or share the note's
-    // origin host.
-    let base = services.public_url.trim_end_matches('/').to_string();
-    let note_uri = note
-        .uri
-        .clone()
-        .unwrap_or_else(|| format!("{base}/notes/{}", note.id));
-    let author_uri = match services.accounts.find_by_id(&note.author_id)? {
-        Some(author) => Some(author.actor_url(&base)),
-        None => None,
-    };
-    let mut authorized = author_uri.as_deref() == Some(actor_uri);
-    if !authorized {
-        if let (Some(actor_host), Some(note_host)) = (host_of(actor_uri), host_of(&note_uri))
-        {
-            authorized = actor_host == note_host;
+    // Path 1: a known note → existing author/host authority + delete.
+    if let Some(note) = find_note_by_uri(services, &object_uri)? {
+        // Authority: the deleter must be the note's author, or share the note's
+        // origin host.
+        let base = services.public_url.trim_end_matches('/').to_string();
+        let note_uri = note
+            .uri
+            .clone()
+            .unwrap_or_else(|| format!("{base}/notes/{}", note.id));
+        let author_uri = match services.accounts.find_by_id(&note.author_id)? {
+            Some(author) => Some(author.actor_url(&base)),
+            None => None,
+        };
+        let mut authorized = author_uri.as_deref() == Some(actor_uri);
+        if !authorized {
+            if let (Some(actor_host), Some(note_host)) = (host_of(actor_uri), host_of(&note_uri))
+            {
+                authorized = actor_host == note_host;
+            }
         }
+        if !authorized {
+            return Ok(unauthorized());
+        }
+
+        services.handle_inbound_delete_note(activity_id, &note.id)?;
+        return Ok(accepted());
     }
-    if !authorized {
+
+    // Path 2: a stamp we authored. Only we may delete it; a remote `Delete`
+    // for our stamp is unauthorized (revocation of our stamps happens
+    // server-side, never via federation input).
+    if services.notes.get_quote_stamp(&object_uri)?.is_some() {
         return Ok(unauthorized());
     }
 
-    services.handle_inbound_delete_note(activity_id, &note.id)?;
+    // Path 3: revocation of a stamp backing a quote we authored.
+    // Authority is the STAMP AUTHOR (the quoted post's author actor), not
+    // merely anyone on the stamp's host: any actor on the author's host
+    // must not be able to revoke another user's stamp. Revocation forwards
+    // re-signed by third parties are ignored — a forged `Delete` must never
+    // revoke a live quote, and a genuinely deleted stamp is delivered
+    // authoritatively by the stamp author's own server. (Forwarding itself
+    // is still implemented outbound as gossip.)
+    let Some(affected) = services.notes.find_note_by_quote_stamp(&object_uri)? else {
+        return Ok(accepted());
+    };
+    let affected_target_author_uri = affected
+        .quote
+        .as_ref()
+        .and_then(|q| q.target_note_id.clone())
+        .and_then(|tid| services.notes.get_note(&tid).ok().flatten())
+        .and_then(|target| {
+            services
+                .accounts
+                .find_by_id(&target.author_id)
+                .ok()
+                .flatten()
+                .map(|acc| acc.actor_url(services.public_url.trim_end_matches('/')))
+        });
+    if affected_target_author_uri.as_deref() != Some(actor_uri) {
+        return Ok(accepted());
+    }
+    let _ = services.handle_inbound_quote_stamp_delete(activity_id, &object_uri)?;
     Ok(accepted())
 }
 
@@ -689,6 +976,21 @@ fn ingest_remote_note(
     author: &Account,
     fetch_media: bool,
 ) -> Result<Option<Note>, PortError> {
+    ingest_remote_note_inner(services, activity_id, parsed, author, fetch_media, true)
+}
+
+/// Inner ingestion with a quote-target resolution depth guard: a fetched
+/// quote target is cached via this same path with `resolve_quote_target =
+/// false`, so a malicious chain of quotes cannot recurse without bound.
+/// The nested quote URI is still retained (unresolved) on the cached copy.
+fn ingest_remote_note_inner(
+    services: &AppServices,
+    activity_id: &str,
+    parsed: &ParsedRemoteNote,
+    author: &Account,
+    fetch_media: bool,
+    resolve_quote_target: bool,
+) -> Result<Option<Note>, PortError> {
     let base = services.public_url.trim_end_matches('/').to_string();
     let author_uri = author.actor_url(&base);
     let (visibility, recipient_uris) = parse_note_audience(
@@ -697,10 +999,23 @@ fn ingest_remote_note(
         Some(&format!("{author_uri}/followers")),
     );
 
-    // Replies to unknown (remote) notes are stored without threading.
-    let reply_to = match parsed.in_reply_to.as_deref() {
-        Some(uri) => find_note_by_uri(services, uri)?.map(|note| note.id),
-        None => None,
+    // Slice B (`docs/replies.md` §6): an `inReplyTo` that resolves to a
+    // cached note links immediately; a present-but-unresolved one is
+    // preserved as a pending parent URI (never flattened into a root).
+    // Blank values carry no relationship.
+    let (reply_to, reply_parent_uri) = match parsed.in_reply_to.as_deref() {
+        Some(uri) => {
+            let target = uri.trim();
+            if target.is_empty() {
+                (None, None)
+            } else {
+                match find_note_by_uri(services, target)? {
+                    Some(note) => (Some(note.id), None),
+                    None => (None, Some(target.to_string())),
+                }
+            }
+        }
+        None => (None, None),
     };
 
     // Specified-visibility recipients, best-effort (unresolvable peers are
@@ -740,7 +1055,52 @@ fn ingest_remote_note(
     } else {
         Vec::new()
     };
+    let mut extra_jobs = extra_jobs;
+    // A pending parent gets its durable resolver job in the same commit as
+    // the note below (a replay enqueues nothing — `record_note_activity`
+    // stays the atomic authority). No unbounded network I/O happens here;
+    // the worker fetches off-request.
+    if let Some(pending_uri) = reply_parent_uri.as_deref() {
+        extra_jobs.push(
+            crate::application::commands::inbound::replies::build_reply_parent_resolve_job(
+                services,
+                pending_uri,
+            )?,
+        );
+    }
+    // Arrival-triggered resolution: a newly stored canonical URI may unblock
+    // children already waiting on it. One cheap pending-index probe per
+    // inbound note; the resolver job does the bounded batch work.
+    // Arrival-triggered resolution: a newly stored canonical URI may unblock
+    // children already waiting on it. One cheap pending-index probe per
+    // inbound note; the resolver job does the bounded batch work.
+    let own_uri = parsed.uri.trim();
+    if !own_uri.is_empty()
+        && !services
+            .notes
+            .pending_reply_children(own_uri, 1)?
+            .is_empty()
+    {
+        extra_jobs.push(
+            crate::application::commands::inbound::replies::build_reply_parent_resolve_job(
+                services,
+                own_uri,
+            )?,
+        );
+    }
     let file_ids = Vec::new();
+
+    // Structured quote (any of the five carriers): resolve the target to a
+    // local note id when possible, and evaluate authorization evidence
+    // gathered BEFORE the storage transaction. Unresolvable targets keep
+    // their URI (`renote_of: None`, quote retained as unapproved/unknown).
+    let (renote_of, quote) = if resolve_quote_target {
+        resolve_inbound_quote(services, parsed, &author_uri)?
+    } else if let Some(target_uri) = parsed.quote_target_uri.clone() {
+        (None, Some(QuoteReference::unapproved(target_uri)))
+    } else {
+        (None, None)
+    };
 
     let input = CreateNoteInput {
         author_id: author.id.clone(),
@@ -749,7 +1109,8 @@ fn ingest_remote_note(
         visibility,
         local_only: false,
         reply_to,
-        renote_of: None,
+        reply_parent_uri,
+        renote_of,
         file_ids,
         visible_users,
         reaction_acceptance: None,
@@ -764,14 +1125,121 @@ fn ingest_remote_note(
         url: parsed.url.clone(),
         extra_mentions: mention_ids,
         extra_tags: parsed.hashtags.clone(),
+        quote,
     };
     services.handle_inbound_create_note(activity_id, input, extra_jobs)
 }
 
-/// Resolve a liked/renoted target note id: local lookup first, otherwise fetch
-/// the remote note (origin-checked) and cache it as a remote note.
-/// Returns `None` when the target cannot be resolved.
-fn resolve_note_target_id(
+/// Resolve an inbound quote target and evaluate its authorization evidence.
+///
+/// Returns `(renote_of, quote)`: the resolved local target id (if any) plus
+/// the domain quote record. Recognition never depends on authorization
+/// metadata — legacy-only payloads yield `(id?, unapproved)`. Stamp
+/// verification happens here (pre-transaction network I/O); transport
+/// failures map to `Unknown` (transient, never rejection), invalid stamp
+/// content maps to `Unapproved` (invalid evidence, never `Rejected` — only
+/// an explicit `Reject` activity sets `Rejected`).
+fn resolve_inbound_quote(
+    services: &AppServices,
+    parsed: &ParsedRemoteNote,
+    quoter_actor_uri: &str,
+) -> Result<(Option<String>, Option<QuoteReference>), PortError> {
+    use crate::domain::quote::QuoteAuthorizationState::{Approved, ApprovedByException, Unknown};
+
+    let Some(target_uri) = parsed.quote_target_uri.clone() else {
+        return Ok((None, None));
+    };
+    if parsed.quote_has_conflict {
+        // Aliases disagreed; canonical `quote` won. Recorded here (server
+        // log) since the domain record carries a single target.
+        eprintln!("quote carriers conflict on {}: kept {target_uri}", parsed.uri);
+    }
+    // Best-effort resolve + cache (origin-checked, SSRF-guarded). Offline
+    // or private targets simply stay unresolved; the URI is retained.
+    let target_id = resolve_quote_target_id(services, &target_uri)?;
+    let mut quote = QuoteReference::unapproved(target_uri.clone());
+    quote.target_note_id = target_id.clone();
+
+    // The target author's actor URI + the target's structured mentions feed
+    // the FEP-044f exception check (structured identity, never substrings).
+    let (target_author_uri, target_mention_uris) = match target_id.as_deref() {
+        Some(tid) => match services.notes.get_note(tid)? {
+            Some(target) => {
+                let base = services.public_url.trim_end_matches('/');
+                let author_uri = match services.accounts.find_by_id(&target.author_id)? {
+                    Some(acc) => acc.actor_url(base),
+                    None => String::new(),
+                };
+                let mut mentions = Vec::new();
+                for mid in &target.mentions {
+                    if let Ok(Some(acc)) = services.accounts.find_by_id(mid) {
+                        let uri = acc.actor_url(base);
+                        if !uri.is_empty() && !mentions.contains(&uri) {
+                            mentions.push(uri);
+                        }
+                    }
+                }
+                (author_uri, mentions)
+            }
+            None => (String::new(), Vec::new()),
+        },
+        None => (String::new(), Vec::new()),
+    };
+
+    if !target_author_uri.is_empty()
+        && crate::activitypub::quotes::approval_exception(
+            quoter_actor_uri,
+            &target_author_uri,
+            &target_mention_uris,
+        )
+    {
+        quote.authorization = ApprovedByException;
+        quote.last_verified_at = Some(services.clock.now_ms());
+    } else if let Some(stamp_iri) = parsed.quote_authorization_uri.clone() {
+        if target_author_uri.is_empty() {
+            // A stamp was offered but its authority cannot be established
+            // without the target author: inconclusive, not rejection.
+            quote.authorization = Unknown;
+        } else {
+            let client = &services.federation_http;
+            match crate::federation::delivery::fetch_quote_stamp_doc(
+                services,
+                client,
+                &stamp_iri,
+            ) {
+                Ok(doc) => {
+                    match crate::activitypub::quotes::verify_stamp_for_quote(
+                        &doc,
+                        &stamp_iri,
+                        &parsed.uri,
+                        &target_uri,
+                        &target_author_uri,
+                    ) {
+                        Ok(()) => {
+                            quote.authorization = Approved;
+                            quote.authorization_uri = Some(stamp_iri);
+                            quote.last_verified_at = Some(services.clock.now_ms());
+                        }
+                        Err(_) => {}
+                    }
+                }
+                Err(_) => quote.authorization = Unknown,
+            }
+        }
+    }
+    if quote.validate().is_err() {
+        quote = QuoteReference::unapproved(target_uri);
+        quote.target_note_id = target_id.clone();
+    }
+    Ok((target_id, Some(quote)))
+}
+
+/// Resolve a liked/renoted/replied-to target note id: local lookup first,
+/// otherwise fetch the remote note (origin-checked) and cache it as a
+/// remote note. Returns `None` when the target cannot be resolved.
+/// Shared with the Slice B reply resolver (`inbound::replies`), which uses
+/// the same lookup-or-fetch-and-cache path for pending reply parents.
+pub(crate) fn resolve_note_target_id(
     services: &AppServices,
     target_uri: &str,
 ) -> Result<Option<String>, PortError> {
@@ -789,6 +1257,31 @@ fn resolve_note_target_id(
     };
     // Cache under the note URI as the dedup key so concurrent fetches converge.
     match ingest_remote_note(services, &parsed.uri, &parsed, &author, false)? {
+        Some(note) => Ok(Some(note.id)),
+        None => Ok(find_note_by_uri(services, target_uri)?.map(|note| note.id)),
+    }
+}
+
+/// Resolve a quote target the same way, except the cached copy keeps any
+/// nested quote as an unresolved URI (one-level depth guard against
+/// malicious quote chains; see `ingest_remote_note_inner`).
+fn resolve_quote_target_id(
+    services: &AppServices,
+    target_uri: &str,
+) -> Result<Option<String>, PortError> {
+    if let Some(note) = find_note_by_uri(services, target_uri)? {
+        return Ok(Some(note.id));
+    }
+    let client = &services.federation_http;
+    let parsed = match fetch_remote_note(services, client, target_uri) {
+        Ok(parsed) => parsed,
+        Err(_) => return Ok(None),
+    };
+    let author = match resolve_remote_account(services, &parsed.attributed_to) {
+        Ok(author) => author,
+        Err(_) => return Ok(None),
+    };
+    match ingest_remote_note_inner(services, &parsed.uri, &parsed, &author, false, false)? {
         Some(note) => Ok(Some(note.id)),
         None => Ok(find_note_by_uri(services, target_uri)?.map(|note| note.id)),
     }
@@ -859,6 +1352,20 @@ fn non_empty_str(value: Option<&Value>) -> Option<String> {
         None
     } else {
         Some(s.to_string())
+    }
+}
+
+/// Map full FEP type IRIs to their short names (some servers serialize
+/// `"type": "https://w3id.org/fep/044f#QuoteRequest"`). Unknown types pass
+/// through unchanged (dispatch ignores them).
+fn canonical_activity_type(t: &str) -> String {
+    let t = t.trim();
+    match t {
+        crate::activitypub::quotes::FEP044F_QUOTE_REQUEST_TYPE => "QuoteRequest".to_string(),
+        crate::activitypub::quotes::FEP044F_QUOTE_AUTHORIZATION_TYPE => {
+            "QuoteAuthorization".to_string()
+        }
+        _ => t.to_string(),
     }
 }
 
@@ -1749,6 +2256,292 @@ mod key_ownership_tests {
             resp.status(),
             StatusCode::ACCEPTED,
             "honest signed activity must still be accepted"
+        );
+    }
+}
+
+/// Slice B end-to-end (`docs/replies.md` §6): a reply to an unknown parent
+/// is stored pending (never flattened), withheld from reads, and linked
+/// exactly once when the parent later arrives — driven by the durable
+/// resolver jobs, with zero network I/O in this hermetic flow.
+#[cfg(test)]
+mod reply_resolution_tests {
+    use super::*;
+    use std::str::FromStr;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use axum::http::{HeaderName, HeaderValue};
+    use serde_json::json;
+
+    use crate::activitypub::signatures::{
+        generate_rsa_keypair_2048, private_key_to_pkcs8_pem, public_key_to_spki_pem,
+        sign_request_headers,
+    };
+    use crate::application::ports::{
+        ActivityDedup, BlobStore, Clock, IdGenerator, Job, JobKind, NoopStreamingSink, PortError,
+        ReplyParentResolvePayload,
+    };
+    use crate::domain::id::{AidxGenerator, ManualClock};
+    use crate::federation::delivery::{
+        format_http_date, upsert_remote_actor_from_doc, SafeHttpClient, SafeHttpConfig,
+    };
+    use crate::federation::retry::DestinationTracker;
+    use crate::jobs::worker::JobWorker;
+    use crate::media::storage::FsBlobStore;
+    use crate::persistence::redb::RedbStore;
+
+    const ROCKY_URI: &str = "https://remote.invalid/users/rocky";
+    const PARENT_URI: &str = "https://remote.invalid/notes/parent-1";
+
+    fn test_services(prefix: &str) -> AppServices {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "pinetree-reply-resolve-{}-{prefix}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_760_400_000_000));
+        let ids: Arc<dyn IdGenerator> = Arc::new(AidxGenerator::new(clock.clone()));
+        let store = RedbStore::open(dir.join("test.redb"), clock.clone(), ids.clone()).unwrap();
+        let blobs: Arc<dyn BlobStore> = Arc::new(FsBlobStore::new(dir.join("blobs")).unwrap());
+        AppServices {
+            clock,
+            ids,
+            accounts: store.clone(),
+            notes: store.clone(),
+            follows: store.clone(),
+            reactions: store.clone(),
+            jobs: store.clone(),
+            media: store.clone(),
+            blobs,
+            notifications: store.clone(),
+            auth: store.clone(),
+            streaming: Arc::new(NoopStreamingSink),
+            dedup: store.clone() as Arc<dyn ActivityDedup>,
+            federation_http: SafeHttpClient::new(SafeHttpConfig {
+                allow_private_ips: true,
+                ..Default::default()
+            }),
+            public_url: "https://pinetree.local".to_string(),
+            max_file_size: 10 * 1024 * 1024,
+            preserved_usernames: Vec::new(),
+            prohibited_words: Vec::new(),
+            sensitive_words: Vec::new(),
+        }
+    }
+
+    fn actor_doc(id: &str, username: &str, key_id: &str, pem: &str) -> Value {
+        json!({
+            "id": id,
+            "type": "Person",
+            "preferredUsername": username,
+            "inbox": format!("{id}/inbox"),
+            "publicKey": {"id": key_id, "type": "Key", "owner": id, "publicKeyPem": pem},
+        })
+    }
+
+    fn signed_inbox_headers(
+        services: &AppServices,
+        path: &str,
+        body: &[u8],
+        key_id: &str,
+        private_pem: &str,
+    ) -> HeaderMap {
+        let date = format_http_date(services.clock.now_ms());
+        let host = "pinetree.local";
+        let signed =
+            sign_request_headers("POST", path, host, &date, Some(body), key_id, private_pem)
+                .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_str("date").unwrap(),
+            HeaderValue::from_str(&date).unwrap(),
+        );
+        headers.insert(
+            HeaderName::from_str("host").unwrap(),
+            HeaderValue::from_str(host).unwrap(),
+        );
+        headers.insert(
+            HeaderName::from_str("digest").unwrap(),
+            HeaderValue::from_str(&signed.digest.unwrap()).unwrap(),
+        );
+        headers.insert(
+            HeaderName::from_str("signature").unwrap(),
+            HeaderValue::from_str(&signed.signature).unwrap(),
+        );
+        headers
+    }
+
+    fn deliver(services: &AppServices, activity: &Value, key_id: &str, private_pem: &str) {
+        let body = serde_json::to_vec(activity).unwrap();
+        let headers = signed_inbox_headers(services, "/inbox", &body, key_id, private_pem);
+        let resp = process_inbox(services, None, headers, body.into());
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    }
+
+    fn worker_for(services: &Arc<AppServices>) -> JobWorker {
+        JobWorker {
+            clock: services.clock.clone(),
+            ids: services.ids.clone(),
+            jobs: services.jobs.clone(),
+            notifications: services.notifications.clone(),
+            streaming: services.streaming.clone(),
+            services: services.clone(),
+            delivery_tracker: Arc::new(DestinationTracker::new()),
+            lease_duration_ms: 60_000,
+            base_backoff_ms: 10,
+        }
+    }
+
+    /// Claim every pending job, returning them oldest-first. Claimed jobs
+    /// stay leased to this caller; consumers `complete` what they inspect.
+    fn drain_claims(services: &AppServices) -> Vec<Job> {
+        let mut out = Vec::new();
+        while let Some(job) = services.jobs.claim_next(60_000).expect("claim") {
+            out.push(job);
+        }
+        out
+    }
+
+    #[test]
+    fn unknown_parent_stays_pending_then_links_on_arrival() {
+        let services = Arc::new(test_services("pending-arrival"));
+        let (priv_key, pub_key) = generate_rsa_keypair_2048().unwrap();
+        let (private_pem, public_pem) = (
+            private_key_to_pkcs8_pem(&priv_key),
+            public_key_to_spki_pem(&pub_key),
+        );
+        let key_id = format!("{ROCKY_URI}#main-key");
+        upsert_remote_actor_from_doc(&services, ROCKY_URI, &actor_doc(ROCKY_URI, "rocky", &key_id, &public_pem))
+            .expect("honest upsert");
+
+        // 1. Reply to an unknown parent: accepted, stored pending — never a
+        // root — with its resolver job committed atomically.
+        let reply_uri = "https://remote.invalid/notes/reply-1";
+        deliver(
+            &services,
+            &json!({
+                "id": "https://remote.invalid/activities/create-reply-1",
+                "type": "Create",
+                "actor": ROCKY_URI,
+                "object": {
+                    "id": reply_uri,
+                    "type": "Note",
+                    "attributedTo": ROCKY_URI,
+                    "content": "a reply to a not-yet-seen note",
+                    "inReplyTo": PARENT_URI,
+                    "to": ["https://www.w3.org/ns/activitystreams#Public"],
+                },
+            }),
+            &key_id,
+            &private_pem,
+        );
+        let reply = services
+            .notes
+            .find_by_uri(reply_uri)
+            .expect("find reply")
+            .expect("reply stored, not dropped");
+        assert_eq!(reply.reply_id, None, "no fabricated parent link");
+        assert_eq!(
+            reply.reply_parent_uri.as_deref(),
+            Some(PARENT_URI),
+            "unresolved inReplyTo preserved"
+        );
+        assert!(
+            matches!(services.notes_show(&reply.id, None), Err(PortError::NotFound(_))),
+            "pending reply withheld from note detail"
+        );
+        let jobs = drain_claims(&services);
+        assert_eq!(jobs.len(), 2, "streaming + resolver committed atomically");
+        let resolve_job = jobs
+            .iter()
+            .find(|j| j.kind == JobKind::ReplyParentResolve)
+            .expect("resolver job enqueued for the pending URI");
+        let payload: ReplyParentResolvePayload =
+            serde_json::from_slice(&resolve_job.payload).expect("resolver payload decodes");
+        assert_eq!(payload.parent_uri, PARENT_URI);
+        // Simulate the resolver having run while the parent was missing
+        // (retry behavior itself is covered in conformance R10): consume
+        // both jobs so the arrival below starts clean.
+        for job in &jobs {
+            services.jobs.complete(&job.id).expect("consume");
+        }
+
+        // 2. The parent arrives: accepted, and its arrival enqueues a fresh
+        // resolver for the waiting child.
+        deliver(
+            &services,
+            &json!({
+                "id": "https://remote.invalid/activities/create-parent-1",
+                "type": "Create",
+                "actor": ROCKY_URI,
+                "object": {
+                    "id": PARENT_URI,
+                    "type": "Note",
+                    "attributedTo": ROCKY_URI,
+                    "content": "the parent, arriving late",
+                    "to": ["https://www.w3.org/ns/activitystreams#Public"],
+                },
+            }),
+            &key_id,
+            &private_pem,
+        );
+        let parent = services
+            .notes
+            .find_by_uri(PARENT_URI)
+            .expect("find parent")
+            .expect("parent stored");
+        let arrival_jobs = drain_claims(&services);
+        assert!(
+            arrival_jobs
+                .iter()
+                .any(|j| j.kind == JobKind::ReplyParentResolve),
+            "parent arrival schedules resolution for waiting children"
+        );
+        for job in &arrival_jobs {
+            services.jobs.complete(&job.id).expect("consume");
+        }
+        // Re-enqueue one resolver (as the arrival did) and run it through
+        // the real worker: the cached parent links with zero network I/O.
+        let resolve = crate::application::commands::inbound::replies::build_reply_parent_resolve_job(
+            &services, PARENT_URI,
+        )
+        .expect("resolver job builds");
+        services.jobs.enqueue_jobs(vec![resolve]).expect("enqueue");
+        let worker = worker_for(&services);
+        assert!(worker.process_one().expect("process"), "resolver claimed");
+        assert!(
+            !worker.process_one().expect("drain"),
+            "no work remains after linking"
+        );
+
+        // 3. Linked exactly once: reply_id set, pending cleared, counter
+        // bumped, index swapped, note visible again.
+        let linked = services
+            .notes
+            .find_by_uri(reply_uri)
+            .expect("find linked")
+            .expect("reply still stored");
+        assert_eq!(linked.reply_id.as_deref(), Some(parent.id.as_str()));
+        assert_eq!(linked.reply_parent_uri, None);
+        let parent_after = services
+            .notes
+            .find_by_uri(PARENT_URI)
+            .expect("find parent again")
+            .expect("parent");
+        assert_eq!(parent_after.replies_count, 1, "counted exactly once");
+        assert!(
+            services
+                .notes
+                .pending_reply_children(PARENT_URI, 10)
+                .expect("pending after link")
+                .is_empty(),
+            "pending row gone after link"
+        );
+        assert!(
+            services.notes_show(&reply.id, None).is_ok(),
+            "linked reply readable again"
         );
     }
 }
