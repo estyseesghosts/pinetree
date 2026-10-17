@@ -1,0 +1,6 @@
+pre-run2b offsets 2026-10-17T19:32:23Z
+    9559 /tmp/pinetree-bench/logs/pt-ks.log
+    7780 /tmp/pinetree-bench/logs/pt-mk.log
+34510346 /tmp/pinetree-bench/logs/misskey.log
+47719236 /tmp/pinetree-bench/logs/catodon.log
+82246921 total

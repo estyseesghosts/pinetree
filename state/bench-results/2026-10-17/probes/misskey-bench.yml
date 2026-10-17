@@ -1,0 +1,8 @@
+url: http://misskey.test/
+port: 3101
+db: {host: 127.0.0.1, port: 15432, db: misskey, user: interop, pass: interop}
+dbReplications: false
+redis: {host: 127.0.0.1, port: 16379, db: 1}
+fulltextSearch: {provider: sqlLike}
+id: 'aidx'
+allowedPrivateNetworks: ['127.0.0.0/8']

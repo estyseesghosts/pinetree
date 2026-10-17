@@ -1,0 +1,943 @@
+warning: unused import: `HeaderValue`
+  --> src/activitypub/signatures.rs:10:41
+   |
+10 | use axum::http::{HeaderMap, HeaderName, HeaderValue};
+   |                                         ^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `SigningKey`
+  --> src/activitypub/signatures.rs:13:32
+   |
+13 | use rsa::pkcs1v15::{Signature, SigningKey, VerifyingKey};
+   |                                ^^^^^^^^^^
+
+warning: unused import: `Clock`
+  --> src/federation/inbox.rs:29:33
+   |
+29 | use crate::application::ports::{Clock, CreateNoteInput, PortError, TimelineCursor, UpdateAccountPatch};
+   |                                 ^^^^^
+
+warning: unreachable pattern
+   --> src/api/misskey/errors.rs:492:15
+    |
+491 |             | "YOUR_ACCOUNT_MOVED"
+    |               -------------------- matches all the relevant values
+492 |             | "YOUR_ACCOUNT_MOVED"
+    |               ^^^^^^^^^^^^^^^^^^^^ no value can reach this
+    |
+    = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: `pinetree` (lib) generated 4 warnings (run `cargo fix --lib -p pinetree` to apply 2 suggestions)
+warning: variable does not need to be mutable
+  --> tests/federation_elixir.rs:74:24
+   |
+74 | fn poll<T>(desc: &str, mut f: impl FnMut() -> Option<T>) -> T {
+   |                        ----^
+   |                        |
+   |                        help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `pt6_id`
+   --> tests/federation_elixir.rs:595:9
+    |
+595 |     let pt6_id = v["id"].as_str().expect("id").to_string();
+    |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_pt6_id`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `username` is never read
+  --> tests/federation_elixir.rs:41:5
+   |
+35 | struct Node {
+   |        ---- field in this struct
+...
+41 |     username: &'static str,
+   |     ^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `masto_status` is never used
+   --> tests/federation_elixir.rs:155:4
+    |
+155 | fn masto_status(c: &SafeHttpClient, n: &Node, id: &str) -> Value {
+    |    ^^^^^^^^^^^^
+
+warning: unused import: `SigningKey`
+  --> src/activitypub/signatures.rs:13:32
+   |
+13 | use rsa::pkcs1v15::{Signature, SigningKey, VerifyingKey};
+   |                                ^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `ActivityDedup`
+   --> src/application/commands/inbound/quotes.rs:383:9
+    |
+383 |         ActivityDedup, CreateNoteInput, JobKind, JobQueue, NoteStore,
+    |         ^^^^^^^^^^^^^
+
+warning: unused import: `AccountStore`
+   --> src/activitypub/actor.rs:964:9
+    |
+964 |         AccountStore, ActivityDedup, BlobStore, Clock, IdGenerator, NoopStreamingSink,
+    |         ^^^^^^^^^^^^
+
+warning: unused import: `NoteStore`
+    --> src/activitypub/actor.rs:1254:95
+     |
+1254 |     use crate::application::ports::{CreateAccountInput, CreateNoteInput, FollowStore, NewJob, NoteStore};
+     |                                                                                               ^^^^^^^^^
+
+warning: unused import: `ReactionStore`
+    --> src/federation/inbox.rs:3232:57
+     |
+3232 |     use crate::application::ports::{CreateAccountInput, ReactionStore};
+     |                                                         ^^^^^^^^^^^^^
+
+warning: unused import: `AuthStore`
+    --> src/federation/inbox.rs:2209:24
+     |
+2209 |         ActivityDedup, AuthStore, BlobStore, Clock, IdGenerator, NoopStreamingSink,
+     |                        ^^^^^^^^^
+
+warning: unused import: `AccountStore`
+    --> src/api/misskey/endpoints/mod.rs:5358:41
+     |
+5358 |         use crate::application::ports::{AccountStore, CreateAccountInput, FollowStore};
+     |                                         ^^^^^^^^^^^^
+
+warning: unused import: `FollowStore`
+    --> src/api/misskey/endpoints/mod.rs:5358:75
+     |
+5358 |         use crate::application::ports::{AccountStore, CreateAccountInput, FollowStore};
+     |                                                                           ^^^^^^^^^^^
+
+warning: unused import: `MediaStore`
+    --> src/api/misskey/endpoints/mod.rs:5833:59
+     |
+5833 |         use crate::application::ports::{InsertMediaInput, MediaStore};
+     |                                                           ^^^^^^^^^^
+
+warning: unused import: `AccountStore`
+    --> src/api/misskey/endpoints/mod.rs:6454:13
+     |
+6454 |             AccountStore, CreateAccountInput, CreateNoteInput,
+     |             ^^^^^^^^^^^^
+
+warning: unused import: `AccountStore`
+    --> src/api/misskey/endpoints/mod.rs:8216:41
+     |
+8216 |         use crate::application::ports::{AccountStore, CreateAccountInput};
+     |                                         ^^^^^^^^^^^^
+
+warning: unused import: `AccountStore`
+    --> src/api/misskey/endpoints/mod.rs:8502:41
+     |
+8502 |         use crate::application::ports::{AccountStore, CreateAccountInput, FollowStore};
+     |                                         ^^^^^^^^^^^^
+
+warning: unused import: `FollowStore`
+    --> src/api/misskey/endpoints/mod.rs:8502:75
+     |
+8502 |         use crate::application::ports::{AccountStore, CreateAccountInput, FollowStore};
+     |                                                                           ^^^^^^^^^^^
+
+warning: unused import: `crate::application::ports::ReactionStore`
+     --> src/api/misskey/endpoints/mod.rs:10300:13
+      |
+10300 |         use crate::application::ports::ReactionStore;
+      |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `ReactionStore`
+    --> src/api/misskey/endpoints/mod.rs:5170:54
+     |
+5170 |         ActivityDedup, BlobStore, NoopStreamingSink, ReactionStore, StreamingSink,
+     |                                                      ^^^^^^^^^^^^^
+
+warning: unused import: `crate::application::ports::HostCapsStore`
+   --> src/federation/host_caps.rs:174:9
+    |
+174 |     use crate::application::ports::HostCapsStore;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `NoteStore`
+   --> src/application/commands/inbound/quotes.rs:383:60
+    |
+383 |         ActivityDedup, CreateNoteInput, JobKind, JobQueue, NoteStore,
+    |                                                            ^^^^^^^^^
+
+warning: unused import: `JobQueue`
+   --> src/application/commands/inbound/quotes.rs:383:50
+    |
+383 |         ActivityDedup, CreateNoteInput, JobKind, JobQueue, NoteStore,
+    |                                                  ^^^^^^^^
+
+warning: unused import: `AuthStore`
+ --> src/application/commands/tests.rs:5:20
+  |
+5 |     ActivityDedup, AuthStore, BlobStore, Clock, IdGenerator, NoopStreamingSink,
+  |                    ^^^^^^^^^
+
+warning: variable does not need to be mutable
+    --> src/api/misskey/endpoints/mod.rs:6533:13
+     |
+6533 |         let mut inbound = |activity: &str, uri: &str, text: &str, visibility: Visibility| {
+     |             ----^^^^^^^
+     |             |
+     |             help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `value`
+    --> src/api/misskey/endpoints/mod.rs:9070:22
+     |
+9070 |         let (status, value) = call(
+     |                      ^^^^^ help: if this is intentional, prefix it with an underscore: `_value`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> src/api/misskey/endpoints/mod.rs:9596:13
+     |
+9596 |         let mut insert = |kind: NotificationKind,
+     |             ----^^^^^^
+     |             |
+     |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src/application/commands/inbound/quotes.rs:523:13
+    |
+523 |         let mut input = quote_input(&alice.id, &target, "quoting deleted");
+    |             ----^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: unused imports: `get` and `post`
+  --> tests/federation.rs:33:21
+   |
+33 | use axum::routing::{get, post};
+   |                     ^^^  ^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `actor`, `objects`, and `webfinger`
+  --> tests/federation.rs:37:29
+   |
+37 | use pinetree::activitypub::{actor, objects, webfinger};
+   |                             ^^^^^  ^^^^^^^  ^^^^^^^^^
+
+warning: unused imports: `inbox_handler` and `user_inbox_handler`
+  --> tests/federation.rs:58:35
+   |
+58 | use pinetree::federation::inbox::{inbox_handler, user_inbox_handler};
+   |                                   ^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `JobQueue`
+  --> tests/federation.rs:49:5
+   |
+49 |     JobQueue, MediaStore, NoopStreamingSink, NoteStore, ReactionStore, TimelineCursor,
+   |     ^^^^^^^^
+
+warning: unused import: `AuthStore`
+  --> tests/federation.rs:48:34
+   |
+48 |     AccountStore, ActivityDedup, AuthStore, BlobStore, Clock, CreateNoteInput, FollowStore,
+   |                                  ^^^^^^^^^
+
+warning: unused import: `FollowStore`
+  --> tests/federation.rs:48:80
+   |
+48 |     AccountStore, ActivityDedup, AuthStore, BlobStore, Clock, CreateNoteInput, FollowStore,
+   |                                                                                ^^^^^^^^^^^
+
+warning: unused import: `AccountStore`
+  --> tests/federation.rs:48:5
+   |
+48 |     AccountStore, ActivityDedup, AuthStore, BlobStore, Clock, CreateNoteInput, FollowStore,
+   |     ^^^^^^^^^^^^
+
+warning: unused import: `NoteStore`
+  --> tests/federation.rs:49:46
+   |
+49 |     JobQueue, MediaStore, NoopStreamingSink, NoteStore, ReactionStore, TimelineCursor,
+   |                                              ^^^^^^^^^
+
+warning: unused import: `ReactionStore`
+  --> tests/federation.rs:49:57
+   |
+49 |     JobQueue, MediaStore, NoopStreamingSink, NoteStore, ReactionStore, TimelineCursor,
+   |                                                         ^^^^^^^^^^^^^
+
+warning: unused import: `MediaStore`
+  --> tests/federation.rs:49:15
+   |
+49 |     JobQueue, MediaStore, NoopStreamingSink, NoteStore, ReactionStore, TimelineCursor,
+   |               ^^^^^^^^^^
+
+warning: unused variable: `visibility`
+   --> tests/federation.rs:877:16
+    |
+877 |     for (note, visibility) in &matrix {
+    |                ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_visibility`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling pinetree v0.1.0 (/root/pinetree)
+warning: unused import: `AuthStore`
+  --> tests/streaming.rs:23:21
+   |
+23 |     ApiTokenRecord, AuthStore, BlobStore, Clock, IdGenerator, PortError,
+   |                     ^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `pinetree` (test "federation_elixir") generated 4 warnings (run `cargo fix --test "federation_elixir" -p pinetree` to apply 2 suggestions)
+warning: `pinetree` (lib test) generated 25 warnings (2 duplicates) (run `cargo fix --lib -p pinetree --tests` to apply 6 suggestions)
+warning: `pinetree` (test "federation") generated 11 warnings (run `cargo fix --test "federation" -p pinetree` to apply 4 suggestions)
+warning: `pinetree` (test "streaming") generated 1 warning
+warning: unused import: `BlobStore`
+  --> tests/conformance.rs:31:46
+   |
+31 |     AccountStore, ActivityDedup, BlockStore, BlobStore, CreateAccountInput, CreateNoteInput,
+   |                                              ^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `alice`
+    --> tests/conformance.rs:2930:9
+     |
+2930 |     let alice = create_user(store, "alice");
+     |         ^^^^^ help: if this is intentional, prefix it with an underscore: `_alice`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `pinetree` (test "conformance") generated 2 warnings (run `cargo fix --test "conformance" -p pinetree` to apply 2 suggestions)
+    Finished `test` profile [optimized + debuginfo] target(s) in 7.26s
+     Running unittests src/lib.rs (/root/pinetree-target/debug/deps/pinetree-2224ffaa3ca92224)
+
+running 397 tests
+test activitypub::actor::tests::http_actor_with_http_inboxes_accepted ... ok
+test activitypub::actor::tests::shared_inbox_on_other_host_falls_back_to_personal_inbox ... ok
+test activitypub::actor::tests::overlong_inbox_urls_rejected_or_dropped ... ok
+test activitypub::actor::tests::https_actor_http_personal_inbox_rejected ... ok
+test activitypub::actor::tests::https_actor_http_shared_inbox_downgrade_dropped ... ok
+test activitypub::actor::tests::unparseable_shared_inbox_dropped ... ok
+test activitypub::objects::quote_render_tests::parse_question_poll_reads_oneof_anyof_and_times ... ok
+test activitypub::objects::quote_render_tests::question_render_parse_roundtrip ... ok
+test activitypub::actor::tests::slice11_invalid_cursor_returns_400 ... ok
+test activitypub::actor::tests::slice11_follow_store_failure_returns_500 ... ok
+test activitypub::objects::quote_render_tests::render_question_matches_misskey_shape ... ok
+test activitypub::objects::quote_render_tests::pure_renote_still_renders_announce_without_quote_fields ... ok
+test activitypub::actor::tests::upsert_applies_inbox_validation_and_shared_inbox_fallback ... ok
+test activitypub::objects::quote_render_tests::render_vote_activity_matches_misskey_shape ... ok
+test activitypub::actor::tests::ff_visibility_non_public_collections_are_403 ... ok
+test activitypub::objects::quote_render_tests::quote_render_never_duplicates_author_fallback ... ok
+test activitypub::objects::tests::context_never_advertises_deprecated_misskey_content ... ok
+test activitypub::objects::quote_render_tests::quote_renders_canonical_plus_aliases_policy_and_single_fallback ... ok
+test activitypub::objects::tests::featured_change_renders_add_remove_to_featured_collection ... ok
+test activitypub::objects::tests::like_render_splits_emoji_aware_and_plain ... ok
+test activitypub::objects::quote_render_tests::quote_render_restricted_post_adds_no_public_fallback ... ok
+test activitypub::objects::tests::mfm_to_html_and_sanitization_strip_xss_payloads ... ok
+test activitypub::quotes::tests::authorization_iri_extraction_never_implies_approval ... ok
+test activitypub::quotes::tests::collapses_matching_aliases_and_prefers_canonical_on_conflict ... ok
+test activitypub::quotes::tests::parses_all_legacy_carriers_with_no_auth_metadata ... ok
+test activitypub::objects::quote_render_tests::render_note_object_embeds_question_for_poll_notes ... ok
+test activitypub::quotes::tests::exceptions_use_structured_identity_not_substrings ... ok
+test activitypub::quotes::tests::parses_fep044f_quote_string_and_object_forms ... ok
+test activitypub::quotes::tests::re_fallback_rules ... ok
+test activitypub::quotes::tests::parses_fep_e232_link_tag ... ok
+test activitypub::quotes::tests::rejects_non_http_targets_and_empty_objects ... ok
+test activitypub::quotes::tests::stamp_verification_all_five_checks ... ok
+test activitypub::objects::quote_render_tests::reply_renders_direct_parent_in_reply_to ... ok
+test activitypub::signatures::tests::digest_header_roundtrip ... ok
+test activitypub::signatures::tests::base64_known_answers ... ok
+test activitypub::quotes::tests::render_helpers_shape ... ok
+test activitypub::objects::quote_render_tests::quote_render_stamp_only_with_approval ... ok
+test activitypub::objects::tests::audience_mapping_roundtrips_all_visibilities ... ok
+test activitypub::signatures::tests::node_crypto_rsa2048_fixture_interop ... ok
+test activitypub::actor::tests::slice11_following_pages_completely ... ok
+test activitypub::actor::tests::slice11_outbox_pages_public_notes_skipping_non_public ... ok
+test activitypub::webfinger::tests::all_resource_forms_resolve_to_canonical_actor_url ... ok
+test activitypub::webfinger::tests::content_negotiation_prefers_explicit_xrd ... ok
+test activitypub::webfinger::tests::extract_host_handles_ports_and_paths ... ok
+test activitypub::webfinger::tests::host_meta_shapes ... ok
+test activitypub::webfinger::tests::nodeinfo_shapes_and_counts ... ok
+test activitypub::webfinger::tests::system_actor_resolves_when_present ... ok
+test activitypub::webfinger::tests::unknown_suspended_deleted_or_remote_are_not_found ... ok
+test activitypub::webfinger::tests::webfinger_handler_defaults_to_jrd_and_serves_xrd_on_demand ... ok
+test activitypub::webfinger::tests::wrong_host_is_unprocessable ... ok
+test activitypub::webfinger::tests::xrd_escapes_xml_specials ... ok
+test api::misskey::auth::tests::callback_url_blocklist ... ok
+test api::misskey::auth::tests::credential_extraction_order ... ok
+test activitypub::signatures::tests::slice12_undersized_key_is_a_clean_error ... ok
+test api::misskey::auth::tests::generated_tokens_are_32_chars ... ok
+test api::misskey::auth::tests::miauth_page_posts_to_session ... ok
+test activitypub::actor::tests::slice11_followers_250_page_through_completely ... ok
+test api::misskey::auth::tests::slice9_legacy_salt_hash_verifies_and_needs_rehash ... ok
+test activitypub::objects::tests::actor_and_note_documents_roundtrip_parse ... ok
+test api::misskey::auth::tests::slice9_outdated_argon2_params_need_rehash ... ok
+test api::misskey::auth::tests::token_hash_is_stable_sha256_hex ... ok
+test api::misskey::auth::tests::slice9_async_password_wrappers_round_trip ... ok
+test api::misskey::auth::tests::slice9_new_hashes_are_argon2id_phc ... ok
+test api::misskey::endpoints::tests::blocking_mute_endpoints_and_relation ... ok
+test api::misskey::endpoints::tests::drive_upload_header_auth_checked_before_body_read ... ok
+test api::misskey::endpoints::tests::drive_upload_concurrency_limit_returns_429 ... ok
+test api::misskey::endpoints::tests::drive_upload_json_and_file_serving ... ok
+test api::misskey::auth::tests::password_roundtrip_and_salt_uniqueness ... ok
+test api::misskey::endpoints::tests::file_named_redirects_and_identicon_serves_svg ... ok
+test api::misskey::endpoints::tests::drafts_crud_count_and_error_codes ... ok
+test activitypub::signatures::tests::key_pem_roundtrip_all_encodings ... ok
+test activitypub::signatures::tests::signature_header_parsing_variants ... ok
+test activitypub::signatures::tests::http_post_sign_and_verify ... ok
+test api::misskey::endpoints::tests::healthz_returns_ok ... ok
+test activitypub::signatures::tests::verify_rejects_missing_required_signed_headers ... ok
+test api::misskey::endpoints::tests::featured_endpoints_return_ranked_notes ... ok
+test api::misskey::endpoints::tests::inline_safe_mime_set ... ok
+test activitypub::signatures::tests::slice12_ring_signature_matches_rsa_crate_and_both_pem_forms_load ... ok
+test api::misskey::endpoints::tests::meta_reports_version ... ok
+test api::misskey::endpoints::tests::follows_and_notifications ... ok
+test activitypub::signatures::tests::keygen_1024_pem_roundtrip_and_sign_verify ... ok
+test api::misskey::endpoints::tests::follow_list_sweep_250_both_directions ... ok
+test activitypub::signatures::tests::http_get_sign_and_verify ... ok
+test api::misskey::endpoints::tests::legacy_auth_flow ... ok
+test api::misskey::endpoints::tests::i_update_and_unsupported_field ... ok
+test api::misskey::endpoints::tests::ff_visibility_gates_and_count_masking ... ok
+test api::misskey::endpoints::tests::i_update_profile_validation_errors ... ok
+test api::misskey::endpoints::tests::miauth_gen_token_and_check_are_one_shot ... ok
+test api::misskey::endpoints::tests::notes_lifecycle ... ok
+test api::misskey::endpoints::tests::i_update_full_profile_round_trip_and_defaults ... ok
+test api::misskey::endpoints::tests::oversized_upload_rejected_without_buffering ... ok
+test api::misskey::endpoints::tests::global_timeline_carries_remote_public_notes ... ok
+test api::misskey::endpoints::tests::oversized_json_body_returns_413 ... ok
+test activitypub::signatures::tests::sign_verify_with_q_larger_than_p ... ok
+test api::misskey::endpoints::tests::notes_polls_vote_flows_and_error_codes ... ok
+test api::misskey::endpoints::tests::parity_export_notes_json_roundtrip ... ok
+test api::misskey::endpoints::tests::notifications_type_filters_agree_on_both_endpoints ... ok
+test api::misskey::endpoints::tests::parity_import_antennas_validates_but_applies_nothing ... ok
+test api::misskey::endpoints::tests::miauth_web_flow_with_callback_redirects ... ok
+test api::misskey::endpoints::tests::notes_reactions_lists_reactors ... ok
+test api::misskey::endpoints::tests::parity_export_rate_limit_trips_and_recovers ... ok
+test api::misskey::endpoints::tests::parity_default_reaction_heart_click ... ok
+test api::misskey::endpoints::tests::parity_no_subsystem_exports_are_empty_but_valid ... ok
+test api::misskey::endpoints::tests::notifications_grouped_shapes ... ok
+test api::misskey::endpoints::tests::parity_import_blocking_guards_use_upstream_errors ... ok
+test api::misskey::endpoints::tests::parity_export_following_exclude_muting_and_inactive ... ok
+test api::misskey::endpoints::tests::parity_notes_edit_endpoint_gates ... ok
+test api::misskey::endpoints::tests::parity_import_muting_applies_rows ... ok
+test api::misskey::endpoints::tests::parity_import_user_lists_validates_but_applies_nothing ... ok
+test api::misskey::endpoints::tests::parity_import_blocking_rows_and_replay ... ok
+test api::misskey::endpoints::tests::parity_notes_edit_noop_and_history ... ok
+test api::misskey::endpoints::tests::parity_notes_edit_edited_notification ... ok
+test api::misskey::endpoints::tests::parity_export_blocking_and_mute_csv ... ok
+test api::misskey::endpoints::tests::parity_export_following_csv_exact_and_notification ... ok
+test api::misskey::endpoints::tests::parity_import_following_acct_and_legacy_rows ... ok
+test api::misskey::endpoints::tests::parity_notes_edit_poll_resets_votes ... ok
+test api::misskey::endpoints::tests::phase3_drive_file_show_update_delete ... ok
+test api::misskey::endpoints::tests::parity_notes_edit_reply_immutable_visibility_forced ... ok
+test api::misskey::endpoints::tests::phase3_drive_files ... ok
+test api::misskey::endpoints::tests::phase3_note_conversation ... ok
+test api::misskey::endpoints::tests::phase3_notes_search ... ok
+test api::misskey::endpoints::tests::phase3_note_relations ... ok
+test api::misskey::endpoints::tests::phase3_notifications_list_and_mark_all ... ok
+test api::misskey::endpoints::tests::phase3_follow_lists ... ok
+test api::misskey::endpoints::tests::reactions_create_rejects_duplicates ... ok
+test api::misskey::endpoints::tests::parity_reject_quotes_end_to_end ... ok
+test api::misskey::endpoints::tests::serve_file_sets_security_headers ... ok
+test api::misskey::endpoints::tests::slice9_spoofed_xff_from_untrusted_peer_is_ignored ... ok
+test api::misskey::endpoints::tests::slice9_xff_honored_only_from_trusted_proxy ... ok
+test api::misskey::endpoints::tests::slice10_api_latency_independent_of_slow_peer ... ok
+test api::misskey::endpoints::tests::unknown_endpoint_is_404 ... ok
+test api::misskey::endpoints::tests::phase3_unrenote ... ok
+test api::misskey::endpoints::tests::phase3_users_notes_filters_and_pagination ... ok
+test api::misskey::errors::tests::envelope_has_top_level_and_nested_fields ... ok
+test api::misskey::errors::tests::port_error_mapping_keeps_misskey_codes ... ok
+test api::misskey::errors::tests::rate_limit_body_carries_retry_after ... ok
+test api::misskey::errors::tests::status_mapping ... ok
+test api::misskey::packers::tests::ff_visibility_count_masking_cases ... ok
+test api::misskey::packers::tests::me_detailed_packs_profile_store_defaults_and_values ... ok
+test api::misskey::packers::tests::pack_following_carries_both_sides_and_id_time ... ok
+test api::misskey::packers::tests::pack_note_reaction_with_note_shape ... ok
+test api::misskey::packers::tests::pack_pure_renote_omits_quote_keys ... ok
+test api::misskey::packers::tests::pack_quote_invisible_target_marks_unavailable_never_leaks_uri ... ok
+test api::misskey::packers::tests::pack_quote_unresolved_target_uri_rules ... ok
+test api::misskey::packers::tests::pack_quote_visible_target_projects_status_and_renote ... ok
+test api::misskey::packers::tests::pack_rejected_quote_still_renders_with_status ... ok
+test api::misskey::packers::tests::public_reactions_pack_rule_local_profile_remote_false ... ok
+test api::misskey::packers::tests::slice8_pack_drive_file_md5_stable_for_same_bytes ... ok
+test api::misskey::packers::tests::snapshot_drive_file_matches_checkout ... ok
+test api::misskey::packers::tests::snapshot_me_detailed_matches_checkout ... ok
+test api::misskey::packers::tests::snapshot_meta_matches_checkout ... ok
+test api::misskey::packers::tests::snapshot_note_matches_checkout ... ok
+test api::misskey::packers::tests::snapshot_user_detailed_matches_checkout ... ok
+test api::misskey::packers::tests::snapshot_user_lite_matches_checkout ... ok
+test api::misskey::packers::tests::timestamps_are_iso8601_utc ... ok
+test api::misskey::request::tests::allows_listed_fields_and_i ... ok
+test api::misskey::request::tests::rejects_unknown_field_naming_it ... ok
+test api::misskey::response::tests::min_interval_enforced ... ok
+test api::misskey::response::tests::slice9_auth_failures_backoff_then_count_cap_then_window_expiry ... ok
+test api::misskey::response::tests::slice9_many_accounts_from_one_ip_trip_the_ip_bucket ... ok
+test api::misskey::response::tests::upload_slots_cap_per_ip_and_release_on_drop ... ok
+test api::misskey::response::tests::upload_slots_global_cap ... ok
+test api::misskey::response::tests::window_count_and_rollover ... ok
+test application::commands::blocks::federation_tests::local_to_remote_block_federates_block_then_undo ... ok
+test application::commands::blocks::federation_tests::remote_to_local_block_federates_nothing ... ok
+test api::misskey::endpoints::tests::reactions_normalize_like_misskey ... ok
+test application::commands::blocks::relation_tests::relation_flags_reflect_block_mute_state ... ok
+test application::commands::blocks::tests::block_cancels_pending_requests_both_ways ... ok
+test application::commands::blocks::tests::block_self_and_unknown ... ok
+test application::commands::blocks::tests::block_tears_down_follows_and_requests_both_ways ... ok
+test application::commands::blocks::tests::follow_blocked_errors_both_directions ... ok
+test application::commands::blocks::tests::blocked_author_filtered_from_local_timeline_and_notes_show ... ok
+test application::commands::blocks::tests::mute_lifecycle_and_expiry ... ok
+test application::commands::blocks::tests::inbound_block_roundtrip_converges ... ok
+test application::commands::blocks::tests::muted_author_filtered_from_home_timeline ... ok
+test api::misskey::endpoints::tests::phase3_revoke_token ... ok
+test application::commands::blocks::tests::poll_vote_block_hook ... ok
+test application::commands::blocks::tests::pure_renote_of_blocker_rejected_quote_allowed ... ok
+test application::commands::blocks::tests::renote_mute_lifecycle ... ok
+test application::commands::blocks::tests::renote_mute_hides_pure_renotes_only ... ok
+test application::commands::blocks::tests::react_blocked_by_author_errors ... ok
+test application::commands::drafts::tests::draft_crud_count_and_list_filters ... ok
+test application::commands::drafts::tests::draft_limit_and_referential_gates ... ok
+test application::commands::drafts::tests::draft_schedule_gates_carry_exact_upstream_codes ... ok
+test application::commands::drafts::tests::scheduled_post_failure_keeps_the_draft_and_notifies ... ok
+test application::commands::drafts::tests::scheduled_post_fires_through_the_worker ... ok
+test application::commands::exports::tests::acct_cells_parse ... ok
+test application::commands::drafts::tests::draft_update_reschedules_and_delete_clears ... ok
+test application::commands::exports::tests::export_file_names_match_upstream_stems ... ok
+test api::misskey::endpoints::tests::pin_unpin_flows_and_errors ... ok
+test api::misskey::endpoints::tests::signup_signin_and_i_roundtrip ... ok
+test application::commands::inbound::quotes::tests::inbound_request_follower_gets_reject_without_stamp ... ok
+test api::misskey::endpoints::tests::timelines_page_with_cursors ... ok
+test api::misskey::endpoints::tests::slice9_signup_stores_argon2id_and_rejects_wrong_password ... ok
+test application::commands::inbound::quotes::tests::local_quote_by_mentioned_author_is_exception ... ok
+test application::commands::inbound::quotes::tests::local_quote_of_local_only_target_stays_pending ... ok
+test application::commands::inbound::quotes::tests::inbound_request_instrument_mismatch_ignored ... ok
+test application::commands::inbound::quotes::tests::local_quote_of_local_public_is_server_approved ... ok
+test application::commands::inbound::quotes::tests::local_self_quote_is_exception_without_request ... ok
+test application::commands::inbound::quotes::tests::quote_of_deleted_target_is_rejected ... ok
+test application::commands::inbound::quotes::tests::decision_reject_retains_relation_and_replay_is_duplicate ... ok
+test application::commands::notes::federation_tests::undo_like_names_the_like_that_was_delivered ... ok
+test api::misskey::endpoints::tests::slice9_legacy_hash_verifies_then_upgrades_to_argon2id_on_signin ... ok
+test application::commands::notifications::tests::absent_or_all_config_delivers ... ok
+test application::commands::notifications::tests::muter_drops_notifier_at_creation ... ok
+test api::misskey::endpoints::tests::users_endpoints ... ok
+test application::commands::notifications::tests::receive_config_never_drops ... ok
+test application::commands::notifications::tests::receive_config_list_without_lists_drops ... ok
+test application::commands::notifications::tests::remote_author_note_carries_host_for_instance_mutes ... ok
+test application::commands::notifications::tests::self_notify_drops_at_creation ... ok
+test application::commands::notifications::tests::receive_config_end_to_end_through_mention_and_reaction ... ok
+test application::commands::pins::tests::featured_cache_honors_ttl ... ok
+test application::commands::notifications::tests::receive_config_relational_kinds ... ok
+test application::commands::pins::tests::featured_ranking_is_deterministic ... ok
+test application::commands::pins::tests::featured_visible_applies_viewer_filters ... ok
+test application::commands::pins::tests::featured_for_user_scopes_and_unknown_is_empty ... ok
+test application::commands::polls::tests::inbound_vote_and_question_sync_converge ... ok
+test application::commands::pins::tests::pin_unpin_flows_limit_dup_and_foreign ... ok
+test application::commands::pins::tests::pin_packs_into_user_and_federates_for_public ... ok
+test application::commands::polls::tests::poll_create_validation_rejects_bad_shapes ... ok
+test application::commands::polls::tests::poll_expiry_job_fires_poll_ended ... ok
+test application::commands::polls::tests::poll_pack_shape_has_isvoted_per_requester ... ok
+test application::commands::polls::tests::poll_only_renote_is_a_quote_and_lists_as_child ... ok
+test application::commands::polls::tests::vote_flows_single_and_multiple ... ok
+test application::commands::polls::tests::vote_rejects_invalid_choice_expired_blocked_and_missing ... ok
+test application::commands::tests::local_upload_sniff_beats_declared_type ... ok
+test application::commands::tests::local_non_utf8_upload_claiming_html_is_not_html ... ok
+test application::commands::tests::profile_also_known_as_resolution ... ok
+test application::commands::tests::profile_name_trim_and_prohibited_words ... ok
+test application::commands::tests::profile_store_round_trip_and_defaults ... ok
+test application::commands::tests::profile_word_mute_validation ... ok
+test application::commands::tests::profile_unlock_accepts_pending_requests ... ok
+test application::commands::tests::slice8_distinct_uploads_never_share_blob_storage ... ok
+test application::commands::tests::slice8_empty_upload_pins_known_md5_and_sha256_vectors ... ok
+test application::commands::tests::slice8_owner_dedup_still_works_and_force_bypasses ... ok
+test application::queries::timeline_tests::global_timeline_is_public_only_and_carries_replies ... ok
+test application::queries::timeline_tests::home_timeline_keeps_replies_from_followed_users ... ok
+test application::queries::timeline_tests::filters_hide_authors_across_every_surface ... ok
+test application::queries::timeline_tests::hybrid_timeline_self_reply_exception ... ok
+test application::queries::timeline_tests::local_timeline_self_reply_exception ... ok
+test domain::account::tests::actor_url_forms ... ok
+test application::queries::timeline_tests::word_mutes_stay_client_side ... ok
+test domain::account::tests::description_and_location_bounds ... ok
+test domain::account::tests::local_username_bounds ... ok
+test domain::account::tests::new_local_lowercases_username ... ok
+test domain::account::tests::new_local_sets_defaults ... ok
+test domain::account::tests::profile_store_bounds ... ok
+test domain::account::tests::birthday_bounds ... ok
+test domain::account::tests::remote_uri_requirement ... ok
+test domain::account::tests::profile_store_defaults_match_upstream_columns ... ok
+test domain::account::tests::remote_username_bounds ... ok
+test domain::blocking::tests::empty_ids_rejected ... ok
+test domain::blocking::tests::self_block_rejected ... ok
+test domain::blocking::tests::valid_blocking_passes ... ok
+test domain::draft::tests::draft_poll_expiry_reuses_create_ident ... ok
+test domain::draft::tests::relaxed_shape_allows_empty_drafts ... ok
+test domain::draft::tests::schedule_rules_carry_exact_upstream_codes ... ok
+test domain::draft::tests::shape_bounds_match_upstream_param_defs ... ok
+test domain::follow::tests::self_follow_rejected ... ok
+test domain::follow::tests::empty_ids_rejected ... ok
+test domain::follow::tests::valid_follow_passes ... ok
+test domain::id::tests::aidx_preserves_lexicographical_sort_order ... ok
+test domain::id::tests::parse_time_rejects_foreign_shapes ... ok
+test domain::media::tests::blob_key_rejects_empty_and_binary ... ok
+test domain::media::tests::hash_rejects_binary ... ok
+test domain::media::tests::mime_and_size_bounds ... ok
+test domain::media::tests::name_bounds ... ok
+test domain::media::tests::sniff_detects_image_and_av_magic ... ok
+test domain::media::tests::sniff_markup_never_becomes_text_or_xml ... ok
+test domain::media::tests::sniff_utf8_is_plain_and_binary_is_octet ... ok
+test domain::id::tests::aidx_matches_regex_and_roundtrips_time ... ok
+test domain::media::tests::source_url_bounds ... ok
+test domain::media::tests::valid_media_passes ... ok
+test domain::muting::tests::active_at_respects_expiry ... ok
+test domain::muting::tests::empty_ids_rejected ... ok
+test domain::muting::tests::expiry_must_be_future ... ok
+test domain::muting::tests::self_mute_rejected ... ok
+test domain::media::tests::url_comment_bounds ... ok
+test domain::note::tests::cw_bounds ... ok
+test domain::note::tests::extract_helpers ... ok
+test domain::note::tests::file_id_bounds ... ok
+test domain::note::tests::poll_stands_in_for_text ... ok
+test domain::note::tests::is_reply_covers_resolved_and_pending ... ok
+test domain::note::tests::resolved_and_pending_parent_conflict ... ok
+test domain::note::tests::specified_requires_visible_user_ids ... ok
+test domain::note::tests::tag_emoji_uri_bounds ... ok
+test domain::note::tests::text_bounds ... ok
+test domain::note::tests::visibility_ordering ... ok
+test domain::notification::tests::notification_roundtrips ... ok
+test domain::pinning::tests::pinning_roundtrips_and_validates ... ok
+test domain::policy::tests::blocking_rejects_pure_renotes_only ... ok
+test domain::policy::tests::deleted_notes_invisible_and_ineligible ... ok
+test domain::policy::tests::e1_read_matrix ... ok
+test domain::policy::tests::e1_timeline_eligibility_agrees_with_reads ... ok
+test domain::policy::tests::e2_followers_remote_remote_fallback ... ok
+test domain::policy::tests::e3_specified_requires_visible_users ... ok
+test domain::policy::tests::e4_local_only_never_federated ... ok
+test domain::note::tests::valid_note_passes_both_validators ... ok
+test domain::policy::tests::instance_policy_downgrades_public_to_home ... ok
+test domain::policy::tests::renote_narrowing_rules ... ok
+test domain::policy::tests::reply_narrowing_rules ... ok
+test domain::poll::tests::poll_already_expired_rejected_with_exact_code ... ok
+test domain::poll::tests::poll_choice_count_bounds ... ok
+test domain::policy::tests::pending_reply_parent_withholds_from_all_viewers ... ok
+test domain::poll::tests::poll_choice_text_bounds_and_uniqueness ... ok
+test domain::quote::tests::api_status_mapping ... ok
+test domain::quote::tests::legacy_constructor_is_unapproved_never_rejected ... ok
+test domain::quote::tests::quote_reference_validation ... ok
+test domain::poll::tests::poll_is_expired_matches_vote_gate ... ok
+test domain::quote::tests::transitions ... ok
+test domain::reaction::tests::normalize_falls_back_to_bare_heart ... ok
+test domain::reaction::tests::normalize_maps_legacies ... ok
+test domain::reaction::tests::normalize_strips_fe0f_unless_zwj ... ok
+test domain::reaction::tests::reaction_bounds ... ok
+test federation::delivery::slice10_transport_tests::slice10_curl_exit_codes_map_to_kinds ... ok
+test federation::delivery::slice10_transport_tests::slice10_dns_nxdomain_is_permanent_other_dns_failures_transient ... ok
+test federation::delivery::slice10_transport_tests::slice10_response_errors_classify_size_timeout_and_protocol ... ok
+test domain::reaction::tests::coerce_reaction_cases ... ok
+test federation::delivery::slice10_transport_tests::slice10_send_error_text_is_unchanged_for_string_callers ... ok
+test federation::delivery::slice10_transport_tests::slice10_ssrf_and_invalid_url_are_permanent ... ok
+test federation::delivery::slice10_transport_tests::slice10_transient_and_permanent_kinds_partition ... ok
+test federation::delivery::tests::curl_args_never_disable_tls_and_keep_ssrf_pins ... ok
+test federation::delivery::tests::decode_chunked_hardening_rejects_garbage_without_panicking ... ok
+test federation::delivery::tests::read_http_response_skips_100_continue_and_decodes_chunked ... ok
+test federation::delivery::tests::read_http_response_skips_proxy_connect_block ... ok
+test federation::delivery::tests::redirect_limit_and_size_limit_enforced ... ok
+test federation::delivery::tests::ssrf_blocks_loopback_private_link_local_and_mapped_ipv6 ... ok
+test federation::host_caps::tests::emoji_support_classification_matches_decided_split ... ok
+test federation::host_caps::tests::freshness_boundary_is_seven_days ... ok
+test federation::host_caps::tests::host_of_url_extracts_cache_key ... ok
+test federation::host_caps::tests::nodeinfo_parse_reads_software_name ... ok
+test federation::host_caps::tests::resolve_caches_successful_probe ... ok
+test federation::host_caps::tests::resolve_probe_failure_is_emoji_aware_and_uncached ... ok
+test federation::host_caps::tests::resolve_reprobes_stale_entries_and_recaches ... ok
+test federation::host_caps::tests::resolve_uses_fresh_cache_without_probing ... ok
+test federation::inbox::inbound_vote_tests::answer_for_unknown_parent_stores_nothing ... ok
+test federation::inbox::inbound_vote_tests::answer_shaped_vote_is_tallied ... ok
+test federation::inbox::inbound_vote_tests::note_shaped_vote_is_tallied ... ok
+test api::misskey::endpoints::tests::slice9_signin_per_ip_bucket_trips_across_accounts ... ok
+test application::commands::inbound::quotes::tests::accept_with_malformed_stamp_uri_is_ignored_never_approved ... ok
+test application::commands::inbound::quotes::tests::inbound_request_public_auto_accepts_with_stamp ... ok
+test api::misskey::endpoints::tests::users_reactions_gates_and_filters ... ok
+test api::misskey::endpoints::tests::slice9_signin_brute_force_returns_rate_limit_exceeded ... ok
+test federation::delivery::slice10_transport_tests::slice10_total_deadline_bounds_a_silent_peer ... ok
+test application::commands::inbound::quotes::tests::inbound_request_private_without_entitlement_is_ignored_not_rejected ... ok
+test application::commands::inbound::quotes::tests::local_quote_of_remote_post_is_pending_with_request_job ... ok
+test federation::inbox::key_ownership_tests::inbox_accepts_honest_signed_follow ... ok
+test federation::inbox::key_ownership_tests::parse_rejects_cross_origin_key_without_owner ... ok
+test federation::inbox::key_ownership_tests::inbox_block_and_undo_block_roundtrip ... ok
+test federation::inbox::key_ownership_tests::parse_rejects_cross_origin_key_with_matching_owner ... ok
+test federation::inbox::like_reaction_tests::like_with_misskey_reaction_stores_custom_reaction ... ok
+test federation::inbox::like_reaction_tests::like_without_misskey_reaction_maps_to_fallback ... ok
+test federation::inbox::key_ownership_tests::parse_accepts_honest_key_shapes ... ok
+test application::commands::inbound::quotes::tests::stamp_delete_revokes_forwards_and_converges ... ok
+test application::commands::tests::actor_keypair_generation_rotation_and_remote_key_cache ... ok
+test federation::inbox::key_ownership_tests::cache_overwrite_refused_for_different_owner ... ok
+test federation::inbox::update_note_tests::update_activity_shape_pins ... ok
+test federation::inbox::update_note_tests::update_note_authority_gates ... ok
+test federation::inbox::update_note_tests::update_note_round_trip_and_replay_converge ... ok
+test federation::outbox::slice10_tests::slice10_fanout_split_threshold ... ok
+test federation::outbox::slice10_tests::slice10_follower_walk_handles_exact_page_multiple_and_empty ... ok
+test federation::outbox::slice10_tests::slice10_follower_walk_pages_past_ten_thousand_without_truncation ... ok
+test federation::outbox::slice10_tests::slice10_follower_walk_propagates_storage_errors ... ok
+test federation::outbox::slice10_tests::slice10_large_fanout_becomes_one_job_per_inbox_with_derived_keys ... ok
+test federation::retry::tests::slice10_cooldown_is_reported_only_while_in_future ... ok
+test federation::retry::tests::slice10_post_redirect_is_permanent ... ok
+test federation::retry::tests::slice10_retry_after_delta_seconds_date_and_cap ... ok
+test federation::retry::tests::slice10_timeouts_5xx_and_429_are_transient ... ok
+test federation::retry::tests::slice10_transient_outcome_carries_retry_after ... ok
+test federation::retry::tests::status_classification_and_backoff ... ok
+test jobs::worker::slice10_tests::slice10_every_batch_is_within_the_cap ... ok
+test jobs::worker::slice10_tests::slice10_followup_batches_respect_the_per_txn_cap ... ok
+test media::remote_cache::tests::remote_html_and_svg_attachments_stored_as_octet_stream ... ok
+test media::remote_cache::tests::remote_media_fetch_job_truncates_to_16 ... ok
+test media::remote_cache::tests::remote_media_ssrf_and_fetch_cache_roundtrip ... ok
+test media::storage::tests::blob_store_get_verifies_length_sidecar ... ok
+test media::storage::tests::blob_store_put_get_delete_and_partial_write_invisible ... ok
+test media::storage::tests::blob_store_rejects_traversal_hashes ... ok
+test observability::tests::env_value_parsing ... ok
+test observability::tests::switch_gates_the_macro ... ok
+test streaming::hub::tests::publish_rejects_garbage_payloads ... ok
+test streaming::hub::tests::publish_routes_streaming_events_to_hub ... ok
+test streaming::hub::tests::send_without_receivers_is_not_an_error ... ok
+test streaming::server::tests::channel_frame_shapes_match_misskey_js_demux ... ok
+test streaming::server::tests::channel_params_use_misskey_defaults ... ok
+test streaming::server::tests::upgrade_token_prefers_bearer_over_query ... ok
+test federation::inbox::media_safety_tests::replayed_create_triggers_zero_fetches ... ok
+test application::commands::inbound::quotes::tests::local_pure_renote_sends_no_quote_request ... ok
+test federation::inbox::key_ownership_tests::upsert_subpath_key_caches_single_row ... ok
+test federation::inbox::reply_resolution_tests::unknown_parent_stays_pending_then_links_on_arrival ... ok
+test federation::inbox::key_ownership_tests::upsert_honest_key_caches_single_row ... ok
+test federation::inbox::media_safety_tests::create_with_too_many_attachments_truncates_to_16 ... ok
+test federation::inbox::key_ownership_tests::upsert_poison_doc_rejected_and_real_key_kept ... ok
+test federation::inbox::media_safety_tests::replayed_uri_object_create_triggers_zero_note_fetches ... ok
+test federation::inbox::key_ownership_tests::parse_rejects_owner_pointing_at_victim ... ok
+test federation::inbox::key_ownership_tests::resolve_returns_owner_and_rejects_fetch_key_mismatch ... ok
+test federation::inbox::key_ownership_tests::inbox_rejects_forged_victim_activity ... ok
+
+test result: ok. 397 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.40s
+
+     Running unittests src/main.rs (/root/pinetree-target/debug/deps/pinetree-96bccb8270fb1c77)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/client_profile.rs (/root/pinetree-target/debug/deps/client_profile-c9aad81249cb2f73)
+
+running 1 test
+[smoke3] server up at http://127.0.0.1:37182 (pid 4173596)
+[smoke3] notes/create graph (post, reply, renote, quote)
+[smoke3] users/notes
+[smoke3] notes/replies|renotes|children|conversation
+[smoke3] notes/unrenote
+[smoke3] users/followers|following (Following[] shape)
+[smoke3] drive/files (+show/update/delete)
+[smoke3] i/notifications + mark-all-as-read
+[smoke3] notes/search + search-by-tag
+[smoke3] error shapes
+[smoke3] stream: globalTimeline note delivery
+[smoke3] stream: main mention + noteUpdated capture
+[smoke3] i/revoke-token
+SMOKE3_OK
+test client_profile_live_binary_and_misskey_js ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.60s
+
+     Running tests/client_smoke.rs (/root/pinetree-target/debug/deps/client_smoke-d584dfa10b1e8a58)
+
+running 1 test
+[smoke] checking --mode=cluster refusal...
+[smoke] cluster refusal OK (exit 1)
+[smoke] checking create-account CLI...
+[smoke] create-account OK: created account cli_admin id=asgeoc1rvnaxypew
+[smoke] server up at http://127.0.0.1:20999 (pid 4173709)
+[smoke1] meta
+[smoke1] username/available (free)
+[smoke1] signup alice + bob
+[smoke1] miauth alice + bob
+[smoke1] i + i/update
+[smoke1] drive/files/create + GET /files/:id
+[smoke1] notes/create
+[smoke1] notes/show
+[smoke1] following/create
+[smoke1] timelines
+[smoke1] notes/reactions/create
+[smoke1] OK
+[smoke] restarting server with SIGKILL on the same --data-dir...
+[smoke] server up at http://127.0.0.1:20999 (pid 4173781)
+[smoke2] OK
+SMOKE_OK
+test client_smoke_live_binary_and_misskey_js ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.05s
+
+     Running tests/conformance.rs (/root/pinetree-target/debug/deps/conformance-4e338235e9a7c3b1)
+
+running 87 tests
+test b10_worker_quarantines_bad_notify_payload ... ok
+test b1_lease_redelivery ... ok
+test b2_no_double_claim ... ok
+test b3_fail_retry ... ok
+test b1b_lease_expiry_counts_as_attempt ... ok
+test b4_complete_is_terminal ... ok
+test b8_terminal_ops_on_missing ... ok
+test b7_quarantine_never_reclaimed ... ok
+test b12_worker_retry_exhaustion_quarantines ... ok
+test b6_payload_bound ... ok
+test c2_case_insensitivity ... ok
+test c3_rename_tombstone ... ok
+test c4_unknown_handle ... ok
+test c1_uniqueness_race ... ok
+test b9_retry_exhaustion_quarantines ... ok
+test d1_first_seen ... ok
+test d1_forget_activity_allows_reprocessing ... ok
+test d2_dedup_and_state_atomicity ... ok
+test d4_reject_follow ... ok
+test e2_followers_remote_remote_fallback ... ok
+test d3_concurrent_duplicates ... ok
+test d4_reject_follow_atomicity ... ok
+test e3_specified_empty_visible_users_rejected ... ok
+test e1_three_call_site_agreement ... ok
+test e4_local_only_never_federated ... ok
+test f1_media_bytes_rejected ... ok
+test f1_request_is_not_an_edge ... ok
+test f2_accept ... ok
+test f2_transaction_scope ... ok
+test f3_cleanup ... ok
+test f4_request_activity_dedup ... ok
+test f3_read_your_commit ... ok
+test g1_block_crud ... ok
+test f5_locked_account_service_flow ... ok
+test g2_renote_visibility ... ok
+test g1_reply_requires_visible_target ... ok
+test g3_enforcement ... ok
+test g2_block_atomicity ... ok
+test g4_mutes ... ok
+test m1_media_source_url_lookup ... ok
+test m3_media_blob_key_roundtrip ... ok
+test m2_attach_remote_media_idempotent ... ok
+test n1_notifications_newest_first_across_kinds ... ok
+test note_edit_history_chaining ... ok
+test note_edit_inbound_dedup ... ok
+test note_edit_noop_writes_nothing ... ok
+test note_edit_lifecycle ... ok
+test note_edit_poll_replace_resets_votes ... ok
+test p1_pinning_crud ... ok
+test p2_pinning_atomicity ... ok
+test q1_quote_create_persists_and_pure_renote_stays_pure ... ok
+test q3_quote_stamps_and_lookups ... ok
+test q4_quote_request_accept_reject_atomicity ... ok
+test q2_quote_authorization_transitions ... ok
+test quote_disable_storage ... ok
+test q5_quote_decision_and_revocation ... ok
+test r11_children_semantics_unchanged ... ok
+test r12_conversation_semantics_unchanged ... ok
+test r1_reply_index_and_counter ... ok
+test r2_reply_paging_and_deleted ... ok
+test r3_delete_counter_consistency ... ok
+test r4_replies_scan_is_visibility_aware ... ok
+test r6_pending_link_idempotent ... ok
+test r7_reply_index_migration_backfills_and_resumes ... ok
+test r8_pending_withheld_from_reads ... ok
+test a3_multi_job_atomicity ... ok
+test s1_draft_crud ... ok
+test s2_scheduled_arming ... ok
+test slice10_complete_with_followups ... ok
+test slice10_cooldown_host_is_deferred_not_attempted ... ok
+test slice10_defer_keeps_attempts ... ok
+test slice10_enqueue_jobs ... ok
+test b11_worker_quarantines_permanent_federate_failure ... ok
+test u1_same_uri_different_activity_ids ... ok
+test a2_crash_before_commit ... ok
+test u2_concurrent_same_uri ... ok
+test u3_deleted_note_releases_uri ... ok
+test a4_delete_atomicity ... ok
+test r10_resolver_links_cached_parent ... ok
+test slice10_one_failing_inbox_retries_only_that_inbox ... ok
+test a5_follow_atomicity ... ok
+test a1_create_then_crash ... ok
+test r9_repair_marks_historical_pending ... ok
+test b5_crash_during_handler ... ok
+test conformance_exit_box_2 ... ok
+test q6_quote_crash_consistency ... ok
+test r5_reply_crash_before_commit ... ok
+
+test result: ok. 87 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.02s
+
+     Running tests/crash_recovery.rs (/root/pinetree-target/debug/deps/crash_recovery-00f824c729bceeaa)
+
+running 2 tests
+test c4_restart_preserves_accounts_follows_reactions_and_timelines ... ok
+test c4_kill_mid_traffic_and_recover ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.26s
+
+     Running tests/federation.rs (/root/pinetree-target/debug/deps/federation-7aa5d197689ef8df)
+
+running 2 tests
+test federation_remote_media_cache ... ok
+test federation_two_node_end_to_end ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.78s
+
+     Running tests/federation_elixir.rs (/root/pinetree-target/debug/deps/federation_elixir-76f4fad94ed6f0b0)
+
+running 2 tests
+test elixir_quote_federation ... ok
+test elixir_quote_stress ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/federation_interop.rs (/root/pinetree-target/debug/deps/federation_interop-10804e5dc543c4b7)
+
+running 1 test
+test federation_interop_four_servers ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/minrepro.rs (/root/pinetree-target/debug/deps/minrepro-dd91264dd55cbff0)
+
+running 1 test
+test minimal_cross_call ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+
+     Running tests/quote_fixtures.rs (/root/pinetree-target/debug/deps/quote_fixtures-02b9f59c501b10d2)
+
+running 5 tests
+test all_legacy_shapes_normalize_to_the_same_quote ... ok
+test bare_link_tag_without_rel_is_not_a_quote ... ok
+test conflicting_aliases_prefer_canonical_quote ... ok
+test mastodon_fep044f_shape_detects_target_and_stamp_iri_without_approving ... ok
+test real_fixture_files_normalize ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/streaming.rs (/root/pinetree-target/debug/deps/streaming-4aaef982d092306b)
+
+running 13 tests
+test bad_and_scoped_tokens_are_rejected_at_upgrade ... ok
+test bearer_header_auth_and_pong_connected ... ok
+test anonymous_global_timeline_streams_public_notes ... ok
+test main_channel_gets_follow_followed_and_notification ... ok
+test me_updated_and_read_notification_round_trip ... ok
+test credential_channels_need_auth_and_unknown_channels_error ... ok
+test main_reply_renote_unfollow_events ... ok
+test note_capture_gets_reacted_unreacted_deleted ... ok
+test followers_only_notes_skip_non_followers_on_global ... ok
+test local_and_hybrid_channels_deliver ... ok
+test home_timeline_only_streams_followed_authors ... ok
+test disconnect_and_unsubscribe_go_silent ... ok
+test specified_capture_gate ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.31s
+
+   Doc-tests pinetree
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+EXIT=0

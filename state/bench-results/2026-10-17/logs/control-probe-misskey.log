@@ -1,0 +1,6 @@
+akkoma=BBVixiipUfRcYCBurY misskey local=asg9uv5dm76904dw user=mk1
+akkoma favs before: ['pm3@pt-mk.test', 'pm4@pt-mk.test', 'pm1@pt-mk.test', 'pm2@pt-mk.test']
+reactions/create status=204
+akkoma shows mk1@misskey.test: False favs=['pm3@pt-mk.test', 'pm4@pt-mk.test', 'pm1@pt-mk.test', 'pm2@pt-mk.test']
+reactions/delete status=204
+akkoma mk1@misskey.test gone after undo: True favs=['pm3@pt-mk.test', 'pm4@pt-mk.test', 'pm1@pt-mk.test', 'pm2@pt-mk.test']

@@ -1,0 +1,319 @@
+20 pairs, tag=259328
+[PASS] post           pt-ks -> catodon A=asg98q17l3tti38c uri=http://pt-ks.test/notes/asg98q17l3tti38c
+[PASS] post           pt-ks -> misskey A=asg98q1al3tti38f uri=http://pt-ks.test/notes/asg98q1al3tti38f
+[PASS] post           pt-ks -> akkoma  A=asg98q1dl3tti38i uri=http://pt-ks.test/notes/asg98q1dl3tti38i
+[PASS] post           pt-ks -> pt-mk   A=asg98q1hl3tti38l uri=http://pt-ks.test/notes/asg98q1hl3tti38l
+[PASS] cw             pt-ks -> catodon C=asg98rtnl3tti38q
+[PASS] cw             pt-ks -> misskey C=asg98rvzl3tti390
+[PASS] reply          pt-ks -> misskey R=asg98tl0fcp902nu out=True
+[PASS] reply          pt-ks -> catodon R=asg98tjoim3800ba out=True
+[PASS] cw             pt-ks -> akkoma  C=asg98rvol3tti38x
+[PASS] cw             pt-ks -> pt-mk   C=asg98s0xl3tti395
+[PASS] reply          pt-ks -> pt-mk   R=asg98twhy8dmuf0g out=True
+[PASS] reply          pt-ks -> akkoma  R=BBVhQuGDTNx4pHb4C0 out=True
+[PASS] reaction       pt-ks -> misskey A=asg98q1al3tti38f out=True per_user=🎉:['mk4@misskey.test']
+[PASS] reaction       pt-ks -> catodon A=asg98q17l3tti38c out=True per_user=🎉:['cd5@catodon.test']
+[PASS] reaction       pt-ks -> pt-mk   A=asg98q1hl3tti38l out=True per_user=🎉:['pm3@pt-mk.test']
+[PASS] reaction       pt-ks -> akkoma  A=asg98q1dl3tti38i out=True per_user=❤:['ak6@akkoma.test']
+[PASS] unreaction     pt-ks -> misskey out=True
+[FAIL] renote/boost   pt-ks -> misskey B=asg98wt5fcp902nw out=count=0,before=0
+[FAIL] unboost        pt-ks -> misskey out=count=1,before=0
+[PASS] unreaction     pt-ks -> catodon out=True
+[PASS] quote          pt-ks -> misskey Q=asg98wuvfcp902nx local_renote_ok=True origin_sees_relation=True
+[FAIL] renote/boost   pt-ks -> catodon B=asg98wwhim3800bc out=count=0,before=0
+[PASS] unboost        pt-ks -> catodon out=True
+[PASS] unreaction     pt-ks -> pt-mk   out=True
+[FAIL] renote/boost   pt-ks -> pt-mk   B=asg98x1ry8dmuf20 out=count=0,before=0
+[PASS] unboost        pt-ks -> pt-mk   out=True
+[PASS] unreaction     pt-ks -> akkoma  out=True
+[PASS] quote          pt-ks -> pt-mk   Q=asg98x2uy8dmuf2d local_renote_ok=True origin_sees_relation=True
+[FAIL] renote/boost   pt-ks -> akkoma  B=BBVhRIKzxG2NV41Dyi out=count=0,before=0
+[PASS] unboost        pt-ks -> akkoma  out=True
+[PASS] quote          pt-ks -> catodon Q=asg98x1gim3800bd local_renote_ok=True origin_sees_relation=True
+[PASS] poll+vote      pt-ks -> misskey P=asg98wwyl3tti3b8 choices={'choices': [{'text': 'alpha', 'votes': 0}, {'text': 'beta', 'votes': 1}, {'text': 'gamma', '
+[PASS] media          pt-ks -> misskey url=http://misskey.test/files/webpublic-867e9666-8eff-4e30-a678-7d873aaaa40b status=200 sha_match=True
+[PASS] poll+vote      pt-ks -> pt-mk   P=asg98x4el3tti3bv choices={'choices': [{'text': 'alpha', 'votes': 0}, {'text': 'beta', 'votes': 1}, {'text': 'gamma', '
+[PASS] poll+vote      pt-ks -> catodon P=asg98x7ul3tti3cj choices={'choices': [{'text': 'alpha', 'votes': 0}, {'text': 'beta', 'votes': 1}, {'text': 'gamma', '
+[PASS] media          pt-ks -> catodon url=http://pt-ks.test/files/asf7ac99ignk99f5 status=200 sha_match=True
+[PASS] media          pt-ks -> pt-mk   url=http://pt-mk.test/files/asg98ysiy8dmuf3m status=200 sha_match=True
+[PASS] followers-only   pt-ks -> misskey on_follower=True leaked_to_global=False
+[PASS] delete         pt-ks -> misskey Dl=asg998b4l3tti3dy
+[PASS] followers-only   pt-ks -> catodon on_follower=True leaked_to_global=False
+[PASS] delete         pt-ks -> catodon Dl=asg998rfl3tti3ec
+[PASS] mention-notif   pt-ks -> misskey Mp=asg998dxl3tti3e7
+[PASS] followers-only   pt-ks -> pt-mk   on_follower=True leaked_to_global=False
+[PASS] delete         pt-ks -> pt-mk   Dl=asg99ao8l3tti3et
+[PASS] mention-notif   pt-ks -> catodon Mp=asg998ysl3tti3el
+[PASS] post           pt-mk -> pt-ks   A=asg99a7dy8dmuf46 uri=http://pt-mk.test/notes/asg99a7dy8dmuf46
+[PASS] mention-notif   pt-ks -> pt-mk   Mp=asg99aq7l3tti3f2
+[PASS] post           pt-mk -> misskey A=asg99au0y8dmuf4e uri=http://pt-mk.test/notes/asg99au0y8dmuf4e
+[PASS] cw             pt-mk -> pt-ks   C=asg99c6ay8dmuf4q
+[PASS] post           pt-mk -> catodon A=asg99cbcy8dmuf4v uri=http://pt-mk.test/notes/asg99cbcy8dmuf4v
+[PASS] reply          pt-mk -> pt-ks   R=asg99e4ll3tti3fk out=True
+[PASS] cw             pt-mk -> misskey C=asg99ckey8dmuf50
+[PASS] reply          pt-mk -> misskey R=asg99edhfcp902oa out=True
+[PASS] reaction       pt-mk -> pt-ks   A=asg99a7dy8dmuf46 out=True per_user=🎉:['pk1@pt-ks.test']
+[PASS] reaction       pt-mk -> misskey A=asg99au0y8dmuf4e out=True per_user=🎉:['mk2@misskey.test']
+[PASS] cw             pt-mk -> catodon C=asg99e70y8dmuf55
+[PASS] reply          pt-mk -> catodon R=asg99gigim3800bh out=True
+[PASS] unreaction     pt-mk -> pt-ks   out=True
+[FAIL] renote/boost   pt-mk -> pt-ks   B=asg99hgfl3tti3gr out=count=0,before=0
+[PASS] unboost        pt-mk -> pt-ks   out=True
+[PASS] quote          pt-mk -> pt-ks   Q=asg99hipl3tti3h4 local_renote_ok=True origin_sees_relation=True
+[PASS] unreaction     pt-mk -> misskey out=True
+[FAIL] renote/boost   pt-mk -> misskey B=asg99huyfcp902oc out=count=0,before=0
+[FAIL] unboost        pt-mk -> misskey out=count=1,before=0
+[PASS] quote          pt-mk -> misskey Q=asg99i5pfcp902od local_renote_ok=True origin_sees_relation=True
+[PASS] reaction       pt-mk -> catodon A=asg99cbcy8dmuf4v out=True per_user=🎉:['cd3@catodon.test']
+[PASS] poll+vote      pt-mk -> pt-ks   P=asg99hmky8dmuf6k choices={'choices': [{'text': 'alpha', 'votes': 0}, {'text': 'beta', 'votes': 1}, {'text': 'gamma', '
+[PASS] poll+vote      pt-mk -> misskey P=asg99ibyy8dmuf7d choices={'choices': [{'text': 'alpha', 'votes': 0}, {'text': 'beta', 'votes': 1}, {'text': 'gamma', '
+[PASS] media          pt-mk -> misskey url=http://misskey.test/files/webpublic-05c3691a-4294-4dd7-aa1a-5fe3281b6731 status=200 sha_match=True
+[PASS] unreaction     pt-mk -> catodon out=True
+[FAIL] renote/boost   pt-mk -> catodon B=asg99kckim3800bj out=count=0,before=0
+[FAIL] unboost        pt-mk -> catodon out=count=1,before=0
+[PASS] quote          pt-mk -> catodon Q=asg99kn8im3800bk local_renote_ok=True origin_sees_relation=True
+[PASS] media          pt-mk -> pt-ks   url=http://pt-ks.test/files/asg99jg5l3tti3i6 status=200 sha_match=True
+[PASS] poll+vote      pt-mk -> catodon P=asg99kx8y8dmuf8i choices={'choices': [{'text': 'alpha', 'votes': 0}, {'text': 'beta', 'votes': 1}, {'text': 'gamma', '
+[PASS] media          pt-mk -> catodon url=http://pt-mk.test/files/asf7mxybeqkybsew status=200 sha_match=True
+[PASS] followers-only   pt-mk -> misskey on_follower=True leaked_to_global=False
+[PASS] delete         pt-mk -> misskey Dl=asg99tt6y8dmuf97
+[PASS] followers-only   pt-mk -> pt-ks   on_follower=True leaked_to_global=False
+[PASS] delete         pt-mk -> pt-ks   Dl=asg99vc8y8dmuf9l
+[PASS] mention-notif   pt-mk -> misskey Mp=asg99tu3y8dmuf9g
+[PASS] followers-only   pt-mk -> catodon on_follower=True leaked_to_global=False
+[PASS] delete         pt-mk -> catodon Dl=asg99whpy8dmufa4
+[PASS] post           pt-mk -> akkoma  A=asg99vhuy8dmuf9z uri=http://pt-mk.test/notes/asg99vhuy8dmuf9z
+[PASS] mention-notif   pt-mk -> catodon Mp=asg99wj3y8dmufad
+[PASS] post         misskey -> pt-ks   A=asg99y6efcp902om uri=http://misskey.test/notes/asg99y6efcp902om
+[PASS] cw             pt-mk -> akkoma  C=asg99x7zy8dmufai
+[PASS] reply          pt-mk -> akkoma  R=BBVhVpNB4ZkJ7CCQt6 out=True
+[PASS] cw           misskey -> pt-ks   C=asg99yb2fcp902on
+[PASS] reply        misskey -> pt-ks   R=asg9a03vl3tti3k5 out=True
+[PASS] reaction       pt-mk -> akkoma  A=asg99vhuy8dmuf9z out=True per_user=❤:['ak4@akkoma.test']
+[PASS] reaction     misskey -> pt-ks   A=asg99y6efcp902om out=True per_user=🎉:['pk5@pt-ks.test']
+[PASS] unreaction     pt-mk -> akkoma  out=True
+[FAIL] renote/boost   pt-mk -> akkoma  B=BBVhWDNLpa93YgSuUS out=count=0,before=0
+[PASS] unboost        pt-mk -> akkoma  out=True
+[PASS] unreaction   misskey -> pt-ks   out=True
+[FAIL] renote/boost misskey -> pt-ks   B=asg9a3b0l3tti3kx out=count=0,before=0
+[PASS] unboost      misskey -> pt-ks   out=True
+[PASS] quote        misskey -> pt-ks   Q=asg9a3cel3tti3la local_renote_ok=True origin_sees_relation=True
+[PASS] poll+vote    misskey -> pt-ks   P=asg9a3dkfcp902oq choices={'choices': [{'text': 'alpha', 'votes': 0}, {'text': 'beta', 'votes': 1}, {'text': 'gamma', '
+[PASS] media        misskey -> pt-ks   url=http://pt-ks.test/files/asg9a52wl3tti3lu status=200 sha_match=True
+[PASS] followers-only misskey -> pt-ks   on_follower=True leaked_to_global=False
+[PASS] delete       misskey -> pt-ks   Dl=asg9agyifcp902ot
+[PASS] quote          pt-ks -> akkoma  Q=BBVhRItjs5pJEoGy80 link-quote arrived at src=True origin_sees_relation=False
+[PASS] quote          pt-mk -> akkoma  Q=BBVhWDfQkMbgSkvLfc link-quote arrived at src=True origin_sees_relation=False
+[FAIL] mention-notif   pt-mk -> pt-ks   Mp=asg99vd0y8dmuf9u
+[PASS] post         misskey -> pt-mk   A=asg9cgvpfcp902ov uri=http://misskey.test/notes/asg9cgvpfcp902ov
+[PASS] cw           misskey -> pt-mk   C=asg9ciphfcp902ow
+[PASS] reply        misskey -> pt-mk   R=asg9civhy8dmufcp out=True
+[PASS] reaction     misskey -> pt-mk   A=asg9cgvpfcp902ov out=True per_user=🎉:['pm6@pt-mk.test']
+[PASS] unreaction   misskey -> pt-mk   out=True
+[FAIL] renote/boost misskey -> pt-mk   B=asg9cm3ky8dmufd7 out=count=0,before=0
+[PASS] unboost      misskey -> pt-mk   out=True
+[PASS] quote        misskey -> pt-mk   Q=asg9cm58y8dmufdk local_renote_ok=True origin_sees_relation=True
+[PASS] poll+vote    misskey -> pt-mk   P=asg9cm6lfcp902oz choices={'choices': [{'text': 'alpha', 'votes': 0}, {'text': 'beta', 'votes': 1}, {'text': 'gamma', '
+[PASS] media        misskey -> pt-mk   url=http://pt-mk.test/files/asg9cnvmy8dmufe3 status=200 sha_match=True
+[PASS] followers-only misskey -> pt-mk   on_follower=True leaked_to_global=False
+[PASS] delete       misskey -> pt-mk   Dl=asg9czsxfcp902p2
+[FAIL] poll+vote      pt-ks -> akkoma  poll unresolvable on dst
+[FAIL] mention-notif misskey -> pt-ks   Mp=asg9aiknfcp902ou
+[PASS] post         misskey -> catodon A=asg9d3yhfcp902p4 uri=http://misskey.test/notes/asg9d3yhfcp902p4
+[PASS] cw           misskey -> catodon C=asg9d45wfcp902p5
+[PASS] reply        misskey -> catodon R=asg9d5yyim3800bo out=True
+[PASS] reaction     misskey -> catodon A=asg9d3yhfcp902p4 out=True per_user=🎉:['cd1@catodon.test']
+[PASS] unreaction   misskey -> catodon out=True
+[FAIL] renote/boost misskey -> catodon B=asg9d9cuim3800bq out=count=0,before=0
+[FAIL] unboost      misskey -> catodon out=count=1,before=0
+[PASS] quote        misskey -> catodon Q=asg9d9isim3800br local_renote_ok=True origin_sees_relation=True
+[PASS] poll+vote    misskey -> catodon P=asg9d9pcfcp902p7 choices={'choices': [{'text': 'alpha', 'votes': 0}, {'text': 'beta', 'votes': 1}, {'text': 'gamma', '
+[PASS] media        misskey -> catodon url=http://misskey.test/files/415ada30-c7d9-41e2-bd4e-e85f5690fa68 status=200 sha_match=True
+[PASS] followers-only misskey -> catodon on_follower=True leaked_to_global=False
+[PASS] delete       misskey -> catodon Dl=asg9dl7ifcp902pa
+[PASS] mention-notif misskey -> catodon Mp=asg9dlbkfcp902pb
+[PASS] post         misskey -> akkoma  A=asg9dn0cfcp902pc uri=http://misskey.test/notes/asg9dn0cfcp902pc
+[PASS] cw           misskey -> akkoma  C=asg9doqlfcp902pd
+[PASS] reply        misskey -> akkoma  R=BBVhm1W5grR1Pa5jAe out=True
+[PASS] reaction     misskey -> akkoma  A=asg9dn0cfcp902pc out=True per_user=❤:['ak2@akkoma.test']
+[PASS] unreaction   misskey -> akkoma  out=True
+[FAIL] renote/boost misskey -> akkoma  B=BBVhmQ5MLNuHbumETY out=count=0,before=0
+[PASS] unboost      misskey -> akkoma  out=True
+[FAIL] poll+vote      pt-mk -> akkoma  poll unresolvable on dst
+[FAIL] media          pt-ks -> akkoma  no attachment on dst copy
+[PASS] followers-only   pt-ks -> akkoma  on_follower=True leaked_to_global=False
+[PASS] delete         pt-ks -> akkoma  Dl=asg9fah3l3tti3q1
+[PASS] mention-notif   pt-ks -> akkoma  Mp=asg9fjhbl3tti3qa
+[PASS] post         catodon -> pt-ks   A=asg9fla5im3800bu uri=http://catodon.test/notes/asg9fla5im3800bu
+[FAIL] mention-notif misskey -> pt-mk   Mp=asg9d1fdfcp902p3
+[PASS] cw           catodon -> pt-ks   C=asg9fllnim3800bv
+[PASS] reply        catodon -> pt-ks   R=asg9fnjkl3tti3qp out=True
+[PASS] post         catodon -> pt-mk   A=asg9fmwkim3800bw uri=http://catodon.test/notes/asg9fmwkim3800bw
+[PASS] cw           catodon -> pt-mk   C=asg9fot0im3800bz
+[PASS] reply        catodon -> pt-mk   R=asg9fp0sy8dmufhk out=True
+[PASS] reaction     catodon -> pt-ks   A=asg9fla5im3800bu out=True per_user=🎉:['pk3@pt-ks.test']
+[PASS] reaction     catodon -> pt-mk   A=asg9fmwkim3800bw out=True per_user=🎉:['pm4@pt-mk.test']
+[PASS] unreaction   catodon -> pt-ks   out=True
+[PASS] unreaction   catodon -> pt-mk   out=True
+[FAIL] renote/boost catodon -> pt-ks   B=asg9fr0fl3tti3rf out=count=1,before=0
+[PASS] quote        misskey -> akkoma  Q=BBVhmQcKMoHJGACYrY link-quote arrived at src=True origin_sees_relation=False
+[FAIL] renote/boost catodon -> pt-mk   B=asg9fsecy8dmufi7 out=count=1,before=0
+[FAIL] unboost      catodon -> pt-ks   out=count=0,before=0
+[PASS] quote        catodon -> pt-ks   Q=asg9fub2l3tti3s2 local_renote_ok=True origin_sees_relation=True
+[FAIL] unboost      catodon -> pt-mk   out=count=0,before=0
+[PASS] quote        catodon -> pt-mk   Q=asg9fvr8y8dmufix local_renote_ok=True origin_sees_relation=True
+[PASS] poll+vote    catodon -> pt-ks   P=asg9fuk3im3800c3 choices={'choices': [{'text': 'alpha', 'votes': 0}, {'text': 'beta', 'votes': 1}, {'text': 'gamma', '
+[PASS] media        catodon -> pt-ks   url=http://pt-ks.test/files/asg9fwykl3tti3st status=200 sha_match=True
+[PASS] poll+vote    catodon -> pt-mk   P=asg9fw0mim3800c5 choices={'choices': [{'text': 'alpha', 'votes': 0}, {'text': 'beta', 'votes': 1}, {'text': 'gamma', '
+[FAIL] media          pt-mk -> akkoma  no attachment on dst copy
+[PASS] media        catodon -> pt-mk   url=http://pt-mk.test/files/asg9fy7oy8dmufjo status=200 sha_match=True
+[PASS] followers-only catodon -> pt-ks   on_follower=True leaked_to_global=False
+[PASS] delete       catodon -> pt-ks   Dl=asg9g71him3800ca
+[PASS] followers-only   pt-mk -> akkoma  on_follower=True leaked_to_global=False
+[PASS] followers-only catodon -> pt-mk   on_follower=True leaked_to_global=False
+[PASS] delete       catodon -> pt-mk   Dl=asg9gamkim3800cc
+[PASS] mention-notif catodon -> pt-mk   Mp=asg9gay2im3800cd
+[PASS] post         catodon -> misskey A=asg9gcmcim3800ce uri=http://catodon.test/notes/asg9gcmcim3800ce
+[PASS] cw           catodon -> misskey C=asg9geriim3800cf
+[PASS] reply        catodon -> misskey R=asg9ggnofcp902pm out=True
+[PASS] reaction     catodon -> misskey A=asg9gcmcim3800ce out=True per_user=🎉:['mk5@misskey.test']
+[PASS] unreaction   catodon -> misskey out=True
+[FAIL] renote/boost catodon -> misskey B=asg9gklufcp902po out=count=1,before=0
+[PASS] delete         pt-mk -> akkoma  Dl=asg9g8q0y8dmufk7
+[FAIL] unboost      catodon -> misskey out=count=0,before=0
+[PASS] quote        catodon -> misskey Q=asg9gnzbfcp902pp local_renote_ok=True origin_sees_relation=True
+[PASS] mention-notif   pt-mk -> akkoma  Mp=asg9gme5y8dmuflf
+[PASS] post         catodon -> akkoma  A=asg9go7eim3800cj uri=http://catodon.test/notes/asg9go7eim3800cj
+[PASS] cw           catodon -> akkoma  C=asg9gq19im3800ck
+[PASS] reply        catodon -> akkoma  R=BBVhz6BDfBcbdhZ0jY out=True
+[PASS] reaction     catodon -> akkoma  A=asg9go7eim3800cj out=True per_user=❤:['ak6@akkoma.test']
+[PASS] unreaction   catodon -> akkoma  out=True
+[FAIL] renote/boost catodon -> akkoma  B=BBVhzUjQNfF7mjkfNg out=count=1,before=0
+[FAIL] unboost      catodon -> akkoma  out=count=1,before=0
+[FAIL] mention-notif catodon -> pt-ks   Mp=asg9g7b8im3800cb
+[PASS] post          akkoma -> pt-ks   A=BBVi7rq6LnxrljrpLM uri=http://akkoma.test/objects/5e5519fb-4074-4c44-a4cf-82269f6dd091
+[PASS] cw            akkoma -> pt-ks   C=BBVi85B8ktWB8koJRQ
+[FAIL] reply         akkoma -> pt-ks   R=asg9iwwdl3tti3vq out=rid=None,A=BBVi7rq6LnxrljrpLM
+[PASS] quote        catodon -> akkoma  Q=BBVhzscVZ1yFsEhTvs link-quote arrived at src=True origin_sees_relation=False
+[FAIL] poll+vote    misskey -> akkoma  P=asg9ftdmfcp902ph choices=None
+[FAIL] poll+vote    catodon -> misskey P=asg9go2eim3800ci choices=None
+[PASS] media        catodon -> misskey url=http://misskey.test/files/webpublic-fb98912a-956f-4b2e-8e8f-a80fb2a3aa29 status=200 sha_match=True
+[PASS] followers-only catodon -> misskey on_follower=True leaked_to_global=False
+[PASS] delete       catodon -> misskey Dl=asg9k6z3im3800co
+[PASS] mention-notif catodon -> misskey Mp=asg9k8ogim3800cp
+[PASS] post          akkoma -> pt-mk   A=BBViEDAZxSrHf3TEK8 uri=http://akkoma.test/objects/194d7825-5458-4a15-82ee-c1d7548de4cf
+[PASS] cw            akkoma -> pt-mk   C=BBViEQRMcN0cosQJn6
+[FAIL] reply         akkoma -> pt-mk   R=asg9kdz1y8dmufno out=rid=None,A=BBViEDAZxSrHf3TEK8
+[FAIL] media        misskey -> akkoma  no attachment on dst copy
+[PASS] followers-only misskey -> akkoma  on_follower=True leaked_to_global=False
+[FAIL] reaction      akkoma -> pt-ks   A=BBVi7rq6LnxrljrpLM out=None per_user=None
+[PASS] unreaction    akkoma -> pt-ks   out=True
+[FAIL] renote/boost  akkoma -> pt-ks   B=asg9lizul3tti3xf out=count=0,before=0
+[PASS] unboost       akkoma -> pt-ks   out=True
+[PASS] quote         akkoma -> pt-ks   Q=asg9lj1nl3tti3xs local_renote_ok=True
+[PASS] poll+vote     akkoma -> pt-ks   P=BBViJY9dMfmEByZeIy choices={'choices': [{'text': 'alpha', 'votes': 0}, {'text': 'beta', 'votes': 1}, {'text': 'gamma',
+[PASS] media         akkoma -> pt-ks   url=http://pt-ks.test/files/asg9lkttl3tti3yd status=200 sha_match=True
+[PASS] followers-only  akkoma -> pt-ks   on_follower=True leaked_to_global=False
+[PASS] delete        akkoma -> pt-ks   Dl=BBViLBg3u8jF3nWTNA
+[FAIL] poll+vote    catodon -> akkoma  P=asg9iyajim3800cl choices=None
+[PASS] delete       misskey -> akkoma  Dl=asg9ldr6fcp902py
+[PASS] mention-notif misskey -> akkoma  Mp=asg9me23fcp902pz
+[PASS] post          akkoma -> misskey A=BBViNUtTQhQPEnthdA uri=http://akkoma.test/objects/5c5fe829-1900-4e67-89a8-6f04f09e714d
+[PASS] cw            akkoma -> misskey C=BBViNhVqVrFWNHwW6i
+[FAIL] reply         akkoma -> misskey R=asg9mjgsfcp902q4 out=rid=None,A=BBViNUtTQhQPEnthdA
+[FAIL] reaction      akkoma -> pt-mk   A=BBViEDAZxSrHf3TEK8 out=None per_user=None
+[PASS] unreaction    akkoma -> pt-mk   out=True
+[FAIL] renote/boost  akkoma -> pt-mk   B=asg9n06hy8dmufpq out=count=0,before=0
+[PASS] unboost       akkoma -> pt-mk   out=True
+[PASS] quote         akkoma -> pt-mk   Q=asg9n083y8dmufq3 local_renote_ok=True
+[PASS] poll+vote     akkoma -> pt-mk   P=BBViPuDUFcy0M1PI0m choices={'choices': [{'text': 'alpha', 'votes': 0}, {'text': 'beta', 'votes': 1}, {'text': 'gamma',
+[PASS] media         akkoma -> pt-mk   url=http://pt-mk.test/files/asg9n20gy8dmufqo status=200 sha_match=True
+[PASS] followers-only  akkoma -> pt-mk   on_follower=True leaked_to_global=False
+[PASS] delete        akkoma -> pt-mk   Dl=BBViRXfJ4EESzYCQtc
+[FAIL] media        catodon -> akkoma  no attachment on dst copy
+[PASS] followers-only catodon -> akkoma  on_follower=True leaked_to_global=False
+[FAIL] mention-notif  akkoma -> pt-ks   Mp=BBViLNrqa9Hmrp83PM
+[PASS] post          akkoma -> catodon A=BBViWYXFGBZh8bot0a uri=http://akkoma.test/objects/dbc20656-393e-4484-898c-2fc5e5021142
+[PASS] cw            akkoma -> catodon C=BBViWmJa1mxjsHXAeW
+[FAIL] reply         akkoma -> catodon R=asg9onj4im3800ct out=rid=None,A=BBViWYXFGBZh8bot0a
+[FAIL] reaction      akkoma -> misskey A=BBViNUtTQhQPEnthdA out=None per_user=None
+[PASS] unreaction    akkoma -> misskey out=True
+[FAIL] renote/boost  akkoma -> misskey B=asg9p5jffcp902q6 out=count=0,before=0
+[PASS] unboost       akkoma -> misskey out=True
+[PASS] quote         akkoma -> misskey Q=asg9p5mkfcp902q7 local_renote_ok=True
+[PASS] poll+vote     akkoma -> misskey P=BBViZA6EZGE4DkQbOi choices={'choices': [{'text': 'alpha', 'votes': 0}, {'text': 'beta', 'votes': 1}, {'text': 'gamma',
+[PASS] media         akkoma -> misskey url=http://misskey.test/files/webpublic-37eadd56-0de3-4451-83eb-04b0e619f23b status=200 sha_match=True
+[PASS] followers-only  akkoma -> misskey on_follower=True leaked_to_global=False
+[PASS] delete        akkoma -> misskey Dl=BBViaW6qDmcglxMH0S
+[FAIL] mention-notif  akkoma -> pt-mk   Mp=BBViRYNyO9xfE566W8
+[FAIL] reaction      akkoma -> catodon A=BBViWYXFGBZh8bot0a out=None per_user=None
+[PASS] unreaction    akkoma -> catodon out=True
+[FAIL] renote/boost  akkoma -> catodon B=asg9r9q9im3800cv out=count=0,before=0
+[FAIL] unboost       akkoma -> catodon out=count=0,before=0
+[PASS] quote         akkoma -> catodon Q=asg9r9wtim3800cw local_renote_ok=True
+[PASS] poll+vote     akkoma -> catodon P=BBViiHzObT3zIRa8Js choices={'choices': [{'text': 'alpha', 'votes': 0}, {'text': 'beta', 'votes': 1}, {'text': 'gamma',
+[PASS] media         akkoma -> catodon url=http://akkoma.test/media/5f0f56d29164ea6869c960f2985ddfa0c605ca8982799bd6a143e74b5e32868e.png status=200 sha_match=T
+[PASS] followers-only  akkoma -> catodon on_follower=True leaked_to_global=False
+[PASS] delete        akkoma -> catodon Dl=BBVijgYSkqDHm6eLuy
+[FAIL] delete       catodon -> akkoma  Dl=asg9ogl9im3800cs
+[PASS] mention-notif catodon -> akkoma  Mp=asg9rojuim3800d0
+[FAIL] mention-notif  akkoma -> misskey Mp=BBViaiHuwQc4XmdHw8
+[FAIL] mention-notif  akkoma -> catodon Mp=BBVijt5W9lmge6Cv6e
+
+=== FEATURE MATRIX (rows=feature, cols=src->dst) ===
+feature        pt>pt pt>mi pt>ca pt>ak pt>pt pt>mi pt>ca pt>ak mi>pt mi>pt mi>ca mi>ak ca>pt ca>pt ca>mi ca>ak ak>pt ak>pt ak>mi ak>ca
+cw               P     P     P     P     P     P     P     P     P     P     P     P     P     P     P     P     P     P     P     P  
+delete           P     P     P     P     P     P     P     P     P     P     P     P     P     P     P     F     P     P     P     P  
+followers-only   P     P     P     P     P     P     P     P     P     P     P     P     P     P     P     P     P     P     P     P  
+media            P     P     P     F     P     P     P     F     P     P     P     F     P     P     P     F     P     P     P     P  
+mention-notif    P     P     P     P     F     P     P     P     F     F     P     P     F     P     P     P     F     F     F     F  
+poll+vote        P     P     P     F     P     P     P     F     P     P     P     F     P     P     F     F     P     P     P     P  
+post             P     P     P     P     P     P     P     P     P     P     P     P     P     P     P     P     P     P     P     P  
+quote            P     P     P     P     P     P     P     P     P     P     P     P     P     P     P     P     P     P     P     P  
+reaction         P     P     P     P     P     P     P     P     P     P     P     P     P     P     P     P     F     F     F     F  
+renote/boost     F     F     F     F     F     F     F     F     F     F     F     F     F     F     F     F     F     F     F     F  
+reply            P     P     P     P     P     P     P     P     P     P     P     P     P     P     P     P     F     F     F     F  
+unboost          P     F     P     P     P     F     F     P     P     P     F     P     F     F     F     F     P     P     P     F  
+unreaction       P     P     P     P     P     P     P     P     P     P     P     P     P     P     P     P     P     P     P     P  
+
+260 checks, 55 failures
+ FAIL renote/boost pt-ks -> misskey B=asg98wt5fcp902nw out=count=0,before=0
+ FAIL unboost pt-ks -> misskey out=count=1,before=0
+ FAIL renote/boost pt-ks -> catodon B=asg98wwhim3800bc out=count=0,before=0
+ FAIL renote/boost pt-ks -> pt-mk B=asg98x1ry8dmuf20 out=count=0,before=0
+ FAIL renote/boost pt-ks -> akkoma B=BBVhRIKzxG2NV41Dyi out=count=0,before=0
+ FAIL renote/boost pt-mk -> pt-ks B=asg99hgfl3tti3gr out=count=0,before=0
+ FAIL renote/boost pt-mk -> misskey B=asg99huyfcp902oc out=count=0,before=0
+ FAIL unboost pt-mk -> misskey out=count=1,before=0
+ FAIL renote/boost pt-mk -> catodon B=asg99kckim3800bj out=count=0,before=0
+ FAIL unboost pt-mk -> catodon out=count=1,before=0
+ FAIL renote/boost pt-mk -> akkoma B=BBVhWDNLpa93YgSuUS out=count=0,before=0
+ FAIL renote/boost misskey -> pt-ks B=asg9a3b0l3tti3kx out=count=0,before=0
+ FAIL mention-notif pt-mk -> pt-ks Mp=asg99vd0y8dmuf9u
+ FAIL renote/boost misskey -> pt-mk B=asg9cm3ky8dmufd7 out=count=0,before=0
+ FAIL poll+vote pt-ks -> akkoma poll unresolvable on dst
+ FAIL mention-notif misskey -> pt-ks Mp=asg9aiknfcp902ou
+ FAIL renote/boost misskey -> catodon B=asg9d9cuim3800bq out=count=0,before=0
+ FAIL unboost misskey -> catodon out=count=1,before=0
+ FAIL renote/boost misskey -> akkoma B=BBVhmQ5MLNuHbumETY out=count=0,before=0
+ FAIL poll+vote pt-mk -> akkoma poll unresolvable on dst
+ FAIL media pt-ks -> akkoma no attachment on dst copy
+ FAIL mention-notif misskey -> pt-mk Mp=asg9d1fdfcp902p3
+ FAIL renote/boost catodon -> pt-ks B=asg9fr0fl3tti3rf out=count=1,before=0
+ FAIL renote/boost catodon -> pt-mk B=asg9fsecy8dmufi7 out=count=1,before=0
+ FAIL unboost catodon -> pt-ks out=count=0,before=0
+ FAIL unboost catodon -> pt-mk out=count=0,before=0
+ FAIL media pt-mk -> akkoma no attachment on dst copy
+ FAIL renote/boost catodon -> misskey B=asg9gklufcp902po out=count=1,before=0
+ FAIL unboost catodon -> misskey out=count=0,before=0
+ FAIL renote/boost catodon -> akkoma B=BBVhzUjQNfF7mjkfNg out=count=1,before=0
+ FAIL unboost catodon -> akkoma out=count=1,before=0
+ FAIL mention-notif catodon -> pt-ks Mp=asg9g7b8im3800cb
+ FAIL reply akkoma -> pt-ks R=asg9iwwdl3tti3vq out=rid=None,A=BBVi7rq6LnxrljrpLM
+ FAIL poll+vote misskey -> akkoma P=asg9ftdmfcp902ph choices=None
+ FAIL poll+vote catodon -> misskey P=asg9go2eim3800ci choices=None
+ FAIL reply akkoma -> pt-mk R=asg9kdz1y8dmufno out=rid=None,A=BBViEDAZxSrHf3TEK8
+ FAIL media misskey -> akkoma no attachment on dst copy
+ FAIL reaction akkoma -> pt-ks A=BBVi7rq6LnxrljrpLM out=None per_user=None
+ FAIL renote/boost akkoma -> pt-ks B=asg9lizul3tti3xf out=count=0,before=0
+ FAIL poll+vote catodon -> akkoma P=asg9iyajim3800cl choices=None

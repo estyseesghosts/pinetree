@@ -1,0 +1,3 @@
+pt-mk->pt-ks (pk1) post=asgbs1nzj6u1ibsp visible_after=3.1s
+misskey->pt-ks (pk1) post=asgbs41kfcp903ha visible_after=3.1s
+catodon->pt-ks (pk1) post=asgbs6fkim3800mn visible_after=3.2s

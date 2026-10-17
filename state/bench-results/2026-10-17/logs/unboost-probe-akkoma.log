@@ -1,0 +1,8 @@
+[before-undo] pt-ks renoteCount=1 notes/renotes(status=200)=[('ak6', 'akkoma.test')]
+[wrapper GET] status=200 id=BBVqgRDC8t4QxCfFoG reblog.id=BBVqfd9aG2TNhWafEu account=ak6 uri=http://pt-ks.test/notes/asgcxxn689m520v2
+[DELETE wrapper] status=404 body={'error': 'Record not found'}
+[after-DELETE-wrapper+30s] pt-ks renoteCount=1 notes/renotes(status=200)=[('ak6', 'akkoma.test')]
+[reblog by ak1] status=200 wrapper2=BBVspBLEiVcoFPisxE
+[after-reblog] pt-ks renoteCount=1 notes/renotes(status=200)=[('ak6', 'akkoma.test')]
+[POST unreblog] status=200 body={'reblog': None, 'url': 'http://pt-ks.test/notes/asgcxxn689m520v2', 'id': 'BBVqfd9aG2TNhWafEu', 'favourited': False, 'spoiler_text': '', 'content': '<p>FTR|post|pt-ks|akkoma|265543</p>', 'edited_at': 
+[after-unreblog+30s] pt-ks renoteCount=1 notes/renotes(status=200)=[('ak6', 'akkoma.test')]

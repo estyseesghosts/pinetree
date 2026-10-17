@@ -1,0 +1,3 @@
+s6 tag S6R268816
+S6: {"deleted": 10, "reaction_rtt_s": {"n": 40, "p50": 1.01, "max": 3.01}, "residue": {"pt-ks": 4, "pt-mk": 4, "misskey": 2, "catodon": 2, "akkoma": 6}}
+S6_RERUN_DONE /tmp/opencode/bench-rerun/logs/s6-rerun.json

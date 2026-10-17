@@ -1,0 +1,34 @@
+ Network pinetree-interop_default Creating 
+ Network pinetree-interop_default Creating 
+ Network pinetree-interop_default Created 
+ Network pinetree-interop_default Created 
+ Container pinetree-interop-redis-1 Creating 
+ Container pinetree-interop-postgres-1 Creating 
+ Container pinetree-interop-postgres-1 Created 
+ Container pinetree-interop-redis-1 Created 
+ Container pinetree-interop-postgres-1 Starting 
+ Container pinetree-interop-redis-1 Starting 
+ Container pinetree-interop-postgres-1 Started 
+ Container pinetree-interop-redis-1 Started 
+[interop] migrating misskey + sharkey...
+[interop] waiting for servers (Sharkey/Misskey boots are slow)...
+[interop] creating accounts...
+[interop] running tests/federation_interop.rs...
+10 | use axum::http::{HeaderMap, HeaderName, HeaderValue};
+13 | use rsa::pkcs1v15::{Signature, SigningKey, VerifyingKey};
+29 | use crate::application::ports::{Clock, CreateNoteInput, PortError, TimelineCursor, UpdateAccountPatch};
+491 |             | "YOUR_ACCOUNT_MOVED"
+492 |             | "YOUR_ACCOUNT_MOVED"
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.32s
+     Running tests/federation_interop.rs (/root/pinetree-target/debug/deps/federation_interop-10804e5dc543c4b7)
+running 1 test
+INTEROP_OK
+test federation_interop_four_servers ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.36s
+SMOKE_OK
+scripts/smoke-phase2.sh: line 75: 129345 Killed                     env "${envs[@]}" setsid "$@" > "$WORK/$name.log" 2>&1
+scripts/smoke-phase2.sh: line 75: 129312 Killed                     env "${envs[@]}" setsid "$@" > "$WORK/$name.log" 2>&1
+scripts/smoke-phase2.sh: line 75: 129370 Killed                     env "${envs[@]}" setsid "$@" > "$WORK/$name.log" 2>&1
+scripts/smoke-phase2.sh: line 75: 129331 Killed                     env "${envs[@]}" setsid "$@" > "$WORK/$name.log" 2>&1
+scripts/smoke-phase2.sh: line 75: 129388 Killed                     env "${envs[@]}" setsid "$@" > "$WORK/$name.log" 2>&1
+PHASE2_EXIT=0

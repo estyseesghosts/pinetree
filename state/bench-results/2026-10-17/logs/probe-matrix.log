@@ -1,0 +1,19 @@
+R1: 30 probes posted in 1s
+R2: 120 pair-checks in 3s, 0 failures
+
+=== PROBE MATRIX (rows=src, cols=dst, ok/FAIL) ===
+src        pt-ks   pt-mk  misske  catodo  akkoma 
+pt-ks        -      ok      ok      ok      ok   
+pt-mk       ok       -      ok      ok      ok   
+misskey     ok      ok       -      ok      ok   
+catodon     ok      ok      ok       -      ok   
+akkoma      ok      ok      ok      ok       -   
+
+=== HOME FEED CENSUS (markers per source, user#1, 32 pages) ===
+pt-ks     items= 960  akkoma:230  catodon:265  misskey:194  pt-ks:13  pt-mk:258
+pt-mk     items= 960  akkoma:230  catodon:265  misskey:195  pt-ks:252  pt-mk:13
+misskey   items= 960  akkoma:247  catodon:224  misskey:22  pt-ks:247  pt-mk:157
+catodon   items= 960  akkoma:257  catodon:32  misskey:67  pt-ks:263  pt-mk:246
+akkoma    items= 960  akkoma:40  catodon:265  misskey:149  pt-ks:247  pt-mk:254
+
+PROBES_DONE

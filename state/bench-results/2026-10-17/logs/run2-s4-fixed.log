@@ -1,0 +1,28 @@
+S4 tag=M266699 uploaded=60 in 6.0s
+  akkoma->catodon    ok=3 bad=0 attach_wait p50=0.09s max=0.11s 
+  akkoma->misskey    ok=3 bad=0 attach_wait p50=0.03s max=0.04s 
+  akkoma->pt-ks      ok=3 bad=0 attach_wait p50=0.0s max=0.01s 
+  akkoma->pt-mk      ok=3 bad=0 attach_wait p50=0.0s max=0.0s 
+  catodon->akkoma    ok=0 bad=3  ['no-attachment-60s', 'no-attachment-60s', 'no-attachment-60s']
+  catodon->misskey   ok=3 bad=0 attach_wait p50=0.02s max=0.04s 
+  catodon->pt-ks     ok=3 bad=0 attach_wait p50=0.0s max=0.0s 
+  catodon->pt-mk     ok=3 bad=0 attach_wait p50=0.0s max=0.0s 
+  misskey->akkoma    ok=0 bad=3  ['no-attachment-60s', 'no-attachment-60s', 'no-attachment-60s']
+  misskey->catodon   ok=3 bad=0 attach_wait p50=0.08s max=0.12s 
+  misskey->pt-ks     ok=3 bad=0 attach_wait p50=0.0s max=0.0s 
+  misskey->pt-mk     ok=3 bad=0 attach_wait p50=0.0s max=0.0s 
+  pt-ks->akkoma      ok=0 bad=3  ['no-attachment-60s', 'no-attachment-60s', 'no-attachment-60s']
+  pt-ks->catodon     ok=3 bad=0 attach_wait p50=0.1s max=0.1s 
+  pt-ks->misskey     ok=3 bad=0 attach_wait p50=0.04s max=0.12s 
+  pt-ks->pt-mk       ok=3 bad=0 attach_wait p50=0.01s max=1.02s 
+  pt-mk->akkoma      ok=0 bad=3  ['no-attachment-60s', 'no-attachment-60s', 'no-attachment-60s']
+  pt-mk->catodon     ok=3 bad=0 attach_wait p50=0.06s max=0.08s 
+  pt-mk->misskey     ok=3 bad=0 attach_wait p50=0.03s max=0.04s 
+  pt-mk->pt-ks       ok=3 bad=0 attach_wait p50=0.0s max=0.01s 
+VERDICT (excl. akkoma dst): 48/48 verified
+akkoma-dst (reported, excluded): ok=0 bad=12
+Traceback (most recent call last):
+  File "/tmp/opencode/bench-rerun/s4_fixed.py", line 107, in <module>
+    json.dump(out, open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs", "s4-fixed.json"), "w"), indent=1)
+                   ~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: '/tmp/opencode/bench-rerun/../logs/s4-fixed.json'

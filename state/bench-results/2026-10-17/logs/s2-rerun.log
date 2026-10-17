@@ -1,0 +1,3 @@
+S2: 8 targets
+S2: {"targets": 8, "reactions_attempted": 106, "reactions_resolved": 79, "verify_wait_s": 90, "shortfall_n": 0, "shortfall": {}, "undo_ok": 79, "undo_fail": 0, "residue_after_undo": {}, "wall_s": 398.3}
+S2_RERUN_DONE /tmp/opencode/bench-rerun/logs/s2-rerun.json

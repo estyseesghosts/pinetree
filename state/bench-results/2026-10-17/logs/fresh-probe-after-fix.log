@@ -1,0 +1,10 @@
+akkoma fresh status=BBVv6bfGIlR4iaWgTI uri=http://akkoma.test/objects/2a4c62fb-7d10-4119-ac9c-31ccee56d5fe
+pt-mk local id=asgepuke4xay4uaz (ap/show status 200)
+[heart] react status=204
+[heart] akkoma lists pm1 as favourite: True favs=['pm1@pt-mk.test']
+[heart] undo status=204
+[heart] akkoma pm1 gone after undo: True favs=[]
+[party] react status=204 (🎉 count before=0)
+[party] akkoma 🎉 count rose: True now=1
+[party] undo status=204
+[party] akkoma 🎉 count back to 0: True now=0

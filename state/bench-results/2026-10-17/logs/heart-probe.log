@@ -1,0 +1,10 @@
+akkoma=BBVixiipUfRcYCBurY pt-mk local=asg9uvtwy8dmuhro
+akkoma favs before: ['pm3@pt-mk.test', 'pm4@pt-mk.test', 'pm2@pt-mk.test']
+[❤] reactions/create status=204
+[❤] akkoma shows pm1 after react: True favs=['pm3@pt-mk.test', 'pm4@pt-mk.test', 'pm1@pt-mk.test', 'pm2@pt-mk.test']
+[❤] reactions/delete status=204
+[❤] akkoma pm1 gone after undo: False favs=['pm3@pt-mk.test', 'pm4@pt-mk.test', 'pm1@pt-mk.test', 'pm2@pt-mk.test']
+[🎉] reactions/create status=204
+[🎉] akkoma shows pm1 after react: True favs=['pm3@pt-mk.test', 'pm4@pt-mk.test', 'pm1@pt-mk.test', 'pm2@pt-mk.test']
+[🎉] reactions/delete status=204
+[🎉] akkoma pm1 gone after undo: False favs=['pm3@pt-mk.test', 'pm4@pt-mk.test', 'pm1@pt-mk.test', 'pm2@pt-mk.test']

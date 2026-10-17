@@ -1,0 +1,3 @@
+pt-mk->pt-ks (pk1) post=asgb5np0y8dmul07 visible_after=NOT within 240s
+misskey->pt-ks (pk1) post=asgbauqqfcp903h9 visible_after=NOT within 240s
+catodon->pt-ks (pk1) post=asgbg1uuim3800mm visible_after=NOT within 240s

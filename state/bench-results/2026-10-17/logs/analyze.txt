@@ -1,0 +1,118 @@
+== FEATURE MATRIX (features.json)
+  post             all 20/20   excl-akkoma 12/12
+  cw               all 20/20   excl-akkoma 12/12
+  reply            all 16/20   excl-akkoma 12/12
+  reaction         all 16/20   excl-akkoma 12/12
+  unreaction       all 20/20   excl-akkoma 12/12
+  renote/boost     all  0/20   excl-akkoma  0/12
+  unboost          all 11/20   excl-akkoma  5/12
+  quote            all 20/20   excl-akkoma 12/12
+  poll+vote        all 15/20   excl-akkoma 11/12
+  media            all 16/20   excl-akkoma 12/12
+  followers-only   all 20/20   excl-akkoma 12/12
+  delete           all 19/20   excl-akkoma 12/12
+  mention-notif    all 12/20   excl-akkoma  8/12
+  TOTAL all 205/260   excl-akkoma 132/156
+  failing pairs: 55
+    FAIL renote/boost      pt-ks -> misskey  B=asg98wt5fcp902nw out=count=0,before=0
+    FAIL unboost           pt-ks -> misskey  out=count=1,before=0
+    FAIL renote/boost      pt-ks -> catodon  B=asg98wwhim3800bc out=count=0,before=0
+    FAIL renote/boost      pt-ks -> pt-mk    B=asg98x1ry8dmuf20 out=count=0,before=0
+    FAIL renote/boost      pt-ks -> akkoma   B=BBVhRIKzxG2NV41Dyi out=count=0,before=0
+    FAIL renote/boost      pt-mk -> pt-ks    B=asg99hgfl3tti3gr out=count=0,before=0
+    FAIL renote/boost      pt-mk -> misskey  B=asg99huyfcp902oc out=count=0,before=0
+    FAIL unboost           pt-mk -> misskey  out=count=1,before=0
+    FAIL renote/boost      pt-mk -> catodon  B=asg99kckim3800bj out=count=0,before=0
+    FAIL unboost           pt-mk -> catodon  out=count=1,before=0
+    FAIL renote/boost      pt-mk -> akkoma   B=BBVhWDNLpa93YgSuUS out=count=0,before=0
+    FAIL renote/boost    misskey -> pt-ks    B=asg9a3b0l3tti3kx out=count=0,before=0
+    FAIL mention-notif     pt-mk -> pt-ks    Mp=asg99vd0y8dmuf9u
+    FAIL renote/boost    misskey -> pt-mk    B=asg9cm3ky8dmufd7 out=count=0,before=0
+    FAIL poll+vote         pt-ks -> akkoma   poll unresolvable on dst
+    FAIL mention-notif   misskey -> pt-ks    Mp=asg9aiknfcp902ou
+    FAIL renote/boost    misskey -> catodon  B=asg9d9cuim3800bq out=count=0,before=0
+    FAIL unboost         misskey -> catodon  out=count=1,before=0
+    FAIL renote/boost    misskey -> akkoma   B=BBVhmQ5MLNuHbumETY out=count=0,before=0
+    FAIL poll+vote         pt-mk -> akkoma   poll unresolvable on dst
+    FAIL media             pt-ks -> akkoma   no attachment on dst copy
+    FAIL mention-notif   misskey -> pt-mk    Mp=asg9d1fdfcp902p3
+    FAIL renote/boost    catodon -> pt-ks    B=asg9fr0fl3tti3rf out=count=1,before=0
+    FAIL renote/boost    catodon -> pt-mk    B=asg9fsecy8dmufi7 out=count=1,before=0
+    FAIL unboost         catodon -> pt-ks    out=count=0,before=0
+    FAIL unboost         catodon -> pt-mk    out=count=0,before=0
+    FAIL media             pt-mk -> akkoma   no attachment on dst copy
+    FAIL renote/boost    catodon -> misskey  B=asg9gklufcp902po out=count=1,before=0
+    FAIL unboost         catodon -> misskey  out=count=0,before=0
+    FAIL renote/boost    catodon -> akkoma   B=BBVhzUjQNfF7mjkfNg out=count=1,before=0
+    FAIL unboost         catodon -> akkoma   out=count=1,before=0
+    FAIL mention-notif   catodon -> pt-ks    Mp=asg9g7b8im3800cb
+    FAIL reply            akkoma -> pt-ks    R=asg9iwwdl3tti3vq out=rid=None,A=BBVi7rq6LnxrljrpLM
+    FAIL poll+vote       misskey -> akkoma   P=asg9ftdmfcp902ph choices=None
+    FAIL poll+vote       catodon -> misskey  P=asg9go2eim3800ci choices=None
+    FAIL reply            akkoma -> pt-mk    R=asg9kdz1y8dmufno out=rid=None,A=BBViEDAZxSrHf3TEK8
+    FAIL media           misskey -> akkoma   no attachment on dst copy
+    FAIL reaction         akkoma -> pt-ks    A=BBVi7rq6LnxrljrpLM out=None per_user=None
+    FAIL renote/boost     akkoma -> pt-ks    B=asg9lizul3tti3xf out=count=0,before=0
+    FAIL poll+vote       catodon -> akkoma   P=asg9iyajim3800cl choices=None
+    FAIL reply            akkoma -> misskey  R=asg9mjgsfcp902q4 out=rid=None,A=BBViNUtTQhQPEnthdA
+    FAIL reaction         akkoma -> pt-mk    A=BBViEDAZxSrHf3TEK8 out=None per_user=None
+    FAIL renote/boost     akkoma -> pt-mk    B=asg9n06hy8dmufpq out=count=0,before=0
+    FAIL media           catodon -> akkoma   no attachment on dst copy
+    FAIL mention-notif    akkoma -> pt-ks    Mp=BBViLNrqa9Hmrp83PM
+    FAIL reply            akkoma -> catodon  R=asg9onj4im3800ct out=rid=None,A=BBViWYXFGBZh8bot0a
+    FAIL reaction         akkoma -> misskey  A=BBViNUtTQhQPEnthdA out=None per_user=None
+    FAIL renote/boost     akkoma -> misskey  B=asg9p5jffcp902q6 out=count=0,before=0
+    FAIL mention-notif    akkoma -> pt-mk    Mp=BBViRYNyO9xfE566W8
+    FAIL reaction         akkoma -> catodon  A=BBViWYXFGBZh8bot0a out=None per_user=None
+    FAIL renote/boost     akkoma -> catodon  B=asg9r9q9im3800cv out=count=0,before=0
+    FAIL unboost          akkoma -> catodon  out=count=0,before=0
+    FAIL delete          catodon -> akkoma   Dl=asg9ogl9im3800cs
+    FAIL mention-notif    akkoma -> misskey  Mp=BBViaiHuwQc4XmdHw8
+    FAIL mention-notif    akkoma -> catodon  Mp=BBVijt5W9lmge6Cv6e
+
+== PROBE MATRIX (probes.json)
+  probe_fails=0
+  fails by dst: {}
+
+== STRESS (stress.json) tag=S260332 wall_total_s=2074.7
+== S1 post storm
+  created=900 create_failures=0 wall_s=31.1 p50/p95/p99 ms=156.7/856.1/2727.8
+  fed latency p50/p95/max s = 4.33/48.41/50.88
+  +15s:
+    pt-ks    markers= 677/720  dupes_legacy=  0  dupes_post_restart=0  dupes_this_run=0  items=960
+    pt-mk    markers= 720/720  dupes_legacy=  0  dupes_post_restart=0  dupes_this_run=0  items=960
+    misskey  markers= 708/720  dupes_legacy=  0  dupes_post_restart=0  dupes_this_run=0  items=960
+    catodon  markers= 720/720  dupes_legacy=  0  dupes_post_restart=0  dupes_this_run=0  items=960
+    akkoma   markers= 720/720  dupes_legacy=  0  dupes_post_restart=0  dupes_this_run=0  items=960
+  +60s:
+    pt-ks    markers= 720/720  dupes_legacy=  0  dupes_post_restart=0  dupes_this_run=0  items=960
+    pt-mk    markers= 720/720  dupes_legacy=  0  dupes_post_restart=0  dupes_this_run=0  items=960
+    misskey  markers= 708/720  dupes_legacy=  0  dupes_post_restart=0  dupes_this_run=0  items=960
+    catodon  markers= 720/720  dupes_legacy=  0  dupes_post_restart=0  dupes_this_run=0  items=960
+    akkoma   markers= 720/720  dupes_legacy=  0  dupes_post_restart=0  dupes_this_run=0  items=960
+  +180s:
+    pt-ks    markers= 720/720  dupes_legacy=  0  dupes_post_restart=0  dupes_this_run=0  items=960
+    pt-mk    markers= 720/720  dupes_legacy=  0  dupes_post_restart=0  dupes_this_run=0  items=960
+    misskey  markers= 708/720  dupes_legacy=  0  dupes_post_restart=0  dupes_this_run=0  items=960
+    catodon  markers= 720/720  dupes_legacy=  0  dupes_post_restart=0  dupes_this_run=0  items=960
+    akkoma   markers= 720/720  dupes_legacy=  0  dupes_post_restart=0  dupes_this_run=0  items=960
+== S2 reactions
+  {"targets": 30, "reactions_attempted": 205, "reactions_resolved": 180, "verify_wait_s": 90, "shortfall_n": 3, "undo_ok": 180, "undo_fail": 0, "residue_after_undo": {"BBViwkUZQYO5kb3gJ7": 3, "BBVix7EkrWP2ICpsLg": 3, "BBVixHmndnZr0gqCno": 3, "BBVixRRBl0ESwYo5VQ": 4, "BBVixZxO5Ak3Mjvunw": 3, "BBVixiipUfRcYCBurY": 3}, "wall_s": 654.9}
+  shortfall_n=3 {"BBViwkUZQYO5kb3gJ7": [7, 8], "BBVixRRBl0ESwYo5VQ": [7, 8], "BBVixiipUfRcYCBurY": [5, 6]}
+== S3 polls
+  polls=25 attempted=122 ok(200|204)=98 shortfall_n=5
+    origin pt-ks    attempts(non-akkoma voters)= 19 ok= 19 tallied= 19  EXACT
+    origin pt-mk    attempts(non-akkoma voters)= 17 ok= 17 tallied= 17  EXACT
+    origin misskey  attempts(non-akkoma voters)= 20 ok= 20 tallied= 20  EXACT
+    origin catodon  attempts(non-akkoma voters)= 19 ok= 19 tallied= 11  short by 8
+    origin akkoma   attempts(non-akkoma voters)= 23 ok= 23 tallied= 23  EXACT
+== S4 media
+  uploads=60 verified_ok=0 bad=[['pt-ks', 'pt-mk', 'no-attachment-60s'], ['pt-ks', 'pt-mk', 'no-attachment-60s'], ['pt-ks', 'pt-mk', 'no-attachment-60s'], ['pt-ks', 'pt-mk', 'no-attachment-60s'], ['pt-ks', 'pt-mk', 'no-attachment-60s'], ['pt-ks', 'pt-mk', 'no-attachment-60s'], ['pt-ks', 'pt-mk', 'no-attachment-60s'], ['pt-ks', 'pt-mk', 'no-attachment-60s'], ['pt-ks', 'pt-mk', 'no-attachment-60s'], ['pt-ks', 'pt-mk', 'no-attachment-60s']]
+  by_dst={'pt-mk': {'ok': 0, 'bad': 12}, 'pt-ks': {'ok': 0, 'bad': 36}, 'misskey': {'ok': 0, 'bad': 12}}
+  attach_wait_s={'n': 0, 'p50': None, 'max': None}
+== S5 replies
+  replies=284 sampled=60 ok=60 bad=[]
+== S6 churn
+  deleted=10 residue={'pt-ks': 1, 'pt-mk': 1, 'misskey': 1, 'catodon': 1, 'akkoma': 3} reaction_rtt_s={'n': 40, 'p50': 1.02, 'max': 3.02}
+== S7 big text
+  {'pt-ks': 'ok', 'pt-mk': 'ok', 'misskey': 'ok', 'catodon': 'ok', 'akkoma': 'ok'}

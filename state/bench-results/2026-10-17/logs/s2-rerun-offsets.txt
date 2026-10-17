@@ -1,0 +1,6 @@
+pre-s2-rerun offsets 2026-10-17T20:00:03Z
+  155854 /tmp/pinetree-bench/logs/pt-ks.log
+  154079 /tmp/pinetree-bench/logs/pt-mk.log
+36337634 /tmp/pinetree-bench/logs/misskey.log
+50463722 /tmp/pinetree-bench/logs/catodon.log
+87111289 total

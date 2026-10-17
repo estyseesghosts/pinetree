@@ -1,0 +1,136 @@
+======================================================================
+[smoke-all] STEP: cargo test (unit + contract + integration) (live output follows)
+======================================================================
+test mastodon_fep044f_shape_detects_target_and_stamp_iri_without_approving ... ok
+test real_fixture_files_normalize ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/streaming.rs (/root/pinetree-target/debug/deps/streaming-4aaef982d092306b)
+
+running 13 tests
+test bad_and_scoped_tokens_are_rejected_at_upgrade ... ok
+test bearer_header_auth_and_pong_connected ... ok
+test anonymous_global_timeline_streams_public_notes ... ok
+test main_channel_gets_follow_followed_and_notification ... ok
+test credential_channels_need_auth_and_unknown_channels_error ... ok
+test note_capture_gets_reacted_unreacted_deleted ... ok
+test main_reply_renote_unfollow_events ... ok
+test me_updated_and_read_notification_round_trip ... ok
+test followers_only_notes_skip_non_followers_on_global ... ok
+test local_and_hybrid_channels_deliver ... ok
+test home_timeline_only_streams_followed_authors ... ok
+test disconnect_and_unsubscribe_go_silent ... ok
+test specified_capture_gate ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.30s
+
+   Doc-tests pinetree
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[smoke-all] DONE: cargo test (unit + contract + integration) (14s)
+======================================================================
+[smoke-all] STEP: smoke-phase1 (core flows, misskey-js) (live output follows)
+======================================================================
+[smoke] checking --mode=cluster refusal...
+[smoke] cluster refusal OK (exit 1)
+[smoke] checking create-account CLI...
+[smoke] create-account OK: created account cli_admin id=asgesb93xecdno0w
+[smoke] server up at http://127.0.0.1:34319 (pid 4181589)
+[smoke1] meta
+[smoke1] username/available (free)
+[smoke1] signup alice + bob
+[smoke1] miauth alice + bob
+[smoke1] i + i/update
+[smoke1] drive/files/create + GET /files/:id
+[smoke1] notes/create
+[smoke1] notes/show
+[smoke1] following/create
+[smoke1] timelines
+[smoke1] notes/reactions/create
+[smoke1] OK
+[smoke] restarting server with SIGKILL on the same --data-dir...
+[smoke] server up at http://127.0.0.1:34319 (pid 4181662)
+[smoke2] OK
+SMOKE_OK
+[smoke-all] DONE: smoke-phase1 (core flows, misskey-js) (1s)
+======================================================================
+[smoke-all] STEP: smoke-phase3 (profile REST + streaming, misskey-js) (live output follows)
+======================================================================
+[smoke3] server up at http://127.0.0.1:34136 (pid 4181698)
+[smoke3] notes/create graph (post, reply, renote, quote)
+[smoke3] users/notes
+[smoke3] notes/replies|renotes|children|conversation
+[smoke3] notes/unrenote
+[smoke3] users/followers|following (Following[] shape)
+[smoke3] drive/files (+show/update/delete)
+[smoke3] i/notifications + mark-all-as-read
+[smoke3] notes/search + search-by-tag
+[smoke3] error shapes
+[smoke3] stream: globalTimeline note delivery
+[smoke3] stream: main mention + noteUpdated capture
+[smoke3] i/revoke-token
+SMOKE3_OK
+[smoke-all] DONE: smoke-phase3 (profile REST + streaming, misskey-js) (2s)
+======================================================================
+[smoke-all] STEP: keystone-sweep (Keystone calls, 38 checks) (live output follows)
+======================================================================
+[PASS] meta public
+[PASS] i returns me
+[PASS] bad token 401
+[PASS] i/update name
+[PASS] users/show by id
+[PASS] users/show by username
+[PASS] users/search
+[PASS] notes/create post
+[PASS] notes/create reply
+[PASS] notes/create repost
+[PASS] notes/show public
+[PASS] users/notes
+[PASS] users/notes untilId
+[PASS] notes/replies
+[PASS] reactions/create 204
+[PASS] myReaction reflected
+[PASS] reactions/delete 204
+[PASS] notes/timeline
+[PASS] notes/local-timeline
+[PASS] notes/global-timeline
+[PASS] notes/search
+[PASS] notes/search-by-tag
+[PASS] following/create
+[PASS] users/followers Following[] shape
+       NOTE: Keystone Profile.tsx types this as UserLite[]; the profile fixes the Misskey
+       Following[] shape — Keystone must map x.follower!/x.followee! (own-repo follow-up).
+[PASS] users/following
+[PASS] following/requests/cancel
+[PASS] following/delete
+[PASS] i/notifications has follow
+[PASS] i/notifications newest-first
+[PASS] mention notification lands
+[PASS] i/notifications untilId pagination
+[PASS] mark-all-as-read
+[PASS] drive/files list
+[PASS] drive multipart upload
+[PASS] drive/files type filter
+[PASS] drive/files/update
+[PASS] drive/files/delete
+[PASS] notes/unrenote
+[PASS] notes/delete own
+[PASS] antennas/list 404
+[PASS] i/revoke-token kills caller only
+
+KEYSWEEP: 41 passed, 0 failed
+KEYSWEEP_OK
+[smoke-all] DONE: keystone-sweep (Keystone calls, 38 checks) (1s)
+[smoke-all] SKIP: smoke-phase2 (four-server federation) — SMOKE_ALL_SKIP_PHASE2=1
+======================================================================
+[smoke-all] RESULTS:
+[smoke-all]   PASS  cargo test (unit + contract + integration) (14s)
+[smoke-all]   PASS  smoke-phase1 (core flows, misskey-js) (1s)
+[smoke-all]   PASS  smoke-phase3 (profile REST + streaming, misskey-js) (2s)
+[smoke-all]   PASS  keystone-sweep (Keystone calls, 38 checks) (1s)
+[smoke-all]   SKIP  smoke-phase2 (four-server federation) — SMOKE_ALL_SKIP_PHASE2=1
+[smoke-all] SMOKE_ALL_OK (18s total)

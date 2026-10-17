@@ -1,0 +1,6 @@
+misskey note asgf6tu9fcp903rx http://misskey.test/notes/asgf6tu9fcp903rx
+pt-ks stored: asgf6tvmqdin6af8
+pt-mk stored: asgf6tvw4xay4uih
+misskey notes/delete status 204
+pt-ks notes/show asgf6tvmqdin6af8: status=400 text=None
+pt-mk notes/show asgf6tvw4xay4uih: status=400 text=None
