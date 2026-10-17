@@ -1,0 +1,2082 @@
+[
+ {
+  "feature": "post",
+  "src": "pt-ks",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "A=asf8rhqvignk99x4 uri=http://pt-ks.test/notes/asf8rhqvignk99x4",
+  "secs": 2.1
+ },
+ {
+  "feature": "post",
+  "src": "pt-ks",
+  "dst": "misskey",
+  "ok": true,
+  "detail": "A=asf8rhqzignk99xa uri=http://pt-ks.test/notes/asf8rhqzignk99xa",
+  "secs": 2.3
+ },
+ {
+  "feature": "post",
+  "src": "pt-ks",
+  "dst": "akkoma",
+  "ok": true,
+  "detail": "A=asf8rhqxignk99x7 uri=http://pt-ks.test/notes/asf8rhqxignk99x7",
+  "secs": 2.3
+ },
+ {
+  "feature": "post",
+  "src": "pt-ks",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "A=asf8rhr2ignk99xd uri=http://pt-ks.test/notes/asf8rhr2ignk99xd",
+  "secs": 2.5
+ },
+ {
+  "feature": "cw",
+  "src": "pt-ks",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "C=asf8rjbsignk99xi",
+  "secs": 2.0
+ },
+ {
+  "feature": "reply",
+  "src": "pt-ks",
+  "dst": "pt-mk",
+  "ok": false,
+  "detail": "R=asf8rkwreqkybsmf out=rid=None,A=asf8rhqvignk99x4",
+  "secs": 0.0
+ },
+ {
+  "feature": "cw",
+  "src": "pt-ks",
+  "dst": "misskey",
+  "ok": true,
+  "detail": "C=asf8rjhyignk99xn",
+  "secs": 2.1
+ },
+ {
+  "feature": "reply",
+  "src": "pt-ks",
+  "dst": "misskey",
+  "ok": false,
+  "detail": "R=asf8rl4tfcp90081 out=rid=None,A=asf8rhqzignk99xa",
+  "secs": 0.1
+ },
+ {
+  "feature": "cw",
+  "src": "pt-ks",
+  "dst": "akkoma",
+  "ok": true,
+  "detail": "C=asf8rjj5ignk99xs",
+  "secs": 2.3
+ },
+ {
+  "feature": "cw",
+  "src": "pt-ks",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "C=asf8rjorignk99xx",
+  "secs": 2.3
+ },
+ {
+  "feature": "reply",
+  "src": "pt-ks",
+  "dst": "akkoma",
+  "ok": false,
+  "detail": "R=BBUEIWnLk445u4msfw out=rid=None,A=asf8rhqxignk99x7",
+  "secs": 0.3
+ },
+ {
+  "feature": "reply",
+  "src": "pt-ks",
+  "dst": "catodon",
+  "ok": false,
+  "detail": "R=asf8rlinmg56013z out=rid=None,A=asf8rhr2ignk99xd",
+  "secs": 0.3
+ },
+ {
+  "feature": "reaction",
+  "src": "pt-ks",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "A=asf8rhqvignk99x4 out=True per_user=None",
+  "secs": 2.0
+ },
+ {
+  "feature": "unreaction",
+  "src": "pt-ks",
+  "dst": "pt-mk",
+  "ok": false,
+  "detail": "out=remaining={'\ud83c\udf89': 1}",
+  "secs": 0.0
+ },
+ {
+  "feature": "renote/boost",
+  "src": "pt-ks",
+  "dst": "pt-mk",
+  "ok": false,
+  "detail": "B=asf8rmi1eqkybsnr out=count=0,before=0",
+  "secs": 0.0
+ },
+ {
+  "feature": "unboost",
+  "src": "pt-ks",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "out=True",
+  "secs": 0.0
+ },
+ {
+  "feature": "reaction",
+  "src": "pt-ks",
+  "dst": "misskey",
+  "ok": true,
+  "detail": "A=asf8rhqzignk99xa out=True per_user=None",
+  "secs": 2.0
+ },
+ {
+  "feature": "unreaction",
+  "src": "pt-ks",
+  "dst": "misskey",
+  "ok": false,
+  "detail": "out=remaining={'\ud83c\udf89': 1}",
+  "secs": 0.0
+ },
+ {
+  "feature": "renote/boost",
+  "src": "pt-ks",
+  "dst": "misskey",
+  "ok": false,
+  "detail": "B=asf8rmskfcp90083 out=count=0,before=0",
+  "secs": 0.0
+ },
+ {
+  "feature": "unboost",
+  "src": "pt-ks",
+  "dst": "misskey",
+  "ok": false,
+  "detail": "out=count=1,before=0",
+  "secs": 0.0
+ },
+ {
+  "feature": "quote",
+  "src": "pt-ks",
+  "dst": "misskey",
+  "ok": true,
+  "detail": "Q=asf8rmucfcp90084 local_renote_ok=True origin_sees_relation=True",
+  "secs": 0.1
+ },
+ {
+  "feature": "reaction",
+  "src": "pt-ks",
+  "dst": "akkoma",
+  "ok": true,
+  "detail": "A=asf8rhqxignk99x7 out=True per_user=None",
+  "secs": 2.1
+ },
+ {
+  "feature": "unreaction",
+  "src": "pt-ks",
+  "dst": "akkoma",
+  "ok": false,
+  "detail": "out=remaining={'\u2764': 1}",
+  "secs": 0.1
+ },
+ {
+  "feature": "renote/boost",
+  "src": "pt-ks",
+  "dst": "akkoma",
+  "ok": false,
+  "detail": "B=BBUEIjuYyYYkaDGKDw out=count=0,before=0",
+  "secs": 0.1
+ },
+ {
+  "feature": "unboost",
+  "src": "pt-ks",
+  "dst": "akkoma",
+  "ok": true,
+  "detail": "out=True",
+  "secs": 0.0
+ },
+ {
+  "feature": "reaction",
+  "src": "pt-ks",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "A=asf8rhr2ignk99xd out=True per_user=None",
+  "secs": 2.1
+ },
+ {
+  "feature": "unreaction",
+  "src": "pt-ks",
+  "dst": "catodon",
+  "ok": false,
+  "detail": "out=remaining={'\ud83c\udf89': 1}",
+  "secs": 0.0
+ },
+ {
+  "feature": "renote/boost",
+  "src": "pt-ks",
+  "dst": "catodon",
+  "ok": false,
+  "detail": "B=asf8rnbmmg560148 out=count=0,before=0",
+  "secs": 0.1
+ },
+ {
+  "feature": "unboost",
+  "src": "pt-ks",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "out=True",
+  "secs": 0.1
+ },
+ {
+  "feature": "quote",
+  "src": "pt-ks",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "Q=asf8rnh1mg56014a local_renote_ok=True origin_sees_relation=True",
+  "secs": 0.2
+ },
+ {
+  "feature": "poll+vote",
+  "src": "pt-ks",
+  "dst": "misskey",
+  "ok": true,
+  "detail": "P=asf8rmw8ignk9a0c choices={'choices': [{'text': 'alpha', 'votes': 0}, {'text': 'beta', 'votes': 1}, {'text': 'gamma', 'votes': 0}], 'expired': False}",
+  "secs": 2.1
+ },
+ {
+  "feature": "media",
+  "src": "pt-ks",
+  "dst": "misskey",
+  "ok": true,
+  "detail": "url=http://misskey.test/files/webpublic-867e9666-8eff-4e30-a678-7d873aaaa40b status=200 sha_match=True",
+  "secs": 0.1
+ },
+ {
+  "feature": "poll+vote",
+  "src": "pt-ks",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "P=asf8rnlmignk9a1b choices={'choices': [{'text': 'alpha', 'votes': 0}, {'text': 'beta', 'votes': 1}, {'text': 'gamma', 'votes': 0}], 'expired': False}",
+  "secs": 2.1
+ },
+ {
+  "feature": "media",
+  "src": "pt-ks",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "url=http://pt-ks.test/files/asf7ac99ignk99f5 status=200 sha_match=True",
+  "secs": 0.1
+ },
+ {
+  "feature": "followers-only",
+  "src": "pt-ks",
+  "dst": "misskey",
+  "ok": true,
+  "detail": "on_follower=True leaked_to_global=False",
+  "secs": 12.1
+ },
+ {
+  "feature": "delete",
+  "src": "pt-ks",
+  "dst": "misskey",
+  "ok": true,
+  "detail": "Dl=asf8rxx4ignk9a25",
+  "secs": 0.0
+ },
+ {
+  "feature": "followers-only",
+  "src": "pt-ks",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "on_follower=True leaked_to_global=False",
+  "secs": 12.3
+ },
+ {
+  "feature": "delete",
+  "src": "pt-ks",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "Dl=asf8ryszignk9a2j",
+  "secs": 0.1
+ },
+ {
+  "feature": "mention-notif",
+  "src": "pt-ks",
+  "dst": "misskey",
+  "ok": true,
+  "detail": "Mp=asf8rxy1ignk9a2e",
+  "secs": 2.1
+ },
+ {
+  "feature": "mention-notif",
+  "src": "pt-ks",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "Mp=asf8ryupignk9a2s",
+  "secs": 2.2
+ },
+ {
+  "feature": "post",
+  "src": "pt-mk",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "A=asf8rzl3eqkybsq5 uri=http://pt-mk.test/notes/asf8rzl3eqkybsq5",
+  "secs": 2.0
+ },
+ {
+  "feature": "post",
+  "src": "pt-mk",
+  "dst": "misskey",
+  "ok": true,
+  "detail": "A=asf8s0l5eqkybsqa uri=http://pt-mk.test/notes/asf8s0l5eqkybsqa",
+  "secs": 2.1
+ },
+ {
+  "feature": "cw",
+  "src": "pt-mk",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "C=asf8s15zeqkybsqf",
+  "secs": 2.0
+ },
+ {
+  "feature": "reply",
+  "src": "pt-mk",
+  "dst": "pt-ks",
+  "ok": false,
+  "detail": "R=asf8s2qyignk9a3a out=rid=None,A=asf8rzl3eqkybsq5",
+  "secs": 0.0
+ },
+ {
+  "feature": "cw",
+  "src": "pt-mk",
+  "dst": "misskey",
+  "ok": true,
+  "detail": "C=asf8s27oeqkybsqk",
+  "secs": 2.1
+ },
+ {
+  "feature": "reply",
+  "src": "pt-mk",
+  "dst": "misskey",
+  "ok": false,
+  "detail": "R=asf8s3tvfcp9008g out=rid=None,A=asf8s0l5eqkybsqa",
+  "secs": 0.1
+ },
+ {
+  "feature": "reaction",
+  "src": "pt-mk",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "A=asf8rzl3eqkybsq5 out=True per_user=None",
+  "secs": 2.0
+ },
+ {
+  "feature": "unreaction",
+  "src": "pt-mk",
+  "dst": "pt-ks",
+  "ok": false,
+  "detail": "out=remaining={'\ud83c\udf89': 1}",
+  "secs": 0.0
+ },
+ {
+  "feature": "renote/boost",
+  "src": "pt-mk",
+  "dst": "pt-ks",
+  "ok": false,
+  "detail": "B=asf8s4c3ignk9a42 out=count=0,before=0",
+  "secs": 0.0
+ },
+ {
+  "feature": "unboost",
+  "src": "pt-mk",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "out=True",
+  "secs": 0.0
+ },
+ {
+  "feature": "reaction",
+  "src": "pt-mk",
+  "dst": "misskey",
+  "ok": true,
+  "detail": "A=asf8s0l5eqkybsqa out=True per_user=None",
+  "secs": 2.0
+ },
+ {
+  "feature": "unreaction",
+  "src": "pt-mk",
+  "dst": "misskey",
+  "ok": false,
+  "detail": "out=remaining={'\ud83c\udf89': 1}",
+  "secs": 0.0
+ },
+ {
+  "feature": "renote/boost",
+  "src": "pt-mk",
+  "dst": "misskey",
+  "ok": false,
+  "detail": "B=asf8s5hbfcp9008i out=count=0,before=0",
+  "secs": 0.0
+ },
+ {
+  "feature": "unboost",
+  "src": "pt-mk",
+  "dst": "misskey",
+  "ok": false,
+  "detail": "out=count=1,before=0",
+  "secs": 0.0
+ },
+ {
+  "feature": "quote",
+  "src": "pt-mk",
+  "dst": "misskey",
+  "ok": true,
+  "detail": "Q=asf8s5j5fcp9008j local_renote_ok=True origin_sees_relation=True",
+  "secs": 0.1
+ },
+ {
+  "feature": "poll+vote",
+  "src": "pt-mk",
+  "dst": "misskey",
+  "ok": true,
+  "detail": "P=asf8s5l8eqkybss8 choices={'choices': [{'text': 'alpha', 'votes': 0}, {'text': 'beta', 'votes': 1}, {'text': 'gamma', 'votes': 0}], 'expired': False}",
+  "secs": 2.1
+ },
+ {
+  "feature": "media",
+  "src": "pt-mk",
+  "dst": "misskey",
+  "ok": true,
+  "detail": "url=http://misskey.test/files/webpublic-05c3691a-4294-4dd7-aa1a-5fe3281b6731 status=200 sha_match=True",
+  "secs": 0.1
+ },
+ {
+  "feature": "followers-only",
+  "src": "pt-mk",
+  "dst": "misskey",
+  "ok": true,
+  "detail": "on_follower=True leaked_to_global=False",
+  "secs": 12.1
+ },
+ {
+  "feature": "delete",
+  "src": "pt-mk",
+  "dst": "misskey",
+  "ok": true,
+  "detail": "Dl=asf8sgm1eqkybsss",
+  "secs": 0.0
+ },
+ {
+  "feature": "mention-notif",
+  "src": "pt-mk",
+  "dst": "misskey",
+  "ok": true,
+  "detail": "Mp=asf8sgmzeqkybst1",
+  "secs": 2.1
+ },
+ {
+  "feature": "post",
+  "src": "pt-mk",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "A=asf8si9oeqkybst6 uri=http://pt-mk.test/notes/asf8si9oeqkybst6",
+  "secs": 2.4
+ },
+ {
+  "feature": "cw",
+  "src": "pt-mk",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "C=asf8sk3geqkybstb",
+  "secs": 2.3
+ },
+ {
+  "feature": "reply",
+  "src": "pt-mk",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "R=asf8slwkmg560152 out=True",
+  "secs": 0.2
+ },
+ {
+  "feature": "reaction",
+  "src": "pt-mk",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "A=asf8si9oeqkybst6 out=True per_user=None",
+  "secs": 2.0
+ },
+ {
+  "feature": "unreaction",
+  "src": "pt-mk",
+  "dst": "catodon",
+  "ok": false,
+  "detail": "out=remaining={'\ud83c\udf89': 1}",
+  "secs": 0.0
+ },
+ {
+  "feature": "renote/boost",
+  "src": "pt-mk",
+  "dst": "catodon",
+  "ok": false,
+  "detail": "B=asf8snlpmg560154 out=count=0,before=0",
+  "secs": 0.1
+ },
+ {
+  "feature": "unboost",
+  "src": "pt-mk",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "out=True",
+  "secs": 0.1
+ },
+ {
+  "feature": "quote",
+  "src": "pt-mk",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "Q=asf8snptmg560155 local_renote_ok=True origin_sees_relation=True",
+  "secs": 0.2
+ },
+ {
+  "feature": "poll+vote",
+  "src": "pt-mk",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "P=asf8snu4eqkybsu5 choices={'choices': [{'text': 'alpha', 'votes': 0}, {'text': 'beta', 'votes': 1}, {'text': 'gamma', 'votes': 0}], 'expired': False}",
+  "secs": 2.1
+ },
+ {
+  "feature": "media",
+  "src": "pt-mk",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "url=http://pt-mk.test/files/asf7mxybeqkybsew status=200 sha_match=True",
+  "secs": 0.1
+ },
+ {
+  "feature": "followers-only",
+  "src": "pt-mk",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "on_follower=True leaked_to_global=False",
+  "secs": 12.3
+ },
+ {
+  "feature": "delete",
+  "src": "pt-mk",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "Dl=asf8sz2deqkybsup",
+  "secs": 0.1
+ },
+ {
+  "feature": "mention-notif",
+  "src": "pt-mk",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "Mp=asf8sz3teqkybsuy",
+  "secs": 2.1
+ },
+ {
+  "feature": "post",
+  "src": "pt-mk",
+  "dst": "akkoma",
+  "ok": true,
+  "detail": "A=asf8t0r6eqkybsv3 uri=http://pt-mk.test/notes/asf8t0r6eqkybsv3",
+  "secs": 2.3
+ },
+ {
+  "feature": "cw",
+  "src": "pt-mk",
+  "dst": "akkoma",
+  "ok": true,
+  "detail": "C=asf8t2iqeqkybsv8",
+  "secs": 2.3
+ },
+ {
+  "feature": "reply",
+  "src": "pt-mk",
+  "dst": "akkoma",
+  "ok": false,
+  "detail": "R=BBUEP6DIy9evUR3r8a out=rid=None,A=asf8t0r6eqkybsv3",
+  "secs": 0.3
+ },
+ {
+  "feature": "reaction",
+  "src": "pt-mk",
+  "dst": "akkoma",
+  "ok": true,
+  "detail": "A=asf8t0r6eqkybsv3 out=True per_user=None",
+  "secs": 2.0
+ },
+ {
+  "feature": "unreaction",
+  "src": "pt-mk",
+  "dst": "akkoma",
+  "ok": false,
+  "detail": "out=remaining={'\u2764': 1}",
+  "secs": 0.0
+ },
+ {
+  "feature": "renote/boost",
+  "src": "pt-mk",
+  "dst": "akkoma",
+  "ok": false,
+  "detail": "B=BBUEPIuzjXjktPauu0 out=count=0,before=0",
+  "secs": 0.0
+ },
+ {
+  "feature": "unboost",
+  "src": "pt-mk",
+  "dst": "akkoma",
+  "ok": true,
+  "detail": "out=True",
+  "secs": 0.0
+ },
+ {
+  "feature": "quote",
+  "src": "pt-ks",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "Q=asf8rmikeqkybso4 local_renote_ok=True origin_sees_relation=False",
+  "secs": 90.4
+ },
+ {
+  "feature": "poll+vote",
+  "src": "pt-ks",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "P=asf8tk8mignk9a7d choices={'choices': [{'text': 'alpha', 'votes': 0}, {'text': 'beta', 'votes': 1}, {'text': 'gamma', 'votes': 0}], 'expired': False}",
+  "secs": 2.0
+ },
+ {
+  "feature": "quote",
+  "src": "pt-ks",
+  "dst": "akkoma",
+  "ok": true,
+  "detail": "Q=BBUEIkNdEToO2MrXX6 link-quote arrived at src=True origin_sees_relation=False",
+  "secs": 92.5
+ },
+ {
+  "feature": "quote",
+  "src": "pt-mk",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "Q=asf8s4clignk9a4f local_renote_ok=True origin_sees_relation=False",
+  "secs": 90.4
+ },
+ {
+  "feature": "poll+vote",
+  "src": "pt-mk",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "P=asf8u234eqkybswq choices={'choices': [{'text': 'alpha', 'votes': 0}, {'text': 'beta', 'votes': 1}, {'text': 'gamma', 'votes': 0}], 'expired': False}",
+  "secs": 2.0
+ },
+ {
+  "feature": "quote",
+  "src": "pt-mk",
+  "dst": "akkoma",
+  "ok": true,
+  "detail": "Q=BBUEPJEqXjcHsyslqS link-quote arrived at src=True origin_sees_relation=False",
+  "secs": 92.5
+ },
+ {
+  "feature": "media",
+  "src": "pt-ks",
+  "dst": "pt-mk",
+  "ok": false,
+  "detail": "no attachment on dst copy",
+  "secs": 90.1
+ },
+ {
+  "feature": "poll+vote",
+  "src": "pt-ks",
+  "dst": "akkoma",
+  "ok": false,
+  "detail": "poll unresolvable on dst",
+  "secs": 90.8
+ },
+ {
+  "feature": "followers-only",
+  "src": "pt-ks",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "on_follower=True leaked_to_global=False",
+  "secs": 12.2
+ },
+ {
+  "feature": "delete",
+  "src": "pt-ks",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "Dl=asf8vsqrignk9a8x",
+  "secs": 0.0
+ },
+ {
+  "feature": "mention-notif",
+  "src": "pt-ks",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "Mp=asf8vsrpignk9a96",
+  "secs": 2.0
+ },
+ {
+  "feature": "post",
+  "src": "misskey",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "A=asf8vubwfcp9008s uri=http://misskey.test/notes/asf8vubwfcp9008s",
+  "secs": 0.1
+ },
+ {
+  "feature": "cw",
+  "src": "misskey",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "C=asf8vudifcp9008t",
+  "secs": 2.1
+ },
+ {
+  "feature": "reply",
+  "src": "misskey",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "R=asf8vvzgignk9a9i out=True",
+  "secs": 0.1
+ },
+ {
+  "feature": "reaction",
+  "src": "misskey",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "A=asf8vubwfcp9008s out=True per_user=\ud83c\udf89:['pk5@pt-ks.test']",
+  "secs": 2.0
+ },
+ {
+  "feature": "unreaction",
+  "src": "misskey",
+  "dst": "pt-ks",
+  "ok": false,
+  "detail": "out=remaining={'\ud83c\udf89': ['pk5@pt-ks.test']}",
+  "secs": 0.0
+ },
+ {
+  "feature": "renote/boost",
+  "src": "misskey",
+  "dst": "pt-ks",
+  "ok": false,
+  "detail": "B=asf8vxmsignk9aa0 out=count=0,before=0",
+  "secs": 0.0
+ },
+ {
+  "feature": "unboost",
+  "src": "misskey",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "out=True",
+  "secs": 0.0
+ },
+ {
+  "feature": "quote",
+  "src": "misskey",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "Q=asf8vxodignk9aad local_renote_ok=True origin_sees_relation=True",
+  "secs": 0.0
+ },
+ {
+  "feature": "poll+vote",
+  "src": "misskey",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "P=asf8vxpnfcp9008w choices={'choices': [{'text': 'alpha', 'votes': 0}, {'text': 'beta', 'votes': 1}, {'text': 'gamma', 'votes': 0}], 'expired': False}",
+  "secs": 2.1
+ },
+ {
+  "feature": "media",
+  "src": "pt-mk",
+  "dst": "pt-ks",
+  "ok": false,
+  "detail": "no attachment on dst copy",
+  "secs": 90.1
+ },
+ {
+  "feature": "media",
+  "src": "misskey",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "url=http://pt-ks.test/files/asf8vzfgignk9aaw status=200 sha_match=True",
+  "secs": 3.1
+ },
+ {
+  "feature": "followers-only",
+  "src": "misskey",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "on_follower=True leaked_to_global=False",
+  "secs": 10.1
+ },
+ {
+  "feature": "delete",
+  "src": "misskey",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "Dl=asf8w9hrfcp90090",
+  "secs": 0.1
+ },
+ {
+  "feature": "followers-only",
+  "src": "pt-mk",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "on_follower=True leaked_to_global=False",
+  "secs": 12.1
+ },
+ {
+  "feature": "delete",
+  "src": "pt-mk",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "Dl=asf8wakheqkybsyt",
+  "secs": 0.0
+ },
+ {
+  "feature": "mention-notif",
+  "src": "misskey",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "Mp=asf8w9k6fcp90091",
+  "secs": 2.0
+ },
+ {
+  "feature": "post",
+  "src": "misskey",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "A=asf8wb4wfcp90093 uri=http://misskey.test/notes/asf8wb4wfcp90093",
+  "secs": 0.1
+ },
+ {
+  "feature": "cw",
+  "src": "misskey",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "C=asf8wb6lfcp90094",
+  "secs": 0.1
+ },
+ {
+  "feature": "reply",
+  "src": "misskey",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "R=asf8wb8oeqkybsze out=True",
+  "secs": 0.1
+ },
+ {
+  "feature": "mention-notif",
+  "src": "pt-mk",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "Mp=asf8walgeqkybsz2",
+  "secs": 2.0
+ },
+ {
+  "feature": "reaction",
+  "src": "misskey",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "A=asf8wb4wfcp90093 out=True per_user=\ud83c\udf89:['pm6@pt-mk.test']",
+  "secs": 2.0
+ },
+ {
+  "feature": "unreaction",
+  "src": "misskey",
+  "dst": "pt-mk",
+  "ok": false,
+  "detail": "out=remaining={'\ud83c\udf89': ['pm6@pt-mk.test']}",
+  "secs": 0.0
+ },
+ {
+  "feature": "renote/boost",
+  "src": "misskey",
+  "dst": "pt-mk",
+  "ok": false,
+  "detail": "B=asf8wcvreqkybszz out=count=0,before=0",
+  "secs": 0.0
+ },
+ {
+  "feature": "unboost",
+  "src": "misskey",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "out=True",
+  "secs": 0.0
+ },
+ {
+  "feature": "quote",
+  "src": "misskey",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "Q=asf8wcx3eqkybt0c local_renote_ok=True origin_sees_relation=True",
+  "secs": 0.0
+ },
+ {
+  "feature": "post",
+  "src": "misskey",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "A=asf8wc63fcp90096 uri=http://misskey.test/notes/asf8wc63fcp90096",
+  "secs": 2.5
+ },
+ {
+  "feature": "poll+vote",
+  "src": "misskey",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "P=asf8wcy2fcp90098 choices={'choices': [{'text': 'alpha', 'votes': 0}, {'text': 'beta', 'votes': 1}, {'text': 'gamma', 'votes': 0}], 'expired': False}",
+  "secs": 2.1
+ },
+ {
+  "feature": "cw",
+  "src": "misskey",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "C=asf8we25fcp90099",
+  "secs": 2.3
+ },
+ {
+  "feature": "reply",
+  "src": "misskey",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "R=asf8wfuymg56016g out=True",
+  "secs": 0.2
+ },
+ {
+  "feature": "media",
+  "src": "misskey",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "url=http://pt-mk.test/files/asf8weoeeqkybt11 status=200 sha_match=True",
+  "secs": 3.1
+ },
+ {
+  "feature": "reaction",
+  "src": "misskey",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "A=asf8wc63fcp90096 out=True per_user=\ud83c\udf89:['cd1@catodon.test']",
+  "secs": 2.1
+ },
+ {
+  "feature": "unreaction",
+  "src": "misskey",
+  "dst": "catodon",
+  "ok": false,
+  "detail": "out=remaining={'\ud83c\udf89': ['cd1@catodon.test']}",
+  "secs": 0.0
+ },
+ {
+  "feature": "renote/boost",
+  "src": "misskey",
+  "dst": "catodon",
+  "ok": false,
+  "detail": "B=asf8whmpmg56016j out=count=0,before=0",
+  "secs": 0.1
+ },
+ {
+  "feature": "unboost",
+  "src": "misskey",
+  "dst": "catodon",
+  "ok": false,
+  "detail": "out=count=1,before=0",
+  "secs": 0.1
+ },
+ {
+  "feature": "quote",
+  "src": "misskey",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "Q=asf8whrnmg56016k local_renote_ok=True origin_sees_relation=True",
+  "secs": 0.2
+ },
+ {
+  "feature": "poll+vote",
+  "src": "misskey",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "P=asf8whwgfcp9009d choices={'choices': [{'text': 'alpha', 'votes': 0}, {'text': 'beta', 'votes': 1}, {'text': 'gamma', 'votes': 0}], 'expired': False}",
+  "secs": 0.1
+ },
+ {
+  "feature": "media",
+  "src": "misskey",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "url=http://misskey.test/files/415ada30-c7d9-41e2-bd4e-e85f5690fa68 status=200 sha_match=True",
+  "secs": 0.3
+ },
+ {
+  "feature": "followers-only",
+  "src": "misskey",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "on_follower=True leaked_to_global=False",
+  "secs": 10.1
+ },
+ {
+  "feature": "delete",
+  "src": "misskey",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "Dl=asf8woqgfcp9009h",
+  "secs": 2.1
+ },
+ {
+  "feature": "followers-only",
+  "src": "misskey",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "on_follower=True leaked_to_global=False",
+  "secs": 12.3
+ },
+ {
+  "feature": "mention-notif",
+  "src": "misskey",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "Mp=asf8wqcefcp9009i",
+  "secs": 2.0
+ },
+ {
+  "feature": "delete",
+  "src": "misskey",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "Dl=asf8wrpzfcp9009j",
+  "secs": 2.1
+ },
+ {
+  "feature": "post",
+  "src": "misskey",
+  "dst": "akkoma",
+  "ok": true,
+  "detail": "A=asf8wrx1fcp9009k uri=http://misskey.test/notes/asf8wrx1fcp9009k",
+  "secs": 2.3
+ },
+ {
+  "feature": "mention-notif",
+  "src": "misskey",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "Mp=asf8wtdkfcp9009l",
+  "secs": 2.1
+ },
+ {
+  "feature": "cw",
+  "src": "misskey",
+  "dst": "akkoma",
+  "ok": true,
+  "detail": "C=asf8wtnlfcp9009m",
+  "secs": 2.2
+ },
+ {
+  "feature": "reply",
+  "src": "misskey",
+  "dst": "akkoma",
+  "ok": true,
+  "detail": "R=BBUEfFFN9R5c8ij8pk out=True",
+  "secs": 0.3
+ },
+ {
+  "feature": "post",
+  "src": "catodon",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "A=asf8wv0gmg56016y uri=http://catodon.test/notes/asf8wv0gmg56016y",
+  "secs": 2.1
+ },
+ {
+  "feature": "cw",
+  "src": "catodon",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "C=asf8wwngmg560171",
+  "secs": 0.1
+ },
+ {
+  "feature": "reply",
+  "src": "catodon",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "R=asf8wwq3ignk9aep out=True",
+  "secs": 0.1
+ },
+ {
+  "feature": "reaction",
+  "src": "misskey",
+  "dst": "akkoma",
+  "ok": true,
+  "detail": "A=asf8wrx1fcp9009k out=True per_user=\u2764:['ak2@akkoma.test']",
+  "secs": 2.1
+ },
+ {
+  "feature": "unreaction",
+  "src": "misskey",
+  "dst": "akkoma",
+  "ok": false,
+  "detail": "out=remaining={'\u2764': ['ak2@akkoma.test']}",
+  "secs": 0.1
+ },
+ {
+  "feature": "renote/boost",
+  "src": "misskey",
+  "dst": "akkoma",
+  "ok": false,
+  "detail": "B=BBUEfSJ2b6kSdrXkrA out=count=0,before=0",
+  "secs": 0.1
+ },
+ {
+  "feature": "unboost",
+  "src": "misskey",
+  "dst": "akkoma",
+  "ok": true,
+  "detail": "out=True",
+  "secs": 0.0
+ },
+ {
+  "feature": "reaction",
+  "src": "catodon",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "A=asf8wv0gmg56016y out=True per_user=\ud83c\udf89:['pk3@pt-ks.test']",
+  "secs": 2.1
+ },
+ {
+  "feature": "unreaction",
+  "src": "catodon",
+  "dst": "pt-ks",
+  "ok": false,
+  "detail": "out=remaining={'\ud83c\udf89': ['pk3@pt-ks.test']}",
+  "secs": 0.0
+ },
+ {
+  "feature": "renote/boost",
+  "src": "catodon",
+  "dst": "pt-ks",
+  "ok": false,
+  "detail": "B=asf8wyf1ignk9afh out=count=1,before=0",
+  "secs": 2.1
+ },
+ {
+  "feature": "unboost",
+  "src": "catodon",
+  "dst": "pt-ks",
+  "ok": false,
+  "detail": "out=count=0,before=0",
+  "secs": 2.1
+ },
+ {
+  "feature": "quote",
+  "src": "catodon",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "Q=asf8x1mrignk9afu local_renote_ok=True origin_sees_relation=True",
+  "secs": 0.1
+ },
+ {
+  "feature": "poll+vote",
+  "src": "catodon",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "P=asf8x1qfmg56017b choices={'choices': [{'text': 'alpha', 'votes': 0}, {'text': 'beta', 'votes': 1}, {'text': 'gamma', 'votes': 0}], 'expired': False}",
+  "secs": 2.1
+ },
+ {
+  "feature": "poll+vote",
+  "src": "pt-mk",
+  "dst": "akkoma",
+  "ok": false,
+  "detail": "poll unresolvable on dst",
+  "secs": 91.5
+ },
+ {
+  "feature": "media",
+  "src": "catodon",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "url=http://pt-ks.test/files/asf8x3jaignk9agd status=200 sha_match=True",
+  "secs": 3.2
+ },
+ {
+  "feature": "followers-only",
+  "src": "catodon",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "on_follower=True leaked_to_global=False",
+  "secs": 10.1
+ },
+ {
+  "feature": "delete",
+  "src": "catodon",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "Dl=asf8xdmpmg56017j",
+  "secs": 0.2
+ },
+ {
+  "feature": "mention-notif",
+  "src": "catodon",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "Mp=asf8xdtbmg56017k",
+  "secs": 2.1
+ },
+ {
+  "feature": "post",
+  "src": "catodon",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "A=asf8xfewmg56017l uri=http://catodon.test/notes/asf8xfewmg56017l",
+  "secs": 0.1
+ },
+ {
+  "feature": "cw",
+  "src": "catodon",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "C=asf8xfi2mg56017m",
+  "secs": 0.1
+ },
+ {
+  "feature": "reply",
+  "src": "catodon",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "R=asf8xflgeqkybt4w out=True",
+  "secs": 0.2
+ },
+ {
+  "feature": "reaction",
+  "src": "catodon",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "A=asf8xfewmg56017l out=True per_user=\ud83c\udf89:['pm4@pt-mk.test']",
+  "secs": 2.0
+ },
+ {
+  "feature": "unreaction",
+  "src": "catodon",
+  "dst": "pt-mk",
+  "ok": false,
+  "detail": "out=remaining={'\ud83c\udf89': ['pm4@pt-mk.test']}",
+  "secs": 0.0
+ },
+ {
+  "feature": "media",
+  "src": "pt-ks",
+  "dst": "akkoma",
+  "ok": false,
+  "detail": "no attachment on dst copy",
+  "secs": 91.2
+ },
+ {
+  "feature": "renote/boost",
+  "src": "catodon",
+  "dst": "pt-mk",
+  "ok": false,
+  "detail": "B=asf8xhdoeqkybt5e out=count=1,before=0",
+  "secs": 2.1
+ },
+ {
+  "feature": "unboost",
+  "src": "catodon",
+  "dst": "pt-mk",
+  "ok": false,
+  "detail": "out=count=0,before=0",
+  "secs": 2.1
+ },
+ {
+  "feature": "quote",
+  "src": "catodon",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "Q=asf8xkl0eqkybt5u local_renote_ok=True origin_sees_relation=True",
+  "secs": 0.1
+ },
+ {
+  "feature": "poll+vote",
+  "src": "catodon",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "P=asf8xknxmg56017v choices={'choices': [{'text': 'alpha', 'votes': 0}, {'text': 'beta', 'votes': 1}, {'text': 'gamma', 'votes': 0}], 'expired': False}",
+  "secs": 2.2
+ },
+ {
+  "feature": "media",
+  "src": "catodon",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "url=http://pt-mk.test/files/asf8xmggeqkybt6d status=200 sha_match=True",
+  "secs": 3.1
+ },
+ {
+  "feature": "followers-only",
+  "src": "pt-ks",
+  "dst": "akkoma",
+  "ok": true,
+  "detail": "on_follower=True leaked_to_global=False",
+  "secs": 12.3
+ },
+ {
+  "feature": "delete",
+  "src": "pt-ks",
+  "dst": "akkoma",
+  "ok": true,
+  "detail": "Dl=asf8xsgwignk9ai1",
+  "secs": 4.0
+ },
+ {
+  "feature": "followers-only",
+  "src": "catodon",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "on_follower=True leaked_to_global=False",
+  "secs": 10.1
+ },
+ {
+  "feature": "delete",
+  "src": "catodon",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "Dl=asf8xwjmmg560183",
+  "secs": 0.2
+ },
+ {
+  "feature": "mention-notif",
+  "src": "pt-ks",
+  "dst": "akkoma",
+  "ok": true,
+  "detail": "Mp=asf8xvldignk9aia",
+  "secs": 2.1
+ },
+ {
+  "feature": "post",
+  "src": "catodon",
+  "dst": "misskey",
+  "ok": true,
+  "detail": "A=asf8xx77mg560185 uri=http://catodon.test/notes/asf8xx77mg560185",
+  "secs": 0.2
+ },
+ {
+  "feature": "mention-notif",
+  "src": "catodon",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "Mp=asf8xwq6mg560184",
+  "secs": 2.1
+ },
+ {
+  "feature": "cw",
+  "src": "catodon",
+  "dst": "misskey",
+  "ok": true,
+  "detail": "C=asf8xxd5mg560186",
+  "secs": 2.2
+ },
+ {
+  "feature": "reply",
+  "src": "catodon",
+  "dst": "misskey",
+  "ok": true,
+  "detail": "R=asf8xz2mfcp9009t out=True",
+  "secs": 0.3
+ },
+ {
+  "feature": "post",
+  "src": "catodon",
+  "dst": "akkoma",
+  "ok": true,
+  "detail": "A=asf8xybjmg560187 uri=http://catodon.test/notes/asf8xybjmg560187",
+  "secs": 2.3
+ },
+ {
+  "feature": "reaction",
+  "src": "catodon",
+  "dst": "misskey",
+  "ok": true,
+  "detail": "A=asf8xx77mg560185 out=True per_user=\ud83c\udf89:['mk5@misskey.test']",
+  "secs": 2.1
+ },
+ {
+  "feature": "unreaction",
+  "src": "catodon",
+  "dst": "misskey",
+  "ok": false,
+  "detail": "out=remaining={'\ud83c\udf89': ['mk5@misskey.test']}",
+  "secs": 0.0
+ },
+ {
+  "feature": "cw",
+  "src": "catodon",
+  "dst": "akkoma",
+  "ok": true,
+  "detail": "C=asf8y02rmg56018d",
+  "secs": 2.3
+ },
+ {
+  "feature": "reply",
+  "src": "catodon",
+  "dst": "akkoma",
+  "ok": true,
+  "detail": "R=BBUEkJwT7e8U9JIzbM out=True",
+  "secs": 0.4
+ },
+ {
+  "feature": "renote/boost",
+  "src": "catodon",
+  "dst": "misskey",
+  "ok": false,
+  "detail": "B=asf8y0wkfcp9009v out=count=1,before=0",
+  "secs": 2.1
+ },
+ {
+  "feature": "reaction",
+  "src": "catodon",
+  "dst": "akkoma",
+  "ok": true,
+  "detail": "A=asf8xybjmg560187 out=True per_user=\u2764:['ak6@akkoma.test']",
+  "secs": 2.1
+ },
+ {
+  "feature": "unreaction",
+  "src": "catodon",
+  "dst": "akkoma",
+  "ok": false,
+  "detail": "out=remaining={'\u2764': ['ak6@akkoma.test']}",
+  "secs": 0.0
+ },
+ {
+  "feature": "unboost",
+  "src": "catodon",
+  "dst": "misskey",
+  "ok": false,
+  "detail": "out=count=0,before=0",
+  "secs": 2.1
+ },
+ {
+  "feature": "quote",
+  "src": "catodon",
+  "dst": "misskey",
+  "ok": true,
+  "detail": "Q=asf8y456fcp9009w local_renote_ok=True origin_sees_relation=True",
+  "secs": 0.1
+ },
+ {
+  "feature": "renote/boost",
+  "src": "catodon",
+  "dst": "akkoma",
+  "ok": false,
+  "detail": "B=BBUEkXkvlLE0za0yYq out=count=1,before=0",
+  "secs": 2.2
+ },
+ {
+  "feature": "unboost",
+  "src": "catodon",
+  "dst": "akkoma",
+  "ok": false,
+  "detail": "out=count=1,before=0",
+  "secs": 2.1
+ },
+ {
+  "feature": "quote",
+  "src": "misskey",
+  "dst": "akkoma",
+  "ok": true,
+  "detail": "Q=BBUEfSoEj7haCc8fTs link-quote arrived at src=True origin_sees_relation=False",
+  "secs": 92.5
+ },
+ {
+  "feature": "media",
+  "src": "pt-mk",
+  "dst": "akkoma",
+  "ok": false,
+  "detail": "no attachment on dst copy",
+  "secs": 91.3
+ },
+ {
+  "feature": "poll+vote",
+  "src": "misskey",
+  "dst": "akkoma",
+  "ok": true,
+  "detail": "P=asf8ywo1fcp9009y choices={'choices': [{'text': 'alpha', 'votes': 0}, {'text': 'beta', 'votes': 1}, {'text': 'gamma', 'votes': 0}], 'expired': False}",
+  "secs": 13.1
+ },
+ {
+  "feature": "followers-only",
+  "src": "pt-mk",
+  "dst": "akkoma",
+  "ok": true,
+  "detail": "on_follower=True leaked_to_global=False",
+  "secs": 12.3
+ },
+ {
+  "feature": "delete",
+  "src": "pt-mk",
+  "dst": "akkoma",
+  "ok": true,
+  "detail": "Dl=asf8zc20eqkybt8x",
+  "secs": 4.1
+ },
+ {
+  "feature": "mention-notif",
+  "src": "pt-mk",
+  "dst": "akkoma",
+  "ok": true,
+  "detail": "Mp=asf8zf8aeqkybt96",
+  "secs": 2.1
+ },
+ {
+  "feature": "post",
+  "src": "akkoma",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "A=BBUEqOxDOtjvQnYPbc uri=http://akkoma.test/objects/4172bdd3-162d-4a07-a005-8463a8f59aff",
+  "secs": 2.1
+ },
+ {
+  "feature": "cw",
+  "src": "akkoma",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "C=BBUEqb08brCwnL0upM",
+  "secs": 2.1
+ },
+ {
+  "feature": "reply",
+  "src": "akkoma",
+  "dst": "pt-ks",
+  "ok": false,
+  "detail": "R=asf8zk3gignk9al2 out=rid=None,A=BBUEqOxDOtjvQnYPbc",
+  "secs": 0.9
+ },
+ {
+  "feature": "quote",
+  "src": "catodon",
+  "dst": "akkoma",
+  "ok": true,
+  "detail": "Q=BBUEkvhuiD4XHAmuBs link-quote arrived at src=True origin_sees_relation=False",
+  "secs": 93.0
+ },
+ {
+  "feature": "media",
+  "src": "misskey",
+  "dst": "akkoma",
+  "ok": false,
+  "detail": "no attachment on dst copy",
+  "secs": 91.4
+ },
+ {
+  "feature": "poll+vote",
+  "src": "catodon",
+  "dst": "misskey",
+  "ok": false,
+  "detail": "P=asf8y48lmg56018p choices=None",
+  "secs": 151.8
+ },
+ {
+  "feature": "media",
+  "src": "catodon",
+  "dst": "misskey",
+  "ok": true,
+  "detail": "url=http://misskey.test/files/webpublic-fb98912a-956f-4b2e-8e8f-a80fb2a3aa29 status=200 sha_match=True",
+  "secs": 0.3
+ },
+ {
+  "feature": "followers-only",
+  "src": "misskey",
+  "dst": "akkoma",
+  "ok": true,
+  "detail": "on_follower=True leaked_to_global=False",
+  "secs": 12.3
+ },
+ {
+  "feature": "followers-only",
+  "src": "catodon",
+  "dst": "misskey",
+  "ok": true,
+  "detail": "on_follower=True leaked_to_global=False",
+  "secs": 12.3
+ },
+ {
+  "feature": "delete",
+  "src": "catodon",
+  "dst": "misskey",
+  "ok": true,
+  "detail": "Dl=asf91n43mg560195",
+  "secs": 0.2
+ },
+ {
+  "feature": "mention-notif",
+  "src": "catodon",
+  "dst": "misskey",
+  "ok": true,
+  "detail": "Mp=asf91n9gmg560196",
+  "secs": 2.2
+ },
+ {
+  "feature": "post",
+  "src": "akkoma",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "A=BBUEzyhTrm68u0lEY4 uri=http://akkoma.test/objects/88303b7c-c1c5-461d-b13a-78d0ff53abf7",
+  "secs": 2.1
+ },
+ {
+  "feature": "cw",
+  "src": "akkoma",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "C=BBUF0AjL8giQDFit72",
+  "secs": 2.1
+ },
+ {
+  "feature": "reply",
+  "src": "akkoma",
+  "dst": "pt-mk",
+  "ok": false,
+  "detail": "R=asf91s7jeqkybtak out=rid=None,A=BBUEzyhTrm68u0lEY4",
+  "secs": 1.0
+ },
+ {
+  "feature": "reaction",
+  "src": "akkoma",
+  "dst": "pt-ks",
+  "ok": false,
+  "detail": "A=BBUEqOxDOtjvQnYPbc out=None per_user=None",
+  "secs": 120.5
+ },
+ {
+  "feature": "unreaction",
+  "src": "akkoma",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "out=True",
+  "secs": 0.0
+ },
+ {
+  "feature": "renote/boost",
+  "src": "akkoma",
+  "dst": "pt-ks",
+  "ok": false,
+  "detail": "B=asf925qxignk9amm out=count=0,before=0",
+  "secs": 0.1
+ },
+ {
+  "feature": "unboost",
+  "src": "akkoma",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "out=True",
+  "secs": 0.0
+ },
+ {
+  "feature": "quote",
+  "src": "akkoma",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "Q=asf925syignk9amz local_renote_ok=True",
+  "secs": 0.0
+ },
+ {
+  "feature": "poll+vote",
+  "src": "akkoma",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "P=BBUF1zcrOdfuLsYoCW choices={'choices': [{'text': 'alpha', 'votes': 0}, {'text': 'beta', 'votes': 1}, {'text': 'gamma', 'votes': 0}], 'expired': False}",
+  "secs": 2.2
+ },
+ {
+  "feature": "delete",
+  "src": "misskey",
+  "dst": "akkoma",
+  "ok": true,
+  "detail": "Dl=asf91et9fcp900a4",
+  "secs": 42.0
+ },
+ {
+  "feature": "mention-notif",
+  "src": "misskey",
+  "dst": "akkoma",
+  "ok": true,
+  "detail": "Mp=asf92b82fcp900a8",
+  "secs": 2.1
+ },
+ {
+  "feature": "post",
+  "src": "akkoma",
+  "dst": "misskey",
+  "ok": true,
+  "detail": "A=BBUF2pk5d0M5zMLJgm uri=http://akkoma.test/objects/f5f05f12-5208-4b0c-ad7d-0a8955725d85",
+  "secs": 2.2
+ },
+ {
+  "feature": "cw",
+  "src": "akkoma",
+  "dst": "misskey",
+  "ok": true,
+  "detail": "C=BBUF32VKBDGjZKXCym",
+  "secs": 2.2
+ },
+ {
+  "feature": "reply",
+  "src": "akkoma",
+  "dst": "misskey",
+  "ok": false,
+  "detail": "R=asf92g9tfcp900ad out=rid=None,A=BBUF2pk5d0M5zMLJgm",
+  "secs": 1.0
+ },
+ {
+  "feature": "poll+vote",
+  "src": "catodon",
+  "dst": "akkoma",
+  "ok": false,
+  "detail": "P=asf906trmg56018z choices=None",
+  "secs": 152.9
+ },
+ {
+  "feature": "media",
+  "src": "akkoma",
+  "dst": "pt-ks",
+  "ok": false,
+  "detail": "no attachment on dst copy",
+  "secs": 90.3
+ },
+ {
+  "feature": "reaction",
+  "src": "akkoma",
+  "dst": "pt-mk",
+  "ok": false,
+  "detail": "A=BBUEzyhTrm68u0lEY4 out=None per_user=None",
+  "secs": 120.4
+ },
+ {
+  "feature": "unreaction",
+  "src": "akkoma",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "out=True",
+  "secs": 0.0
+ },
+ {
+  "feature": "renote/boost",
+  "src": "akkoma",
+  "dst": "pt-mk",
+  "ok": false,
+  "detail": "B=asf94dxeeqkybtcd out=count=0,before=0",
+  "secs": 0.1
+ },
+ {
+  "feature": "unboost",
+  "src": "akkoma",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "out=True",
+  "secs": 0.0
+ },
+ {
+  "feature": "quote",
+  "src": "akkoma",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "Q=asf94dz1eqkybtcq local_renote_ok=True",
+  "secs": 0.0
+ },
+ {
+  "feature": "followers-only",
+  "src": "akkoma",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "on_follower=True leaked_to_global=False",
+  "secs": 12.1
+ },
+ {
+  "feature": "poll+vote",
+  "src": "akkoma",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "P=BBUFBZe8qFe0frjDfM choices={'choices': [{'text': 'alpha', 'votes': 0}, {'text': 'beta', 'votes': 1}, {'text': 'gamma', 'votes': 0}], 'expired': False}",
+  "secs": 2.2
+ },
+ {
+  "feature": "delete",
+  "src": "akkoma",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "Dl=BBUFBeGZfIlP0Djy7s",
+  "secs": 2.1
+ },
+ {
+  "feature": "mention-notif",
+  "src": "akkoma",
+  "dst": "pt-ks",
+  "ok": true,
+  "detail": "Mp=BBUFBqUqC5J0vwVX1s",
+  "secs": 2.1
+ },
+ {
+  "feature": "post",
+  "src": "akkoma",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "A=BBUFC2FKVa1pNJLJWC uri=http://akkoma.test/objects/cbb69c49-4336-4306-80f0-8816ffe83016",
+  "secs": 2.4
+ },
+ {
+  "feature": "cw",
+  "src": "akkoma",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "C=BBUFCFn89Dn3NuFzVY",
+  "secs": 2.3
+ },
+ {
+  "feature": "reply",
+  "src": "akkoma",
+  "dst": "catodon",
+  "ok": false,
+  "detail": "R=asf94lh2mg56019v out=rid=None,A=BBUFC2FKVa1pNJLJWC",
+  "secs": 1.1
+ },
+ {
+  "feature": "reaction",
+  "src": "akkoma",
+  "dst": "misskey",
+  "ok": false,
+  "detail": "A=BBUF2pk5d0M5zMLJgm out=None per_user=None",
+  "secs": 120.4
+ },
+ {
+  "feature": "unreaction",
+  "src": "akkoma",
+  "dst": "misskey",
+  "ok": true,
+  "detail": "out=True",
+  "secs": 0.0
+ },
+ {
+  "feature": "renote/boost",
+  "src": "akkoma",
+  "dst": "misskey",
+  "ok": false,
+  "detail": "B=asf95209fcp900af out=count=0,before=0",
+  "secs": 0.1
+ },
+ {
+  "feature": "unboost",
+  "src": "akkoma",
+  "dst": "misskey",
+  "ok": true,
+  "detail": "out=True",
+  "secs": 0.1
+ },
+ {
+  "feature": "quote",
+  "src": "akkoma",
+  "dst": "misskey",
+  "ok": true,
+  "detail": "Q=asf9523rfcp900ag local_renote_ok=True",
+  "secs": 0.1
+ },
+ {
+  "feature": "poll+vote",
+  "src": "akkoma",
+  "dst": "misskey",
+  "ok": true,
+  "detail": "P=BBUFESochBO4MD0cM4 choices={'choices': [{'text': 'alpha', 'votes': 0}, {'text': 'beta', 'votes': 1}, {'text': 'gamma', 'votes': 0}], 'expired': False}",
+  "secs": 2.2
+ },
+ {
+  "feature": "media",
+  "src": "akkoma",
+  "dst": "misskey",
+  "ok": true,
+  "detail": "url=http://misskey.test/files/webpublic-37eadd56-0de3-4451-83eb-04b0e619f23b status=200 sha_match=True",
+  "secs": 0.2
+ },
+ {
+  "feature": "followers-only",
+  "src": "akkoma",
+  "dst": "misskey",
+  "ok": true,
+  "detail": "on_follower=True leaked_to_global=False",
+  "secs": 12.2
+ },
+ {
+  "feature": "delete",
+  "src": "akkoma",
+  "dst": "misskey",
+  "ok": true,
+  "detail": "Dl=BBUFFoOHxsEXYrKlyC",
+  "secs": 0.1
+ },
+ {
+  "feature": "media",
+  "src": "catodon",
+  "dst": "akkoma",
+  "ok": false,
+  "detail": "no attachment on dst copy",
+  "secs": 91.6
+ },
+ {
+  "feature": "followers-only",
+  "src": "catodon",
+  "dst": "akkoma",
+  "ok": true,
+  "detail": "on_follower=True leaked_to_global=False",
+  "secs": 12.5
+ },
+ {
+  "feature": "delete",
+  "src": "catodon",
+  "dst": "akkoma",
+  "ok": true,
+  "detail": "Dl=asf95p39mg5601a6",
+  "secs": 4.8
+ },
+ {
+  "feature": "mention-notif",
+  "src": "catodon",
+  "dst": "akkoma",
+  "ok": true,
+  "detail": "Mp=asf95st4mg5601a7",
+  "secs": 2.2
+ },
+ {
+  "feature": "media",
+  "src": "akkoma",
+  "dst": "pt-mk",
+  "ok": false,
+  "detail": "no attachment on dst copy",
+  "secs": 90.2
+ },
+ {
+  "feature": "followers-only",
+  "src": "akkoma",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "on_follower=True leaked_to_global=False",
+  "secs": 12.1
+ },
+ {
+  "feature": "delete",
+  "src": "akkoma",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "Dl=BBUFLDJwheoKKOsXD6",
+  "secs": 2.1
+ },
+ {
+  "feature": "mention-notif",
+  "src": "akkoma",
+  "dst": "pt-mk",
+  "ok": true,
+  "detail": "Mp=BBUFLPYDERLwG7e676",
+  "secs": 2.1
+ },
+ {
+  "feature": "reaction",
+  "src": "akkoma",
+  "dst": "catodon",
+  "ok": false,
+  "detail": "A=BBUFC2FKVa1pNJLJWC out=None per_user=None",
+  "secs": 120.5
+ },
+ {
+  "feature": "unreaction",
+  "src": "akkoma",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "out=True",
+  "secs": 0.1
+ },
+ {
+  "feature": "renote/boost",
+  "src": "akkoma",
+  "dst": "catodon",
+  "ok": false,
+  "detail": "B=asf977cumg5601ab out=count=0,before=0",
+  "secs": 0.2
+ },
+ {
+  "feature": "unboost",
+  "src": "akkoma",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "out=True",
+  "secs": 0.1
+ },
+ {
+  "feature": "quote",
+  "src": "akkoma",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "Q=asf977kjmg5601ac local_renote_ok=True",
+  "secs": 0.2
+ },
+ {
+  "feature": "poll+vote",
+  "src": "akkoma",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "P=BBUFNjh3JTzDJEtBsu choices={'choices': [{'text': 'alpha', 'votes': 0}, {'text': 'beta', 'votes': 1}, {'text': 'gamma', 'votes': 0}], 'expired': False}",
+  "secs": 2.3
+ },
+ {
+  "feature": "media",
+  "src": "akkoma",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "url=http://akkoma.test/media/5f0f56d29164ea6869c960f2985ddfa0c605ca8982799bd6a143e74b5e32868e.png status=200 sha_match=True",
+  "secs": 0.3
+ },
+ {
+  "feature": "followers-only",
+  "src": "akkoma",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "on_follower=True leaked_to_global=False",
+  "secs": 12.4
+ },
+ {
+  "feature": "delete",
+  "src": "akkoma",
+  "dst": "catodon",
+  "ok": true,
+  "detail": "Dl=BBUFP7c3rn5rmfDQ2q",
+  "secs": 2.2
+ },
+ {
+  "feature": "mention-notif",
+  "src": "akkoma",
+  "dst": "misskey",
+  "ok": false,
+  "detail": "Mp=BBUFFp8jBDNdst3rM0",
+  "secs": 120.1
+ },
+ {
+  "feature": "mention-notif",
+  "src": "akkoma",
+  "dst": "catodon",
+  "ok": false,
+  "detail": "Mp=BBUFPKDizaLoswvfPs",
+  "secs": 121.1
+ }
+]

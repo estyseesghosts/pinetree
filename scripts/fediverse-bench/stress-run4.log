@@ -1,0 +1,10 @@
+stress tag=S201181
+skipping S1 (reuse batch in timelines)
+S2: 0 targets
+S3: 25 polls
+S3: {"polls": 25, "votes_attempted": 122, "votes_ok": 0, "verify_wait_s": 120, "shortfall_n": 0, "shortfall": {}, "wall_s": 147.2}
+S4: {"uploads": 60, "verified_ok": 0, "bad": [["pt-ks", "pt-mk", "no-attachment"], ["pt-ks", "pt-mk", "no-attachment"], ["pt-ks", "pt-mk", "no-attachment"], ["pt-ks", "pt-mk", "no-attachment"], ["pt-ks", "pt-mk", "no-attachment"], ["pt-ks", "pt-mk", "no-attachment"], ["pt-ks", "pt-mk", "no-attachment"], ["pt-ks", "pt-mk", "no-attachment"], ["pt-ks", "pt-mk", "no-attachment"], ["pt-ks", "pt-mk", "no-attachment"]], "wall_s": 15.8}
+S5: {"replies": 240, "sampled": 60, "ok": 60, "bad": [], "wall_s": 130.3}
+S6: {"deleted": 10, "reaction_rtt_s": {"n": 40, "p50": 1.02, "max": 3.02}, "residue": {"pt-ks": 2, "pt-mk": 2, "misskey": 1, "akkoma": 3}}
+S7: {"pt-ks": "ok", "pt-mk": "ok", "misskey": "ok", "catodon": "ok", "akkoma": "ok"}
+STRESS_DONE {"S1_post_storm": null, "S2_reaction_storm": null, "S3_poll_storm": 147.2, "S4_media_burst": 15.8, "S5_reply_storm": 130.3, "S6_churn": null, "S7_big_text": null}

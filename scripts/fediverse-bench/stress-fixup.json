@@ -1,0 +1,116 @@
+{
+ "s6_residue_detail": {
+  "pt-ks": [
+   {
+    "id": "asfat0yaignk9jzt",
+    "uri": "http://catodon.test/notes/asfat0ufmg5603vs",
+    "author": "cd2",
+    "host": "catodon.test",
+    "direct_show": 200,
+    "deleted": false
+   },
+   {
+    "id": "asfat0g1ignk9jzg",
+    "uri": "http://misskey.test/notes/asfat0dvfcp901px",
+    "author": "mk1",
+    "host": "misskey.test",
+    "direct_show": 200,
+    "deleted": false
+   }
+  ],
+  "pt-mk": [
+   {
+    "id": "asfat0y0eqkyc2n8",
+    "uri": "http://catodon.test/notes/asfat0ufmg5603vs",
+    "author": "cd2",
+    "host": "catodon.test",
+    "direct_show": 200,
+    "deleted": false
+   },
+   {
+    "id": "asfat0fneqkyc2mv",
+    "uri": "http://misskey.test/notes/asfat0dvfcp901px",
+    "author": "mk1",
+    "host": "misskey.test",
+    "direct_show": 200,
+    "deleted": false
+   }
+  ],
+  "misskey": [
+   {
+    "id": "asfat0ufm76902qo",
+    "uri": "http://catodon.test/notes/asfat0ufmg5603vs",
+    "author": "cd2",
+    "host": "catodon.test",
+    "direct_show": 200,
+    "deleted": false
+   }
+  ],
+  "akkoma": [
+   {
+    "id": "BBUJOU53FMfKzcj7Oy",
+    "uri": "http://catodon.test/notes/asfat0ufmg5603vs",
+    "author": null,
+    "host": null,
+    "direct_show": 200,
+    "deleted": true
+   },
+   {
+    "id": "BBUJOSpPu0Z76qP7OS",
+    "uri": "http://catodon.test/notes/asfat0jzmg5603vr",
+    "author": null,
+    "host": null,
+    "direct_show": 200,
+    "deleted": true
+   },
+   {
+    "id": "BBUJOQ1iJpcSQ78Oe0",
+    "uri": "http://misskey.test/notes/asfat0dvfcp901px",
+    "author": null,
+    "host": null,
+    "direct_show": 200,
+    "deleted": true
+   }
+  ]
+ },
+ "S2_reaction_storm": {
+  "targets": 24,
+  "attempted": 205,
+  "note": null,
+  "resolved": 0,
+  "fails": 205,
+  "shortfall_n": 0,
+  "shortfall": {},
+  "undo_ok": 0,
+  "undo_fail": 0,
+  "residue_after_undo": {
+   "asf9tus5ignk9d67": 2,
+   "asf9tuupignk9d9m": 2,
+   "asf9tuy9ignk9ddu": 2,
+   "asf9tv22ignk9dhy": 4,
+   "asf9tv5mignk9dm6": 4,
+   "asf9tv9aignk9dqa": 4,
+   "asf9tvcleqkybvu0": 6,
+   "asf9tvhaeqkybvyl": 6,
+   "asf9tvkveqkybw2s": 6,
+   "asf9tvp3eqkybw72": 8
+  },
+  "wall_s": 251.7
+ },
+ "S3_poll_storm": {
+  "polls": 15,
+  "attempted": 72,
+  "votes_ok": 0,
+  "shortfall_n": 0,
+  "shortfall": {},
+  "wall_s": 699.7
+ },
+ "S4b_media": {
+  "uploads": 25,
+  "ok": 25,
+  "bad": [],
+  "p50_link_s": 300,
+  "max_link_s": 300,
+  "wall_s": 10.2
+ }
+}

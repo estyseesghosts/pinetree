@@ -1,0 +1,212 @@
+stress tag=S199292
+Exception in thread Thread-2 (poll):
+Traceback (most recent call last):
+  File "/usr/lib64/python3.14/threading.py", line 1082, in _bootstrap_inner
+    self._context.run(self.run)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/usr/lib64/python3.14/threading.py", line 1024, in run
+    self._target(*self._args, **self._kwargs)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/opencode/bench/phase-stress.py", line 71, in poll
+    if any(marker in note_text(dst, n) for n in deep_home_node(dst, du)):
+       ^^^
+  File "/tmp/opencode/bench/phase-stress.py", line 71, in <genexpr>
+    if any(marker in note_text(dst, n) for n in deep_home_node(dst, du)):
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: argument of type 'NoneType' is not a container or iterable
+Exception in thread Thread-5 (poll):
+Traceback (most recent call last):
+  File "/usr/lib64/python3.14/threading.py", line 1082, in _bootstrap_inner
+    self._context.run(self.run)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/usr/lib64/python3.14/threading.py", line 1024, in run
+    self._target(*self._args, **self._kwargs)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/opencode/bench/phase-stress.py", line 71, in poll
+    if any(marker in note_text(dst, n) for n in deep_home_node(dst, du)):
+       ^^^
+  File "/tmp/opencode/bench/phase-stress.py", line 71, in <genexpr>
+    if any(marker in note_text(dst, n) for n in deep_home_node(dst, du)):
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: argument of type 'NoneType' is not a container or iterable
+Exception in thread Thread-8 (poll):
+Traceback (most recent call last):
+  File "/usr/lib64/python3.14/threading.py", line 1082, in _bootstrap_inner
+    self._context.run(self.run)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/usr/lib64/python3.14/threading.py", line 1024, in run
+    self._target(*self._args, **self._kwargs)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/opencode/bench/phase-stress.py", line 71, in poll
+    if any(marker in note_text(dst, n) for n in deep_home_node(dst, du)):
+       ^^^
+  File "/tmp/opencode/bench/phase-stress.py", line 71, in <genexpr>
+    if any(marker in note_text(dst, n) for n in deep_home_node(dst, du)):
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: argument of type 'NoneType' is not a container or iterable
+Exception in thread Thread-11 (poll):
+Traceback (most recent call last):
+  File "/usr/lib64/python3.14/threading.py", line 1082, in _bootstrap_inner
+    self._context.run(self.run)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/usr/lib64/python3.14/threading.py", line 1024, in run
+    self._target(*self._args, **self._kwargs)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/opencode/bench/phase-stress.py", line 71, in poll
+    if any(marker in note_text(dst, n) for n in deep_home_node(dst, du)):
+       ^^^
+  File "/tmp/opencode/bench/phase-stress.py", line 71, in <genexpr>
+    if any(marker in note_text(dst, n) for n in deep_home_node(dst, du)):
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: argument of type 'NoneType' is not a container or iterable
+Exception in thread Thread-14 (poll):
+Traceback (most recent call last):
+  File "/usr/lib64/python3.14/threading.py", line 1082, in _bootstrap_inner
+    self._context.run(self.run)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/usr/lib64/python3.14/threading.py", line 1024, in run
+    self._target(*self._args, **self._kwargs)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/opencode/bench/phase-stress.py", line 71, in poll
+    if any(marker in note_text(dst, n) for n in deep_home_node(dst, du)):
+       ^^^
+  File "/tmp/opencode/bench/phase-stress.py", line 71, in <genexpr>
+    if any(marker in note_text(dst, n) for n in deep_home_node(dst, du)):
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: argument of type 'NoneType' is not a container or iterable
+Exception in thread Thread-17 (poll):
+Traceback (most recent call last):
+  File "/usr/lib64/python3.14/threading.py", line 1082, in _bootstrap_inner
+    self._context.run(self.run)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/usr/lib64/python3.14/threading.py", line 1024, in run
+    self._target(*self._args, **self._kwargs)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/opencode/bench/phase-stress.py", line 71, in poll
+    if any(marker in note_text(dst, n) for n in deep_home_node(dst, du)):
+       ^^^
+  File "/tmp/opencode/bench/phase-stress.py", line 71, in <genexpr>
+    if any(marker in note_text(dst, n) for n in deep_home_node(dst, du)):
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: argument of type 'NoneType' is not a container or iterable
+Exception in thread Thread-20 (poll):
+Traceback (most recent call last):
+  File "/usr/lib64/python3.14/threading.py", line 1082, in _bootstrap_inner
+    self._context.run(self.run)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/usr/lib64/python3.14/threading.py", line 1024, in run
+    self._target(*self._args, **self._kwargs)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/opencode/bench/phase-stress.py", line 71, in poll
+    if any(marker in note_text(dst, n) for n in deep_home_node(dst, du)):
+       ^^^
+  File "/tmp/opencode/bench/phase-stress.py", line 71, in <genexpr>
+    if any(marker in note_text(dst, n) for n in deep_home_node(dst, du)):
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: argument of type 'NoneType' is not a container or iterable
+Exception in thread Thread-23 (poll):
+Traceback (most recent call last):
+  File "/usr/lib64/python3.14/threading.py", line 1082, in _bootstrap_inner
+    self._context.run(self.run)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/usr/lib64/python3.14/threading.py", line 1024, in run
+    self._target(*self._args, **self._kwargs)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/opencode/bench/phase-stress.py", line 71, in poll
+    if any(marker in note_text(dst, n) for n in deep_home_node(dst, du)):
+       ^^^
+  File "/tmp/opencode/bench/phase-stress.py", line 71, in <genexpr>
+    if any(marker in note_text(dst, n) for n in deep_home_node(dst, du)):
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: argument of type 'NoneType' is not a container or iterable
+Exception in thread Thread-26 (poll):
+Traceback (most recent call last):
+  File "/usr/lib64/python3.14/threading.py", line 1082, in _bootstrap_inner
+    self._context.run(self.run)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/usr/lib64/python3.14/threading.py", line 1024, in run
+    self._target(*self._args, **self._kwargs)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/opencode/bench/phase-stress.py", line 71, in poll
+    if any(marker in note_text(dst, n) for n in deep_home_node(dst, du)):
+       ^^^
+  File "/tmp/opencode/bench/phase-stress.py", line 71, in <genexpr>
+    if any(marker in note_text(dst, n) for n in deep_home_node(dst, du)):
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: argument of type 'NoneType' is not a container or iterable
+Exception in thread Thread-29 (poll):
+Traceback (most recent call last):
+  File "/usr/lib64/python3.14/threading.py", line 1082, in _bootstrap_inner
+    self._context.run(self.run)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/usr/lib64/python3.14/threading.py", line 1024, in run
+    self._target(*self._args, **self._kwargs)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/opencode/bench/phase-stress.py", line 71, in poll
+    if any(marker in note_text(dst, n) for n in deep_home_node(dst, du)):
+       ^^^
+  File "/tmp/opencode/bench/phase-stress.py", line 71, in <genexpr>
+    if any(marker in note_text(dst, n) for n in deep_home_node(dst, du)):
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: argument of type 'NoneType' is not a container or iterable
+Exception in thread Thread-32 (poll):
+Traceback (most recent call last):
+  File "/usr/lib64/python3.14/threading.py", line 1082, in _bootstrap_inner
+    self._context.run(self.run)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/usr/lib64/python3.14/threading.py", line 1024, in run
+    self._target(*self._args, **self._kwargs)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/opencode/bench/phase-stress.py", line 71, in poll
+    if any(marker in note_text(dst, n) for n in deep_home_node(dst, du)):
+       ^^^
+  File "/tmp/opencode/bench/phase-stress.py", line 71, in <genexpr>
+    if any(marker in note_text(dst, n) for n in deep_home_node(dst, du)):
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: argument of type 'NoneType' is not a container or iterable
+Exception in thread Thread-35 (poll):
+Traceback (most recent call last):
+  File "/usr/lib64/python3.14/threading.py", line 1082, in _bootstrap_inner
+    self._context.run(self.run)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/usr/lib64/python3.14/threading.py", line 1024, in run
+    self._target(*self._args, **self._kwargs)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/opencode/bench/phase-stress.py", line 71, in poll
+    if any(marker in note_text(dst, n) for n in deep_home_node(dst, du)):
+       ^^^
+  File "/tmp/opencode/bench/phase-stress.py", line 71, in <genexpr>
+    if any(marker in note_text(dst, n) for n in deep_home_node(dst, du)):
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: argument of type 'NoneType' is not a container or iterable
+Exception in thread Thread-38 (poll):
+Traceback (most recent call last):
+  File "/usr/lib64/python3.14/threading.py", line 1082, in _bootstrap_inner
+    self._context.run(self.run)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/usr/lib64/python3.14/threading.py", line 1024, in run
+    self._target(*self._args, **self._kwargs)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/opencode/bench/phase-stress.py", line 71, in poll
+    if any(marker in note_text(dst, n) for n in deep_home_node(dst, du)):
+       ^^^
+  File "/tmp/opencode/bench/phase-stress.py", line 71, in <genexpr>
+    if any(marker in note_text(dst, n) for n in deep_home_node(dst, du)):
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: argument of type 'NoneType' is not a container or iterable
+S1 created: {"posts": 900, "create_failures": 0, "wall_s": 32.1, "create_p50_ms": 191.8, "create_p95_ms": 971.1, "create_p99_ms": 2274.1}
+S1 sweep +15s: {"pt-ks": {"per_src": {"pt-mk": 180, "misskey": 180, "catodon": 180, "akkoma": 180}, "total_markers": 720, "dupes": 11, "items": 960}, "pt-mk": {"per_src": {"pt-ks": 180, "misskey": 180, "catodon": 180, "akkoma": 180}, "total_markers": 720, "dupes": 9, "items": 960}, "misskey": {"per_src": {"pt-ks": 180, "pt-mk": 129, "catodon": 0, "akkoma": 62}, "total_markers": 371, "dupes": 0, "items": 591}, "catodon": {"per_src": {"pt-ks": 180, "pt-mk": 180, "misskey": 180, "akkoma": 180}, "total_markers": 720, "dupes": 0, "items": 960}, "akkoma": {"per_src": {"pt-ks": 180, "pt-mk": 180, "misskey": 180, "catodon": 180}, "total_markers": 720, "dupes": 3, "items": 960}}
+S1 sweep +60s: {"pt-ks": {"per_src": {"pt-mk": 180, "misskey": 180, "catodon": 180, "akkoma": 180}, "total_markers": 720, "dupes": 11, "items": 960}, "pt-mk": {"per_src": {"pt-ks": 180, "misskey": 180, "catodon": 180, "akkoma": 180}, "total_markers": 720, "dupes": 9, "items": 960}, "misskey": {"per_src": {"pt-ks": 180, "pt-mk": 129, "catodon": 0, "akkoma": 62}, "total_markers": 371, "dupes": 0, "items": 591}, "catodon": {"per_src": {"pt-ks": 180, "pt-mk": 180, "misskey": 180, "akkoma": 180}, "total_markers": 720, "dupes": 0, "items": 960}, "akkoma": {"per_src": {"pt-ks": 180, "pt-mk": 180, "misskey": 180, "catodon": 180}, "total_markers": 720, "dupes": 3, "items": 960}}
+S1 sweep +180s: {"pt-ks": {"per_src": {"pt-mk": 180, "misskey": 180, "catodon": 180, "akkoma": 180}, "total_markers": 720, "dupes": 11, "items": 960}, "pt-mk": {"per_src": {"pt-ks": 180, "misskey": 180, "catodon": 180, "akkoma": 180}, "total_markers": 720, "dupes": 9, "items": 960}, "misskey": {"per_src": {"pt-ks": 180, "pt-mk": 129, "catodon": 0, "akkoma": 62}, "total_markers": 371, "dupes": 0, "items": 591}, "catodon": {"per_src": {"pt-ks": 180, "pt-mk": 180, "misskey": 180, "akkoma": 180}, "total_markers": 720, "dupes": 0, "items": 960}, "akkoma": {"per_src": {"pt-ks": 180, "pt-mk": 180, "misskey": 180, "catodon": 180}, "total_markers": 720, "dupes": 3, "items": 960}}
+S2: 0 targets
+Traceback (most recent call last):
+  File "/tmp/opencode/bench/phase-stress.py", line 418, in <module>
+    main()
+    ~~~~^^
+  File "/tmp/opencode/bench/phase-stress.py", line 412, in main
+    s1(); s2(); s3(); s4(); s5(); s6(); s7()
+          ~~^^
+  File "/tmp/opencode/bench/phase-stress.py", line 154, in s2
+    for tgt in targets[(ri * 3) % len(targets):(ri * 3) % len(targets) + 10]:
+                       ~~~~~~~~~^~~~~~~~~~~~~~
+ZeroDivisionError: division by zero
