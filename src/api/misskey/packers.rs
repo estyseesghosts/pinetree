@@ -482,6 +482,27 @@ pub fn pack_note_reaction_with_note(
     }))
 }
 
+/// `NoteReaction` (`note-reaction.ts` `packedNoteReactionSchema`):
+/// `{id, createdAt, user: UserLite, type}`.
+pub fn pack_note_reaction(
+    reaction: &Reaction,
+    reactor: &Account,
+    services: &AppServices,
+) -> Value {
+    let created_at = format_millis(
+        services
+            .ids
+            .parse_time(&reaction.id)
+            .unwrap_or_else(|_| services.clock.now_ms()),
+    );
+    serde_json::json!({
+        "id": reaction.id,
+        "createdAt": created_at,
+        "user": pack_user_lite(reactor, &services.public_url, services.clock.now_ms()),
+        "type": reaction.reaction,
+    })
+}
+
 /// `Blocking` (`blocking.ts` `packedBlockingSchema`):
 /// `{id, createdAt, blockeeId, blockee}` with the blockee packed as
 /// `UserDetailedNotMe` (`Null` when the account row is gone).

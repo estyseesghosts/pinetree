@@ -140,3 +140,21 @@ Naming note: this storage group reuses the `E1`–`E6` case labels from `docs/mi
 - **E6 quote-disable storage (§3)**: (a) remote author (`host` set) with `reject_quotes=true` (set via `AccountStore::update_account` patch) creates a quote → stored note is PLAIN (`renote_id` None, `quote` None, `process_errors` contains `"quoteUnavailable"`), no `renote_count` bump on target; (b) local author with `reject_quotes=true` → `Validation(QUOTE_DISABLED_FOR_USER)`; (c) remote author with flag false → quote stored normally (control).
 
 Execution status (honest): E1–E6 are green on redb only (`tests/conformance.rs`: `note_edit_lifecycle`, `note_edit_noop_writes_nothing`, `note_edit_poll_replace_resets_votes`, `note_edit_history_chaining`, `note_edit_inbound_dedup`, `quote_disable_storage`); the FDB adapter is still a stub and has not run them.
+
+## Note URI uniqueness (Group U, added 2026-10-17; Draft)
+
+Every backend MUST keep **at most one live note per non-empty `uri`**, enforced
+inside the storage transaction (not by caller-side find-then-insert):
+
+- `record_note_activity(activity_id, input, jobs)` with a `uri` already held by a
+  live note returns `Ok(None)` (a replay of the note under a different activity id),
+  commits nothing, and enqueues none of `jobs`.
+- `create_note` with a taken `uri` returns `PortError::Conflict("DUPLICATE_NOTE_URI")`.
+- Deleting a note releases its `uri` (tombstones do not hold it).
+- `NoteStore::find_by_uri` is an indexed lookup, never a table scan.
+- redb: `NOTES_BY_URI` (uri → note id), written in the note's transaction, backfilled
+  at open (`run_uri_index_backfill`; pre-existing duplicate rows resolve to the richest
+  row, losers stay in `NOTES` but are unreachable by uri). FDB: a key per uri in the
+  note transaction; the read of that key is the conflict range.
+- Tests: `u1_same_uri_different_activity_ids`, `u2_concurrent_same_uri`,
+  `u3_deleted_note_releases_uri` in `tests/conformance.rs`.

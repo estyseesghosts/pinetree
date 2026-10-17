@@ -1330,7 +1330,9 @@ pub fn parse_remote_note(obj_val: &Value) -> Result<ParsedRemoteNote, String> {
         .as_object()
         .ok_or_else(|| "Note must be a JSON object".to_string())?;
     let note_type = obj.get("type").and_then(Value::as_str).unwrap_or("Note");
-    if !matches!(note_type, "Note" | "Article" | "Page" | "Question") {
+    // `Answer` is Pleroma/Akkoma's poll-vote object (`Create(Answer{name,
+    // inReplyTo})`); it is only meaningful to the vote branch of the inbox.
+    if !matches!(note_type, "Note" | "Article" | "Page" | "Question" | "Answer") {
         return Err(format!("unsupported note object type: {note_type}"));
     }
     let uri = obj

@@ -1229,6 +1229,45 @@ impl AppServices {
         Ok(kept)
     }
 
+    /// `notes/reactions` (list reactors; Misskey `notes/reactions.ts`): the
+    /// note must be visible to the viewer (`NO_SUCH_NOTE` otherwise), rows
+    /// are newest-first by reaction id with the usual id/date cursor, and an
+    /// optional `reaction_type` filter (`:name@.:` is the local spelling of
+    /// `:name:`). Rows whose reactor account is gone are skipped.
+    pub fn note_reactions(
+        &self,
+        note_id: &str,
+        viewer_id: Option<&str>,
+        reaction_type: Option<&str>,
+        cursor: &TimelineCursor,
+    ) -> Result<Vec<(Reaction, Account)>, PortError> {
+        let note = self.notes_show(note_id, viewer_id)?;
+        let wanted = reaction_type.filter(|t| !t.is_empty()).map(|t| {
+            match t.strip_suffix("@.:") {
+                Some(name) => format!("{name}:"),
+                None => t.to_string(),
+            }
+        });
+        let mut rows: Vec<Reaction> = self
+            .reactions
+            .reactions_for_note(&note.id)?
+            .into_iter()
+            .filter(|r| wanted.as_deref().map_or(true, |w| r.reaction == w))
+            .filter(|r| self.follow_matches_cursor(&r.id, cursor))
+            .collect();
+        rows.sort_by(|a, b| b.id.cmp(&a.id));
+        let mut out = Vec::new();
+        for reaction in rows {
+            if out.len() >= cursor.limit {
+                break;
+            }
+            if let Some(account) = self.accounts.find_by_id(&reaction.user_id)? {
+                out.push((reaction, account));
+            }
+        }
+        Ok(out)
+    }
+
     /// Mark every notification of `account_id` read and fan out the
     /// `readAllNotifications` main event. Shared by `i/notifications`
     /// (`markAsRead`) and `notifications/mark-all-as-read`. (A write op

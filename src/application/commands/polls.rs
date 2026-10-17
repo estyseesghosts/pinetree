@@ -178,31 +178,31 @@ impl AppServices {
         choice_name: &str,
     ) -> Result<bool, PortError> {
         let Some(note) = self.notes.get_note(note_id)? else {
-            return Ok(false);
+            return Ok(vote_dropped("no-note", activity_id, note_id));
         };
         if note.is_deleted {
-            return Ok(false);
+            return Ok(vote_dropped("note-deleted", activity_id, note_id));
         }
         let Some(poll) = self.polls.get_poll(note_id)? else {
-            return Ok(false);
+            return Ok(vote_dropped("no-poll", activity_id, note_id));
         };
         if poll.is_expired(self.now_ms()) {
-            return Ok(false);
+            return Ok(vote_dropped("poll-expired", activity_id, note_id));
         }
         let Some(choice) = poll.choices.iter().position(|c| c == choice_name) else {
-            return Ok(false);
+            return Ok(vote_dropped("unknown-choice", activity_id, note_id));
         };
         // Blocked voters cannot vote (same gate as the local path).
         if note.author_id != voter_id && self.blocks.is_blocking(&note.author_id, voter_id)? {
-            return Ok(false);
+            return Ok(vote_dropped("voter-blocked", activity_id, note_id));
         }
         let existing = self.polls.votes_by_user_for_note(voter_id, note_id)?;
         if poll.multiple {
             if existing.iter().any(|v| v.choice == choice) {
-                return Ok(false);
+                return Ok(vote_dropped("already-voted", activity_id, note_id));
             }
         } else if !existing.is_empty() {
-            return Ok(false);
+            return Ok(vote_dropped("already-voted", activity_id, note_id));
         }
         let mut jobs = vec![self.streaming_job(
             &StreamingEvent::PollVoted {
@@ -238,11 +238,13 @@ impl AppServices {
             jobs,
         ) {
             Ok(_) => Ok(true),
-            Err(PortError::Conflict(msg)) if msg == "ALREADY_VOTED" => Ok(false),
+            Err(PortError::Conflict(msg)) if msg == "ALREADY_VOTED" => {
+                Ok(vote_dropped("already-voted-race", activity_id, note_id))
+            }
             Err(PortError::Validation(msg))
                 if msg == "ALREADY_EXPIRED" || msg == "INVALID_CHOICE" =>
             {
-                Ok(false)
+                Ok(vote_dropped("rejected-by-storage", activity_id, note_id))
             }
             Err(e) => Err(e),
         }
@@ -322,6 +324,14 @@ impl AppServices {
             )?,
         ))
     }
+}
+
+/// An inbound vote that changes nothing is acknowledged (`202`) but never
+/// silent: one stderr line per drop with its reason, so a tally that stays
+/// at zero can be told apart from a vote that was never processed.
+pub(crate) fn vote_dropped(reason: &str, activity_id: &str, note_id: &str) -> bool {
+    eprintln!("[inbound-vote] dropped reason={reason} activity={activity_id} note={note_id}");
+    false
 }
 
 #[cfg(test)]

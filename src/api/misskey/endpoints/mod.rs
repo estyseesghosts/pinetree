@@ -3318,6 +3318,40 @@ fn api_dispatch_blocking(
             pack_note_list(&state.services, &notes, Some(&caller.account.id))
         }
 
+        "notes/reactions" => {
+            check_allowed_fields(
+                &obj,
+                &[
+                    "noteId",
+                    "type",
+                    "limit",
+                    "sinceId",
+                    "untilId",
+                    "sinceDate",
+                    "untilDate",
+                ],
+            )?;
+            let note_id = required_str(&obj, "noteId")?;
+            let reaction_type = opt_string(&obj, "type")?;
+            let cursor = parse_cursor(&obj)?;
+            let viewer_id = caller.as_ref().map(|caller| caller.account.id.as_str());
+            let rows = state
+                .services
+                .note_reactions(&note_id, viewer_id, reaction_type.as_deref(), &cursor)
+                .map_err(ApiError::from_port_error)?;
+            let out: Vec<Value> = rows
+                .iter()
+                .map(|(reaction, reactor)| {
+                    crate::api::misskey::packers::pack_note_reaction(
+                        reaction,
+                        reactor,
+                        &state.services,
+                    )
+                })
+                .collect();
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
         "notes/reactions/create" => {
             check_allowed_fields(&obj, &["noteId", "reaction"])?;
             let caller = require_caller(caller)?;
@@ -4043,85 +4077,13 @@ fn api_dispatch_blocking(
                             Err(_) => return Err(no_such_object()),
                         },
                     };
-                    let author_uri = author.actor_url(&state.services.public_url);
-                    let (visibility, _) = ap_objects::parse_note_audience(
-                        &parsed.to,
-                        &parsed.cc,
-                        Some(&format!("{author_uri}/followers")),
-                    );
-                    // Best-effort quote retention on the lookup path:
-                    // local-only target resolution, no stamp verification
-                    // (the federated inbox path remains authoritative).
-                    // Never discards a recognized quote. When the target
-                    // resolves locally, both `renote_of` and
-                    // `quote.target_note_id` point at it so the API
-                    // projection shows the relation; otherwise the URI is
-                    // retained with `renote_of: None` (no fabricated ID).
-                    let resolved_quote_target: Option<String> = parsed
-                        .quote_target_uri
-                        .as_deref()
-                        .and_then(|u| {
-                            state.services.notes.find_by_uri(u).ok().flatten()
-                        })
-                        .map(|n| n.id);
-                    // Same inbound-poll gate as the federated inbox: attach
-                    // only invariant-meeting Questions, never fail the note.
-                    let lookup_poll = parsed.poll.as_ref().filter(|p| {
-                        p.choices.len() >= 2
-                            && p.choices.len() <= 10
-                            && p.choices.iter().all(|c| {
-                                let n = c.chars().count();
-                                n >= 1 && n <= 50
-                            })
-                    });
-                    let input = CreateNoteInput {
-                        author_id: author.id.clone(),
-                        text: parsed.text.clone(),
-                        cw: parsed.cw.clone(),
-                        visibility,
-                        local_only: false,
-                        reply_to: None,
-                        reply_parent_uri: None,
-                        renote_of: resolved_quote_target.clone(),
-                        file_ids: Vec::new(),
-                        visible_users: Vec::new(),
-                        reaction_acceptance: None,
-                        no_extract_mentions: false,
-                        no_extract_hashtags: false,
-                        no_extract_emojis: false,
-                        has_poll: lookup_poll.is_some(),
-                        poll: lookup_poll.map(|p| {
-                            crate::domain::poll::PollInput {
-                                choices: p.choices.clone(),
-                                multiple: p.multiple,
-                                expires_at_ms: p.expires_at_ms,
-                            }
-                        }),
-                        poll_initial_votes: lookup_poll.map(|p| p.votes.clone()),
-                        has_channel: false,
-                        prohibited_words: Vec::new(),
-                        sensitive_words: Vec::new(),
-                        uri: Some(parsed.uri.clone()),
-                        url: parsed.url.clone(),
-                        extra_mentions: Vec::new(),
-                        extra_tags: Vec::new(),
-                        quote: parsed.quote_target_uri.clone().map(|target_uri| {
-                            crate::domain::quote::QuoteReference {
-                                target_uri,
-                                target_note_id: resolved_quote_target.clone(),
-                                authorization:
-                                    crate::domain::quote::QuoteAuthorizationState::Unapproved,
-                                authorization_uri: None,
-                                request_activity_uri: None,
-                                last_verified_at: None,
-                            }
-                        }),
-                    };
-                    // Cache under the note URI as the dedup key so concurrent
-                    // fetches converge.
-                    match state
-                        .services
-                        .handle_inbound_create_note(&parsed.uri, input, Vec::new())
+                    // Same ingest as the federated inbox (one pipeline, no
+                    // adapter-local copy): reply link, media job, quotes.
+                    match crate::federation::inbox::ingest_fetched_remote_note(
+                        &state.services,
+                        &parsed,
+                        &author,
+                    )
                     {
                         Ok(Some(note)) => {
                             let packed = pack_note(&note, viewer_id, &state.services, 0)
@@ -8159,6 +8121,94 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
         assert_eq!(value["code"], "NO_SUCH_USER");
         let _ = bob_id;
+    }
+
+    #[tokio::test]
+    async fn notes_reactions_lists_reactors() {
+        let (state, _) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (bob_id, bob_token) = signup_user(&state, "bob").await;
+        let (_, carol_token) = signup_user(&state, "carol").await;
+        let (status, created) = call(
+            &state,
+            "notes/create",
+            serde_json::json!({ "text": "hello" }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let note_id = created["createdNote"]["id"].as_str().unwrap().to_string();
+        for (token, reaction) in [(&alice_token, "👍"), (&bob_token, "❤")] {
+            let (status, v) = call(
+                &state,
+                "notes/reactions/create",
+                serde_json::json!({ "noteId": note_id, "reaction": reaction }),
+                Some(token),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{v}");
+        }
+
+        // Anonymous read of a public note: newest first, upstream shape.
+        let (status, rows) = call(
+            &state,
+            "notes/reactions",
+            serde_json::json!({ "noteId": note_id }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{rows}");
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["user"]["id"], bob_id);
+        assert_eq!(rows[0]["type"], "❤");
+        assert_eq!(rows[1]["user"]["id"], alice_id);
+        assert!(rows[1]["createdAt"].is_string() && rows[1].get("note").is_none());
+
+        // `type` filter and paging.
+        let (_, only) = call(
+            &state,
+            "notes/reactions",
+            serde_json::json!({ "noteId": note_id, "type": "👍" }),
+            None,
+        )
+        .await;
+        assert_eq!(only.as_array().unwrap().len(), 1);
+        let (_, page) = call(
+            &state,
+            "notes/reactions",
+            serde_json::json!({ "noteId": note_id, "limit": 1, "untilId": rows[0]["id"] }),
+            None,
+        )
+        .await;
+        assert_eq!(page.as_array().unwrap().len(), 1);
+        assert_eq!(page[0]["user"]["id"], alice_id);
+
+        // Unknown note, and a followers-only note hidden from a stranger.
+        let (status, v) = call(
+            &state,
+            "notes/reactions",
+            serde_json::json!({ "noteId": "nosuchnote0000000" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        let (_, private) = call(
+            &state,
+            "notes/create",
+            serde_json::json!({ "text": "fo", "visibility": "followers" }),
+            Some(&bob_token),
+        )
+        .await;
+        let pid = private["createdNote"]["id"].as_str().unwrap().to_string();
+        let (status, v) = call(
+            &state,
+            "notes/reactions",
+            serde_json::json!({ "noteId": pid }),
+            Some(&carol_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
     }
 
     #[tokio::test]

@@ -129,7 +129,10 @@ def pair_worker(pi, src, dst):
             def unreact_seen():
                 rs = S.reactions(A, su)
                 total = sum(len(a) if isinstance(a, list) else int(a or 0) for a in rs.values())
-                return True if total == 0 else (f"remaining={rs}" if total else True)
+                # Only a settled state is truthy: wait_until stops on the first
+                # truthy value, so returning "remaining=..." here made the check
+                # fail instantly (0.0 s) before the Undo could be delivered.
+                return True if total == 0 else None
             out = wait_until(unreact_seen, timeout=120)
             undo_ok = out is True
             rec("unreaction", src, dst, undo_ok, f"out={out}", time.time() - t0)

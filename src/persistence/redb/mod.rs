@@ -106,6 +106,12 @@ const NOTES_BY_REPLY: TableDefinition<(&str, &str), u8> =
 /// URI; removed atomically when the child links (or is deleted).
 const NOTES_BY_REPLY_PENDING: TableDefinition<(&str, &str), u8> =
     TableDefinition::new("notes_by_reply_pending");
+/// Unique index of live notes by ActivityPub `uri` → note id. Written in the
+/// same transaction as the note row; this is the storage-enforced
+/// uniqueness rule for note URIs (`docs/persistence-conformance.md`, "Note
+/// URI uniqueness") and the O(1) path behind `NoteStore::find_by_uri`.
+/// Rebuildable derived state; backfilled at open for older databases.
+const NOTES_BY_URI: TableDefinition<&str, &str> = TableDefinition::new("notes_by_uri");
 /// Schema/migration markers (`docs/replies.md` §4): single-row string
 /// keys (done markers, resume cursors) for versioned backfills.
 const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
@@ -126,6 +132,8 @@ const REPLY_INDEX_DONE_KEY: &str = "migration:notes_by_reply:v1";
 const REPLY_INDEX_DONE_VALUE: &str = "done";
 /// Resume cursor for an interrupted backfill: the last scanned note id.
 const REPLY_INDEX_PROGRESS_KEY: &str = "migration:notes_by_reply:v1:progress";
+/// `NOTES_BY_URI` backfill done marker (single transaction at open).
+const URI_INDEX_DONE_KEY: &str = "migration:notes_by_uri:v1";
 
 pub struct RedbStore {
     db: Database,
@@ -167,6 +175,7 @@ impl RedbStore {
         // completion here — before this handle serves any request — in
         // bounded crash-resumable batches (see `run_reply_index_backfill`).
         store.run_reply_index_backfill()?;
+        store.run_uri_index_backfill()?;
         Ok(store)
     }
 
@@ -247,6 +256,7 @@ impl RedbStore {
         let _ = write_txn
             .open_table(NOTES_BY_REPLY_PENDING)
             .map_err(map_redb_err)?;
+        let _ = write_txn.open_table(NOTES_BY_URI).map_err(map_redb_err)?;
         let _ = write_txn.open_table(NOTE_EDITS).map_err(map_redb_err)?;
         let _ = write_txn
             .open_table(NOTE_EDITS_BY_NOTE)
@@ -349,6 +359,54 @@ impl RedbStore {
         }
         self.commit_write(write_txn)?;
         Ok(exhausted)
+    }
+
+    /// Build `NOTES_BY_URI` for databases created before the index existed.
+    /// One pass; when several live rows share a `uri` (duplicates created
+    /// before uniqueness was enforced) the richest row wins (resolved reply
+    /// link or pending parent, then attachments), ties going to the oldest.
+    /// The losing rows stay in `NOTES` but are unreachable by uri.
+    pub fn run_uri_index_backfill(&self) -> Result<(), PortError> {
+        if self.meta_get(URI_INDEX_DONE_KEY)?.as_deref() == Some(REPLY_INDEX_DONE_VALUE) {
+            return Ok(());
+        }
+        let write_txn = self.begin_write()?;
+        {
+            let notes_table = write_txn.open_table(NOTES).map_err(map_redb_err)?;
+            let mut by_uri = write_txn.open_table(NOTES_BY_URI).map_err(map_redb_err)?;
+            let mut best: std::collections::HashMap<String, (u8, String)> =
+                std::collections::HashMap::new();
+            for entry in notes_table.iter().map_err(map_redb_err)? {
+                let (k, v) = entry.map_err(map_redb_err)?;
+                let note: Note = decode_json(v.value())?;
+                let Some(uri) = note.uri.as_deref().map(str::trim).filter(|u| !u.is_empty())
+                else {
+                    continue;
+                };
+                if note.is_deleted {
+                    continue;
+                }
+                let rank = u8::from(note.reply_id.is_some() || note.reply_parent_uri.is_some())
+                    + u8::from(!note.file_ids.is_empty());
+                let id = k.value().to_string();
+                match best.get(uri) {
+                    Some((r, _)) if *r >= rank => {}
+                    _ => {
+                        best.insert(uri.to_string(), (rank, id));
+                    }
+                }
+            }
+            for (uri, (_, id)) in &best {
+                by_uri
+                    .insert(uri.as_str(), id.as_str())
+                    .map_err(map_redb_err)?;
+            }
+            let mut meta_table = write_txn.open_table(META).map_err(map_redb_err)?;
+            meta_table
+                .insert(URI_INDEX_DONE_KEY, REPLY_INDEX_DONE_VALUE)
+                .map_err(map_redb_err)?;
+        }
+        self.commit_write(write_txn)
     }
 
     fn meta_get(&self, key: &str) -> Result<Option<String>, PortError> {
@@ -539,6 +597,7 @@ impl RedbStore {
         let mut by_reply_pending_table = write_txn
             .open_table(NOTES_BY_REPLY_PENDING)
             .map_err(map_redb_err)?;
+        let mut by_uri_table = write_txn.open_table(NOTES_BY_URI).map_err(map_redb_err)?;
         let media_table = write_txn.open_table(MEDIA_META).map_err(map_redb_err)?;
 
         let mut author: Account = match accounts_table
@@ -745,6 +804,28 @@ impl RedbStore {
             }
         }
 
+        let note_uri = input
+            .uri
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .map(str::to_string);
+        if let Some(uri) = note_uri.as_deref() {
+            // Tombstones don't hold their uri (deleting drops the index row).
+            let holder = by_uri_table
+                .get(uri)
+                .map_err(map_redb_err)?
+                .map(|g| g.value().to_string());
+            if let Some(holder_id) = holder {
+                let live = match notes_table.get(holder_id.as_str()).map_err(map_redb_err)? {
+                    Some(g) => !decode_json::<Note>(g.value())?.is_deleted,
+                    None => false,
+                };
+                if live {
+                    return Err(PortError::Conflict("DUPLICATE_NOTE_URI".to_string()));
+                }
+            }
+        }
         let note_id = self.ids.generate();
         // Quotes always carry `renote_id` for Misskey API compatibility, so
         // the resolved local target id is the single source of truth: when
@@ -838,6 +919,11 @@ impl RedbStore {
         by_author_table
             .insert((note.author_id.as_str(), note.id.as_str()), &1u8)
             .map_err(map_redb_err)?;
+        if let Some(uri) = note_uri.as_deref() {
+            by_uri_table
+                .insert(uri, note.id.as_str())
+                .map_err(map_redb_err)?;
+        }
         // Slice A adjacency index: a resolved reply links its
         // `(parent, child)` row in the same transaction as the note, the
         // parent counter bump, and the durable jobs below. A pending
@@ -859,6 +945,7 @@ impl RedbStore {
         drop(by_author_table);
         drop(by_reply_table);
         drop(by_reply_pending_table);
+        drop(by_uri_table);
         drop(media_table);
 
         // §4: the poll row commits in the same transaction as the note
@@ -1392,6 +1479,16 @@ impl RedbStore {
             let reply_parent_id = note.reply_id.clone();
             let reply_parent_uri = note.reply_parent_uri.clone();
 
+            if let Some(uri) = note.uri.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+                let mut by_uri = write_txn.open_table(NOTES_BY_URI).map_err(map_redb_err)?;
+                let owned = by_uri
+                    .get(uri)
+                    .map_err(map_redb_err)?
+                    .is_some_and(|g| g.value() == id);
+                if owned {
+                    by_uri.remove(uri).map_err(map_redb_err)?;
+                }
+            }
             note.is_deleted = true;
             note.text = None;
             note.cw = None;
@@ -2864,15 +2961,17 @@ impl NoteStore for RedbStore {
             return Ok(None);
         }
         let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let by_uri = read_txn.open_table(NOTES_BY_URI).map_err(map_redb_err)?;
+        let Some(id) = by_uri.get(target).map_err(map_redb_err)?.map(|g| g.value().to_string())
+        else {
+            return Ok(None);
+        };
         let notes_table = read_txn.open_table(NOTES).map_err(map_redb_err)?;
-        for entry in notes_table.iter().map_err(map_redb_err)? {
-            let (_, v) = entry.map_err(map_redb_err)?;
-            let note: Note = decode_json(v.value())?;
-            if !note.is_deleted && note.uri.as_deref() == Some(target) {
-                return Ok(Some(note));
-            }
-        }
-        Ok(None)
+        let found = match notes_table.get(id.as_str()).map_err(map_redb_err)? {
+            Some(g) => Some(decode_json::<Note>(g.value())?),
+            None => None,
+        };
+        Ok(found.filter(|n| !n.is_deleted))
     }
 
     fn notes_by_reply(
@@ -4979,9 +5078,20 @@ impl ActivityDedup for RedbStore {
             let _ = write_txn.abort();
             return Ok(None);
         }
-        let note = self.create_note_in_txn(&write_txn, input, jobs)?;
-        self.commit_write(write_txn)?;
-        Ok(Some(note))
+        // The same note arriving under a different activity id (an `ap/show`
+        // fetch, a quote-target cache, a re-wrapped `Create`) is a replay of
+        // the note, not a second note.
+        match self.create_note_in_txn(&write_txn, input, jobs) {
+            Ok(note) => {
+                self.commit_write(write_txn)?;
+                Ok(Some(note))
+            }
+            Err(PortError::Conflict(m)) if m == "DUPLICATE_NOTE_URI" => {
+                let _ = write_txn.abort();
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn record_delete_note_activity(

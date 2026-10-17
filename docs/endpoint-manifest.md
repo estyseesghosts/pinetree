@@ -69,6 +69,7 @@ Errors (stable idents): `NO_SUCH_RENOTE_TARGET`, `NO_SUCH_REPLY_TARGET`, `CANNOT
 | `following/delete` | `write:following`, 100/h | `userId*` | `UserLite` followee; `NO_SUCH_USER`, `FOLLOWEE_IS_YOURSELF`, `NOT_FOLLOWING` |
 | `notes/reactions/create` | `write:reactions` | `noteId*`, `reaction?` (string ≤260; absent/null → reactor's `defaultReaction ?? ❤` per the superseding note below; DIVERGENCE — upstream `notes/reactions/create.ts:19-74` requires `reaction`) | `204 No Content`; `NO_SUCH_NOTE`, `ALREADY_REACTED`, `YOU_HAVE_BEEN_BLOCKED`, `CANNOT_REACT_TO_RENOTE` (M `notes/reactions/create.ts:19-74`; `likeOnly` coerces to the bare-heart fallback `❤` (U+2764, no VS16) and every other reaction is normalized (legacies map, FE0F strip unless ZWJ) per `ReactionService.ts:34-48,125-162,383-401` — see §15) |
 | `notes/reactions/delete` | `write:reactions`, 60/h (min 3 s interval) | `noteId*` | `204 No Content`; `NO_SUCH_NOTE`, `NOT_REACTED` (M `notes/reactions/delete.ts:18-46`) |
+| `notes/reactions` (2026-10-17) | none (anonymous ok) | `noteId*`, `type?` (`:name@.:` = local `:name:`), `limit` 1..100 (default 10), `sinceId`/`untilId`/`sinceDate`/`untilDate` | `NoteReaction[]` `{id, createdAt, user: UserLite, type}`, newest first; `NO_SUCH_NOTE` when missing or invisible/hidden to the viewer (M `notes/reactions.ts`). Scans the note's reactions then pages in the application layer (no per-note reaction index yet). |
 | `notes/polls/vote` (§15) | credential `write:votes` | `noteId*`, `choice*` (integer) | `204 No Content`; `NO_SUCH_NOTE`, `NO_POLL`, `INVALID_CHOICE`, `ALREADY_VOTED`, `ALREADY_EXPIRED`, `YOU_HAVE_BEEN_BLOCKED` (all exact upstream code/message/id) |
 | `drive/files/create` | `write:drive`, 120/h | multipart/form-data (`file*`, `name?`, `comment?`, `isSensitive = false`, `force = false`, `folderId?`, `i?`) or JSON | `DriveFile` (packed `self: true`); `INVALID_FILE_NAME`, `MAX_FILE_SIZE_EXCEEDED` (413), `UNALLOWED_FILE_TYPE`. Public bytes served at `GET /files/:id` (and `/files/:id/:name` → 301 canonical, M `FileServerService.ts:93-99`, `DriveFileEntityService.ts:126`) |
 
@@ -144,7 +145,7 @@ extends this manifest without contradicting it:
   `notifications/mark-all-as-read`, `i/revoke-token`, `notes/search`,
   `notes/search-by-tag`.
 - Explicitly out (profile §5, as amended by §§13–18): antennas, drive folders,
-  clips, channels, chat, pages, Reversi, lists, featured/mentions/user-list timelines, `notes/reactions` (list),
+  clips, channels, chat, pages, Reversi, lists, featured/mentions/user-list timelines,
   `signin-flow`, OAuth, Mastodon API. Polls/vote shipped in §15. (`notifications-grouped` shipped in §18 and is no longer out.)
 
 ## 10. Superseding note — branched replies (2026-10-16, `docs/replies.md`)

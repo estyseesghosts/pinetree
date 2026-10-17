@@ -771,22 +771,52 @@ fn handle_create(
             (parsed.name.clone(), parsed.in_reply_to.clone())
         {
             if !choice_name.trim().is_empty() {
-                if let Some(target) = find_note_by_uri(services, reply_uri.trim())? {
-                    if services.polls.get_poll(&target.id)?.is_some() {
-                        let _ = services.handle_inbound_vote(
-                            activity_id,
-                            &author.id,
-                            &target.id,
-                            choice_name.trim(),
-                        )?;
-                        return Ok(accepted());
+                match find_note_by_uri(services, reply_uri.trim())? {
+                    Some(target) => {
+                        if services.polls.get_poll(&target.id)?.is_some() {
+                            let applied = services.handle_inbound_vote(
+                                activity_id,
+                                &author.id,
+                                &target.id,
+                                choice_name.trim(),
+                            )?;
+                            if applied {
+                                eprintln!(
+                                    "[inbound-vote] applied activity={activity_id} note={}",
+                                    target.id
+                                );
+                            }
+                            return Ok(accepted());
+                        }
+                        eprintln!(
+                            "[inbound-vote] not-a-poll, ingesting as note activity={activity_id} parent={}",
+                            target.id
+                        );
                     }
+                    None => eprintln!(
+                        "[inbound-vote] parent-not-cached, ingesting as note activity={activity_id} parent={}",
+                        reply_uri.trim()
+                    ),
                 }
             }
         }
     }
+    // An `Answer` is a vote, never a note: when it did not resolve to a
+    // cached poll above, drop it (logged) instead of storing an empty note.
+    if is_answer_object(activity) {
+        eprintln!("[inbound-vote] answer-without-cached-poll activity={activity_id}");
+        return Ok(accepted());
+    }
     ingest_remote_note(services, activity_id, &parsed, &author, true)?;
     Ok(accepted())
+}
+
+fn is_answer_object(activity: &Value) -> bool {
+    activity
+        .get("object")
+        .and_then(|o| o.get("type"))
+        .and_then(Value::as_str)
+        == Some("Answer")
 }
 
 fn handle_announce(
@@ -1211,6 +1241,19 @@ fn ingest_remote_note(
     ingest_remote_note_inner(services, activity_id, parsed, author, fetch_media, true)
 }
 
+/// Ingest a note fetched on demand (Misskey `ap/show` lookup). Runs the same
+/// pipeline as an inbox `Create` (reply link or pending parent, mentions,
+/// media job, quote resolution), keyed by the note URI as the activity id.
+/// A note already cached under its `uri` returns `Ok(None)` (the storage
+/// uniqueness rule); the caller re-reads it.
+pub fn ingest_fetched_remote_note(
+    services: &AppServices,
+    parsed: &ParsedRemoteNote,
+    author: &Account,
+) -> Result<Option<Note>, PortError> {
+    ingest_remote_note(services, &parsed.uri, parsed, author, true)
+}
+
 /// Inner ingestion with a quote-target resolution depth guard: a fetched
 /// quote target is cached via this same path with `resolve_quote_target =
 /// false`, so a malicious chain of quotes cannot recurse without bound.
@@ -1508,7 +1551,7 @@ pub(crate) fn resolve_note_target_id(
         Err(_) => return Ok(None),
     };
     // Cache under the note URI as the dedup key so concurrent fetches converge.
-    match ingest_remote_note(services, &parsed.uri, &parsed, &author, false)? {
+    match ingest_remote_note(services, &parsed.uri, &parsed, &author, true)? {
         Some(note) => Ok(Some(note.id)),
         None => Ok(find_note_by_uri(services, target_uri)?.map(|note| note.id)),
     }
@@ -1533,7 +1576,7 @@ fn resolve_quote_target_id(
         Ok(author) => author,
         Err(_) => return Ok(None),
     };
-    match ingest_remote_note_inner(services, &parsed.uri, &parsed, &author, false, false)? {
+    match ingest_remote_note_inner(services, &parsed.uri, &parsed, &author, true, false)? {
         Some(note) => Ok(Some(note.id)),
         None => Ok(find_note_by_uri(services, target_uri)?.map(|note| note.id)),
     }
@@ -3189,5 +3232,101 @@ mod like_reaction_tests {
         let resp = handle_like(&services, &activity, "like-act-2", CAROL_URI).expect("handle");
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
         assert_eq!(stored_reaction(&services, &carol.id, &note.id), "🎉");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inbound poll votes (P6): payload shapes per software
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod inbound_vote_tests {
+    use super::*;
+    use serde_json::json;
+
+    use crate::application::ports::CreateAccountInput;
+    use crate::domain::poll::PollInput;
+
+    const CAROL_URI: &str = "https://remote.example/users/carol";
+
+    fn setup() -> (AppServices, Note, String) {
+        let services = crate::application::commands::tests::test_services("inbound-vote");
+        let alice = services.create_account("alice", None).expect("alice");
+        services
+            .accounts
+            .create_account(CreateAccountInput {
+                handle: "carol".to_string(),
+                host: Some("remote.example".to_string()),
+                display_name: None,
+                description: None,
+                location: None,
+                birthday: None,
+                uri: Some(CAROL_URI.to_string()),
+                inbox: Some("https://remote.example/inbox".to_string()),
+                shared_inbox: None,
+                is_bot: false,
+                is_cat: false,
+                is_locked: false,
+                preserved_usernames: Vec::new(),
+            })
+            .expect("carol");
+        let mut input = CreateNoteInput::simple_public(&alice.id, "poll?");
+        input.poll = Some(PollInput {
+            choices: vec!["alpha".to_string(), "beta".to_string()],
+            multiple: false,
+            expires_at_ms: None,
+        });
+        input.has_poll = true;
+        let note = services.create_note(input).expect("poll note");
+        let uri = format!("{}/notes/{}", services.public_url.trim_end_matches('/'), note.id);
+        (services, note, uri)
+    }
+
+    fn votes(services: &AppServices, note: &Note) -> Vec<u64> {
+        services.polls.get_poll(&note.id).unwrap().unwrap().votes
+    }
+
+    fn create(object: Value) -> Value {
+        json!({ "type": "Create", "actor": CAROL_URI, "object": object })
+    }
+
+    /// Misskey/Sharkey/Catodon: a `Note` carrying `name` + `inReplyTo`.
+    #[test]
+    fn note_shaped_vote_is_tallied() {
+        let (services, note, uri) = setup();
+        let activity = create(json!({
+            "id": "https://remote.example/notes/v1", "type": "Note",
+            "attributedTo": CAROL_URI, "inReplyTo": uri, "name": "beta",
+            "to": [uri.clone()], "content": null,
+        }));
+        handle_create(&services, &activity, "https://remote.example/a/v1", CAROL_URI).unwrap();
+        assert_eq!(votes(&services, &note), vec![0, 1]);
+    }
+
+    /// Pleroma/Akkoma: `Create(Answer{name, inReplyTo})`. Previously the
+    /// parser rejected the type and the vote vanished without a trace.
+    #[test]
+    fn answer_shaped_vote_is_tallied() {
+        let (services, note, uri) = setup();
+        let activity = create(json!({
+            "id": "https://remote.example/answers/1", "type": "Answer",
+            "attributedTo": CAROL_URI, "inReplyTo": uri, "name": "alpha",
+            "to": [uri.clone()],
+        }));
+        handle_create(&services, &activity, "https://remote.example/a/v2", CAROL_URI).unwrap();
+        assert_eq!(votes(&services, &note), vec![1, 0]);
+    }
+
+    /// An `Answer` for an unknown parent is dropped, never stored as a note.
+    #[test]
+    fn answer_for_unknown_parent_stores_nothing() {
+        let (services, _note, _uri) = setup();
+        let activity = create(json!({
+            "id": "https://remote.example/answers/2", "type": "Answer",
+            "attributedTo": CAROL_URI, "inReplyTo": "https://elsewhere.example/notes/x",
+            "name": "alpha",
+        }));
+        handle_create(&services, &activity, "https://remote.example/a/v3", CAROL_URI).unwrap();
+        assert!(services.notes.find_by_uri("https://remote.example/answers/2").unwrap().is_none());
     }
 }

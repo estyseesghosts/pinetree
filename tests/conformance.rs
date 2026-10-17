@@ -5365,3 +5365,112 @@ fn quote_disable_storage() {
     let store = factory.open(clock.clone());
     case_e6_quote_disable_storage(&*store, &clock);
 }
+
+// ---------------------------------------------------------------------------
+// Group U — note URI uniqueness (`docs/persistence-conformance.md`)
+// ---------------------------------------------------------------------------
+
+fn uri_input(author_id: &str, uri: &str, text: &str) -> CreateNoteInput {
+    let mut input = CreateNoteInput::simple_public(author_id, text);
+    input.uri = Some(uri.to_string());
+    input
+}
+
+/// U1: the same note `uri` arriving under two different activity ids
+/// (`ap/show`-shaped fetch, then the real `Create`) yields exactly one row;
+/// the second is a replay (`Ok(None)`), its jobs are not enqueued, and
+/// `find_by_uri` resolves the first row.
+fn case_u1_same_uri_different_activity<S: ConformanceStore>(store: &S, clock: &ManualClock) {
+    let remote = remote_account(store, "u1_remote");
+    let uri = "https://remote.example/notes/u1";
+    let first = store
+        .record_note_activity(
+            uri,
+            uri_input(&remote.id, uri, "bare copy"),
+            vec![streaming_job(clock, "u1:job-1")],
+        )
+        .expect("first")
+        .expect("first wins");
+    let second = store
+        .record_note_activity(
+            "https://remote.example/activities/u1-create",
+            uri_input(&remote.id, uri, "full copy"),
+            vec![streaming_job(clock, "u1:job-2")],
+        )
+        .expect("second");
+    assert_eq!(second, None, "same uri under another activity id is a replay");
+    assert_eq!(store.pending_count().expect("count"), 1, "loser enqueued no job");
+    let found = NoteStore::find_by_uri(&*store, uri).expect("find").expect("indexed");
+    assert_eq!(found.id, first.id);
+    let rows = list_all(store).iter().filter(|n| n.uri.as_deref() == Some(uri)).count();
+    assert_eq!(rows, 1, "exactly one row per uri");
+
+    // A plain create with a taken uri is a conflict, not a second row.
+    let err = store
+        .create_note(uri_input(&remote.id, uri, "again"), Vec::new())
+        .expect_err("duplicate uri");
+    assert!(matches!(err, PortError::Conflict(_)), "got {err:?}");
+}
+
+#[test]
+fn u1_same_uri_different_activity_ids() {
+    let factory = RedbFactory::fresh("u1");
+    let clock = test_clock();
+    let store = factory.open(clock.clone());
+    case_u1_same_uri_different_activity(&*store, &clock);
+}
+
+/// U2: 8 racers, same uri, distinct activity ids → one winner, one row.
+#[test]
+fn u2_concurrent_same_uri() {
+    let factory = RedbFactory::fresh("u2");
+    let clock = test_clock();
+    let store: Arc<RedbStore> = factory.open(clock.clone());
+    let remote = remote_account(&*store, "u2_remote");
+    let uri = "https://remote.example/notes/u2";
+    let results: Vec<_> = std::thread::scope(|s| {
+        (0..8)
+            .map(|i| {
+                let store = store.clone();
+                let clock = clock.clone();
+                let author = remote.id.clone();
+                s.spawn(move || {
+                    store.record_note_activity(
+                        &format!("https://remote.example/activities/u2-{i}"),
+                        uri_input(&author, uri, &format!("racer {i}")),
+                        vec![streaming_job(&clock, &format!("u2:job-{i}"))],
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().expect("join"))
+            .collect()
+    });
+    assert!(results.iter().all(Result::is_ok), "{results:?}");
+    assert_eq!(results.iter().filter(|r| matches!(r, Ok(Some(_)))).count(), 1);
+    let rows = list_all(&*store).iter().filter(|n| n.uri.as_deref() == Some(uri)).count();
+    assert_eq!(rows, 1);
+    assert_eq!(store.pending_count().expect("count"), 1);
+}
+
+/// U3: a deleted note releases its uri (re-fetch after `Delete` may recreate).
+#[test]
+fn u3_deleted_note_releases_uri() {
+    let factory = RedbFactory::fresh("u3");
+    let clock = test_clock();
+    let store = factory.open(clock.clone());
+    let remote = remote_account(&*store, "u3_remote");
+    let uri = "https://remote.example/notes/u3";
+    let first = store
+        .record_note_activity("act:u3:1", uri_input(&remote.id, uri, "one"), Vec::new())
+        .unwrap()
+        .unwrap();
+    store.delete_note(&first.id, Vec::new()).expect("delete");
+    assert!(NoteStore::find_by_uri(&*store, uri).unwrap().is_none(), "tombstone not found by uri");
+    let again = store
+        .record_note_activity("act:u3:2", uri_input(&remote.id, uri, "two"), Vec::new())
+        .unwrap()
+        .expect("uri free again");
+    assert_eq!(NoteStore::find_by_uri(&*store, uri).unwrap().unwrap().id, again.id);
+}
