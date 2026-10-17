@@ -26,6 +26,7 @@ Each contract file carries a `Status:` line at the top: `Draft` or `Frozen`.
 | Testing guide (all suites + browser topologies) | How-to (`docs/testing.md`; entry point: `scripts/smoke-all.sh`) | §9 all phases |
 | Quote posts + FEP-044f | Implementation guide (`docs/quote-posts.md`; reviewed 2026-10-16) | §9 |
 | Branched replies | Implementation guide (`docs/replies.md`; reviewed 2026-10-16) | §9 |
+| Misskey parity plan (backend only) | Draft (`docs/misskey-parity-plan.md`; 2026-10-16) | §6 |
 | Wiki (overview, current state, roadmap, feature matrix) | Living docs (`docs/wiki/Home.md`) | all |
 
 Conventions: concrete over abstract (methods, fields, nullability, error shapes); record unsupported behavior explicitly; no implementation code in contracts.

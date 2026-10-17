@@ -1891,6 +1891,7 @@ mod tests {
             _user: &str,
             _note: &str,
             _reaction: &str,
+            _reaction_id: &str,
             _upsert: bool,
             _jobs: Vec<NewJob>,
         ) -> Result<Reaction, PortError> {

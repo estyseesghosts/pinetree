@@ -1092,11 +1092,15 @@ pub trait MuteStore: Send + Sync {
 }
 
 pub trait ReactionStore: Send + Sync {
+    /// `reaction_id` becomes the stored row id. The application also federates
+    /// the Like under this id, so a later `Undo(Like)` (built from the row id)
+    /// names the activity the remote server actually received.
     fn react(
         &self,
         user_id: &str,
         note_id: &str,
         reaction: &str,
+        reaction_id: &str,
         upsert: bool,
         jobs: Vec<NewJob>,
     ) -> Result<Reaction, PortError>;
@@ -1158,6 +1162,22 @@ pub trait ActivityDedup: Send + Sync {
     ) -> Result<bool, PortError> {
         let _ = (activity_id, note_id, jobs);
         unimplemented!("ActivityDedup::record_delete_note_activity not implemented")
+    }
+    /// Inbound `Delete` addressed by object URI (bench S6, 2026-10-17): the
+    /// deleter may reach the store before the note's `Create`. Atomically
+    /// deletes the live note at `object_uri` if one is held, else records a
+    /// tombstone so a later `record_note_activity` / `create_note` for that
+    /// URI is refused (`Ok(None)` / `Conflict`). Returns `true` only when a
+    /// note was deleted. Replays of `activity_id` return `false`. Callers
+    /// must have authorised the deleter against `object_uri` first.
+    fn record_delete_uri_activity(
+        &self,
+        activity_id: &str,
+        object_uri: &str,
+        jobs: Vec<NewJob>,
+    ) -> Result<bool, PortError> {
+        let _ = (activity_id, object_uri, jobs);
+        unimplemented!("ActivityDedup::record_delete_uri_activity not implemented")
     }
     fn record_follow_activity(
         &self,

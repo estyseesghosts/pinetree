@@ -109,8 +109,11 @@ async fn main() {
 
     let mut cfg = Config::default();
     let mut positional: Vec<String> = Vec::new();
+    let mut debug_federation_flag = false;
     for arg in std::env::args().skip(1) {
-        if let Some(mode) = arg.strip_prefix("--mode=") {
+        if arg == "--debug-federation" {
+            debug_federation_flag = true;
+        } else if let Some(mode) = arg.strip_prefix("--mode=") {
             cfg.mode = match mode {
                 "single" => DeploymentMode::Single,
                 "cluster" => DeploymentMode::Cluster,
@@ -141,6 +144,17 @@ async fn main() {
     if let Err(err) = cfg.validate() {
         eprintln!("{err}");
         std::process::exit(1);
+    }
+
+    // Federation debug lines (accept/reject, delivery). Off unless the flag or
+    // PINETREE_DEBUG_FEDERATION is set. See `pinetree::observability`.
+    let env_debug = pinetree::observability::env_enables_federation_debug(
+        std::env::var(pinetree::observability::DEBUG_FEDERATION_ENV).ok().as_deref(),
+    );
+    if debug_federation_flag || env_debug {
+        pinetree::observability::set_federation_debug(true);
+        let source = if debug_federation_flag { "--debug-federation" } else { "PINETREE_DEBUG_FEDERATION" };
+        eprintln!("federation debug logging on (source: {source})");
     }
 
     if positional.first().is_some_and(|cmd| cmd == "create-account") {

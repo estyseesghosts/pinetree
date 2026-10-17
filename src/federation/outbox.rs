@@ -388,9 +388,11 @@ pub fn execute_federate_deliver(
             inbox_override,
         } => {
             let Some(note) = services.notes.get_note(&note_id)? else {
+                crate::fed_debug!("out skip note={note_id:?} reason=note-missing");
                 return Ok(DeliveryOutcome::Delivered);
             };
             if !is_eligible_for_federation_delivery(&note) {
+                crate::fed_debug!("out skip note={note_id:?} reason=not-eligible");
                 return Ok(DeliveryOutcome::Delivered);
             }
             let activity = render_create_or_announce_for_note(services, &note)?;
@@ -1128,6 +1130,12 @@ fn fan_out(
     if inboxes.is_empty() {
         return Ok(DeliveryOutcome::Delivered);
     }
+    crate::fed_debug!(
+        "out fanout type={} recipients={} split={}",
+        activity.get("type").and_then(Value::as_str).unwrap_or("?"),
+        inboxes.len(),
+        fanout_is_split(inboxes.len())
+    );
     let now_ms = services.clock.now_ms();
     if fanout_is_split(inboxes.len()) {
         let mut followups = Vec::with_capacity(inboxes.len());
@@ -1187,12 +1195,19 @@ fn deliver_single(
     activity: &Value,
 ) -> Result<DeliveryOutcome, PortError> {
     let now_ms = services.clock.now_ms();
+    let kind = activity.get("type").and_then(Value::as_str).unwrap_or("?");
     if let Some(until_ms) = tracker.cooldown_until(inbox_url, now_ms) {
+        crate::fed_debug!(
+            "out defer type={kind} inbox={inbox_url:?} until_ms={until_ms} reason=destination-cooldown"
+        );
         return Ok(DeliveryOutcome::Deferred { until_ms });
     }
     let body = serde_json::to_vec(activity)
         .map_err(|e| PortError::Validation(format!("serialize activity: {e}")))?;
-    match signed_post_activity(services, client, sender_account_id, inbox_url, &body) {
+    let started = std::time::Instant::now();
+    let sent = signed_post_activity(services, client, sender_account_id, inbox_url, &body);
+    let elapsed_ms = started.elapsed().as_millis();
+    match sent {
         Ok(resp) => {
             let reason = String::from_utf8_lossy(&resp.body).into_owned();
             let retry_after = resp.header("retry-after").map(str::to_owned);
@@ -1202,16 +1217,32 @@ fn deliver_single(
                 retry_after.as_deref(),
                 now_ms,
             );
+            crate::fed_debug!(
+                "out send type={kind} inbox={inbox_url:?} status={} ms={elapsed_ms} outcome={outcome:?}",
+                resp.status
+            );
             Ok(settle_outcome(tracker, inbox_url, now_ms, outcome))
         }
         Err(err) if err.kind.is_transient() => {
+            crate::fed_debug!(
+                "out send type={kind} inbox={inbox_url:?} error=transient kind={:?} ms={elapsed_ms} msg={:?}",
+                err.kind,
+                err.message
+            );
             let outcome = DeliveryOutcome::TransientFailure {
                 reason: err.message,
                 retry_after_ms: None,
             };
             Ok(settle_outcome(tracker, inbox_url, now_ms, outcome))
         }
-        Err(err) => Ok(DeliveryOutcome::PermanentFailure(err.message)),
+        Err(err) => {
+            crate::fed_debug!(
+                "out send type={kind} inbox={inbox_url:?} error=permanent kind={:?} ms={elapsed_ms} msg={:?}",
+                err.kind,
+                err.message
+            );
+            Ok(DeliveryOutcome::PermanentFailure(err.message))
+        }
     }
 }
 

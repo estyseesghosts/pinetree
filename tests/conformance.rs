@@ -4564,7 +4564,7 @@ fn case_g3_enforcement<S: ConformanceStore>(store: &S) {
         Err(PortError::Validation(msg)) if msg == "BLOCKED"
     ));
     assert!(matches!(
-        store.react(&alice.id, &target.id, "❤", false, vec![]),
+        store.react(&alice.id, &target.id, "❤", "blocked-reaction-id", false, vec![]),
         Err(PortError::Validation(msg)) if msg == "YOU_HAVE_BEEN_BLOCKED"
     ));
     let mut pure = CreateNoteInput::simple_public(&alice.id, "x");
@@ -5473,4 +5473,206 @@ fn u3_deleted_note_releases_uri() {
         .unwrap()
         .expect("uri free again");
     assert_eq!(NoteStore::find_by_uri(&*store, uri).unwrap().unwrap().id, again.id);
+}
+
+// ---------------------------------------------------------------------------
+// Group N — notification order (`docs/persistence-conformance.md`)
+// ---------------------------------------------------------------------------
+
+/// N1: `i/notifications` order is newest-first across kinds, and `sinceId`/`untilId`
+/// paging walks that same order. Ids mirror production (`notify:{kind}:{suffix}`), so
+/// a key order that starts with the kind would group rows by kind and fail here.
+#[test]
+fn n1_notifications_newest_first_across_kinds() {
+    use pinetree::domain::notification::{Notification, NotificationKind};
+
+    let factory = RedbFactory::fresh("n1");
+    let clock = test_clock();
+    let store = factory.open(clock.clone());
+    let me = remote_account(&*store, "n1_me");
+    let who = remote_account(&*store, "n1_who");
+
+    // Oldest first. Kinds interleave so a kind-grouped order is visibly wrong.
+    let rows = [
+        ("inbound-reply", NotificationKind::Reply),
+        ("inbound-reaction", NotificationKind::Reaction),
+        ("inbound-mention", NotificationKind::Mention),
+        ("inbound-follow", NotificationKind::Follow),
+        ("inbound-reply", NotificationKind::Reply),
+        ("inbound-mention", NotificationKind::Mention),
+    ];
+    let mut ids = Vec::new();
+    for (i, (label, kind)) in rows.iter().enumerate() {
+        let id = format!("notify:{label}:{:016}", i + 1);
+        store
+            .insert_notification(Notification {
+                id: id.clone(),
+                notifiee_id: me.id.clone(),
+                notifier_id: who.id.clone(),
+                kind: kind.clone(),
+                note_id: None,
+                reaction: None,
+                draft_id: None,
+                file_id: None,
+                exported_entity: None,
+                is_read: false,
+            })
+            .expect("insert notification");
+        ids.push(id);
+    }
+    let newest_first: Vec<String> = ids.iter().rev().cloned().collect();
+
+    let all = store
+        .list_notifications_filtered(&me.id, &TimelineCursor::with_limit(20), &[], &[])
+        .expect("filtered list");
+    let got: Vec<String> = all.iter().map(|n| n.id.clone()).collect();
+    assert_eq!(got, newest_first, "newest-first across kinds");
+
+    let plain = store.list_notifications(&me.id, 20).expect("list");
+    let got: Vec<String> = plain.iter().map(|n| n.id.clone()).collect();
+    assert_eq!(got, newest_first, "unfiltered list uses the same order");
+
+    // Page 2 via untilId = the third-newest id, limit 2 → the next two rows.
+    let cursor = TimelineCursor {
+        until_id: Some(newest_first[2].clone()),
+        limit: 2,
+        ..Default::default()
+    };
+    let page = store
+        .list_notifications_filtered(&me.id, &cursor, &[], &[])
+        .expect("paged list");
+    let got: Vec<String> = page.iter().map(|n| n.id.clone()).collect();
+    assert_eq!(got, newest_first[3..5].to_vec(), "untilId pages across kinds");
+
+    // sinceId = the third-newest id → only the two newer rows.
+    let cursor = TimelineCursor {
+        since_id: Some(newest_first[2].clone()),
+        limit: 20,
+        ..Default::default()
+    };
+    let newer = store
+        .list_notifications_filtered(&me.id, &cursor, &[], &[])
+        .expect("since list");
+    let got: Vec<String> = newer.iter().map(|n| n.id.clone()).collect();
+    assert_eq!(got, newest_first[..2].to_vec(), "sinceId returns only newer rows");
+}
+
+// ---------------------------------------------------------------------------
+// Group T — remembered deletions (tombstones; bench S6, 2026-10-17)
+// ---------------------------------------------------------------------------
+
+/// T1: a `Delete` that reaches the store before its `Create` leaves a
+/// tombstone. The late `Create` under a new activity id is refused (`Ok(None)`),
+/// stores no row, and enqueues no job.
+fn case_t1_delete_before_create<S: ConformanceStore>(store: &S, clock: &ManualClock) {
+    let remote = remote_account(store, "t1_remote");
+    let uri = "https://remote.example/notes/t1";
+    let deleted = store
+        .record_delete_uri_activity("https://remote.example/activities/t1-delete", uri, Vec::new())
+        .expect("delete first");
+    assert!(!deleted, "no note held: the delete only records a tombstone");
+    let late = store
+        .record_note_activity(
+            "https://remote.example/activities/t1-create",
+            uri_input(&remote.id, uri, "late copy"),
+            vec![streaming_job(clock, "t1:job-1")],
+        )
+        .expect("late create");
+    assert_eq!(late, None, "a tombstoned uri must not be stored");
+    assert_eq!(store.pending_count().expect("count"), 0, "refused copy enqueued no job");
+    assert!(NoteStore::find_by_uri(&*store, uri).expect("find").is_none());
+    // A plain create of the same uri is refused the same way.
+    let err = store
+        .create_note(uri_input(&remote.id, uri, "again"), Vec::new())
+        .expect_err("tombstoned uri");
+    assert!(matches!(err, PortError::Conflict(_)), "got {err:?}");
+}
+
+#[test]
+fn t1_delete_before_create_leaves_tombstone() {
+    let factory = RedbFactory::fresh("t1");
+    let clock = test_clock();
+    let store = factory.open(clock.clone());
+    case_t1_delete_before_create(&*store, &clock);
+}
+
+/// T2: a `Delete` by URI for a held note removes it and enqueues its streaming
+/// job. The uri is released afterwards, as Group U3 requires, so a fresh `Create`
+/// may take it again.
+fn case_t2_delete_by_uri_removes_and_releases<S: ConformanceStore>(
+    store: &S,
+    clock: &ManualClock,
+) {
+    let remote = remote_account(store, "t2_remote");
+    let uri = "https://remote.example/notes/t2";
+    store
+        .record_note_activity(
+            "https://remote.example/activities/t2-create",
+            uri_input(&remote.id, uri, "stored"),
+            Vec::new(),
+        )
+        .expect("create")
+        .expect("stored");
+    let deleted = store
+        .record_delete_uri_activity(
+            "https://remote.example/activities/t2-delete",
+            uri,
+            vec![streaming_job(clock, "t2:job-del")],
+        )
+        .expect("delete");
+    assert!(deleted, "the held note is deleted");
+    assert!(NoteStore::find_by_uri(&*store, uri).expect("find").is_none());
+    assert_eq!(store.pending_count().expect("count"), 1, "delete enqueued its job");
+    let again = store
+        .record_note_activity(
+            "https://remote.example/activities/t2-create-again",
+            uri_input(&remote.id, uri, "fetched again"),
+            Vec::new(),
+        )
+        .expect("create after delete")
+        .expect("uri released after a held note is deleted");
+    assert_eq!(NoteStore::find_by_uri(&*store, uri).expect("find").unwrap().id, again.id);
+}
+
+#[test]
+fn t2_delete_by_uri_removes_and_releases() {
+    let factory = RedbFactory::fresh("t2");
+    let clock = test_clock();
+    let store = factory.open(clock.clone());
+    case_t2_delete_by_uri_removes_and_releases(&*store, &clock);
+}
+
+/// T3: a replayed delete activity is a no-op, a tombstone is scoped to its own
+/// uri, and an empty uri is rejected.
+fn case_t3_delete_replay_and_scope<S: ConformanceStore>(store: &S) {
+    let remote = remote_account(store, "t3_remote");
+    let uri = "https://remote.example/notes/t3";
+    let other = "https://remote.example/notes/t3-other";
+    let delete_id = "https://remote.example/activities/t3-delete";
+    assert!(!store.record_delete_uri_activity(delete_id, uri, Vec::new()).expect("first"));
+    assert!(
+        !store.record_delete_uri_activity(delete_id, uri, Vec::new()).expect("replay"),
+        "a replayed delete activity is a no-op"
+    );
+    let kept = store
+        .record_note_activity(
+            "https://remote.example/activities/t3-create-other",
+            uri_input(&remote.id, other, "other"),
+            Vec::new(),
+        )
+        .expect("other create")
+        .expect("other uri is not tombstoned");
+    assert_eq!(kept.uri.as_deref(), Some(other));
+    let err = store
+        .record_delete_uri_activity("https://remote.example/activities/t3-empty", "  ", Vec::new())
+        .expect_err("empty uri");
+    assert!(matches!(err, PortError::Validation(_)), "got {err:?}");
+}
+
+#[test]
+fn t3_delete_replay_and_scope() {
+    let factory = RedbFactory::fresh("t3");
+    let clock = test_clock();
+    let store = factory.open(clock.clone());
+    case_t3_delete_replay_and_scope(&*store);
 }

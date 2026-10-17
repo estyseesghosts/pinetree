@@ -84,8 +84,12 @@ const JOBS_DUE_INDEX: TableDefinition<(i64, &str), u8> = TableDefinition::new("j
 const ACTIVITY_DEDUP: TableDefinition<&str, u8> = TableDefinition::new("activity_dedup");
 const MEDIA_META: TableDefinition<&str, &[u8]> = TableDefinition::new("media_meta");
 const NOTIFICATIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("notifications");
-const NOTIFICATIONS_BY_USER: TableDefinition<(&str, &str), u8> =
-    TableDefinition::new("notifications_by_user");
+/// `(notifiee, order key) -> notification id`. The order key is the time-ordered
+/// suffix of the id (see [`notification_order_key`]). The full id cannot be the key:
+/// it starts with the kind (`notify:inbound-reply:…`), so ordering by it groups rows
+/// by kind. Renamed from `notifications_by_user`; old rows are backfilled at open.
+const NOTIFICATIONS_BY_USER: TableDefinition<(&str, &str), &str> =
+    TableDefinition::new("notifications_by_user_ordered");
 const CREDENTIALS: TableDefinition<&str, &str> = TableDefinition::new("credentials");
 const API_TOKENS: TableDefinition<&str, &[u8]> = TableDefinition::new("api_tokens");
 const MIAUTH_SESSIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("miauth_sessions");
@@ -112,6 +116,12 @@ const NOTES_BY_REPLY_PENDING: TableDefinition<(&str, &str), u8> =
 /// URI uniqueness") and the O(1) path behind `NoteStore::find_by_uri`.
 /// Rebuildable derived state; backfilled at open for older databases.
 const NOTES_BY_URI: TableDefinition<&str, &str> = TableDefinition::new("notes_by_uri");
+/// Remembered deletions: a remote note URI whose `Delete` arrived while no note
+/// was held (the `Delete` overtook its `Create`). A `Create` or fetch of a
+/// tombstoned URI is refused so the late copy cannot resurrect the note. Keyed
+/// by URI only; the value is a marker. Written only by
+/// `record_delete_uri_activity`; deleting a held note does not write one (Group U3).
+const TOMBSTONES_BY_URI: TableDefinition<&str, u8> = TableDefinition::new("tombstones_by_uri");
 /// Schema/migration markers (`docs/replies.md` §4): single-row string
 /// keys (done markers, resume cursors) for versioned backfills.
 const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
@@ -134,6 +144,8 @@ const REPLY_INDEX_DONE_VALUE: &str = "done";
 const REPLY_INDEX_PROGRESS_KEY: &str = "migration:notes_by_reply:v1:progress";
 /// `NOTES_BY_URI` backfill done marker (single transaction at open).
 const URI_INDEX_DONE_KEY: &str = "migration:notes_by_uri:v1";
+/// META marker: `NOTIFICATIONS_BY_USER` has been built from `NOTIFICATIONS`.
+const NOTIFICATION_ORDER_DONE_KEY: &str = "migration:notifications_by_user_ordered:v1";
 
 pub struct RedbStore {
     db: Database,
@@ -176,6 +188,7 @@ impl RedbStore {
         // bounded crash-resumable batches (see `run_reply_index_backfill`).
         store.run_reply_index_backfill()?;
         store.run_uri_index_backfill()?;
+        store.run_notification_order_backfill()?;
         Ok(store)
     }
 
@@ -257,6 +270,9 @@ impl RedbStore {
             .open_table(NOTES_BY_REPLY_PENDING)
             .map_err(map_redb_err)?;
         let _ = write_txn.open_table(NOTES_BY_URI).map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(TOMBSTONES_BY_URI)
+            .map_err(map_redb_err)?;
         let _ = write_txn.open_table(NOTE_EDITS).map_err(map_redb_err)?;
         let _ = write_txn
             .open_table(NOTE_EDITS_BY_NOTE)
@@ -404,6 +420,38 @@ impl RedbStore {
             let mut meta_table = write_txn.open_table(META).map_err(map_redb_err)?;
             meta_table
                 .insert(URI_INDEX_DONE_KEY, REPLY_INDEX_DONE_VALUE)
+                .map_err(map_redb_err)?;
+        }
+        self.commit_write(write_txn)
+    }
+
+    /// Build `NOTIFICATIONS_BY_USER` (order-keyed) from `NOTIFICATIONS` once, for
+    /// databases written before the index was keyed by the id's time-ordered
+    /// suffix. Idempotent; the META marker makes later opens a no-op.
+    pub fn run_notification_order_backfill(&self) -> Result<(), PortError> {
+        if self.meta_get(NOTIFICATION_ORDER_DONE_KEY)?.as_deref() == Some("done") {
+            return Ok(());
+        }
+        let write_txn = self.begin_write()?;
+        {
+            let notif_table = write_txn.open_table(NOTIFICATIONS).map_err(map_redb_err)?;
+            let mut by_user = write_txn
+                .open_table(NOTIFICATIONS_BY_USER)
+                .map_err(map_redb_err)?;
+            for entry in notif_table.iter().map_err(map_redb_err)? {
+                let (k, v) = entry.map_err(map_redb_err)?;
+                let stored: Notification = decode_json(v.value())?;
+                let nid = k.value();
+                by_user
+                    .insert(
+                        (stored.notifiee_id.as_str(), notification_order_key(nid)),
+                        nid,
+                    )
+                    .map_err(map_redb_err)?;
+            }
+            let mut meta_table = write_txn.open_table(META).map_err(map_redb_err)?;
+            meta_table
+                .insert(NOTIFICATION_ORDER_DONE_KEY, "done")
                 .map_err(map_redb_err)?;
         }
         self.commit_write(write_txn)
@@ -824,6 +872,14 @@ impl RedbStore {
                 if live {
                     return Err(PortError::Conflict("DUPLICATE_NOTE_URI".to_string()));
                 }
+            }
+            // A remembered deletion blocks a late copy of the same URI
+            // (`Delete` overtook its `Create`, or a fetch replays a deleted note).
+            let tombstones = write_txn
+                .open_table(TOMBSTONES_BY_URI)
+                .map_err(map_redb_err)?;
+            if tombstones.get(uri).map_err(map_redb_err)?.is_some() {
+                return Err(PortError::Conflict("TOMBSTONED_NOTE_URI".to_string()));
             }
         }
         let note_id = self.ids.generate();
@@ -1486,6 +1542,8 @@ impl RedbStore {
                     .map_err(map_redb_err)?
                     .is_some_and(|g| g.value() == id);
                 if owned {
+                    // Deleting a held note releases its uri (Group U3): only a
+                    // `Delete` that arrives with no note held leaves a tombstone.
                     by_uri.remove(uri).map_err(map_redb_err)?;
                 }
             }
@@ -2440,6 +2498,12 @@ fn contains_any_word(haystacks: &[&str], words: &[String]) -> bool {
         }
     }
     false
+}
+
+/// Time-ordered part of a notification id: `notify:{kind}:{suffix}` → `{suffix}`.
+/// Ids without a `:` are returned unchanged.
+fn notification_order_key(id: &str) -> &str {
+    id.rsplit(':').next().unwrap_or(id)
 }
 
 fn matches_cursor(note_id: &str, cursor: &TimelineCursor) -> bool {
@@ -4684,6 +4748,7 @@ impl ReactionStore for RedbStore {
         user_id: &str,
         note_id: &str,
         reaction_str: &str,
+        reaction_id: &str,
         upsert: bool,
         jobs: Vec<NewJob>,
     ) -> Result<Reaction, PortError> {
@@ -4691,7 +4756,7 @@ impl ReactionStore for RedbStore {
             job.validate()?;
         }
         let reaction = Reaction {
-            id: self.ids.generate(),
+            id: reaction_id.to_string(),
             user_id: user_id.to_string(),
             note_id: note_id.to_string(),
             reaction: reaction_str.to_string(),
@@ -5086,7 +5151,10 @@ impl ActivityDedup for RedbStore {
                 self.commit_write(write_txn)?;
                 Ok(Some(note))
             }
-            Err(PortError::Conflict(m)) if m == "DUPLICATE_NOTE_URI" => {
+            // A tombstoned URI is a deleted note arriving again: same as a replay.
+            Err(PortError::Conflict(m))
+                if m == "DUPLICATE_NOTE_URI" || m == "TOMBSTONED_NOTE_URI" =>
+            {
                 let _ = write_txn.abort();
                 Ok(None)
             }
@@ -5108,6 +5176,56 @@ impl ActivityDedup for RedbStore {
         self.delete_note_in_txn(&write_txn, note_id, jobs)?;
         self.commit_write(write_txn)?;
         Ok(true)
+    }
+
+    /// Delete by object URI. Deletes the live note holding `object_uri` if
+    /// one exists (it may have appeared since the caller's lookup), otherwise
+    /// records a tombstone. Both happen in this one write transaction, so a
+    /// concurrent `Create` either commits first (and is deleted here) or sees
+    /// the tombstone and is refused. `jobs` are only used when a note is
+    /// deleted; a tombstone-only outcome has no note to announce, so they are
+    /// dropped.
+    fn record_delete_uri_activity(
+        &self,
+        activity_id: &str,
+        object_uri: &str,
+        jobs: Vec<NewJob>,
+    ) -> Result<bool, PortError> {
+        let uri = object_uri.trim();
+        if uri.is_empty() {
+            return Err(PortError::Validation("empty object uri".to_string()));
+        }
+        let write_txn = self.begin_write()?;
+        if self.check_and_mark_dedup_in_txn(&write_txn, activity_id)? {
+            let _ = write_txn.abort();
+            return Ok(false);
+        }
+        let holder = {
+            let by_uri = write_txn.open_table(NOTES_BY_URI).map_err(map_redb_err)?;
+            let holder = by_uri
+                .get(uri)
+                .map_err(map_redb_err)?
+                .map(|g| g.value().to_string());
+            holder
+        };
+        let mut deleted = false;
+        if let Some(note_id) = holder {
+            match self.delete_note_in_txn(&write_txn, &note_id, jobs) {
+                Ok(()) => deleted = true,
+                // The index pointed at a row that is already deleted: treat as
+                // absent and fall through to the tombstone.
+                Err(PortError::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if !deleted {
+            let mut tombstones = write_txn
+                .open_table(TOMBSTONES_BY_URI)
+                .map_err(map_redb_err)?;
+            tombstones.insert(uri, &1u8).map_err(map_redb_err)?;
+        }
+        self.commit_write(write_txn)?;
+        Ok(deleted)
     }
 
     fn record_note_edit_activity(
@@ -5577,8 +5695,11 @@ impl NotificationStore for RedbStore {
                 .map_err(map_redb_err)?;
             by_user
                 .insert(
-                    (notification.notifiee_id.as_str(), notification.id.as_str()),
-                    &1u8,
+                    (
+                        notification.notifiee_id.as_str(),
+                        notification_order_key(&notification.id),
+                    ),
+                    notification.id.as_str(),
                 )
                 .map_err(map_redb_err)?;
         }
@@ -5604,8 +5725,8 @@ impl NotificationStore for RedbStore {
             .map_err(map_redb_err)?
             .rev()
         {
-            let (k, _) = entry.map_err(map_redb_err)?;
-            let (_, nid) = k.value();
+            let (_, v) = entry.map_err(map_redb_err)?;
+            let nid = v.value();
             if let Some(g) = notif_table.get(nid).map_err(map_redb_err)? {
                 out.push(decode_json(g.value())?);
                 if out.len() >= limit {
@@ -5624,6 +5745,12 @@ impl NotificationStore for RedbStore {
         exclude: &[NotificationKind],
     ) -> Result<Vec<Notification>, PortError> {
         let limit = if cursor.limit == 0 { 10 } else { cursor.limit };
+        // Cursor ids are full notification ids; compare them on the order key.
+        let aid_cursor = TimelineCursor {
+            since_id: cursor.since_id.as_deref().map(|s| notification_order_key(s).to_string()),
+            until_id: cursor.until_id.as_deref().map(|s| notification_order_key(s).to_string()),
+            ..cursor.clone()
+        };
         let read_txn = self.db.begin_read().map_err(map_redb_err)?;
         let notif_table = read_txn.open_table(NOTIFICATIONS).map_err(map_redb_err)?;
         let by_user = read_txn
@@ -5636,9 +5763,9 @@ impl NotificationStore for RedbStore {
             .map_err(map_redb_err)?
             .rev()
         {
-            let (k, _) = entry.map_err(map_redb_err)?;
-            let (_, nid) = k.value();
-            if !matches_cursor(nid, cursor) {
+            let (_, v) = entry.map_err(map_redb_err)?;
+            let nid = v.value();
+            if !matches_cursor(notification_order_key(nid), &aid_cursor) {
                 continue;
             }
             let Some(g) = notif_table.get(nid).map_err(map_redb_err)? else {
@@ -5671,7 +5798,7 @@ impl NotificationStore for RedbStore {
                 .range((notifiee_id, "")..=(notifiee_id, "\u{10ffff}"))
                 .map_err(map_redb_err)?
                 .filter_map(|entry| {
-                    entry.ok().map(|(k, _)| k.value().1.to_string())
+                    entry.ok().map(|(_, v)| v.value().to_string())
                 })
                 .collect();
             for nid in ids {

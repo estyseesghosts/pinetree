@@ -607,10 +607,12 @@ impl JobWorker {
             Ok(outcome) => outcome,
             // Unparseable payloads can never succeed on retry.
             Err(PortError::Validation(reason)) => {
+                crate::fed_debug!("out job key={:?} quarantine reason=bad-payload: {reason}", job.idempotency_key);
                 return Ok(Disposition::Quarantine(format!("bad-payload: {reason}")));
             }
             Err(e) => return Err(e),
         };
+        crate::fed_debug!("out job key={:?} outcome={outcome:?}", job.idempotency_key);
         Ok(match outcome {
             DeliveryOutcome::Delivered => Disposition::Done,
             DeliveryOutcome::PermanentFailure(reason) => {

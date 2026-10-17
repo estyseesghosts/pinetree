@@ -78,20 +78,38 @@ fn process_inbox(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    crate::fed_debug!(
+        "in  recv path={} bytes={}",
+        match user_id {
+            Some(uid) => format!("/users/{uid}/inbox"),
+            None => "/inbox".to_string(),
+        },
+        body.len()
+    );
     if body.len() > MAX_INBOX_BODY_BYTES {
+        crate::fed_debug!("in  reject reason=payload-too-large bytes={}", body.len());
         return payload_too_large();
     }
     let activity: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(_) => return bad_request(),
+        Err(_) => {
+            crate::fed_debug!("in  reject reason=bad-json");
+            return bad_request();
+        }
     };
     let activity_type = match non_empty_str(activity.get("type")) {
         Some(t) => canonical_activity_type(&t),
-        None => return bad_request(),
+        None => {
+            crate::fed_debug!("in  reject reason=missing-type");
+            return bad_request();
+        }
     };
     let activity_id = match non_empty_str(activity.get("id")) {
         Some(id) => id,
-        None => return bad_request(),
+        None => {
+            crate::fed_debug!("in  reject reason=missing-id type={activity_type}");
+            return bad_request();
+        }
     };
 
     // Personal inbox: the addressed account must exist and be local.
@@ -100,7 +118,10 @@ fn process_inbox(
     if let Some(uid) = user_id {
         match services.accounts.find_by_id(uid) {
             Ok(Some(acc)) if acc.is_local() => {}
-            Ok(_) => return not_found(),
+            Ok(_) => {
+                crate::fed_debug!("in  reject reason=personal-inbox-not-local user={uid:?}");
+                return not_found();
+            }
             Err(_) => return internal_error(),
         }
     }
@@ -111,24 +132,41 @@ fn process_inbox(
     };
     let signer_actor = match authenticate(services, &path_and_query, &headers, &body) {
         Ok(owner) => owner,
-        Err(resp) => return resp,
+        Err(resp) => {
+            crate::fed_debug!("in  reject reason=signature type={activity_type} id={activity_id:?}");
+            return resp;
+        }
     };
 
     // Actor authority: the activity actor must be the key owner.
     let actor_uri = match non_empty_str(activity.get("actor")) {
         Some(a) => a,
-        None => return unauthorized(),
+        None => {
+            crate::fed_debug!("in  reject reason=missing-actor type={activity_type} id={activity_id:?}");
+            return unauthorized();
+        }
     };
     if actor_uri != signer_actor {
+        crate::fed_debug!(
+            "in  reject reason=actor-not-signer type={activity_type} id={activity_id:?} actor={actor_uri:?} signer={signer_actor:?}"
+        );
         return unauthorized();
     }
 
     // Object authority for types whose objects the signer claims to own.
     if !check_object_authority(&activity_type, &activity, &signer_actor) {
+        crate::fed_debug!(
+            "in  reject reason=object-authority type={activity_type} id={activity_id:?} actor={actor_uri:?}"
+        );
         return unauthorized();
     }
 
-    dispatch(services, &activity, &activity_id, &activity_type, &actor_uri)
+    let resp = dispatch(services, &activity, &activity_id, &activity_type, &actor_uri);
+    crate::fed_debug!(
+        "in  done type={activity_type} id={activity_id:?} actor={actor_uri:?} status={}",
+        resp.status().as_u16()
+    );
+    resp
 }
 
 // ---------------------------------------------------------------------------
@@ -153,9 +191,16 @@ fn authenticate(
         .and_then(|v| v.to_str().ok())
         .or_else(|| headers.get("authorization").and_then(|v| v.to_str().ok()));
     let Some(raw) = raw else {
+        crate::fed_debug!("in  reject reason=no-signature-header");
         return Err(unauthorized());
     };
-    let parsed = parse_signature_header(raw).map_err(|_| unauthorized())?;
+    let parsed = match parse_signature_header(raw) {
+        Ok(p) => p,
+        Err(_) => {
+            crate::fed_debug!("in  reject reason=signature-header-unparseable");
+            return Err(unauthorized());
+        }
+    };
     let key_id = parsed.key_id.clone();
 
     let now_ms = services.clock.now_ms();
@@ -177,15 +222,26 @@ fn authenticate(
             Ok(_) => Ok(owner),
             Err(_) => {
                 // Stale cached key (e.g. rotated): refresh once and re-verify.
+                crate::fed_debug!("in  signature-retry keyId={key_id:?} (cached key failed; refreshing)");
                 match resolve_remote_public_key(services, client, &key_id, true) {
-                    Ok((fresh_owner, fresh_pem)) => {
-                        verify(&fresh_pem).map(|_| fresh_owner).map_err(|_| unauthorized())
+                    Ok((fresh_owner, fresh_pem)) => match verify(&fresh_pem) {
+                        Ok(_) => Ok(fresh_owner),
+                        Err(_) => {
+                            crate::fed_debug!("in  reject reason=signature-invalid keyId={key_id:?}");
+                            Err(unauthorized())
+                        }
+                    },
+                    Err(_) => {
+                        crate::fed_debug!("in  reject reason=key-unresolvable keyId={key_id:?}");
+                        Err(unauthorized())
                     }
-                    Err(_) => Err(unauthorized()),
                 }
             }
         },
-        Err(_) => Err(unauthorized()),
+        Err(_) => {
+            crate::fed_debug!("in  reject reason=key-unresolvable keyId={key_id:?}");
+            Err(unauthorized())
+        }
     }
 }
 
@@ -279,7 +335,10 @@ fn dispatch(
         "Delete" => handle_delete(services, activity, activity_id, actor_uri),
         "Update" => handle_update(services, activity, activity_id, actor_uri),
         "QuoteRequest" => handle_quote_request(services, activity, activity_id, actor_uri),
-        _ => Ok(accepted()),
+        _ => {
+            crate::fed_debug!("in  ignore type={activity_type} id={activity_id:?} reason=unsupported-type");
+            Ok(accepted())
+        }
     };
     outcome.unwrap_or_else(|_| internal_error())
 }
@@ -734,6 +793,7 @@ fn handle_create(
     // first delivery that passes this check simply does the (idempotent)
     // work twice and still converges.
     if services.dedup.is_recorded(activity_id)? {
+        crate::fed_debug!("in  drop type=Create id={activity_id:?} reason=replay-already-recorded");
         return Ok(accepted());
     }
     let client = &services.federation_http;
@@ -741,21 +801,37 @@ fn handle_create(
         Some(Value::String(uri)) => {
             let uri = uri.trim();
             if uri.is_empty() {
+                crate::fed_debug!("in  drop type=Create id={activity_id:?} reason=empty-object-uri");
                 return Ok(accepted());
             }
             match fetch_remote_note(services, client, uri) {
                 Ok(parsed) => parsed,
-                Err(_) => return Ok(accepted()),
+                Err(err) => {
+                    crate::fed_debug!(
+                        "in  drop type=Create id={activity_id:?} reason=object-fetch-failed uri={uri:?} err={err:?}"
+                    );
+                    return Ok(accepted());
+                }
             }
         }
         Some(obj @ Value::Object(_)) => match parse_remote_note(obj) {
             Ok(parsed) => parsed,
-            Err(_) => return Ok(accepted()),
+            Err(err) => {
+                crate::fed_debug!("in  drop type=Create id={activity_id:?} reason=object-unparseable err={err:?}");
+                return Ok(accepted());
+            }
         },
-        _ => return Ok(accepted()),
+        _ => {
+            crate::fed_debug!("in  drop type=Create id={activity_id:?} reason=object-missing");
+            return Ok(accepted());
+        }
     };
     // The note author must be the signer.
     if parsed.attributed_to != actor_uri {
+        crate::fed_debug!(
+            "in  reject reason=author-not-signer type=Create id={activity_id:?} author={:?} actor={actor_uri:?}",
+            parsed.attributed_to
+        );
         return Ok(unauthorized());
     }
     let author = resolve_remote_account(services, actor_uri)?;
@@ -807,7 +883,17 @@ fn handle_create(
         eprintln!("[inbound-vote] answer-without-cached-poll activity={activity_id}");
         return Ok(accepted());
     }
-    ingest_remote_note(services, activity_id, &parsed, &author, true)?;
+    match ingest_remote_note(services, activity_id, &parsed, &author, true)? {
+        Some(note) => crate::fed_debug!(
+            "in  applied type=Create id={activity_id:?} uri={:?} note={}",
+            parsed.uri,
+            note.id
+        ),
+        None => crate::fed_debug!(
+            "in  drop type=Create id={activity_id:?} reason=already-cached-uri uri={:?}",
+            parsed.uri
+        ),
+    }
     Ok(accepted())
 }
 
@@ -954,6 +1040,19 @@ fn handle_delete(
     // authoritatively by the stamp author's own server. (Forwarding itself
     // is still implemented outbound as gossip.)
     let Some(affected) = services.notes.find_note_by_quote_stamp(&object_uri)? else {
+        // Path 4: a `Delete` for a note this node does not hold. Misskey and
+        // Catodon can send the `Delete` before the `Create` it races with
+        // (bench S6, 2026-10-17). Record a tombstone so the late `Create` is
+        // refused. Only the object's own host may tombstone it, the same
+        // origin rule as Path 1, and a local URI is never tombstoned from
+        // federation input.
+        let local_host = host_of(&services.public_url);
+        if let (Some(actor_host), Some(object_host)) = (host_of(actor_uri), host_of(&object_uri))
+        {
+            if actor_host == object_host && Some(&object_host) != local_host.as_ref() {
+                services.handle_inbound_tombstone_uri(activity_id, &object_uri)?;
+            }
+        }
         return Ok(accepted());
     };
     let affected_target_author_uri = affected
@@ -3232,6 +3331,133 @@ mod like_reaction_tests {
         let resp = handle_like(&services, &activity, "like-act-2", CAROL_URI).expect("handle");
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
         assert_eq!(stored_reaction(&services, &carol.id, &note.id), "🎉");
+    }
+}
+
+#[cfg(test)]
+mod delete_tombstone_tests {
+    use super::*;
+    use serde_json::json;
+
+    use crate::application::ports::{CreateAccountInput, CreateNoteInput};
+
+    const MK_ACTOR: &str = "http://misskey.test/users/asf64vjyfcp90003";
+    const MK_NOTE: &str = "http://misskey.test/notes/n1";
+
+    /// Shape check: Misskey renders `Delete { object: Tombstone { id: <note uri> } }`
+    /// (`ApRendererService.renderDelete`), and that shape removes an already
+    /// stored remote note. This passes; the race where the Delete overtakes its
+    /// Create is pinned by `delete_before_create_does_not_resurrect` below.
+    #[test]
+    fn misskey_tombstone_delete_removes_the_remote_note() {
+        let services = crate::application::commands::tests::test_services("delete-tombstone");
+        let author = services
+            .accounts
+            .create_account(CreateAccountInput {
+                handle: "mk1".to_string(),
+                host: Some("misskey.test".to_string()),
+                display_name: None,
+                description: None,
+                location: None,
+                birthday: None,
+                uri: Some(MK_ACTOR.to_string()),
+                inbox: Some("http://misskey.test/inbox".to_string()),
+                shared_inbox: None,
+                is_bot: false,
+                is_cat: false,
+                is_locked: false,
+                preserved_usernames: Vec::new(),
+            })
+            .expect("remote author");
+        let note = services
+            .handle_inbound_create_note(
+                "http://misskey.test/notes/n1/activity",
+                CreateNoteInput {
+                    uri: Some(MK_NOTE.to_string()),
+                    ..CreateNoteInput::simple_public(&author.id, "PERF|churn|misskey|mk1|T")
+                },
+                Vec::new(),
+            )
+            .expect("create")
+            .expect("note stored");
+
+        let activity = json!({
+            "id": "http://misskey.test/793fb4d9-b03d-480d-b9a6-f9c5e90edace",
+            "type": "Delete",
+            "actor": MK_ACTOR,
+            "object": {
+                "id": MK_NOTE,
+                "type": "Tombstone",
+                "formerType": "Note"
+            },
+        });
+        let resp = handle_delete(
+            &services,
+            &activity,
+            "http://misskey.test/793fb4d9-b03d-480d-b9a6-f9c5e90edace",
+            MK_ACTOR,
+        )
+        .expect("handle");
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        // `get_note` reports a deleted note as absent.
+        assert!(
+            services.notes.get_note(&note.id).expect("read").is_none(),
+            "Delete(Tombstone) must delete the remote note"
+        );
+    }
+
+    /// Bench S6 residue (2026-10-17): Misskey and Catodon post then delete a
+    /// note within milliseconds. When the Delete is handled while the Create is
+    /// still in flight, `handle_delete` finds no note, returns 202, and remembers
+    /// nothing; the Create then stores the note and it stays live on pinetree
+    /// (`fast_delete_probe`: 2 of 5 notes resident on pt-ks, 1 of 5 on pt-mk; every Delete answered 202).
+    /// A Delete that arrives first must keep the late Create from resurrecting it.
+    /// Fixed by Path 4 of `handle_delete` (tombstone) and the tombstone check in
+    /// `create_note_in_txn`.
+    #[test]
+    fn delete_before_create_does_not_resurrect() {
+        let services = crate::application::commands::tests::test_services("delete-before-create");
+        let author = services
+            .accounts
+            .create_account(CreateAccountInput {
+                handle: "mk2".to_string(),
+                host: Some("misskey.test".to_string()),
+                display_name: None,
+                description: None,
+                location: None,
+                birthday: None,
+                uri: Some(MK_ACTOR.to_string()),
+                inbox: Some("http://misskey.test/inbox".to_string()),
+                shared_inbox: None,
+                is_bot: false,
+                is_cat: false,
+                is_locked: false,
+                preserved_usernames: Vec::new(),
+            })
+            .expect("remote author");
+        let delete_id = "http://misskey.test/late-delete-1";
+        let delete = json!({
+            "id": delete_id,
+            "type": "Delete",
+            "actor": MK_ACTOR,
+            "object": { "id": MK_NOTE, "type": "Tombstone", "formerType": "Note" },
+        });
+        handle_delete(&services, &delete, delete_id, MK_ACTOR).expect("delete first");
+        services
+            .handle_inbound_create_note(
+                "http://misskey.test/notes/n1/activity",
+                CreateNoteInput {
+                    uri: Some(MK_NOTE.to_string()),
+                    ..CreateNoteInput::simple_public(&author.id, "PERF|churn|misskey|mk2|T")
+                },
+                Vec::new(),
+            )
+            .expect("late create");
+        assert!(
+            services.notes.find_by_uri(MK_NOTE).expect("read").is_none(),
+            "late Create must not resurrect a note whose Delete already arrived"
+        );
     }
 }
 

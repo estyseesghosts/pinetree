@@ -150,7 +150,8 @@ inside the storage transaction (not by caller-side find-then-insert):
   live note returns `Ok(None)` (a replay of the note under a different activity id),
   commits nothing, and enqueues none of `jobs`.
 - `create_note` with a taken `uri` returns `PortError::Conflict("DUPLICATE_NOTE_URI")`.
-- Deleting a note releases its `uri` (tombstones do not hold it).
+- Deleting a held note releases its `uri` (Group U3). The one exception is a `Delete`
+  that finds no note: see Group T below.
 - `NoteStore::find_by_uri` is an indexed lookup, never a table scan.
 - redb: `NOTES_BY_URI` (uri → note id), written in the note's transaction, backfilled
   at open (`run_uri_index_backfill`; pre-existing duplicate rows resolve to the richest
@@ -158,3 +159,57 @@ inside the storage transaction (not by caller-side find-then-insert):
   note transaction; the read of that key is the conflict range.
 - Tests: `u1_same_uri_different_activity_ids`, `u2_concurrent_same_uri`,
   `u3_deleted_note_releases_uri` in `tests/conformance.rs`.
+
+## Remembered deletions (Group T, added 2026-10-17; Draft)
+
+**Why:** bench S6 (2026-10-17). Misskey and Catodon send `Delete` before the `Create`
+it races with. Before this, a `Delete` that found no note returned 202 and kept nothing,
+so the late `Create` stored the note and it stayed live.
+
+- `record_delete_uri_activity(activity_id, object_uri, jobs) -> Result<bool, PortError>`
+  (`ActivityDedup`) is one atomic write:
+  - A replayed `activity_id` returns `Ok(false)` and changes nothing.
+  - If a live note holds `object_uri` (it may have appeared since the caller's lookup),
+    it is deleted with `jobs`, the uri is released as in U3, and the result is `Ok(true)`.
+  - Otherwise a tombstone is written for `object_uri` and the result is `Ok(false)`.
+    `jobs` are dropped, since no note was deleted.
+  - An empty uri returns `Validation`.
+- A tombstoned uri refuses later writes of that uri: `record_note_activity` returns
+  `Ok(None)` (no row, no jobs), and `create_note` returns `Conflict("TOMBSTONED_NOTE_URI")`.
+- Only the `Delete` path writes tombstones. Deleting a held note (`delete_note`,
+  `record_delete_note_activity`) does not, so U3 still holds: a re-fetch after deleting a
+  held note may recreate it.
+- Authority is the caller's job: `handle_delete` tombstones only when the deleter's host
+  equals the object URI's host and the object is not local. Federation input can therefore
+  grow the tombstone table without bound. Accepted for the MVP, with the same limit as the
+  activity-dedup table.
+- The race between a concurrent `Create` and `Delete` closes inside the write transaction:
+  either the `Create` commits first and the `Delete` deletes it, or the `Delete` commits
+  first and the `Create` is refused.
+- Known gap: a note that appears between the caller's lookup and the write is deleted
+  without a `NoteDeleted` streaming event, because the caller does not yet know the note id.
+- redb: `TOMBSTONES_BY_URI` (uri → marker), created at open. FDB: a key per uri, read in the
+  create transaction, so the read is the conflict range.
+- Tests: `t1_delete_before_create_leaves_tombstone`, `t2_delete_by_uri_removes_and_releases`,
+  `t3_delete_replay_and_scope` in `tests/conformance.rs`. Handler level:
+  `federation::inbox::delete_tombstone_tests::delete_before_create_does_not_resurrect`.
+- Port change: `ActivityDedup::record_delete_uri_activity` is new. `docs/application-ports.md`
+  is Frozen and is NOT edited. This addendum and state log `2026-10-17-bench-rerun.md`
+  supersede it for this method, pending the owner's sign-off.
+
+## 16. Notification order (Group N, added 2026-10-17; Draft)
+
+- **Contract:** `list_notifications` and `list_notifications_filtered` return a
+  notifiee's notifications newest-first **across all kinds**. `sinceId`/`untilId`
+  compare on the time-ordered suffix of the id, and `sinceDate`/`untilDate` use that
+  same suffix. Ids have the shape `notify:{kind}:{suffix}` (plain ids are their own
+  suffix).
+- **Why:** the index used to be keyed by the full id. Full ids start with the kind,
+  so rows came back grouped by kind (replies, then renotes, reactions, mentions,
+  follows). Mentions were buried on the first page of `i/notifications`.
+- **Redb:** `notifications_by_user_ordered` maps `(notifiee, suffix) → id`. It is
+  built once from `notifications` at open (META `migration:notifications_by_user_ordered:v1`).
+- **Test:** `n1_notifications_newest_first_across_kinds` (tests/conformance.rs, Group N).
+  It failed on the pre-fix code with grouped output.
+- **FDB (Phase 4):** the per-user index must also be keyed by the time-ordered suffix.
+  Keying it by the full id reproduces the bug.

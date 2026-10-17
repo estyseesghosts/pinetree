@@ -136,6 +136,27 @@ impl AppServices {
         }
     }
 
+    /// Record an inbound `Delete` for a note URI this node does not hold
+    /// (bench S6, 2026-10-17). Writes a tombstone so a later `Create` or fetch
+    /// of the URI cannot resurrect the note. The caller authorises the deleter
+    /// first. If the note appeared between the caller's lookup and this write,
+    /// it is deleted in the same transaction. That path emits no streaming
+    /// event, because the caller does not know the note id in advance.
+    pub fn handle_inbound_tombstone_uri(
+        &self,
+        activity_id: &str,
+        object_uri: &str,
+    ) -> Result<bool, PortError> {
+        match self
+            .dedup
+            .record_delete_uri_activity(activity_id, object_uri, Vec::new())
+        {
+            Ok(v) => Ok(v),
+            Err(PortError::NotFound(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Record an inbound `Update(Note|Article|Page)` (§8; Sharkey
     /// `ApNoteService.updateNote` parity): apply a remote author's edit to
     /// the cached local copy through the same storage path as local edits.
