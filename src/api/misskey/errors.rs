@@ -87,6 +87,10 @@ pub const NO_SUCH_NOTE_DRAFT_ID: &str = "49cd6b9d-848e-41ee-b0b9-adaca711a6b1";
 /// Misskey `i/pin.ts` idents (verbatim upstream UUIDs).
 pub const PIN_LIMIT_EXCEEDED_ID: &str = "72dab508-c64d-498f-8740-a8eec1ba385a";
 pub const ALREADY_PINNED_ID: &str = "8b18c2b7-68fe-4edb-9892-c0cbaeb6c913";
+/// Misskey invite-code idents (verbatim upstream UUIDs; Batch M WP2).
+pub const NO_SUCH_INVITE_CODE_ID: &str = "cd4f9ae4-7854-4e3e-8df9-c296f051e634";
+pub const CAN_NOT_DELETE_INVITE_CODE_ID: &str = "ff17af39-000c-4d4e-abdf-848fa30fc1ce";
+pub const INVALID_DATE_TIME_ID: &str = "f1380b15-3760-4c6c-a1db-5c3aaf1cbd49";
 /// Sharkey `notes/edit.ts` idents (verbatim upstream UUIDs). Codes already
 /// known to pinetree (`NO_SUCH_NOTE`, `NO_SUCH_REPLY_TARGET`, …) keep the
 /// existing pinetree UUID (one UUID per code, §16 convention); only new
@@ -449,6 +453,7 @@ fn is_known_client_code(code: &str) -> bool {
         code,
         "NO_SUCH_NOTE"
             | "NO_SUCH_USER"
+            | "NO_SUCH_INVITE_CODE"
             | "NO_SUCH_REPLY_TARGET"
             | "NO_SUCH_RENOTE_TARGET"
             | "NO_SUCH_FILE"
@@ -569,6 +574,24 @@ fn lookup_known_code(code: &str) -> Option<(&'static str, &'static str, u16, &'s
         ),
         "NO_SUCH_NOTE" => ("No such note.", NO_SUCH_NOTE_ID, 400, "client"),
         "NO_SUCH_USER" => ("No such user.", NO_SUCH_USER_ID, 400, "client"),
+        "NO_SUCH_INVITE_CODE" => (
+            "No such invite code.",
+            NO_SUCH_INVITE_CODE_ID,
+            400,
+            "client",
+        ),
+        "CAN_NOT_DELETE_INVITE_CODE" => (
+            "You can't delete this invite code.",
+            CAN_NOT_DELETE_INVITE_CODE_ID,
+            400,
+            "client",
+        ),
+        "INVALID_DATE_TIME" => (
+            "Invalid date-time format",
+            INVALID_DATE_TIME_ID,
+            400,
+            "client",
+        ),
         "NO_SUCH_AVATAR" => ("No such avatar file.", NO_SUCH_AVATAR_ID, 400, "client"),
         "NO_SUCH_BANNER" => ("No such banner file.", NO_SUCH_BANNER_ID, 400, "client"),
         "AVATAR_NOT_AN_IMAGE" => (

@@ -1856,6 +1856,7 @@ mod media_safety_tests {
             host_caps: store.clone(),
             moderation: store.clone(),
             instance_settings: store.clone(),
+            invites: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()
@@ -2266,6 +2267,7 @@ mod key_ownership_tests {
             host_caps: store.clone(),
             moderation: store.clone(),
             instance_settings: store.clone(),
+            invites: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()
@@ -2801,6 +2803,7 @@ mod reply_resolution_tests {
             host_caps: store.clone(),
             moderation: store.clone(),
             instance_settings: store.clone(),
+            invites: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()
@@ -3067,7 +3070,7 @@ mod update_note_tests {
                 is_cat: false,
                 is_locked: false,
                 preserved_usernames: Vec::new(),
-            })
+            }, None)
             .expect("remote author")
     }
 
@@ -3274,7 +3277,7 @@ mod like_reaction_tests {
                 is_cat: false,
                 is_locked: false,
                 preserved_usernames: Vec::new(),
-            })
+            }, None)
             .expect("remote liker")
     }
 
@@ -3373,7 +3376,7 @@ mod delete_tombstone_tests {
                 is_cat: false,
                 is_locked: false,
                 preserved_usernames: Vec::new(),
-            })
+            }, None)
             .expect("remote author");
         let note = services
             .handle_inbound_create_note(
@@ -3440,7 +3443,7 @@ mod delete_tombstone_tests {
                 is_cat: false,
                 is_locked: false,
                 preserved_usernames: Vec::new(),
-            })
+            }, None)
             .expect("remote author");
         let delete_id = "http://misskey.test/late-delete-1";
         let delete = json!({
@@ -3500,7 +3503,7 @@ mod inbound_vote_tests {
                 is_cat: false,
                 is_locked: false,
                 preserved_usernames: Vec::new(),
-            })
+            }, None)
             .expect("carol");
         let mut input = CreateNoteInput::simple_public(&alice.id, "poll?");
         input.poll = Some(PollInput {

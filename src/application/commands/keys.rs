@@ -55,7 +55,7 @@ impl AppServices {
             None => {
                 let mut input = CreateAccountInput::local("system_actor");
                 input.is_bot = true;
-                self.accounts.create_account(input)?
+                self.accounts.create_account(input, None)?
             }
         };
         let keypair = self.ensure_actor_keypair(&account.id)?;

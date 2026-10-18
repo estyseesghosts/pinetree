@@ -225,12 +225,12 @@ Backend-agnostic, same cases both adapters (FDB inherits). Atomicity rule (§2.3
 - **H3 concurrent suspend and unsuspend**: N threads alternate suspend/unsuspend on one account; every call lands, exactly one log row per call (none lost, none duplicated), account row still valid.
 - **H4 log append never lost**: `update_account_logged` commits patch + row + jobs together; an invalid row aborts all three; committed pairs survive reopen.
 
-### Group I — registration and invites (cases land with WP2; ports: `InviteStore`)
+### Group I — registration and invites (executed: `tests/conformance.rs` `i1_invite_single_use`, `i2_consume_create_atomic`, `i3_registration_policy`, `i4_consume_happy_path`, 4/4 green 2026-10-17; ports: `InviteStore`)
 
-- **I1 single-use invite race**: one invite consumed by N concurrent signups → exactly one succeeds.
-- **I2 consume + create atomicity**: no account without a consumed invite and no consumed invite without an account (one transaction).
-- **I3 expired invite rejected**.
-- **I4 closed registration without invite rejected**.
+- **I1 single-use invite under N retries**: one code claimed by 5 `consume_and_create_account` calls → exactly one succeeds and creates exactly one account; the others fail `NotFound` and create nothing (the unique-index row goes with the claim).
+- **I2 consume + create atomicity**: a failing account insert inside the claim (duplicate handle) aborts the whole transaction — the code stays unused and claimable and no account row appears; a later valid claim then succeeds. No account without a consumed invite, no consumed invite without an account.
+- **I3 registration policy persists**: `InstanceSettings.registration` (upstream `disableRegistration`) round-trips through `InstanceSettingsStore` and each write commits with its `updateServerSettings` row. The gate itself is application logic (`AppServices::signup`); its enforcement is asserted by the endpoint test `wp2_signup_policy_gate_and_invite_claim` (closed + no code → plain 400, nothing created).
+- **I4 claim happy path + refusals**: a valid unexpired code creates the account, marks `usedBy`/`usedAt`, and drops the index row; re-consuming the same code, an unknown code, and an expired code all fail `NotFound` and create nothing (upstream's signup gate 400s for all three).
 
 ### Group J — favorites and emoji (cases land with WP7/WP8)
 

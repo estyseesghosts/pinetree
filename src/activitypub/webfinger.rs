@@ -590,7 +590,11 @@ mod tests {
     }
 
     impl AccountStore for Mem {
-        fn create_account(&self, _input: CreateAccountInput) -> Result<Account, PortError> {
+        fn create_account(
+            &self,
+            _input: CreateAccountInput,
+            _log: Option<&crate::domain::moderation::ModerationLogEntry>,
+        ) -> Result<Account, PortError> {
             unavailable("create_account")
         }
         fn find_by_id(&self, id: &str) -> Result<Option<Account>, PortError> {
@@ -816,6 +820,53 @@ mod tests {
             _log: crate::domain::moderation::ModerationLogEntry,
         ) -> Result<crate::domain::instance::InstanceSettings, PortError> {
             unavailable("instance_settings update")
+        }
+    }
+
+    impl crate::application::ports::InviteStore for Mem {
+        fn create_invites(
+            &self,
+            _inputs: &[crate::application::ports::CreateInviteInput],
+            _log: Option<&crate::domain::moderation::ModerationLogEntry>,
+        ) -> Result<Vec<crate::domain::instance::InviteCode>, PortError> {
+            unavailable("create_invites")
+        }
+        fn find_invite_by_id(
+            &self,
+            _id: &str,
+        ) -> Result<Option<crate::domain::instance::InviteCode>, PortError> {
+            unavailable("find_invite_by_id")
+        }
+        fn find_invite_by_code(
+            &self,
+            _code: &str,
+        ) -> Result<Option<crate::domain::instance::InviteCode>, PortError> {
+            unavailable("find_invite_by_code")
+        }
+        fn list_invites(
+            &self,
+            _filter: &crate::application::ports::InviteListFilter,
+        ) -> Result<Vec<crate::domain::instance::InviteCode>, PortError> {
+            unavailable("list_invites")
+        }
+        fn delete_invite(
+            &self,
+            _id: &str,
+            _log: Option<&crate::domain::moderation::ModerationLogEntry>,
+        ) -> Result<(), PortError> {
+            unavailable("delete_invite")
+        }
+        fn consume_and_create_account(
+            &self,
+            _input: crate::application::ports::ConsumeInviteInput,
+        ) -> Result<
+            (
+                crate::domain::account::Account,
+                crate::domain::instance::InviteCode,
+            ),
+            PortError,
+        > {
+            unavailable("consume_and_create_account")
         }
     }
 
@@ -1135,6 +1186,7 @@ mod tests {
             host_caps: mem.clone(),
             moderation: mem.clone(),
             instance_settings: mem.clone(),
+            invites: mem.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()

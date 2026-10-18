@@ -15,6 +15,7 @@ use crate::domain::account::{Account, FollowVisibility};
 use crate::domain::blocking::Blocking;
 use crate::domain::draft::NoteDraft;
 use crate::domain::follow::Follow;
+use crate::domain::instance::InviteCode;
 use crate::domain::muting::{Muting, RenoteMuting};
 use crate::domain::media::MediaMeta;
 use crate::domain::moderation::ModerationLogEntry;
@@ -451,6 +452,28 @@ pub fn pack_following(
         "follower": follower,
         "followee": followee,
     }))
+}
+
+/// Packed `InviteCode` (upstream `InviteCodeEntityService.pack`):
+/// `{id, code, expiresAt, createdAt, createdBy, usedBy, usedAt, used}`.
+/// `createdBy`/`usedBy` are `UserLite` or `null`.
+pub fn pack_invite_code(
+    services: &AppServices,
+    invite: &InviteCode,
+    created_by: Option<&Account>,
+    used_by: Option<&Account>,
+) -> Value {
+    let clock_ms = services.clock.now_ms();
+    serde_json::json!({
+        "id": invite.id,
+        "code": invite.code,
+        "expiresAt": invite.expires_at_ms.map(format_millis),
+        "createdAt": format_millis(invite.created_at_ms),
+        "createdBy": created_by.map(|account| pack_user_lite(account, &services.public_url, clock_ms)),
+        "usedBy": used_by.map(|account| pack_user_lite(account, &services.public_url, clock_ms)),
+        "usedAt": invite.used_at_ms.map(format_millis),
+        "used": invite.is_used(),
+    })
 }
 
 /// `ModerationLog` (upstream `ModerationLogEntityService.pack`):
@@ -1540,8 +1563,12 @@ pub fn pack_note_draft(draft: &NoteDraft, services: &AppServices) -> Value {
 }
 
 /// Instance metadata: `MetaLite` always, plus `MetaDetailedOnly` when
-/// `detail` is true (`meta.ts`).
-pub fn pack_meta(services: &AppServices, detail: bool) -> Value {    let uri = services.public_url.trim_end_matches('/').to_string();
+/// `detail` is true (`meta.ts`). `disableRegistration` and
+/// `maxNoteTextLength` read [`InstanceSettings`] (WP2); everything else
+/// keeps the pre-batch constants.
+pub fn pack_meta(services: &AppServices, detail: bool) -> Result<Value, PortError> {
+    let settings = services.instance_settings.get()?;
+    let uri = services.public_url.trim_end_matches('/').to_string();
     let mut obj = Map::new();
     obj.insert("maintainerName".to_string(), Value::Null);
     obj.insert("maintainerEmail".to_string(), Value::Null);
@@ -1571,7 +1598,10 @@ pub fn pack_meta(services: &AppServices, detail: bool) -> Value {    let uri = s
             "showActivitiesForVisitor": true,
         }),
     );
-    obj.insert("disableRegistration".to_string(), Value::Bool(false));
+    obj.insert(
+        "disableRegistration".to_string(),
+        Value::Bool(settings.registration.disable_registration()),
+    );
     obj.insert("emailRequiredForSignup".to_string(), Value::Bool(false));
     obj.insert("enableHcaptcha".to_string(), Value::Bool(false));
     obj.insert("hcaptchaSiteKey".to_string(), Value::Null);
@@ -1594,7 +1624,10 @@ pub fn pack_meta(services: &AppServices, detail: bool) -> Value {    let uri = s
     obj.insert("infoImageUrl".to_string(), Value::Null);
     obj.insert("notFoundImageUrl".to_string(), Value::Null);
     obj.insert("iconUrl".to_string(), Value::Null);
-    obj.insert("maxNoteTextLength".to_string(), Value::Number(3000.into()));
+    obj.insert(
+        "maxNoteTextLength".to_string(),
+        Value::Number(settings.max_note_text_length.into()),
+    );
     obj.insert("ads".to_string(), Value::Array(Vec::new()));
     obj.insert("notesPerOneAd".to_string(), Value::Number(0.into()));
     obj.insert("enableEmail".to_string(), Value::Bool(false));
@@ -1650,7 +1683,7 @@ pub fn pack_meta(services: &AppServices, detail: bool) -> Value {    let uri = s
             Value::Bool(false),
         );
     }
-    Value::Object(obj)
+    Ok(Value::Object(obj))
 }
 
 #[cfg(test)]
@@ -1705,7 +1738,11 @@ mod tests {
     }
 
     impl AccountStore for Mem {
-        fn create_account(&self, _input: CreateAccountInput) -> Result<Account, PortError> {
+        fn create_account(
+            &self,
+            _input: CreateAccountInput,
+            _log: Option<&crate::domain::moderation::ModerationLogEntry>,
+        ) -> Result<Account, PortError> {
             unavailable("create_account")
         }
         fn find_by_id(&self, id: &str) -> Result<Option<Account>, PortError> {
@@ -1910,7 +1947,8 @@ mod tests {
 
     impl crate::application::ports::InstanceSettingsStore for Mem {
         fn get(&self) -> Result<crate::domain::instance::InstanceSettings, PortError> {
-            unavailable("instance_settings get")
+            // `pack_meta` reads the settings (WP2); answer the defaults.
+            Ok(crate::domain::instance::InstanceSettings::default())
         }
         fn update(
             &self,
@@ -1918,6 +1956,53 @@ mod tests {
             _log: crate::domain::moderation::ModerationLogEntry,
         ) -> Result<crate::domain::instance::InstanceSettings, PortError> {
             unavailable("instance_settings update")
+        }
+    }
+
+    impl crate::application::ports::InviteStore for Mem {
+        fn create_invites(
+            &self,
+            _inputs: &[crate::application::ports::CreateInviteInput],
+            _log: Option<&crate::domain::moderation::ModerationLogEntry>,
+        ) -> Result<Vec<crate::domain::instance::InviteCode>, PortError> {
+            unavailable("create_invites")
+        }
+        fn find_invite_by_id(
+            &self,
+            _id: &str,
+        ) -> Result<Option<crate::domain::instance::InviteCode>, PortError> {
+            unavailable("find_invite_by_id")
+        }
+        fn find_invite_by_code(
+            &self,
+            _code: &str,
+        ) -> Result<Option<crate::domain::instance::InviteCode>, PortError> {
+            unavailable("find_invite_by_code")
+        }
+        fn list_invites(
+            &self,
+            _filter: &crate::application::ports::InviteListFilter,
+        ) -> Result<Vec<crate::domain::instance::InviteCode>, PortError> {
+            unavailable("list_invites")
+        }
+        fn delete_invite(
+            &self,
+            _id: &str,
+            _log: Option<&crate::domain::moderation::ModerationLogEntry>,
+        ) -> Result<(), PortError> {
+            unavailable("delete_invite")
+        }
+        fn consume_and_create_account(
+            &self,
+            _input: crate::application::ports::ConsumeInviteInput,
+        ) -> Result<
+            (
+                crate::domain::account::Account,
+                crate::domain::instance::InviteCode,
+            ),
+            PortError,
+        > {
+            unavailable("consume_and_create_account")
         }
     }
 
@@ -2307,6 +2392,7 @@ mod tests {
             host_caps: mem.clone(),
             moderation: mem.clone(),
             instance_settings: mem.clone(),
+            invites: mem.clone(),
             federation_http: crate::federation::delivery::SafeHttpClient::new(
                 crate::federation::delivery::SafeHttpConfig {
                     allow_private_ips: true,
@@ -2930,13 +3016,13 @@ mod tests {
             return;
         };
 
-        let packed = pack_meta(&services, false);
+        let packed = pack_meta(&services, false).unwrap();
         assert_shape(&packed, &lite, "MetaLite");
         assert_eq!(packed["version"], PACKER_VERSION);
         assert_eq!(packed["uri"], "https://example.local");
         assert_eq!(packed["maxNoteTextLength"], 3000);
 
-        let packed = pack_meta(&services, true);
+        let packed = pack_meta(&services, true).unwrap();
         let mut all = lite;
         all.extend(detailed_only);
         assert_shape(&packed, &all, "MetaDetailed");

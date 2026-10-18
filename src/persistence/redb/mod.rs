@@ -7,8 +7,10 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, WriteTran
 
 use crate::application::ports::{
     AccountStore, ActivityDedup, ActorKeypairRecord, ApiTokenRecord, AuthStore, BlockStore, Clock,
-    CreateAccountInput, CreateNoteInput, EditNoteInput, FollowStore, HostCapsStore, HostSoftware,
-    IdGenerator, InsertMediaInput, InstanceSettingsPatch, InstanceSettingsStore,
+    ConsumeInviteInput, CreateAccountInput, CreateInviteInput, CreateNoteInput, EditNoteInput,
+    FollowStore, HostCapsStore, HostSoftware,
+    IdGenerator, InsertMediaInput, InstanceSettingsPatch, InstanceSettingsStore, InviteListFilter,
+    InviteSort, InviteStore, InviteTypeFilter,
     Job, JobQueue, LegacyAuthSessionRecord, MediaStore, MiAuthSessionRecord, ModerationLogFilter,
     ModerationLogStore, MuteStore, NewJob,
     NoteStore, NotificationStore, PollChoiceCount, PollStore, PortError, ReactionStore,
@@ -18,7 +20,7 @@ use crate::domain::account::{validate_local_username, Account};
 use crate::domain::blocking::Blocking;
 use crate::domain::draft::NoteDraft;
 use crate::domain::follow::{Follow, FollowNotify, FollowRequest};
-use crate::domain::instance::InstanceSettings;
+use crate::domain::instance::{InstanceSettings, InviteCode};
 use crate::domain::moderation::ModerationLogEntry;
 use crate::domain::muting::{validate_mute_expiry, validate_mute_params, Muting, RenoteMuting};
 use crate::domain::id::{parse_aidx_time, AidxGenerator};
@@ -144,6 +146,13 @@ const MODERATION_LOGS: TableDefinition<&str, &[u8]> = TableDefinition::new("mode
 /// Instance settings singleton row (Batch M §3.3; `InstanceSettingsStore`),
 /// keyed by `"settings"`. Absent row = [`InstanceSettings::default()`].
 const INSTANCE_SETTINGS: TableDefinition<&str, &[u8]> = TableDefinition::new("instance_settings");
+/// Invite codes (Batch M WP2; upstream `RegistrationTicket`), keyed by
+/// ticket id (aidx, time-ordered → reverse range reads newest-first).
+const INVITES: TableDefinition<&str, &[u8]> = TableDefinition::new("invites");
+/// Unique invite-code index (upstream `RegistrationTicket.code` unique
+/// column): code → ticket id. A row present here means the code is
+/// unconsumed; `consume_and_create_account` removes it atomically.
+const INVITE_CODES: TableDefinition<&str, &str> = TableDefinition::new("invite_codes");
 
 /// `NOTES_BY_REPLY` backfill version marker: present with value
 /// [`REPLY_INDEX_DONE_VALUE`] once every stored note has been indexed.
@@ -291,6 +300,8 @@ impl RedbStore {
         let _ = write_txn
             .open_table(INSTANCE_SETTINGS)
             .map_err(map_redb_err)?;
+        let _ = write_txn.open_table(INVITES).map_err(map_redb_err)?;
+        let _ = write_txn.open_table(INVITE_CODES).map_err(map_redb_err)?;
         let _ = write_txn.open_table(META).map_err(map_redb_err)?;
         write_txn.commit().map_err(map_redb_err)?;
         Ok(())
@@ -2790,6 +2801,278 @@ impl InstanceSettingsStore for RedbStore {
     }
 }
 
+/// Row filter shared by the invite listings (keyset + `admin/invite/list`
+/// `type` + creator scope).
+fn matches_invite_filter(invite: &InviteCode, filter: &InviteListFilter, now_ms: i64) -> bool {
+    if let Some(creator) = &filter.created_by {
+        if invite.created_by.as_deref() != Some(creator.as_str()) {
+            return false;
+        }
+    }
+    match filter.filter {
+        InviteTypeFilter::All => {}
+        InviteTypeFilter::Unused => {
+            if invite.is_used() {
+                return false;
+            }
+        }
+        InviteTypeFilter::Used => {
+            if !invite.is_used() {
+                return false;
+            }
+        }
+        InviteTypeFilter::Expired => {
+            if !invite.is_expired(now_ms) {
+                return false;
+            }
+        }
+    }
+    if let Some(since_id) = &filter.since_id {
+        if invite.id.as_str() <= since_id.as_str() {
+            return false;
+        }
+    }
+    if let Some(until_id) = &filter.until_id {
+        if invite.id.as_str() >= until_id.as_str() {
+            return false;
+        }
+    }
+    if let Some(since_date_ms) = filter.since_date_ms {
+        if invite.created_at_ms <= since_date_ms {
+            return false;
+        }
+    }
+    if let Some(until_date_ms) = filter.until_date_ms {
+        if invite.created_at_ms >= until_date_ms {
+            return false;
+        }
+    }
+    true
+}
+
+impl InviteStore for RedbStore {
+    fn create_invites(
+        &self,
+        inputs: &[CreateInviteInput],
+        log: Option<&ModerationLogEntry>,
+    ) -> Result<Vec<InviteCode>, PortError> {
+        if inputs.is_empty() || inputs.len() > 100 {
+            return Err(PortError::Validation(
+                "INVALID_PARAM invite count must be 1..=100".to_string(),
+            ));
+        }
+        let now_ms = self.clock.now_ms();
+        let write_txn = self.begin_write()?;
+        let mut created = Vec::with_capacity(inputs.len());
+        {
+            let mut invites_table = write_txn.open_table(INVITES).map_err(map_redb_err)?;
+            let mut codes_table = write_txn.open_table(INVITE_CODES).map_err(map_redb_err)?;
+            for input in inputs {
+                let id = self.ids.generate();
+                let invite = InviteCode::new(
+                    id.clone(),
+                    input.code.clone(),
+                    input.created_by.clone(),
+                    now_ms,
+                    input.expires_at_ms,
+                )?;
+                if codes_table
+                    .get(invite.code.as_str())
+                    .map_err(map_redb_err)?
+                    .is_some()
+                {
+                    return Err(PortError::Conflict(format!(
+                        "invite code {} already exists",
+                        invite.code
+                    )));
+                }
+                let bytes = encode_json(&invite)?;
+                invites_table
+                    .insert(id.as_str(), bytes.as_slice())
+                    .map_err(map_redb_err)?;
+                codes_table
+                    .insert(invite.code.as_str(), id.as_str())
+                    .map_err(map_redb_err)?;
+                created.push(invite);
+            }
+        }
+        if let Some(entry) = log {
+            self.append_log_in_txn(&write_txn, entry)?;
+        }
+        self.commit_write(write_txn)?;
+        Ok(created)
+    }
+
+    fn find_invite_by_id(&self, id: &str) -> Result<Option<InviteCode>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(INVITES).map_err(map_redb_err)?;
+        match table.get(id).map_err(map_redb_err)? {
+            Some(guard) => Ok(Some(decode_json(guard.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn find_invite_by_code(&self, code: &str) -> Result<Option<InviteCode>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let codes_table = read_txn.open_table(INVITE_CODES).map_err(map_redb_err)?;
+        let Some(id_guard) = codes_table.get(code).map_err(map_redb_err)? else {
+            // Consumed or never issued: the unique-index row is the source
+            // of truth for "still claimable".
+            return Ok(None);
+        };
+        let id = id_guard.value().to_string();
+        drop(id_guard);
+        let table = read_txn.open_table(INVITES).map_err(map_redb_err)?;
+        match table.get(id.as_str()).map_err(map_redb_err)? {
+            Some(guard) => Ok(Some(decode_json(guard.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn list_invites(&self, filter: &InviteListFilter) -> Result<Vec<InviteCode>, PortError> {
+        if filter.limit == 0 {
+            return Ok(Vec::new());
+        }
+        // Bounded scan (conformance F2 parity): filtered listings stop
+        // after this many rows even when more exist.
+        const SCAN_CAP: usize = 10_000;
+        let now_ms = self.clock.now_ms();
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(INVITES).map_err(map_redb_err)?;
+        let mut out: Vec<InviteCode> = Vec::new();
+        let mut scanned = 0usize;
+        match filter.sort {
+            // Id order == created order (aidx); scan in the requested
+            // direction so a bounded scan sees the right end first.
+            InviteSort::CreatedAsc => {
+                for entry in table.range(""..).map_err(map_redb_err)? {
+                    scanned += 1;
+                    if scanned > SCAN_CAP {
+                        break;
+                    }
+                    let (_, v) = entry.map_err(map_redb_err)?;
+                    let invite: InviteCode = decode_json(v.value())?;
+                    if matches_invite_filter(&invite, filter, now_ms) {
+                        out.push(invite);
+                    }
+                }
+            }
+            InviteSort::CreatedDesc => {
+                for entry in table.range(""..).map_err(map_redb_err)?.rev() {
+                    scanned += 1;
+                    if scanned > SCAN_CAP {
+                        break;
+                    }
+                    let (_, v) = entry.map_err(map_redb_err)?;
+                    let invite: InviteCode = decode_json(v.value())?;
+                    if matches_invite_filter(&invite, filter, now_ms) {
+                        out.push(invite);
+                    }
+                }
+            }
+            InviteSort::UsedAsc | InviteSort::UsedDesc => {
+                for entry in table.range(""..).map_err(map_redb_err)?.rev() {
+                    scanned += 1;
+                    if scanned > SCAN_CAP {
+                        break;
+                    }
+                    let (_, v) = entry.map_err(map_redb_err)?;
+                    let invite: InviteCode = decode_json(v.value())?;
+                    if matches_invite_filter(&invite, filter, now_ms) {
+                        out.push(invite);
+                    }
+                }
+                out.sort_by(|a, b| {
+                    // `+usedAt` = used_at DESC with unused LAST
+                    // (`NULLS LAST`); `-usedAt` = used_at ASC with unused
+                    // FIRST (`NULLS FIRST`). Option ordering already puts
+                    // None first ascending, so only the descending case
+                    // inverts. Id breaks ties deterministically.
+                    let by_used = match filter.sort {
+                        InviteSort::UsedDesc => b.used_at_ms.cmp(&a.used_at_ms),
+                        _ => a.used_at_ms.cmp(&b.used_at_ms),
+                    };
+                    by_used.then_with(|| a.id.cmp(&b.id))
+                });
+            }
+        }
+        Ok(out.into_iter().skip(filter.offset).take(filter.limit).collect())
+    }
+
+    fn delete_invite(
+        &self,
+        id: &str,
+        log: Option<&ModerationLogEntry>,
+    ) -> Result<(), PortError> {
+        let write_txn = self.begin_write()?;
+        let code = {
+            let mut invites_table = write_txn.open_table(INVITES).map_err(map_redb_err)?;
+            let Some(guard) = invites_table.get(id).map_err(map_redb_err)? else {
+                return Err(PortError::NotFound("NO_SUCH_INVITE_CODE".to_string()));
+            };
+            let invite: InviteCode = decode_json(guard.value())?;
+            drop(guard);
+            invites_table.remove(id).map_err(map_redb_err)?;
+            invite.code
+        };
+        {
+            let mut codes_table = write_txn.open_table(INVITE_CODES).map_err(map_redb_err)?;
+            codes_table.remove(code.as_str()).map_err(map_redb_err)?;
+        }
+        if let Some(entry) = log {
+            self.append_log_in_txn(&write_txn, entry)?;
+        }
+        self.commit_write(write_txn)
+    }
+
+    fn consume_and_create_account(
+        &self,
+        input: ConsumeInviteInput,
+    ) -> Result<(Account, InviteCode), PortError> {
+        let account = self.build_account(input.account)?;
+        let now_ms = self.clock.now_ms();
+        // One transaction: the claim (mark used + drop the unique-index
+        // row) and the account creation commit together or not at all
+        // (conformance I1/I2). A failure here (bad username, duplicate
+        // handle, injected fault) aborts everything below.
+        let write_txn = self.begin_write()?;
+        let consumed = {
+            let mut codes_table = write_txn.open_table(INVITE_CODES).map_err(map_redb_err)?;
+            let mut invites_table = write_txn.open_table(INVITES).map_err(map_redb_err)?;
+            let id = match codes_table.get(input.code.as_str()).map_err(map_redb_err)? {
+                Some(guard) => guard.value().to_string(),
+                None => return Err(PortError::NotFound("NO_SUCH_INVITE_CODE".to_string())),
+            };
+            let mut invite: InviteCode = match invites_table.get(id.as_str()).map_err(map_redb_err)? {
+                Some(guard) => decode_json(guard.value())?,
+                None => return Err(PortError::NotFound("NO_SUCH_INVITE_CODE".to_string())),
+            };
+            // Missing, used, and expired codes fail the same way upstream's
+            // signup gate does (`SignupApiService`: `ticket == null ||
+            // ticket.usedById != null` → 400).
+            if invite.is_used() || invite.is_expired(now_ms) {
+                return Err(PortError::NotFound("NO_SUCH_INVITE_CODE".to_string()));
+            }
+            invite.consume(&account.id, now_ms)?;
+            let bytes = encode_json(&invite)?;
+            invites_table
+                .insert(id.as_str(), bytes.as_slice())
+                .map_err(map_redb_err)?;
+            codes_table.remove(input.code.as_str()).map_err(map_redb_err)?;
+            invite
+        };
+        self.create_account_in_txn(&write_txn, &account, None)?;
+        if let Some(hash) = &input.password_hash {
+            let mut credentials = write_txn.open_table(CREDENTIALS).map_err(map_redb_err)?;
+            credentials
+                .insert(account.id.as_str(), hash.as_str())
+                .map_err(map_redb_err)?;
+        }
+        self.commit_write(write_txn)?;
+        Ok((account, consumed))
+    }
+}
+
 fn matches_cursor(note_id: &str, cursor: &TimelineCursor) -> bool {
     if let Some(since_id) = &cursor.since_id {
         if note_id <= since_id.as_str() {
@@ -2818,8 +3101,12 @@ fn matches_cursor(note_id: &str, cursor: &TimelineCursor) -> bool {
     true
 }
 
-impl AccountStore for RedbStore {
-    fn create_account(&self, input: CreateAccountInput) -> Result<Account, PortError> {
+impl RedbStore {
+    /// Validate + construct one account row from `input` (no writes).
+    /// The local-username and preserved-name rules run here so every
+    /// creation path (CLI, signup, `admin/accounts/create`, invite claim)
+    /// shares them.
+    fn build_account(&self, input: CreateAccountInput) -> Result<Account, PortError> {
         let username = input.handle.trim().to_string();
         let username_lower = username.to_ascii_lowercase();
         let is_local = input.host.is_none();
@@ -2900,9 +3187,22 @@ impl AccountStore for RedbStore {
             default_reaction: None,
         };
         account.validate()?;
+        Ok(account)
+    }
 
-        let handle_key = Self::handle_key(&username_lower, account.host.as_deref());
-        let write_txn = self.begin_write()?;
+    /// Account uniqueness checks + row/index inserts (+ optional `log`)
+    /// inside an open write transaction: the account row, its handle
+    /// index, the owner mapping, and the moderation-log row commit
+    /// together (§2.3).
+    fn create_account_in_txn(
+        &self,
+        write_txn: &WriteTransaction,
+        account: &Account,
+        log: Option<&ModerationLogEntry>,
+    ) -> Result<(), PortError> {
+        let is_local = account.host.is_none();
+        let username_lower = account.username_lower.as_str();
+        let handle_key = Self::handle_key(&account.username_lower, account.host.as_deref());
         {
             let mut accounts_table = write_txn.open_table(ACCOUNTS).map_err(map_redb_err)?;
             let mut handle_table = write_txn.open_table(HANDLE_INDEX).map_err(map_redb_err)?;
@@ -2911,7 +3211,7 @@ impl AccountStore for RedbStore {
 
             if is_local
                 && used_table
-                    .get(username_lower.as_str())
+                    .get(username_lower)
                     .map_err(map_redb_err)?
                     .is_some()
             {
@@ -2929,7 +3229,7 @@ impl AccountStore for RedbStore {
                 )));
             }
 
-            let encoded = encode_json(&account)?;
+            let encoded = encode_json(account)?;
             accounts_table
                 .insert(account.id.as_str(), encoded.as_slice())
                 .map_err(map_redb_err)?;
@@ -2940,6 +3240,22 @@ impl AccountStore for RedbStore {
                 .insert(account.id.as_str(), self.local_node_id.as_str())
                 .map_err(map_redb_err)?;
         }
+        if let Some(entry) = log {
+            self.append_log_in_txn(write_txn, entry)?;
+        }
+        Ok(())
+    }
+}
+
+impl AccountStore for RedbStore {
+    fn create_account(
+        &self,
+        input: CreateAccountInput,
+        log: Option<&ModerationLogEntry>,
+    ) -> Result<Account, PortError> {
+        let account = self.build_account(input)?;
+        let write_txn = self.begin_write()?;
+        self.create_account_in_txn(&write_txn, &account, log)?;
         self.commit_write(write_txn)?;
         Ok(account)
     }

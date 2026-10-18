@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use crate::application::ports::{
     AccountStore, ActivityDedup, AuthStore, BlobStore, BlockStore, Clock, FollowStore, HostCapsStore,
-    IdGenerator, InstanceSettingsStore, JobQueue, MediaStore, ModerationLogStore, MuteStore,
-    NoteStore, NotificationStore, PollStore, ReactionStore, StreamingSink,
+    IdGenerator, InstanceSettingsStore, InviteStore, JobQueue, MediaStore, ModerationLogStore,
+    MuteStore, NoteStore, NotificationStore, PollStore, ReactionStore, StreamingSink,
 };
 use crate::federation::delivery::SafeHttpClient;
 
@@ -14,6 +14,7 @@ pub mod exports;
 pub mod follows;
 pub mod helpers;
 pub mod inbound;
+pub mod invites;
 pub mod keys;
 pub mod media;
 pub mod moderation;
@@ -52,6 +53,8 @@ pub struct AppServices {
     pub moderation: Arc<dyn ModerationLogStore>,
     /// Instance registration policy and blocked hosts (Batch M §3.3).
     pub instance_settings: Arc<dyn InstanceSettingsStore>,
+    /// Invite codes and the atomic signup claim (Batch M WP2).
+    pub invites: Arc<dyn InviteStore>,
     pub federation_http: SafeHttpClient,
     pub public_url: String,
     pub max_file_size: u64,

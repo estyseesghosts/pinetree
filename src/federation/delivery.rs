@@ -1323,7 +1323,7 @@ pub fn upsert_remote_actor_from_doc(
             is_cat: parsed.is_cat,
             is_locked: parsed.manually_approves_followers,
             preserved_usernames: Vec::new(),
-        })?
+        }, None)?
     };
 
     // Slice 3 (H5): run domain validation on the upsert path (both the

@@ -26,17 +26,20 @@ use http_body_util::{BodyExt, Limited};
 use serde_json::{Map, Value};
 
 use crate::activitypub::{actor as ap_actor, objects as ap_objects, webfinger as ap_webfinger};
+use crate::application::commands::invites::SignupRejection;
 use crate::application::commands::pins::FeaturedCache;
 use crate::application::commands::AppServices;
 use crate::application::ports::{
     ApiTokenRecord, CreateDraftInput, CreateNoteInput, EditNoteInput, ExportEntity, ImportEntity,
-    LegacyAuthSessionRecord, MiAuthSessionRecord, ModerationLogFilter, PortError, TimelineCursor,
+    InviteListFilter, InviteSort, InviteTypeFilter, LegacyAuthSessionRecord, MiAuthSessionRecord,
+    ModerationLogFilter, PortError, TimelineCursor,
     UpdateAccountPatch, UpdateDraftPatch,
 };
 use crate::domain::account::{
     Account, AvatarDecoration, ChatScope, FollowVisibility, MutedWord,
     NotificationRecieveConfig, ProfileField,
 };
+use crate::domain::instance::InviteCode;
 use crate::domain::moderation::ModerationAction;
 use crate::domain::note::{
     ReactionAcceptance, Visibility, MAX_CW_API_CHARS, MAX_NOTE_TEXT_CHARS,
@@ -52,12 +55,12 @@ use crate::streaming::server::streaming_handler;
 
 use super::auth::{
     authenticate, extract_raw_token, generate_random_token, hash_password_async, hash_token,
-    is_safe_callback_url, needs_rehash, render_miauth_page, require_moderator,
+    is_safe_callback_url, needs_rehash, render_miauth_page, require_admin, require_moderator,
     verify_password_async, AuthenticatedCaller, SESSION_COOKIE_NAME,
 };
 use super::errors::ApiError;
 use super::packers::{
-    pack_blocking, pack_drive_file, pack_following, pack_me_detailed,
+    pack_blocking, pack_drive_file, pack_following, pack_invite_code, pack_me_detailed,
     pack_meta, pack_moderation_log, pack_muting, pack_note, pack_note_draft,
     pack_note_reaction_with_note,
     pack_notification, pack_renote_muting, pack_user_detailed_not_me, pack_user_lite,
@@ -1618,46 +1621,125 @@ async fn miauth_check(
     }
 }
 
+/// `limit` with an upstream default other than the 10-row moderation-log
+/// default (the invite listings default to 30 upstream).
+fn get_limit_with_default(
+    obj: &Map<String, Value>,
+    default: usize,
+) -> Result<usize, ApiError> {
+    match opt_usize(obj, "limit")? {
+        None => Ok(default),
+        Some(limit) if (1..=100).contains(&limit) => Ok(limit),
+        Some(_) => Err(ApiError::invalid_param(
+            "limit",
+            "must be an integer between 1 and 100",
+        )),
+    }
+}
+
+/// Packed `InviteCode[]` for the invite listings (resolves `createdBy`/
+/// `usedBy` through the account store, upstream `InviteCodeEntityService.
+/// packMany`).
+fn pack_invite_codes(state: &ApiState, invites: &[InviteCode]) -> Result<Value, ApiError> {
+    let mut packed = Vec::with_capacity(invites.len());
+    for invite in invites {
+        let (created_by, used_by) = state.services.invite_fields(invite);
+        packed.push(pack_invite_code(
+            &state.services,
+            invite,
+            created_by.as_ref(),
+            used_by.as_ref(),
+        ));
+    }
+    Ok(Value::Array(packed))
+}
+
+/// `admin/invite/create` `expiresAt` (upstream parses any `Date.parse`-
+/// acceptable string and answers `INVALID_DATE_TIME` when it does not).
+fn parse_invite_expires_at(raw: &str) -> Result<i64, ApiError> {
+    let invalid = || {
+        ApiError::from_port_error(PortError::Validation(
+            "INVALID_DATE_TIME".to_string(),
+        ))
+    };
+    let trimmed = raw.trim();
+    chrono::DateTime::parse_from_rfc3339(trimmed)
+        .map(|dt| dt.timestamp_millis())
+        .or_else(|_| {
+            chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S%.f")
+                .or_else(|_| {
+                    chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S%.f")
+                })
+                .map(|dt| dt.and_utc().timestamp_millis())
+        })
+        .map_err(|_| invalid())
+}
+
 // --- Web signup / signin ---------------------------------------------------
+
+/// Signup failure. `Rejected` answers plain HTTP 400 with an empty body —
+/// the upstream shape for registration-gate rejections (`SignupApiService.ts`
+/// around line 136: `reply.code(400); return;`); everything else keeps the
+/// standard `{ error: … }` envelope.
+enum SignupError {
+    Rejected,
+    Api(ApiError),
+}
 
 async fn do_signup(
     state: &ApiState,
     obj: &Map<String, Value>,
     ip: &str,
-) -> Result<(Account, String), ApiError> {
+) -> Result<(Account, String), SignupError> {
     let username = match obj.get("username").and_then(Value::as_str) {
         Some(username) if !username.is_empty() => username,
         _ => {
-            return Err(ApiError::invalid_param(
+            return Err(SignupError::Api(ApiError::invalid_param(
                 "username",
                 "username is required",
-            ));
+            )));
         }
     };
     let password = match obj.get("password").and_then(Value::as_str) {
         Some(password) if !password.is_empty() => password,
         _ => {
-            return Err(ApiError::invalid_param(
+            return Err(SignupError::Api(ApiError::invalid_param(
                 "password",
                 "password is required",
-            ));
+            )));
         }
     };
     if let Some(host) = obj.get("host") {
         if !host.is_null() {
-            return Err(ApiError::invalid_param(
+            return Err(SignupError::Api(ApiError::invalid_param(
                 "host",
                 "remote accounts are unsupported in Phase 1",
-            ));
+            )));
         }
     }
     // Slice 9 (H4): every signup attempt from one IP counts.
-    state.rate_limiter.check(&auth_ip_key(ip), "auth/signup")?;
-    let hash = hash_password_async(password.to_string()).await?;
+    state
+        .rate_limiter
+        .check(&auth_ip_key(ip), "auth/signup")
+        .map_err(SignupError::Api)?;
+    let hash = hash_password_async(password.to_string())
+        .await
+        .map_err(SignupError::Api)?;
+    // WP2: `AppServices::signup` enforces `InstanceSettings.registration`
+    // and, when closed, claims `invitationCode` in the account-creation
+    // transaction (conformance I1/I2). Gate rejections are the plain 400.
     let account = state
         .services
-        .create_account(username, Some(&hash))
-        .map_err(ApiError::from_port_error)?;
+        .signup(
+            username,
+            Some(&hash),
+            obj.get("invitationCode").and_then(Value::as_str),
+            state.services.clock.now_ms(),
+        )
+        .map_err(|err| match err {
+            SignupRejection::InviteOnly => SignupError::Rejected,
+            SignupRejection::Port(err) => SignupError::Api(ApiError::from_port_error(err)),
+        })?;
     let raw_token = generate_random_token();
     state
         .services
@@ -1672,7 +1754,7 @@ async fn do_signup(
             icon_url: None,
             created_at_ms: state.services.clock.now_ms(),
         })
-        .map_err(ApiError::from_port_error)?;
+        .map_err(|err| SignupError::Api(ApiError::from_port_error(err)))?;
     Ok((account, raw_token))
 }
 
@@ -1767,7 +1849,12 @@ async fn signup(
     let obj = parse_json_body(&body)?;
     check_allowed_fields(&obj, SIGNUP_FIELDS)?;
     let ip = client_ip(peer, &headers, &state.trusted_proxies);
-    let (account, raw_token) = do_signup(&state, &obj, &ip).await?;
+    let (account, raw_token) = match do_signup(&state, &obj, &ip).await {
+        Ok(ok) => ok,
+        // Registration-gate rejection: upstream's plain empty 400.
+        Err(SignupError::Rejected) => return Ok(StatusCode::BAD_REQUEST.into_response()),
+        Err(SignupError::Api(err)) => return Err(err),
+    };
     let mut packed = pack_me_detailed(&account, true, &state.services)
         .map_err(ApiError::from_port_error)?;
     if let Some(obj) = packed.as_object_mut() {
@@ -2073,7 +2160,8 @@ fn api_dispatch_blocking(
         "meta" => {
             check_allowed_fields(&obj, &["detail"])?;
             let detail = opt_bool(&obj, "detail", true)?;
-            Ok(Json(pack_meta(&state.services, detail)).into_response())
+            let meta = pack_meta(&state.services, detail).map_err(ApiError::from_port_error)?;
+            Ok(Json(meta).into_response())
         }
 
         "miauth/gen-token" => {
@@ -2272,10 +2360,60 @@ fn api_dispatch_blocking(
             }
         }
 
-        "signup" | "admin/accounts/create" => {
+        "signup" => {
             check_allowed_fields(&obj, SIGNUP_FIELDS)?;
-            let (account, raw_token) =
-                tokio::runtime::Handle::current().block_on(do_signup(&state, &obj, &client_ip))?;
+            let (account, raw_token) = match tokio::runtime::Handle::current()
+                .block_on(do_signup(&state, &obj, &client_ip))
+            {
+                Ok(ok) => ok,
+                // Registration-gate rejection: upstream's plain empty 400.
+                Err(SignupError::Rejected) => return Ok(StatusCode::BAD_REQUEST.into_response()),
+                Err(SignupError::Api(err)) => return Err(err),
+            };
+            let mut packed = pack_me_detailed(&account, true, &state.services)
+                .map_err(ApiError::from_port_error)?;
+            if let Some(map) = packed.as_object_mut() {
+                map.insert("token".to_string(), Value::String(raw_token));
+            }
+            Ok(Json(packed).into_response())
+        }
+
+        // WP2: `admin/accounts/create` (upstream `admin/accounts/create.ts`)
+        // is the ADMIN-only operator path and deliberately bypasses the
+        // registration gate (upstream calls `SignupService` there, not the
+        // gated `SignupApiService`). DIVERGENCES: pinetree always requires
+        // an authenticated admin — upstream's first-setup bootstrap
+        // (`setupPassword`, `INCORRECT_INITIAL_PASSWORD`) has no equivalent
+        // here (CLI `create-account` bootstraps), so `setupPassword` is
+        // accepted but never consulted, exactly as upstream ignores it for
+        // an authenticated admin; and the action logs `createAccount`
+        // (upstream writes no moderation-log row).
+        "admin/accounts/create" => {
+            check_allowed_fields(&obj, &["username", "password", "setupPassword"])?;
+            let caller = require_caller(caller)?;
+            require_admin(&caller)?;
+            let username = required_str(&obj, "username")?;
+            let password = required_str(&obj, "password")?;
+            let hash = tokio::runtime::Handle::current().block_on(hash_password_async(password))?;
+            let account = state
+                .services
+                .create_account_admin(&username, Some(&hash), &caller.account.id)
+                .map_err(ApiError::from_port_error)?;
+            let raw_token = generate_random_token();
+            state
+                .services
+                .auth
+                .store_token(ApiTokenRecord {
+                    token_hash: hash_token(&raw_token),
+                    account_id: account.id.clone(),
+                    permissions: Vec::new(),
+                    is_first_party: true,
+                    name: None,
+                    description: None,
+                    icon_url: None,
+                    created_at_ms: state.services.clock.now_ms(),
+                })
+                .map_err(ApiError::from_port_error)?;
             let mut packed = pack_me_detailed(&account, true, &state.services)
                 .map_err(ApiError::from_port_error)?;
             if let Some(map) = packed.as_object_mut() {
@@ -2914,6 +3052,243 @@ fn api_dispatch_blocking(
                 );
             }
             Ok(Json(Value::Array(packed)).into_response())
+        }
+
+        // --- Batch M WP2: registration policy + invite codes -------------
+        // (upstream `invite/*` + `admin/invite/*`; §9.1 default policy:
+        // moderator-only creation — upstream `canInvite`, default false).
+        // `admin/invite/create` is upstream's moderator endpoint and logs
+        // `createInvitation`; `invite/create` is silent there upstream too.
+
+        "invite/create" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:invite-codes")?;
+            require_moderator(&caller)?;
+            let codes = state
+                .services
+                .create_invites(
+                    &caller.account.id,
+                    1,
+                    None,
+                    state.services.clock.now_ms(),
+                    false,
+                )
+                .map_err(ApiError::from_port_error)?;
+            let packed = pack_invite_codes(&state, &codes)?;
+            // Single object upstream (`res: ref: InviteCode`).
+            let first = packed
+                .as_array()
+                .and_then(|rows| rows.first())
+                .cloned()
+                .unwrap_or(Value::Null);
+            Ok(Json(first).into_response())
+        }
+
+        "invite/list" => {
+            check_allowed_fields(
+                &obj,
+                &["limit", "sinceId", "untilId", "sinceDate", "untilDate"],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:invite-codes")?;
+            require_moderator(&caller)?;
+            let filter = InviteListFilter {
+                since_id: opt_string(&obj, "sinceId")?,
+                until_id: opt_string(&obj, "untilId")?,
+                since_date_ms: opt_i64(&obj, "sinceDate")?,
+                until_date_ms: opt_i64(&obj, "untilDate")?,
+                limit: get_limit_with_default(&obj, 30)?,
+                ..Default::default()
+            };
+            let invites = state
+                .services
+                .list_my_invites(&caller.account.id, filter)
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(pack_invite_codes(&state, &invites)?).into_response())
+        }
+
+        "invite/delete" => {
+            check_allowed_fields(&obj, &["inviteId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:invite-codes")?;
+            require_moderator(&caller)?;
+            let invite_id = required_str(&obj, "inviteId")?;
+            state
+                .services
+                .delete_invite(
+                    &invite_id,
+                    &caller.account.id,
+                    caller.account.has_moderator_powers(),
+                )
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "invite/limit" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:invite-codes")?;
+            require_moderator(&caller)?;
+            let remaining = state.services.invite_limit(&caller.account.id);
+            Ok(Json(serde_json::json!({ "remaining": remaining })).into_response())
+        }
+
+        // `admin/invite/create` (upstream `requireModerator`): `count`
+        // codes with an optional `expiresAt`, logged as one
+        // `createInvitation` row in the create transaction.
+        "admin/invite/create" => {
+            check_allowed_fields(&obj, &["count", "expiresAt"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:invite-codes")?;
+            require_moderator(&caller)?;
+            let count = opt_usize(&obj, "count")?.unwrap_or(1);
+            if count == 0 || count > 100 {
+                return Err(ApiError::invalid_param(
+                    "count",
+                    "must be an integer between 1 and 100",
+                ));
+            }
+            let expires_at_ms = match obj.get("expiresAt") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(raw)) => Some(parse_invite_expires_at(raw)?),
+                Some(_) => {
+                    return Err(ApiError::invalid_param("expiresAt", "must be a string"));
+                }
+            };
+            let codes = state
+                .services
+                .create_invites(
+                    &caller.account.id,
+                    count,
+                    expires_at_ms,
+                    state.services.clock.now_ms(),
+                    true,
+                )
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(pack_invite_codes(&state, &codes)?).into_response())
+        }
+
+        // `admin/invite/list` (upstream `requireModerator`): `type` filter
+        // (`all`/`unused`/`used`/`expired`), `sort`, `limit`, `offset`.
+        "admin/invite/list" => {
+            check_allowed_fields(&obj, &["limit", "offset", "type", "sort"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:admin:invite-codes")?;
+            require_moderator(&caller)?;
+            let type_filter = match opt_string(&obj, "type")?.as_deref() {
+                None | Some("all") => InviteTypeFilter::All,
+                Some("unused") => InviteTypeFilter::Unused,
+                Some("used") => InviteTypeFilter::Used,
+                Some("expired") => InviteTypeFilter::Expired,
+                Some(_) => {
+                    return Err(ApiError::invalid_param(
+                        "type",
+                        "must be one of unused, used, expired, all",
+                    ));
+                }
+            };
+            let sort = match opt_string(&obj, "sort")?.as_deref() {
+                None | Some("+createdAt") => InviteSort::CreatedDesc,
+                Some("-createdAt") => InviteSort::CreatedAsc,
+                Some("+usedAt") => InviteSort::UsedDesc,
+                Some("-usedAt") => InviteSort::UsedAsc,
+                Some(_) => {
+                    return Err(ApiError::invalid_param(
+                        "sort",
+                        "must be one of +createdAt, -createdAt, +usedAt, -usedAt",
+                    ));
+                }
+            };
+            let filter = InviteListFilter {
+                filter: type_filter,
+                sort,
+                limit: get_limit_with_default(&obj, 30)?,
+                offset: opt_usize(&obj, "offset")?.unwrap_or(0),
+                ..Default::default()
+            };
+            let invites = state
+                .services
+                .list_all_invites(filter)
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(pack_invite_codes(&state, &invites)?).into_response())
+        }
+
+        // WP2 `admin/meta` + `admin/update-meta` (upstream files of the
+        // same names, both `requireAdmin`). WP2 ships the stored-settings
+        // subset (`disableRegistration`, `blockedHosts`); WP6 completes
+        // the admin read view. `blockedHosts` is STORED from here and
+        // enforced from WP5.
+        "admin/meta" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:admin:meta")?;
+            require_admin(&caller)?;
+            let mut meta = pack_meta(&state.services, true).map_err(ApiError::from_port_error)?;
+            let settings = state
+                .services
+                .instance_settings
+                .get()
+                .map_err(ApiError::from_port_error)?;
+            if let Some(map) = meta.as_object_mut() {
+                map.insert(
+                    "blockedHosts".to_string(),
+                    serde_json::json!(settings.blocked_hosts),
+                );
+            }
+            Ok(Json(meta).into_response())
+        }
+
+        "admin/update-meta" => {
+            check_allowed_fields(&obj, &["disableRegistration", "blockedHosts"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:meta")?;
+            require_admin(&caller)?;
+            let disable_registration = match obj.get("disableRegistration") {
+                None | Some(Value::Null) => None,
+                Some(Value::Bool(b)) => Some(*b),
+                Some(_) => {
+                    return Err(ApiError::invalid_param(
+                        "disableRegistration",
+                        "must be a boolean",
+                    ));
+                }
+            };
+            let blocked_hosts = match obj.get("blockedHosts") {
+                None | Some(Value::Null) => None,
+                Some(Value::Array(items)) => {
+                    let mut hosts = Vec::with_capacity(items.len());
+                    for item in items {
+                        match item {
+                            Value::String(host) => hosts.push(host.clone()),
+                            _ => {
+                                return Err(ApiError::invalid_param(
+                                    "blockedHosts",
+                                    "must be an array of strings",
+                                ));
+                            }
+                        }
+                    }
+                    Some(hosts)
+                }
+                Some(_) => {
+                    return Err(ApiError::invalid_param(
+                        "blockedHosts",
+                        "must be an array of strings",
+                    ));
+                }
+            };
+            state
+                .services
+                .update_instance_settings(
+                    &caller.account.id,
+                    disable_registration,
+                    blocked_hosts,
+                    state.services.clock.now_ms(),
+                )
+                .map_err(ApiError::from_port_error)?;
+            // Upstream has a void res (204), like the export endpoints.
+            Ok(StatusCode::NO_CONTENT.into_response())
         }
 
         // §13 profile import/export (Misskey `i/export-*` + `i/import-*`
@@ -5291,6 +5666,7 @@ mod tests {
             host_caps: store.clone(),
             moderation: store.clone(),
             instance_settings: store.clone(),
+            invites: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()
@@ -5450,7 +5826,7 @@ mod tests {
                 is_cat: false,
                 is_locked: false,
                 preserved_usernames: Vec::new(),
-            })
+            }, None)
             .expect("remote follower");
         state
             .services
@@ -6541,7 +6917,7 @@ mod tests {
                 is_cat: false,
                 is_locked: false,
                 preserved_usernames: Vec::new(),
-            })
+            }, None)
             .expect("remote account");
 
         async fn post(
@@ -8355,7 +8731,7 @@ mod tests {
                 is_cat: false,
                 is_locked: false,
                 preserved_usernames: Vec::new(),
-            })
+            }, None)
             .expect("remote account");
         let (status, value) = call(
             &state,
@@ -8569,14 +8945,14 @@ mod tests {
         let owner = state
             .services
             .accounts
-            .create_account(CreateAccountInput::local("owner"))
+            .create_account(CreateAccountInput::local("owner"), None)
             .expect("owner account");
         let mut fans: Vec<String> = Vec::with_capacity(250);
         for i in 0..250 {
             let fan = state
                 .services
                 .accounts
-                .create_account(CreateAccountInput::local(format!("fan{i:03}")))
+                .create_account(CreateAccountInput::local(format!("fan{i:03}")), None)
                 .expect("fan account");
             // Both directions: every fan follows the owner and vice versa.
             state
@@ -11190,6 +11566,395 @@ mod tests {
     /// §6 per-user `defaultReaction` heart-click (`docs/misskey-parity-plan.md`
     /// §6 DIVERGENCE: `notes/reactions/create` leaves `reaction` optional and
     /// resolves an absent param server-side to `defaultReaction ?? FALLBACK`).
+    // --- Batch M WP2: registration policy + invite codes -----------------
+
+    #[tokio::test]
+    async fn wp2_signup_policy_gate_and_invite_claim() {
+        let (state, _) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+
+        // Non-admin: 403 on admin/update-meta.
+        let (status, value) = call(
+            &state,
+            "admin/update-meta",
+            serde_json::json!({ "disableRegistration": true }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{value}");
+
+        // Admin closes registration; meta reflects the setting.
+        state
+            .services
+            .set_role(None, &alice_id, true, false)
+            .expect("set role");
+        let (status, value) = call(
+            &state,
+            "admin/update-meta",
+            serde_json::json!({ "disableRegistration": true }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{value}");
+        let (status, meta) = call(&state, "meta", serde_json::json!({}), None).await;
+        assert_eq!(status, StatusCode::OK, "{meta}");
+        assert_eq!(meta["disableRegistration"], serde_json::json!(true));
+
+        // Closed with no invite: plain empty 400 (upstream
+        // `SignupApiService` gate), no account created.
+        let (status, value) = call(
+            &state,
+            "signup",
+            serde_json::json!({ "username": "nosuchluck", "password": "s3cret-pw" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert!(
+            value.get("error").is_none(),
+            "the registration gate answers a plain 400: {value}"
+        );
+        assert!(
+            state
+                .services
+                .accounts
+                .find_by_handle("nosuchluck")
+                .unwrap()
+                .is_none(),
+            "a refused signup creates nothing"
+        );
+
+        // A bad code is refused the same way.
+        let (status, value) = call(
+            &state,
+            "signup",
+            serde_json::json!({
+                "username": "nosuchluck2",
+                "password": "s3cret-pw",
+                "invitationCode": "NOTACODE0AAAA",
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+
+        // Moderator issues one code; exactly one signup consumes it.
+        let (status, codes) = call(
+            &state,
+            "admin/invite/create",
+            serde_json::json!({}),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{codes}");
+        let code = codes.as_array().unwrap()[0]["code"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (status, value) = call(
+            &state,
+            "signup",
+            serde_json::json!({
+                "username": "newbie",
+                "password": "s3cret-pw",
+                "invitationCode": code,
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value["username"], serde_json::json!("newbie"));
+        let (status, value) = call(
+            &state,
+            "signup",
+            serde_json::json!({
+                "username": "latecomer",
+                "password": "s3cret-pw",
+                "invitationCode": code,
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert!(
+            state
+                .services
+                .accounts
+                .find_by_handle("latecomer")
+                .unwrap()
+                .is_none(),
+            "the second consume creates nothing"
+        );
+
+        // Reopened: signup needs no code again.
+        let (status, _) = call(
+            &state,
+            "admin/update-meta",
+            serde_json::json!({ "disableRegistration": false }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, value) = call(
+            &state,
+            "signup",
+            serde_json::json!({ "username": "freedom", "password": "s3cret-pw" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+    }
+
+    #[tokio::test]
+    async fn wp2_admin_accounts_create_admin_only_bypasses_gate() {
+        let (state, _) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (_, bob_token) = signup_user(&state, "bob").await;
+
+        // Non-admin: 403 (upstream ACCESS_DENIED).
+        let (status, value) = call(
+            &state,
+            "admin/accounts/create",
+            serde_json::json!({ "username": "made1", "password": "s3cret-pw" }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{value}");
+
+        // Close registration: the public path is shut…
+        state
+            .services
+            .set_role(None, &alice_id, true, false)
+            .expect("set role");
+        let (status, _) = call(
+            &state,
+            "admin/update-meta",
+            serde_json::json!({ "disableRegistration": true }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // …but admin/accounts/create creates accounts anyway (its
+        // purpose: it bypasses the gate).
+        let (status, value) = call(
+            &state,
+            "admin/accounts/create",
+            serde_json::json!({ "username": "made2", "password": "s3cret-pw" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value["username"], serde_json::json!("made2"));
+        assert!(value["token"].is_string(), "{value}");
+
+        // The `createAccount` row committed with the account.
+        let (status, logs) = call(
+            &state,
+            "admin/show-moderation-logs",
+            serde_json::json!({ "type": "createAccount" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{logs}");
+        let rows = logs.as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{logs}");
+        assert_eq!(rows[0]["type"], "createAccount");
+        assert_eq!(rows[0]["info"]["userUsername"], serde_json::json!("made2"));
+    }
+
+    #[tokio::test]
+    async fn wp2_invite_lifecycle_endpoints() {
+        let (state, _) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (_bob_id, bob_token) = signup_user(&state, "bob").await;
+        state
+            .services
+            .set_role(None, &alice_id, false, true)
+            .expect("set role");
+
+        // §9.1 default: plain users cannot create codes (upstream
+        // `canInvite`, default false).
+        let (status, value) = call(
+            &state,
+            "invite/create",
+            serde_json::json!({}),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{value}");
+
+        // Moderator creates one code (single object, upstream shape).
+        let (status, code1) = call(
+            &state,
+            "invite/create",
+            serde_json::json!({}),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{code1}");
+        assert!(code1["code"].is_string(), "{code1}");
+        assert!(code1["id"].is_string(), "{code1}");
+        assert_eq!(code1["used"], serde_json::json!(false));
+        assert_eq!(code1["createdBy"]["username"], serde_json::json!("alice"));
+
+        // invite/list is scoped to the caller.
+        let (status, mine) = call(
+            &state,
+            "invite/list",
+            serde_json::json!({}),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{mine}");
+        assert_eq!(mine.as_array().unwrap().len(), 1, "{mine}");
+        let (status, value) = call(&state, "invite/list", serde_json::json!({}), Some(&bob_token)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{value}");
+
+        // invite/limit: `remaining` is null with the default (uncapped) policy.
+        let (status, limit) = call(
+            &state,
+            "invite/limit",
+            serde_json::json!({}),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{limit}");
+        assert_eq!(limit["remaining"], serde_json::json!(null));
+
+        // admin/invite/create: `count` + `expiresAt`; unparsable datetime
+        // is upstream's INVALID_DATE_TIME.
+        let (status, value) = call(
+            &state,
+            "admin/invite/create",
+            serde_json::json!({ "count": 3, "expiresAt": "not-a-date" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "INVALID_DATE_TIME");
+        assert_eq!(value["id"], "f1380b15-3760-4c6c-a1db-5c3aaf1cbd49");
+        let (status, batch) = call(
+            &state,
+            "admin/invite/create",
+            serde_json::json!({ "count": 3, "expiresAt": "2030-01-02T03:04:05.000Z" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{batch}");
+        let rows = batch.as_array().unwrap();
+        assert_eq!(rows.len(), 3, "{batch}");
+        for row in rows {
+            assert_eq!(
+                row["expiresAt"],
+                serde_json::json!("2030-01-02T03:04:05.000Z"),
+                "{row}"
+            );
+        }
+
+        // admin/invite/list: every creator's codes, `type` filter.
+        let (status, all) = call(
+            &state,
+            "admin/invite/list",
+            serde_json::json!({ "type": "unused" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{all}");
+        assert_eq!(all.as_array().unwrap().len(), 4, "{all}");
+        let (status, used) = call(
+            &state,
+            "admin/invite/list",
+            serde_json::json!({ "type": "used" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{used}");
+        assert_eq!(used.as_array().unwrap().len(), 0, "{used}");
+
+        // invite/delete: own code goes (204); unknown id is upstream's
+        // NO_SUCH_INVITE_CODE (400).
+        let code1_id = code1["id"].as_str().unwrap().to_string();
+        let (status, value) = call(
+            &state,
+            "invite/delete",
+            serde_json::json!({ "inviteId": code1_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{value}");
+        let (status, after) = call(
+            &state,
+            "admin/invite/list",
+            serde_json::json!({ "type": "unused" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(after.as_array().unwrap().len(), 3, "{after}");
+        let (status, value) = call(
+            &state,
+            "invite/delete",
+            serde_json::json!({ "inviteId": "missing-invite-id" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_INVITE_CODE");
+        assert_eq!(value["id"], "cd4f9ae4-7854-4e3e-8df9-c296f051e634");
+    }
+
+    #[tokio::test]
+    async fn wp2_admin_meta_and_blocked_hosts() {
+        let (state, _) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+
+        // Both admin endpoints are admin-only.
+        for endpoint in ["admin/meta", "admin/update-meta"] {
+            let (status, value) = call(&state, endpoint, serde_json::json!({}), Some(&alice_token)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{endpoint}: {value}");
+        }
+
+        state
+            .services
+            .set_role(None, &alice_id, true, false)
+            .expect("set role");
+        // blockedHosts: lowercased, deduped, empties dropped (upstream
+        // `admin/update-meta.ts` normalization).
+        let (status, value) = call(
+            &state,
+            "admin/update-meta",
+            serde_json::json!({
+                "blockedHosts": ["Example.COM", "", " example.com ", "sub.example.com"],
+            }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{value}");
+        let (status, meta) = call(&state, "admin/meta", serde_json::json!({}), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::OK, "{meta}");
+        assert_eq!(
+            meta["blockedHosts"],
+            serde_json::json!(["example.com", "sub.example.com"])
+        );
+        assert_eq!(meta["disableRegistration"], serde_json::json!(false));
+
+        // Public meta carries the setting too (WP2 acceptance).
+        let (status, public_meta) = call(&state, "meta", serde_json::json!({}), None).await;
+        assert_eq!(status, StatusCode::OK, "{public_meta}");
+        assert_eq!(public_meta["disableRegistration"], serde_json::json!(false));
+
+        // Fields outside the WP2 subset are refused explicitly (WP6
+        // completes the parameter set) — never silently ignored.
+        let (status, value) = call(
+            &state,
+            "admin/update-meta",
+            serde_json::json!({ "name": "Nope" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+    }
+
     #[tokio::test]
     async fn parity_default_reaction_heart_click() {
         let (state, _) = test_state();
@@ -11341,7 +12106,7 @@ mod tests {
                 is_cat: false,
                 is_locked: false,
                 preserved_usernames: Vec::new(),
-            })
+            }, None)
             .unwrap()
             .id
     }

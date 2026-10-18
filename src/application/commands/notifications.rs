@@ -124,6 +124,7 @@ mod tests {
             host_caps: store.clone(),
             moderation: store.clone(),
             instance_settings: store.clone(),
+            invites: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()
@@ -404,7 +405,7 @@ mod tests {
                 is_cat: false,
                 is_locked: false,
                 preserved_usernames: Vec::new(),
-            })
+            }, None)
             .unwrap();
         let note = services
             .create_note(crate::application::ports::CreateNoteInput {

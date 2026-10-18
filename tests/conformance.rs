@@ -28,14 +28,17 @@ use std::time::{Duration, Instant};
 
 use pinetree::application::commands::AppServices;
 use pinetree::application::ports::{
-    AccountStore, ActivityDedup, BlockStore, BlobStore, CreateAccountInput, CreateNoteInput,
-    EditNoteInput, FollowStore, InsertMediaInput, InstanceSettingsStore, JobKind, JobQueue,
+    AccountStore, ActivityDedup, BlockStore, BlobStore, ConsumeInviteInput, CreateAccountInput,
+    CreateInviteInput, CreateNoteInput,
+    EditNoteInput, FollowStore, InsertMediaInput, InstanceSettingsPatch, InstanceSettingsStore,
+    InviteStore, JobKind, JobQueue,
     MediaStore, ModerationLogFilter, ModerationLogStore, MuteStore, NewJob,
     NoopStreamingSink, NoteStore, NotificationStore, PollExpiryPayload, PollStore, PortError,
     ReactionStore, ReplyParentResolvePayload, ScheduledDraftPayload, StreamingSink, TimelineCursor,
     UpdateAccountPatch, MAX_JOBS_PER_TXN, MAX_JOB_ATTEMPTS, MAX_JOB_PAYLOAD_BYTES,
 };
 use pinetree::domain::id::{Clock, ManualClock};
+use pinetree::domain::instance::RegistrationPolicy;
 use pinetree::domain::moderation::{ModerationAction, ModerationLogEntry};
 use pinetree::domain::poll::{PollInput, PollVote};
 use pinetree::domain::draft::NoteDraft;
@@ -70,6 +73,7 @@ pub trait ConformanceStore:
         + PollStore
         + ModerationLogStore
         + InstanceSettingsStore
+        + InviteStore
 {
 }
 
@@ -86,6 +90,7 @@ impl<T> ConformanceStore for T where
         + PollStore
         + ModerationLogStore
         + InstanceSettingsStore
+        + InviteStore
 {
 }
 
@@ -170,7 +175,7 @@ fn federate_job(clock: &ManualClock, key: &str) -> NewJob {
 
 fn create_user<S: AccountStore>(store: &S, handle: &str) -> pinetree::domain::account::Account {
     store
-        .create_account(CreateAccountInput::local(handle))
+        .create_account(CreateAccountInput::local(handle), None)
         .unwrap_or_else(|e| panic!("create_account({handle}) failed: {e:?}"))
 }
 
@@ -1009,6 +1014,7 @@ fn open_worker_stack(
         host_caps: store.clone(),
         moderation: store.clone(),
         instance_settings: store.clone(),
+        invites: store.clone(),
         streaming: Arc::new(NoopStreamingSink),
         dedup: store.clone() as Arc<dyn ActivityDedup>,
         federation_http: SafeHttpClient::new(SafeHttpConfig {
@@ -1396,7 +1402,7 @@ fn slice10_remote_account<S: AccountStore>(
             is_cat: false,
             is_locked: false,
             preserved_usernames: Vec::new(),
-        })
+        }, None)
         .unwrap_or_else(|e| panic!("remote account {handle}: {e:?}"))
 }
 
@@ -1558,7 +1564,7 @@ fn c1_uniqueness_race() {
             .map(|h| {
                 let store = store.clone();
                 let h = h.to_string();
-                s.spawn(move || store.create_account(CreateAccountInput::local(&h)))
+                s.spawn(move || store.create_account(CreateAccountInput::local(&h), None))
             })
             .collect::<Vec<_>>()
             .into_iter()
@@ -1584,7 +1590,7 @@ fn case_c2_case_insensitivity<S: ConformanceStore>(store: &S) {
         assert_eq!(found.id, alice.id, "case-insensitive resolve of {probe}");
     }
     let err = store
-        .create_account(CreateAccountInput::local("ALICE_c2"))
+        .create_account(CreateAccountInput::local("ALICE_c2"), None)
         .expect_err("differing-case create must collide");
     assert!(is_conflict(&err), "got {err:?}");
 }
@@ -1617,7 +1623,7 @@ fn c3_rename_tombstone() {
         "actor URL unchanged across rename"
     );
     let err = store
-        .create_account(CreateAccountInput::local("alice"))
+        .create_account(CreateAccountInput::local("alice"), None)
         .expect_err("old handle must stay tombstoned");
     assert!(is_conflict(&err), "got {err:?}");
     assert!(
@@ -4961,7 +4967,7 @@ fn remote_account<S: AccountStore>(
             is_cat: false,
             is_locked: false,
             preserved_usernames: Vec::new(),
-        })
+        }, None)
         .unwrap_or_else(|e| panic!("remote account {handle}: {e:?}"))
 }
 
@@ -6015,4 +6021,223 @@ fn h4_log_never_lost() {
             .reject_quotes,
         "the state change survived with the row"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Group I — invite codes and the signup claim (Batch M WP2;
+// `docs/implementer-guide-batch-m.md`)
+// ---------------------------------------------------------------------------
+
+fn invite_input(code: &str, created_by: Option<&str>, expires_at_ms: Option<i64>) -> CreateInviteInput {
+    CreateInviteInput {
+        code: code.to_string(),
+        created_by: created_by.map(str::to_string),
+        expires_at_ms,
+    }
+}
+
+fn consume_input(code: &str, handle: &str) -> ConsumeInviteInput {
+    ConsumeInviteInput {
+        code: code.to_string(),
+        account: CreateAccountInput::local(handle),
+        password_hash: Some(format!("hash-for-{handle}")),
+    }
+}
+
+/// I1: one invite code creates at most one account even under N retrying
+/// claims — exactly one `consume_and_create_account` succeeds (the
+/// unique-index row is dropped with the claim).
+fn case_i1_invite_single_use<S: ConformanceStore>(store: &S) {
+    store
+        .create_invites(&[invite_input("ICODE0001AAAA", None, None)], None)
+        .expect("create invite");
+    let mut successes = 0usize;
+    for attempt in 0..5 {
+        match store.consume_and_create_account(consume_input(
+            "ICODE0001AAAA",
+            &format!("i1_claimant{attempt}"),
+        )) {
+            Ok((account, ticket)) => {
+                successes += 1;
+                assert_eq!(
+                    ticket.used_by.as_deref(),
+                    Some(account.id.as_str()),
+                    "the winning claim marks the code used for its account"
+                );
+            }
+            Err(PortError::NotFound(_)) => {}
+            Err(err) => panic!("attempt {attempt} failed unexpectedly: {err:?}"),
+        }
+    }
+    assert_eq!(successes, 1, "exactly one of 5 claims succeeds");
+    assert!(
+        store
+            .find_invite_by_code("ICODE0001AAAA")
+            .expect("lookup")
+            .is_none(),
+        "a consumed code is gone from the unique index"
+    );
+    assert!(
+        store.find_by_handle("i1_claimant0").expect("lookup").is_some(),
+        "the first (winning) claim created the account"
+    );
+    assert!(
+        store.find_by_handle("i1_claimant1").expect("lookup").is_none(),
+        "losing claims created nothing"
+    );
+}
+
+/// I2: the claim and the account create are ONE transaction — a failing
+/// account insert (duplicate handle) aborts the claim entirely: the code
+/// stays unused and claimable, and no account row appears.
+fn case_i2_consume_create_atomic<S: ConformanceStore>(store: &S) {
+    create_user(store, "i2_taken");
+    store
+        .create_invites(&[invite_input("ICODE0002AAAA", None, None)], None)
+        .expect("create invite");
+    let err = store
+        .consume_and_create_account(consume_input("ICODE0002AAAA", "i2_taken"))
+        .expect_err("duplicate handle refuses the consume");
+    assert!(
+        matches!(err, PortError::Conflict(_)),
+        "duplicate handle is a conflict, got {err:?}"
+    );
+    let ticket = store
+        .find_invite_by_code("ICODE0002AAAA")
+        .expect("lookup")
+        .expect("the code survived the failed claim");
+    assert!(!ticket.is_used(), "the failed claim consumed nothing");
+    // A valid claim in the same state now succeeds.
+    let (account, ticket) = store
+        .consume_and_create_account(consume_input("ICODE0002AAAA", "i2_fresh"))
+        .expect("claim after the failed attempt");
+    assert!(ticket.is_used());
+    assert!(store.find_by_id(&account.id).expect("lookup").is_some());
+    assert!(
+        store.find_by_handle("i2_taken").expect("lookup").is_some(),
+        "the pre-existing account is untouched"
+    );
+}
+
+/// I3: `InstanceSettings.registration` (upstream `disableRegistration`)
+/// persists through the settings store and commits with its
+/// `updateServerSettings` row. The gate itself is application logic
+/// (`AppServices::signup`), asserted by the endpoint tests; a passing
+/// backend must store the policy exactly.
+fn case_i3_registration_policy<S: ConformanceStore>(store: &S) {
+    let close = InstanceSettingsPatch {
+        registration: Some(RegistrationPolicy::Closed),
+        ..Default::default()
+    };
+    let updated = store
+        .update(
+            close,
+            log_entry(
+                "i3log000000000a",
+                None,
+                ModerationAction::UpdateServerSettings,
+                None,
+                serde_json::json!({ "before": {"disableRegistration": false}, "after": {"disableRegistration": true} }),
+            ),
+        )
+        .expect("close registration");
+    assert!(updated.registration.disable_registration());
+    assert!(InstanceSettingsStore::get(store)
+        .expect("get")
+        .registration
+        .disable_registration());
+    let open = InstanceSettingsPatch {
+        registration: Some(RegistrationPolicy::Open),
+        ..Default::default()
+    };
+    store
+        .update(
+            open,
+            log_entry(
+                "i3log000000000b",
+                None,
+                ModerationAction::UpdateServerSettings,
+                None,
+                serde_json::json!({ "before": {"disableRegistration": true}, "after": {"disableRegistration": false} }),
+            ),
+        )
+        .expect("reopen registration");
+    assert!(!InstanceSettingsStore::get(store)
+        .expect("get")
+        .registration
+        .disable_registration());
+    assert_eq!(log_rows(store).len(), 2, "each write kept its row");
+}
+
+/// I4: the happy path of the claim — a valid unexpired code creates the
+/// account, marks the code used (used_by/used_at), and drops the unique
+/// index row; missing, used, and expired codes all refuse the same way
+/// (upstream's signup gate answers 400 for all three).
+fn case_i4_consume_happy_path<S: ConformanceStore>(store: &S, clock: &ManualClock) {
+    store
+        .create_invites(
+            &[invite_input("ICODE0004AAAA", None, Some(BASE_MS + 60_000))],
+            None,
+        )
+        .expect("create invite");
+    let (account, ticket) = store
+        .consume_and_create_account(consume_input("ICODE0004AAAA", "i4_newbie"))
+        .expect("consume a valid invite");
+    assert_eq!(ticket.used_by.as_deref(), Some(account.id.as_str()));
+    assert_eq!(ticket.used_at_ms, Some(clock.now_ms()));
+    assert!(store.find_by_handle("i4_newbie").expect("lookup").is_some());
+    assert!(store
+        .find_invite_by_code("ICODE0004AAAA")
+        .expect("lookup")
+        .is_none());
+    // Second consume of the same code: refused.
+    assert!(matches!(
+        store.consume_and_create_account(consume_input("ICODE0004AAAA", "i4_ghost")),
+        Err(PortError::NotFound(_))
+    ));
+    assert!(store.find_by_handle("i4_ghost").expect("lookup").is_none());
+    // Expired code: refused the same way, nothing created.
+    store
+        .create_invites(
+            &[invite_input("ICODE0004EXPD", None, Some(BASE_MS - 1))],
+            None,
+        )
+        .expect("create expired invite");
+    assert!(matches!(
+        store.consume_and_create_account(consume_input("ICODE0004EXPD", "i4_late")),
+        Err(PortError::NotFound(_))
+    ));
+    assert!(store.find_by_handle("i4_late").expect("lookup").is_none());
+}
+
+#[test]
+fn i1_invite_single_use() {
+    let factory = RedbFactory::fresh("i1");
+    let clock = test_clock();
+    let store = factory.open(clock);
+    case_i1_invite_single_use(&*store);
+}
+
+#[test]
+fn i2_consume_create_atomic() {
+    let factory = RedbFactory::fresh("i2");
+    let clock = test_clock();
+    let store = factory.open(clock);
+    case_i2_consume_create_atomic(&*store);
+}
+
+#[test]
+fn i3_registration_policy() {
+    let factory = RedbFactory::fresh("i3");
+    let clock = test_clock();
+    let store = factory.open(clock);
+    case_i3_registration_policy(&*store);
+}
+
+#[test]
+fn i4_consume_happy_path() {
+    let factory = RedbFactory::fresh("i4");
+    let clock = test_clock();
+    let store = factory.open(clock.clone());
+    case_i4_consume_happy_path(&*store, &clock);
 }

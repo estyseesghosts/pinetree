@@ -43,6 +43,7 @@ pub(crate) fn test_services(prefix: &str) -> AppServices {
         host_caps: store.clone(),
         moderation: store.clone(),
         instance_settings: store.clone(),
+        invites: store.clone(),
         federation_http: SafeHttpClient::new(SafeHttpConfig {
             allow_private_ips: true,
             ..Default::default()

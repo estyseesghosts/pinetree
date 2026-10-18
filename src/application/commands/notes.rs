@@ -702,7 +702,7 @@ mod federation_tests {
                 is_cat: false,
                 is_locked: false,
                 preserved_usernames: Vec::new(),
-            })
+            }, None)
             .unwrap()
             .id
     }

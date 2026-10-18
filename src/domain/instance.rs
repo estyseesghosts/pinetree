@@ -144,9 +144,14 @@ pub fn host_is_blocked(blocked_hosts: &[String], host: &str) -> bool {
 
 /// One invite code (upstream `models/RegistrationTicket.ts` subset used by
 /// Batch M WP2). `code` is unique, 1..=64 chars (upstream column
-/// `varchar(64)`).
+/// `varchar(64)`). The ticket `id` (upstream `id`, a Misskey aid) is what
+/// `invite/delete` addresses (`inviteId`) and what the packed `InviteCode`
+/// exposes as `id`; the guide's §3.3 store sketch omits it, but the upstream
+/// response shape and delete parameter both require it.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct InviteCode {
+    /// Ticket id (upstream `RegistrationTicket.id`), sortable.
+    pub id: String,
     pub code: String,
     /// Creator account id (upstream `createdById`, nullable).
     pub created_by: Option<String>,
@@ -158,12 +163,14 @@ pub struct InviteCode {
 
 impl InviteCode {
     pub fn new(
+        id: String,
         code: String,
         created_by: Option<String>,
         created_at_ms: i64,
         expires_at_ms: Option<i64>,
     ) -> Result<Self, DomainError> {
         let invite = Self {
+            id,
             code,
             created_by,
             created_at_ms,
@@ -204,6 +211,9 @@ impl InviteCode {
     }
 
     pub fn validate(&self) -> Result<(), DomainError> {
+        if self.id.is_empty() || self.id.chars().count() > 32 {
+            return Err(invalid("invite id must be 1..=32 chars".to_string()));
+        }
         if self.code.is_empty() || self.code.chars().count() > 64 {
             return Err(invalid("invite code must be 1..=64 chars".to_string()));
         }
@@ -297,6 +307,7 @@ mod tests {
     #[test]
     fn invite_lifecycle() {
         let mut invite = InviteCode::new(
+            "aid0000000000000a".to_string(),
             "ABCD2345EFGH".to_string(),
             Some("aid00000000000001".to_string()),
             1_000,
@@ -315,7 +326,7 @@ mod tests {
             .is_err());
 
         for bad in ["", "has space", &"x".repeat(65), "dash-code"] {
-            assert!(InviteCode::new(bad.to_string(), None, 0, None).is_err());
+            assert!(InviteCode::new("aid0000000000000b".to_string(), bad.to_string(), None, 0, None).is_err());
         }
     }
 }

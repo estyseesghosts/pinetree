@@ -1,7 +1,7 @@
 use super::AppServices;
 
 use crate::application::ports::{
-    ApiTokenRecord, CreateAccountInput, PortError, UpdateAccountPatch,
+    ApiTokenRecord, PortError, UpdateAccountPatch,
 };
 use crate::domain::account::{
     AVATAR_DECORATION_LIMIT_DEFAULT, MutedWord, WORD_MUTE_LIMIT_DEFAULT,
@@ -15,22 +15,43 @@ impl AppServices {
         username: &str,
         password_hash: Option<&str>,
     ) -> Result<Account, PortError> {
-        let input = CreateAccountInput {
-            handle: username.to_string(),
-            host: None,
-            display_name: None,
-            description: None,
-            location: None,
-            birthday: None,
-            uri: None,
-            inbox: None,
-            shared_inbox: None,
-            is_bot: false,
-            is_cat: false,
-            is_locked: false,
-            preserved_usernames: self.preserved_usernames.clone(),
-        };
-        let account = self.accounts.create_account(input)?;
+        let input = self.account_input(username);
+        let account = self.accounts.create_account(input, None)?;
+        if let Some(hash) = password_hash {
+            self.auth.set_password_hash(&account.id, hash)?;
+        }
+        Ok(account)
+    }
+
+    /// `admin/accounts/create` (Batch M WP2): operator-created account.
+    /// Bypasses the registration gate (that is its purpose) and commits
+    /// its `createAccount` moderation-log row in the same transaction
+    /// (§2.3).
+    ///
+    /// DIVERGENCE: upstream `admin/accounts/create.ts` writes no
+    /// moderation-log row at all (the action string is the guide's); the
+    /// row's `userId` is `null` because account ids are store-generated
+    /// and cannot be referenced from a row built before the insert.
+    pub fn create_account_admin(
+        &self,
+        username: &str,
+        password_hash: Option<&str>,
+        moderator_id: &str,
+    ) -> Result<Account, PortError> {
+        let input = self.account_input(username);
+        let log = ModerationLogEntry::new(
+            self.ids.generate(),
+            Some(moderator_id.to_string()),
+            ModerationAction::CreateAccount,
+            None,
+            serde_json::json!({
+                "userId": null,
+                "userUsername": username,
+                "userHost": null,
+            }),
+            self.clock.now_ms(),
+        )?;
+        let account = self.accounts.create_account(input, Some(&log))?;
         if let Some(hash) = password_hash {
             self.auth.set_password_hash(&account.id, hash)?;
         }

@@ -1365,6 +1365,7 @@ mod timeline_tests {
             host_caps: store.clone(),
             moderation: store.clone(),
             instance_settings: store.clone(),
+            invites: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()
@@ -1397,7 +1398,7 @@ mod timeline_tests {
                 is_cat: false,
                 is_locked: false,
                 preserved_usernames: Vec::new(),
-            })
+            }, None)
             .unwrap()
             .id
     }
@@ -1433,8 +1434,9 @@ mod timeline_tests {
         fn create_account(
             &self,
             input: CreateAccountInput,
+            log: Option<&crate::domain::moderation::ModerationLogEntry>,
         ) -> Result<Account, PortError> {
-            self.inner.create_account(input)
+            self.inner.create_account(input, log)
         }
         fn find_by_id(&self, id: &str) -> Result<Option<Account>, PortError> {
             let mut account = self.inner.find_by_id(id)?;
