@@ -3006,6 +3006,133 @@ fn api_dispatch_blocking(
             Ok(Json(packed).into_response())
         }
 
+        // Batch M WP6 `admin/show-user` (upstream `admin/show-user.ts`):
+        // moderator only. Returns account details including isSuspended,
+        // isAdmin, isModerator, and report counts.
+        "admin/show-user" => {
+            check_allowed_fields(&obj, &["userId"])?;
+            let caller = require_caller(caller)?;
+            require_moderator(&caller)?;
+            let user_id = required_str(&obj, "userId")?;
+            let account = state
+                .services
+                .accounts
+                .find_by_id(&user_id)
+                .map_err(ApiError::from_port_error)?
+                .ok_or_else(|| ApiError::from_port_error(PortError::NotFound("NO_SUCH_USER".to_string())))?;
+            let report_count = state
+                .services
+                .abuse_reports
+                .count_for_target(&user_id)
+                .map_err(ApiError::from_port_error)?;
+            let mut packed = if account.id == caller.account.id {
+                pack_me_detailed(&account, caller.is_first_party, &state.services)
+                    .map_err(ApiError::from_port_error)?
+            } else {
+                pack_user_detailed_not_me(&account, Some(&caller.account.id), &state.services)
+                    .map_err(ApiError::from_port_error)?
+            };
+            if let Some(o) = packed.as_object_mut() {
+                o.insert("reportCount".to_string(), serde_json::json!(report_count));
+                o.insert("moderationNote".to_string(), serde_json::json!(account.moderator_note));
+            }
+            Ok(Json(packed).into_response())
+        }
+
+        // Batch M WP6 `admin/show-users` (upstream `admin/show-users.ts`):
+        // moderator only. Subset of upstream params.
+        "admin/show-users" => {
+            check_allowed_fields(&obj, &["limit", "offset", "state", "origin", "username", "hostname", "sort"])?;
+            let caller = require_caller(caller)?;
+            require_moderator(&caller)?;
+            let limit = get_limit(&obj)?;
+            let offset = opt_usize(&obj, "offset")?.unwrap_or(0);
+            let state_filter = opt_string(&obj, "state")?.unwrap_or_else(|| "all".to_string());
+            let origin = opt_string(&obj, "origin")?.unwrap_or_else(|| "combined".to_string());
+            let username_filter = opt_string(&obj, "username")?;
+            let hostname_filter = opt_string(&obj, "hostname")?;
+            // Enumerate accounts bounded.
+            let mut accounts = state.services.accounts.search_accounts("", 0, 10_000).map_err(ApiError::from_port_error)?;
+            // Filter.
+            let mut filtered: Vec<_> = accounts.into_iter().filter(|a| {
+                if a.is_deleted { return false; }
+                match state_filter.as_str() {
+                    "available" => !a.is_suspended,
+                    "suspended" => a.is_suspended,
+                    "admin" => a.is_admin,
+                    "moderator" => a.is_moderator && !a.is_admin,
+                    "adminOrModerator" => a.is_admin || a.is_moderator,
+                    _ => true,
+                }
+            }).filter(|a| match origin.as_str() {
+                "local" => a.host.is_none(),
+                "remote" => a.host.is_some(),
+                _ => true,
+            }).filter(|a| {
+                if let Some(u) = &username_filter {
+                    a.username_lower.starts_with(&u.to_lowercase())
+                } else { true }
+            }).filter(|a| {
+                if let Some(h) = &hostname_filter {
+                    a.host.as_deref() == Some(h.as_str())
+                } else { true }
+            }).collect();
+            // sort by id asc default
+            filtered.sort_by(|a, b| a.id.cmp(&b.id));
+            let page: Vec<_> = filtered.into_iter().skip(offset).take(limit).collect();
+            let mut out = Vec::new();
+            for a in page {
+                let rc = state.services.abuse_reports.count_for_target(&a.id).map_err(ApiError::from_port_error)?;
+                let mut packed = pack_user_detailed_not_me(&a, Some(&caller.account.id), &state.services).map_err(ApiError::from_port_error)?;
+                if let Some(o) = packed.as_object_mut() {
+                    o.insert("reportCount".to_string(), serde_json::json!(rc));
+                    o.insert("moderationNote".to_string(), serde_json::json!(a.moderator_note));
+                }
+                out.push(packed);
+            }
+            Ok(Json(serde_json::json!(out)).into_response())
+        }
+
+        // Batch M WP6 `admin/update-user-note` (upstream `admin/update-user-note.ts`).
+        "admin/update-user-note" => {
+            check_allowed_fields(&obj, &["userId", "text"])?;
+            let caller = require_caller(caller)?;
+            require_moderator(&caller)?;
+            let user_id = required_str(&obj, "userId")?;
+            let text = required_str(&obj, "text")?;
+            let account = state
+                .services
+                .update_user_note(&caller.account.id, &user_id, &text)
+                .map_err(ApiError::from_port_error)?;
+            let packed = pack_user_detailed_not_me(&account, Some(&caller.account.id), &state.services).map_err(ApiError::from_port_error)?;
+            Ok(Json(packed).into_response())
+        }
+
+        // Batch M WP6 `admin/delete-account` (upstream `admin/delete-account.ts`): admin only.
+        "admin/delete-account" => {
+            check_allowed_fields(&obj, &["userId"])?;
+            let caller = require_caller(caller)?;
+            require_admin(&caller)?;
+            let user_id = required_str(&obj, "userId")?;
+            state
+                .services
+                .delete_account(Some(&caller.account.id), &user_id, None)
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(serde_json::json!({})).into_response())
+        }
+
+        // Batch M WP6 `i/delete-account` (upstream `i/delete-account.ts`): self-service, password required.
+        "i/delete-account" => {
+            check_allowed_fields(&obj, &["password"])?;
+            let caller = require_caller(caller)?;
+            let password = required_str(&obj, "password")?;
+            state
+                .services
+                .delete_account(Some(&caller.account.id), &caller.account.id, Some(&password))
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(serde_json::json!({})).into_response())
+        }
+
         // Batch M §3.2 `admin/show-moderation-logs` (upstream file of the
         // same name): cursor-paged moderation log with `type`/`userId`/
         // `search` filters. DIVERGENCE: upstream requires admin
@@ -5285,6 +5412,7 @@ fn parse_profile_patch(obj: &Map<String, Value>) -> Result<UpdateAccountPatch, A
         verified_links: None,
         reject_quotes: update_bool_field(obj, "rejectQuotes")?,
         default_reaction: bounded_nullable_string(obj, "defaultReaction", 260)?,
+        moderator_note: None,
     })
 }
 

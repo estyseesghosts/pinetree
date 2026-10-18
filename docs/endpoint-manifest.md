@@ -481,3 +481,19 @@ Semantics (upstream `UtilityService.isBlockedHost`): a host is blocked when it e
 Storage: `InstanceSettingsStore::get/update` (required, no defaults) + `InstanceSettings::blocked_hosts`. `queries.rs::blocked_hosts()` now reads the store (no second copy).
 
 DIVERGENCES: none new. `federation/instances` endpoint (upstream) not implemented (optional; skipped, recorded here).
+
+## §26 — Admin read and user views (Batch M WP6)
+
+Endpoints:
+- `admin/show-user` `{userId}` (moderator only): returns account details including `isSuspended`, `isAdmin`, `isModerator`, `moderationNote`, and `reportCount` (abuse reports whose target is the user). Error `NO_SUCH_USER` for missing.
+- `admin/show-users` `{limit?, offset?, state?, origin?, username?, hostname?, sort?}` (moderator only): list users with upstream param subset (`state`: all/alive/available/admin/moderator/adminOrModerator/suspended; `origin`: combined/local/remote). Includes flags + report counts.
+- `admin/update-user-note` `{userId, text}` (moderator only): sets the account's moderator note. Logged as `updateUserNote`.
+- `admin/delete-account` `{userId}` (admin only): tombstones the account (handle reserved), removes follows and follow requests in both directions, logs `deleteAccount`, enqueues `Delete(Person)` to knowable shared inboxes for local accounts. Shares machinery with `i/delete-account`.
+- `i/delete-account` `{password}` (self-service): password required; same machinery, actor = the account itself, logged `deleteAccount`.
+
+Storage: `ModerationLogStore::delete_account` (required, no default). `Account.moderator_note` added (serde default). `AbuseReportStore::count_for_target` added (required). `UpdateAccountPatch.moderator_note` added.
+
+DIVERGENCES:
+- Note bodies are not deleted in-line; tombstoning leaves them filtered by the read path (transaction-size bound). A cleanup job is deferred.
+- Self-delete logs a `deleteAccount` row with actor = the account itself (upstream logs via `DeleteAccountService`; pinetree records it for audit).
+- `INCORRECT_PASSWORD` is answered as `PortError::Validation("INCORRECT_PASSWORD")` (upstream throws untyped "incorrect password").

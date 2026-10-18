@@ -2357,6 +2357,9 @@ impl RedbStore {
             if let Some(v) = patch.default_reaction {
                 acc.default_reaction = v;
             }
+            if let Some(v) = patch.moderator_note {
+                acc.moderator_note = v;
+            }
             // `update.ts` resets `verifiedLinks` on every profile update;
             // re-verification happens off-request (see `verifyLink`).
             // Only applied when the caller sets the field (profile updates);
@@ -2685,6 +2688,56 @@ impl ModerationLogStore for RedbStore {
         Ok(updated)
     }
 
+    fn delete_account(
+        &self,
+        account_id: &str,
+        log: Option<ModerationLogEntry>,
+        jobs: Vec<NewJob>,
+    ) -> Result<(), PortError> {
+        for job in &jobs {
+            job.validate()?;
+        }
+        if let Some(l) = &log {
+            l.validate()?;
+        }
+        let write_txn = self.begin_write()?;
+        self.set_account_flags_in_txn(&write_txn, account_id, |account| {
+            account.is_deleted = true;
+            account.is_suspended = true;
+        })?;
+        self.delete_follow_requests_involving_in_txn(&write_txn, account_id)?;
+        // Remove follow edges in both directions (account as follower or followee).
+        let mut keys: Vec<(String, String)> = Vec::new();
+        {
+            let fwd = write_txn.open_table(FOLLOWS_FORWARD).map_err(map_redb_err)?;
+            for entry in fwd.range((account_id, "")..=(account_id, "\u{10ffff}")).map_err(map_redb_err)? {
+                let (k, _) = entry.map_err(map_redb_err)?;
+                let (f, fe) = k.value();
+                keys.push((f.to_string(), fe.to_string()));
+            }
+        }
+        {
+            let rev = write_txn.open_table(FOLLOWS_REVERSE).map_err(map_redb_err)?;
+            for entry in rev.range((account_id, "")..=(account_id, "\u{10ffff}")).map_err(map_redb_err)? {
+                let (k, _) = entry.map_err(map_redb_err)?;
+                let (fe, f) = k.value();
+                keys.push((f.to_string(), fe.to_string()));
+            }
+        }
+        for (f, fe) in keys {
+            let mut fwd = write_txn.open_table(FOLLOWS_FORWARD).map_err(map_redb_err)?;
+            let _ = fwd.remove((f.as_str(), fe.as_str())).map_err(map_redb_err)?;
+            let mut rev = write_txn.open_table(FOLLOWS_REVERSE).map_err(map_redb_err)?;
+            let _ = rev.remove((fe.as_str(), f.as_str())).map_err(map_redb_err)?;
+        }
+        if let Some(l) = log {
+            self.append_log_in_txn(&write_txn, &l)?;
+        }
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)?;
+        Ok(())
+    }
+
     fn append(&self, entry: ModerationLogEntry) -> Result<(), PortError> {
         let write_txn = self.begin_write()?;
         self.append_log_in_txn(&write_txn, &entry)?;
@@ -2758,6 +2811,20 @@ impl AbuseReportStore for RedbStore {
         }
         self.commit_write(write_txn)?;
         Ok(report)
+    }
+
+    fn count_for_target(&self, account_id: &str) -> Result<usize, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(ABUSE_REPORTS).map_err(map_redb_err)?;
+        let mut count = 0usize;
+        for entry in table.range(""..).map_err(map_redb_err)? {
+            let (_, v) = entry.map_err(map_redb_err)?;
+            let report: AbuseReport = decode_json(v.value())?;
+            if report.target_account == account_id {
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     fn get(&self, id: &str) -> Result<Option<AbuseReport>, PortError> {
@@ -3353,6 +3420,7 @@ impl RedbStore {
             ],
             reject_quotes: false,
             default_reaction: None,
+            moderator_note: None,
         };
         account.validate()?;
         Ok(account)

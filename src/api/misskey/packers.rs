@@ -1937,6 +1937,14 @@ mod tests {
         ) -> Result<Account, PortError> {
             unavailable("update_account_logged")
         }
+        fn delete_account(
+            &self,
+            _account_id: &str,
+            _log: Option<crate::domain::moderation::ModerationLogEntry>,
+            _jobs: Vec<NewJob>,
+        ) -> Result<(), PortError> {
+            unavailable("delete_account")
+        }
         fn append(
             &self,
             _entry: crate::domain::moderation::ModerationLogEntry,
@@ -2015,6 +2023,7 @@ mod tests {
 
     impl crate::application::ports::AbuseReportStore for Mem {
         fn create(&self, _report: crate::domain::moderation::AbuseReport) -> Result<crate::domain::moderation::AbuseReport, PortError> { unavailable("create") }
+        fn count_for_target(&self, _account_id: &str) -> Result<usize, PortError> { unavailable("count_for_target") }
         fn get(&self, _id: &str) -> Result<Option<crate::domain::moderation::AbuseReport>, PortError> { unavailable("get") }
         fn list(&self, _filter: &crate::application::ports::AbuseReportFilter, _cursor: &crate::application::ports::TimelineCursor) -> Result<Vec<crate::domain::moderation::AbuseReport>, PortError> { unavailable("list") }
         fn resolve(&self, _id: &str, _resolved_as: Option<crate::domain::moderation::AbuseReportResolution>, _assignee: Option<String>, _log: crate::domain::moderation::ModerationLogEntry, _jobs: Vec<crate::application::ports::NewJob>) -> Result<crate::domain::moderation::AbuseReport, PortError> { unavailable("resolve") }

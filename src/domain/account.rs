@@ -95,6 +95,8 @@ pub struct Account {
     pub is_moderator: bool,
     pub is_explorable: bool,
     pub is_deleted: bool,
+    #[serde(default)]
+    pub moderator_note: Option<String>,
     pub is_cat: bool,
     // --- Full profile store (§0B; Misskey `MiUser` columns) -----------------
     /// `MiUser.hideOnlineStatus` (default false).
@@ -411,6 +413,7 @@ impl Account {
             is_moderator: false,
             is_explorable: true,
             is_deleted: false,
+            moderator_note: None,
             is_cat: false,
             hide_online_status: false,
             avatar_decorations: Vec::new(),
@@ -625,6 +628,7 @@ mod tests {
             is_moderator: false,
             is_explorable: false,
             is_deleted: false,
+            moderator_note: None,
             is_cat: false,
             hide_online_status: false,
             avatar_decorations: Vec::new(),

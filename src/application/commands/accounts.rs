@@ -403,6 +403,101 @@ impl AppServices {
         Ok(account)
     }
 
+    /// Batch M WP6: shared delete-account machinery used by both
+    /// `admin/delete-account` (admin only) and `i/delete-account`
+    /// (self-service, password required). One transaction: tombstone the
+    /// account (handle stays reserved, conformance C3), remove follows and
+    /// follow requests in both directions, append the moderation-log row when
+    /// an actor is present, and enqueue a `Delete(Person)` broadcast to
+    /// knowable shared inboxes for local accounts. Note bodies are NOT
+    /// deleted in-line (transaction-size bound); they are left tombstoned
+    /// author-side and filtered by the read path. Password verification, when
+    /// a password is supplied, runs here against the stored hash.
+    pub fn delete_account(
+        &self,
+        actor: Option<&str>,
+        account_id: &str,
+        password: Option<&str>,
+    ) -> Result<(), PortError> {
+        let target = self
+            .accounts
+            .find_by_id(account_id)?
+            .ok_or_else(|| PortError::NotFound("NO_SUCH_USER".to_string()))?;
+        self.accounts.get_owner(account_id)?;
+
+        if let Some(pw) = password {
+            let stored = self.auth.get_password_hash(account_id)?;
+            let stored = stored.as_deref().unwrap_or("");
+            if !crate::api::misskey::auth::verify_password(pw, stored) {
+                return Err(PortError::Validation("INCORRECT_PASSWORD".to_string()));
+            }
+        }
+
+        let log = actor.map(|a| {
+            ModerationLogEntry::new(
+                self.ids.generate(),
+                Some(a.to_string()),
+                ModerationAction::DeleteAccount,
+                Some(account_id.to_string()),
+                serde_json::json!({
+                    "userId": account_id,
+                    "userUsername": target.username,
+                    "userHost": target.host,
+                }),
+                self.clock.now_ms(),
+            )
+            .expect("valid log entry")
+        });
+
+        let mut jobs = Vec::new();
+        if target.is_local() {
+            let broadcast = crate::federation::outbox::FederateDeliverPayload::SuspendBroadcast {
+                account_id: account_id.to_string(),
+                activity_id: self.ids.generate(),
+                undo: false,
+                inbox_override: None,
+            };
+            jobs.push(self.federate_job(&broadcast, &format!("delete-account:{account_id}"))?);
+        }
+
+        self.moderation.delete_account(account_id, log, jobs)?;
+        Ok(())
+    }
+
+    /// Batch M WP6 `admin/update-user-note`: moderator note on an account.
+    pub fn update_user_note(
+        &self,
+        moderator_id: &str,
+        account_id: &str,
+        text: &str,
+    ) -> Result<Account, PortError> {
+        let target = self
+            .accounts
+            .find_by_id(account_id)?
+            .ok_or_else(|| PortError::NotFound("NO_SUCH_USER".to_string()))?;
+        self.accounts.get_owner(account_id)?;
+        let log = ModerationLogEntry::new(
+            self.ids.generate(),
+            Some(moderator_id.to_string()),
+            ModerationAction::UpdateUserNote,
+            Some(account_id.to_string()),
+            serde_json::json!({
+                "userId": account_id,
+                "userUsername": target.username,
+                "userHost": target.host,
+                "before": target.moderator_note,
+                "after": text,
+            }),
+            self.clock.now_ms(),
+        )?;
+        let patch = UpdateAccountPatch {
+            moderator_note: Some(Some(text.to_string())),
+            ..Default::default()
+        };
+        self.moderation
+            .update_account_logged(account_id, patch, log, Vec::new())
+    }
+
     /// Re-export for callers that only need token bookkeeping through commands.
     pub fn store_token(&self, record: ApiTokenRecord) -> Result<(), PortError> {
         self.auth.store_token(record)

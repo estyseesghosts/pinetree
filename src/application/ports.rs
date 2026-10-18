@@ -114,6 +114,9 @@ pub struct UpdateAccountPatch {
     pub reject_quotes: Option<bool>,
     /// DIVERGENCE (§6 per-user default reaction, 1..=260 chars).
     pub default_reaction: Option<Option<String>>,
+    /// Batch M WP6 `admin/update-user-note`: moderator-only note text.
+    /// `Some(Some(text))` sets, `Some(None)` clears, `None` leaves unchanged.
+    pub moderator_note: Option<Option<String>>,
 }
 
 impl UpdateAccountPatch {
@@ -1943,6 +1946,18 @@ pub trait ModerationLogStore: Send + Sync {
         jobs: Vec<NewJob>,
     ) -> Result<Account, PortError>;
 
+    /// Batch M WP6 delete-account: tombstone the account (handle stays
+    /// reserved), remove follows and follow requests in both directions,
+    /// append `log` when given, and enqueue `jobs` — one transaction
+    /// (conformance C3 + delete atomicity). `log` is `Some` for admin
+    /// deletes and self-deletes (actor = the account itself).
+    fn delete_account(
+        &self,
+        account_id: &str,
+        log: Option<ModerationLogEntry>,
+        jobs: Vec<NewJob>,
+    ) -> Result<(), PortError>;
+
     /// Append one log row in its own transaction. Only for rows that ARE
     /// the action (nothing else commits with them); moderation actions use
     /// the compound methods above so a log row can never be lost against
@@ -2097,6 +2112,9 @@ pub trait AbuseReportStore: Send + Sync {
     fn create(&self, report: AbuseReport) -> Result<AbuseReport, PortError>;
 
     fn get(&self, id: &str) -> Result<Option<AbuseReport>, PortError>;
+
+    /// Batch M WP6: number of abuse reports whose target is `account_id`.
+    fn count_for_target(&self, account_id: &str) -> Result<usize, PortError>;
 
     fn list(
         &self,
