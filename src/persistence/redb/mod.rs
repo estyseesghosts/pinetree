@@ -3466,6 +3466,44 @@ impl AccountStore for RedbStore {
         Ok(matches.into_iter().skip(offset).take(limit).collect())
     }
 
+    fn remote_shared_inboxes(
+        &self,
+        after: Option<&str>,
+        max_rows: usize,
+    ) -> Result<(Vec<String>, Option<String>), PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(ACCOUNTS).map_err(map_redb_err)?;
+        let start = after.as_deref().unwrap_or("");
+        let mut out = Vec::new();
+        let mut next: Option<String> = None;
+        let mut scanned = 0usize;
+        for entry in table.range(start..).map_err(map_redb_err)? {
+            let (k, v) = entry.map_err(map_redb_err)?;
+            let id = k.value();
+            // The cursor is exclusive: skip the row it names.
+            if Some(id) == after.as_deref() {
+                continue;
+            }
+            scanned += 1;
+            let account: Account = decode_json(v.value())?;
+            if account.host.is_some() {
+                if let Some(inbox) = account
+                    .shared_inbox
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    out.push(inbox.to_string());
+                }
+            }
+            if scanned >= max_rows {
+                next = Some(id.to_string());
+                break;
+            }
+        }
+        Ok((out, next))
+    }
+
     fn find_by_uri(&self, uri: &str) -> Result<Option<Account>, PortError> {
         let target = uri.trim();
         if target.is_empty() {

@@ -48,6 +48,9 @@ pub enum HubMessage {
     NoteDeleted { note_id: String },
     /// A `main`-channel event for one user.
     Main(MainMessage),
+    /// The account was suspended: connections authenticated as it close
+    /// (Batch M WP3). Anonymous sockets and other users' sockets ignore it.
+    UserSuspended { account_id: String },
 }
 
 /// Process-wide broadcast hub. `send` is synchronous and never blocks a
@@ -146,6 +149,12 @@ impl StreamingSink for BroadcastStreamingSink {
                     body: serde_json::Value::Null,
                 }));
             }
+            // WP3 stream close: each connection whose viewer is the
+            // suspended account drops its socket (`streaming::server`);
+            // everyone else's connections ignore the event.
+            StreamingEvent::UserSuspended { account_id } => {
+                self.hub.send(HubMessage::UserSuspended { account_id });
+            }
             // `Unfollowed` never reaches the hub through the worker: the
             // worker intercepts it first to pack the followee (it needs
             // `AppServices`, which the sink does not have). This arm exists
@@ -206,6 +215,21 @@ mod tests {
                 assert_eq!(msg.user_id, "u1");
                 assert_eq!(msg.kind, MainEventKind::MeUpdated);
             }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_suspended_event_routes_to_hub() {
+        let (hub, sink) = hub_and_sink(16);
+        let mut rx = hub.subscribe();
+        let event = StreamingEvent::UserSuspended {
+            account_id: "u9".to_string(),
+        };
+        sink.publish("streaming", &serde_json::to_vec(&event).unwrap())
+            .unwrap();
+        match rx.try_recv().unwrap() {
+            HubMessage::UserSuspended { account_id } => assert_eq!(account_id, "u9"),
             other => panic!("unexpected {other:?}"),
         }
     }

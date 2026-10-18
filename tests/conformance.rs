@@ -6023,6 +6023,109 @@ fn h4_log_never_lost() {
     );
 }
 
+/// H5 (Batch M WP3): the knowable-shared-inbox enumeration behind the
+/// `Delete(Person)` sweep (`AccountStore::remote_shared_inboxes`) walks the
+/// accounts table exactly once — bounded pages, exclusive explicit cursor,
+/// NO silent truncation (a short scan is never mistaken for the end) — and
+/// yields only non-empty remote shared inboxes. Duplicates across rows are
+/// the caller's dedup (the sweep dedupes with a set).
+fn case_h5_shared_inbox_enumeration<S: ConformanceStore>(store: &S) {
+    let _local = create_user(store, "h5_local");
+    let remote = |handle: &str, shared: Option<&str>, inbox: &str| {
+        store
+            .create_account(
+                CreateAccountInput {
+                    handle: handle.to_string(),
+                    host: Some("remote.example".to_string()),
+                    display_name: None,
+                    description: None,
+                    location: None,
+                    birthday: None,
+                    uri: Some(format!("https://remote.example/users/{handle}")),
+                    inbox: Some(inbox.to_string()),
+                    shared_inbox: shared.map(str::to_string),
+                    is_bot: false,
+                    is_cat: false,
+                    is_locked: false,
+                    preserved_usernames: Vec::new(),
+                },
+                None,
+            )
+            .unwrap_or_else(|e| panic!("remote account {handle}: {e:?}"))
+    };
+    remote("h5_r1", Some("https://a.example/inbox"), "https://a.example/personal");
+    remote("h5_r2", Some("https://a.example/inbox"), "https://a.example/personal2");
+    remote("h5_r3", Some("https://b.example/inbox"), "https://b.example/personal");
+    // No shared inbox: upstream delivers only to shared inboxes (its
+    // followings rows snapshot `sharedInbox` only) — skipped here too.
+    remote("h5_r4", None, "https://c.example/personal");
+
+    // Walk with one row per page: every row is visited exactly once (the
+    // cursor advances monotonically) and the walk ends with a `None` cursor.
+    let mut seen: Vec<String> = Vec::new();
+    let mut pages = 0usize;
+    let mut cursor: Option<String> = None;
+    loop {
+        let (page, next) = store
+            .remote_shared_inboxes(cursor.as_deref(), 1)
+            .expect("shared-inbox page");
+        pages += 1;
+        assert!(pages <= 10, "walk must terminate");
+        for inbox in page {
+            if !seen.contains(&inbox) {
+                seen.push(inbox);
+            }
+        }
+        match next {
+            None => break,
+            Some(after) => {
+                assert_ne!(
+                    Some(after.as_str()),
+                    cursor.as_deref(),
+                    "cursor must advance"
+                );
+                cursor = Some(after);
+            }
+        }
+    }
+    // 5 account rows: one page per row plus the terminal empty page.
+    assert_eq!(pages, 6, "one page per row + terminal: {pages}");
+    let mut sorted = seen.clone();
+    sorted.sort();
+    assert_eq!(
+        sorted,
+        vec![
+            "https://a.example/inbox".to_string(),
+            "https://b.example/inbox".to_string(),
+        ],
+        "remote shared inboxes only, dupes left to the caller: {seen:?}"
+    );
+
+    // A large page returns the same set in one walk.
+    let (page, next) = store
+        .remote_shared_inboxes(None, 1_000)
+        .expect("one-shot page");
+    assert!(next.is_none(), "the full scan reports table end");
+    let mut sorted = page.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(
+        sorted,
+        vec![
+            "https://a.example/inbox".to_string(),
+            "https://b.example/inbox".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn h5_shared_inbox_enumeration() {
+    let factory = RedbFactory::fresh("h5");
+    let clock = test_clock();
+    let store = factory.open(clock.clone());
+    case_h5_shared_inbox_enumeration(&*store);
+}
+
 // ---------------------------------------------------------------------------
 // Group I — invite codes and the signup claim (Batch M WP2;
 // `docs/implementer-guide-batch-m.md`)

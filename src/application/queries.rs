@@ -1489,6 +1489,13 @@ mod timeline_tests {
         ) -> Result<Vec<Account>, PortError> {
             self.inner.search_accounts(query, offset, limit)
         }
+        fn remote_shared_inboxes(
+            &self,
+            after: Option<&str>,
+            max_rows: usize,
+        ) -> Result<(Vec<String>, Option<String>), PortError> {
+            self.inner.remote_shared_inboxes(after, max_rows)
+        }
     }
 
     /// Same services but with `suspended_id` reading back suspended.

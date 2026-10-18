@@ -769,3 +769,62 @@ async fn me_updated_and_read_notification_round_trip() {
     assert_eq!(status, 200);
     assert!(notifs.as_array().unwrap().iter().all(|n| n["isRead"] == true));
 }
+
+/// Batch M WP3: suspending an account closes ITS open `/streaming` sockets
+/// (and nobody else's). The suspend transaction queues one `UserSuspended`
+/// streaming job; the worker fans it out through the hub and each
+/// connection whose viewer matches drops its socket.
+#[tokio::test]
+async fn wp3_suspend_closes_open_streams_for_that_account_only() {
+    let srv = LiveServer::start().await;
+    let (alice_id, alice_token) = srv.signup("alice").await;
+    let (_bob_id, bob_token) = srv.signup("bob").await;
+    let (mod_id, mod_token) = srv.signup("mod").await;
+    srv.services
+        .set_role(None, &mod_id, false, true)
+        .expect("set role");
+
+    let mut alice_ws = connect(&srv.ws_url(&format!("?i={alice_token}"))).await;
+    send(&mut alice_ws, serde_json::json!({
+        "type": "connect", "body": { "channel": "main", "id": "m" },
+    })).await;
+    let mut bob_ws = connect(&srv.ws_url(&format!("?i={bob_token}"))).await;
+    send(&mut bob_ws, serde_json::json!({
+        "type": "connect", "body": { "channel": "globalTimeline", "id": "g" },
+    })).await;
+
+    let (status, value) = srv
+        .api(
+            "admin/suspend-user",
+            serde_json::json!({ "userId": alice_id }),
+            Some(&mod_token),
+        )
+        .await;
+    assert_eq!(status, 204, "{value}");
+
+    // Alice's socket closes (the worker runs the stream-close job).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout_at(deadline, alice_ws.next()).await {
+            Err(_) => panic!("suspended account's stream stayed open"),
+            Ok(None) | Ok(Some(Err(_))) => break,
+            Ok(Some(Ok(Message::Close(_)))) => break,
+            Ok(Some(Ok(_))) => continue, // pings / stray frames
+        }
+    }
+
+    // Bob's socket stays open and keeps streaming.
+    let (status, created) = srv
+        .api(
+            "notes/create",
+            serde_json::json!({ "text": "still streaming" }),
+            Some(&bob_token),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let note_id = created["createdNote"]["id"].as_str().unwrap().to_string();
+    let frame = recv(&mut bob_ws).await;
+    let (id, event, body) = channel_body(&frame);
+    assert_eq!((id, event), ("g", "note"));
+    assert_eq!(body["id"], note_id);
+}

@@ -408,3 +408,45 @@ Model: one switch (Misskey's). `InstanceSettings.registration` open/closed; `met
 Packed `InviteCode` (upstream `InviteCodeEntityService.pack`): `{id, code, expiresAt, createdAt, createdBy, usedBy, usedAt, used}` with `createdBy`/`usedBy` `UserLite` or `null`. The ticket `id` is an aidx (upstream `RegistrationTicket.id`); `invite/delete` addresses it and list pagination is id-ordered. DIVERGENCE from the guide §3.3 store sketch (which omits `id`): both upstream shapes require it. Codes are generated as upstream (`misc/generate-invite-code.ts`): 8 chars from `23456789ABCDEFGHJKLMNPQRSTUVWXYZ` plus the current minute in base 32 over the same alphabet.
 
 The consume claim and the account create are one storage transaction (`InviteStore::consume_and_create_account`): the code is marked used (`usedBy`/`usedAt`), its unique index row is removed, and the account row (with the password hash) commits together — or nothing does. Conformance Group I (I1 single-use under N retries, I2 claim+create transactional, I3 registration settings round-trip, I4 claim happy path + missing/used/expired refusal) is green against the redb store.
+
+## 23. Superseding note — WP3: suspension (2026-10-18, `docs/implementer-guide-batch-m.md`)
+
+Reference pins: Misskey `2026.10.1-alpha.0` (`./misskey`), Sharkey `2025.4.7` (`./sharkey`). Status: LANDED (this session; see `state/logs/2026-10-17-batch-m-wp3.md`).
+
+Endpoints (moderator only; strict `userId` field; void → 204):
+
+| Endpoint | Auth | Params | Response |
+|---|---|---|---|
+| `admin/suspend-user` | credential + `write:admin:suspend-user` + moderator | `userId*` | `204 No Content`; `NO_SUCH_USER` (missing target), `INVALID_PARAM` carrying `cannot suspend moderator account` (moderator/admin target) |
+| `admin/unsuspend-user` | credential + `write:admin:unsuspend-user` + moderator | `userId*` | `204 No Content`; `NO_SUCH_USER` (missing target), `INVALID_PARAM` carrying `cannot unsuspend moderator account` (moderator/admin target) |
+
+`signin` behavior change (WP3): a suspended account is refused at `do_signin` with `403 USER_SUSPENDED` — checked **after** the password verifies (pinetree's existence-hiding sign-in is preserved). Upstream checks before the password (`SigninApiService.ts:138`); DIVERGENCE.
+
+Suspend is one transaction (`ModerationLogStore::set_suspended`, conformance H1/H2/H3):
+1. set `is_suspended = true`;
+2. delete follow requests in both directions (upstream `postSuspend`);
+3. append the moderation-log row (`suspend` / `unsuspend`);
+4. enqueue ≤3 jobs for local targets only: `StreamingPublish(UserSuspended)` (stream close), one `FederateDeliverPayload::SuspendBroadcast` sweep, one `JobKind::UnfollowAll` sweep. Remote targets take flag + log + follow-request teardown only (no sweeps).
+
+Unsuspend flips the flag, logs `unsuspend`, and for a local user enqueues `SuspendBroadcast { undo: true }` (Undo(Delete(Person))). Removed follow requests stay removed; sign-in/token/stream/actor-fetch restore.
+
+Bounded fan-out (guide §2 rule 5 / §11): the suspend transaction never fans out in-line. `SuspendBroadcast { account_id, activity_id, undo, inbox_override }` (`src/federation/outbox.rs` + `render_delete_person_activity` in `src/activitypub/objects.rs`) is `Delete(Person)` on suspend / `Undo(Delete(Person))` on unsuspend to every knowable shared inbox, reusing the `FeaturedChanged`-style `fan_out` (inline ≤ `FANOUT_INLINE_MAX`, one-inbox jobs beyond). The recipient set comes from the required port method `AccountStore::remote_shared_inboxes(after, max_rows)` (`conformance H5`), wrapped by `collect_known_shared_inboxes` (caller dedupes; accounts without `shared_inbox` are skipped — upstream-exact). `activity_id` is minted at enqueue so re-runs re-deliver stable ids.
+
+`JobKind::UnfollowAll` + `UnfollowAllPayload { account_id, after }` (`src/application/ports.rs`, worker arm in `src/jobs/worker.rs`): each run silently removes ≤ `UNFOLLOW_ALL_PAGE` (100) outgoing follow rows; every row deletion commits in one transaction with its own `FederateDeliver` `Undo(Follow)` job (remote followees only; local followees just lose the edge). A full batch returns a continuation carrying the advanced `after` cursor. Deterministic undo ids `suspend-unfollow-{follow_id}`. Crash-safe: re-runs see removed rows gone; retries mint no second `Undo(Follow)`.
+
+Activity shapes: `Delete(Person)` / `Undo(Delete)` match upstream (`object` = actor URI string, no `to`/`cc`, `published`) plus activity ids (`{base}/activities/{id}`, Undo id `{id}/undo` = upstream's `renderUndo` id rule) — upstream renders none; the ids make re-runs re-deliver stable ids for receiver-side dedupe.
+
+Stream close: `StreamingEvent::UserSuspended` (`src/application/events.rs`) → `HubMessage::UserSuspended` (`src/streaming/hub.rs`) → `run_connection` breaks for that viewer (`src/streaming/server.rs`). Wired from the command, not the store (house rule: commands never touch sockets). DIVERGENCE: pinned upstream (Misskey `2026.10.1-alpha.0` AND Sharkey `2025.4.7`) does NOT drop sockets on `userChangeSuspendedState` — it only invalidates caches (`CacheService.ts:145`) and refuses new upgrades (`StreamingApiServerService.ts:80`); pinetree's drop is a deliberate hardening the deliverable required.
+
+DIVERGENCES (recorded; do not "fix" back):
+- Refusal rule applies to BOTH endpoints (guide §3.1 blanket rule): suspend carries upstream's verbatim `cannot suspend moderator account` (`suspend-user.ts:46`); unsuspend carries pinetree-constructed `cannot unsuspend moderator account`. Upstream `unsuspend-user.ts` has no check (apparent oversight); both upstream refusals throw untyped `Error`s → `500 INTERNAL_ERROR` (`ApiCallService.ts:#onExecError`), while pinetree answers `400 INVALID_PARAM` carrying the message (WP1 precedent).
+- Missing target → `NO_SUCH_USER` (pinetree UUID `fcd2eef9-…`, one-UUID-per-code; do NOT copy the guide's `1acefcb5-…`). Upstream throws untyped `user not found` → 500.
+- Sign-in ordering: pinetree checks `is_suspended` AFTER password verification (keeps existence-hiding sign-in); upstream checks before the password (`SigninApiService.ts:138`, 403 with per-endpoint id `e03a5f46-…` — NOT copied; pinetree's `USER_SUSPENDED` id `a8c724b3-…`).
+- Fan-out shape: one sweep job per outbound concern (`SuspendBroadcast`, `UnfollowAll`), each expanding at run time — not literally one job — (guide §11 boundedness: `MAX_JOBS_PER_TXN` 500, 64 KiB payload cap, FDB ~5 s/10 MiB). Outgoing-follow rows are deleted at worker time in sweep batches (each row delete + its job = one transaction), never in the suspend transaction.
+- No-change suspend/unsuspend calls are NOT no-ops (upstream `suspend()` re-logs and re-runs post-suspend work unconditionally) — unlike `admin/reject-quotes`.
+- Remote targets take flag + log + follow-request teardown only; sweeps are local-only. (Upstream `unFollowAll` runs for remote targets too — deletes their edges to local accounts and delivers `Reject` per edge. Possible later revisit.)
+- Sweep recipient set = `AccountStore::remote_shared_inboxes` (all known remote `shared_inbox` values; superset of upstream's `followings`-snapshot set — upstream `postSuspend`/`postUnsuspend` "知り得る全SharedInbox"). Accounts without `shared_inbox` are skipped (upstream-exact).
+- Activity ids are minted (upstream renders none) so re-runs re-deliver stable ids for receiver-side dedupe.
+- Stream close is a durable job wired from the command, not the store; upstream does NOT drop sockets (only invalidates caches and refuses new upgrades) — pinetree's drop is deliberate hardening.
+- Semantics (upstream parity): outgoing follows removed (stay removed), incoming follows kept, follow requests removed in both directions (stay removed). Unsuspend restores sign-in/token/stream/actor-fetch but none of those rows.
+- `NO_SUCH_USER` UUID for the missing-target path is pinetree's `fcd2eef9-…` (one-UUID-per-code convention); do not copy the guide's `1acefcb5-…`.

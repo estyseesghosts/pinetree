@@ -653,6 +653,13 @@ mod tests {
         ) -> Result<Vec<Account>, PortError> {
             Ok(self.accounts.lock().unwrap().values().cloned().collect())
         }
+        fn remote_shared_inboxes(
+            &self,
+            _after: Option<&str>,
+            _max_rows: usize,
+        ) -> Result<(Vec<String>, Option<String>), PortError> {
+            Ok((Vec::new(), None))
+        }
     }
 
     impl NoteStore for Mem {

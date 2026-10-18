@@ -192,6 +192,24 @@ pub enum FederateDeliverPayload {
         added: bool,
         inbox_override: Option<String>,
     },
+    /// Deliver `Delete(Person)` (suspend) or `Undo(Delete(Person))`
+    /// (unsuspend) for a local account to every knowable shared inbox
+    /// (Batch M WP3; upstream `UserSuspendService.postSuspend`/
+    /// `postUnsuspend`, "知り得る全SharedInboxにDelete配信"). One sweep job
+    /// per action commits in the suspend transaction and the worker
+    /// expands it at run time: the inbox set is resolved from
+    /// [`collect_known_shared_inboxes`] and fanned out through [`fan_out`]
+    /// (inline ≤ [`FANOUT_INLINE_MAX`], one-inbox jobs beyond). `activity_id`
+    /// is minted at enqueue time, so a re-run of the sweep re-delivers the
+    /// SAME activity ids and receivers can dedupe.
+    SuspendBroadcast {
+        account_id: String,
+        activity_id: String,
+        /// `false` = `Delete(Person)` (suspend), `true` =
+        /// `Undo(Delete(Person))` (unsuspend).
+        undo: bool,
+        inbox_override: Option<String>,
+    },
 }
 
 impl FederateDeliverPayload {
@@ -247,6 +265,35 @@ where
         cursor = Some(last);
     }
     Ok(all)
+}
+
+/// Distinct remote shared inboxes the instance knows (Batch M WP3
+/// `Delete(Person)` sweep). Upstream gathers these from the `followings`
+/// rows' `followerSharedInbox`/`followeeSharedInbox` snapshots
+/// (`postSuspend`/`postUnsuspend`); pinetree reads them from the cached
+/// remote accounts (superset of upstream's set — a host known only through
+/// a mention still holds a cached actor). Walked in bounded pages and
+/// deduplicated here; the walk ends only at the table end.
+pub fn collect_known_shared_inboxes(services: &AppServices) -> Result<Vec<String>, PortError> {
+    const SCAN_PAGE: usize = 1_000;
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let (page, next) = services
+            .accounts
+            .remote_shared_inboxes(cursor.as_deref(), SCAN_PAGE)?;
+        for inbox in page {
+            if seen.insert(inbox.clone()) {
+                out.push(inbox);
+            }
+        }
+        match next {
+            None => break,
+            Some(after) => cursor = Some(after),
+        }
+    }
+    Ok(out)
 }
 
 /// Collect deduplicated remote inbox URLs for an author's followers plus any
@@ -1064,6 +1111,64 @@ pub fn execute_federate_deliver(
                             actor_id: actor_id.clone(),
                             note_id: note_id.clone(),
                             added,
+                            inbox_override: Some(inbox.to_string()),
+                        },
+                    )
+                }
+            }
+        }
+
+        FederateDeliverPayload::SuspendBroadcast {
+            account_id,
+            activity_id,
+            undo,
+            inbox_override,
+        } => {
+            let actor = match services.accounts.find_by_id(&account_id)? {
+                Some(a) if a.is_local() => a,
+                // Gone or remote accounts have no Person to withdraw.
+                _ => return Ok(DeliveryOutcome::Delivered),
+            };
+            let actor_uri = actor.actor_url(base);
+            let delete = crate::activitypub::objects::render_delete_person_activity(
+                base,
+                &activity_id,
+                &actor_uri,
+                services.clock.now_ms(),
+            );
+            // Upstream `renderUndo(renderDelete(...))` parity: the Undo id
+            // hangs off the Delete id (`{id}/undo`, upstream's
+            // `renderUndo` id rule).
+            let activity = if undo {
+                render_undo_activity(
+                    base,
+                    &format!("{activity_id}/undo"),
+                    &actor_uri,
+                    &delete,
+                    None,
+                    None,
+                )
+            } else {
+                delete
+            };
+            match inbox_override {
+                Some(inbox) => {
+                    deliver_single(services, client, tracker, &account_id, &inbox, &activity)
+                }
+                None => {
+                    let inboxes = collect_known_shared_inboxes(services)?;
+                    fan_out(
+                        services,
+                        client,
+                        tracker,
+                        job_key,
+                        &account_id,
+                        &inboxes,
+                        &activity,
+                        &|inbox: &str| FederateDeliverPayload::SuspendBroadcast {
+                            account_id: account_id.clone(),
+                            activity_id: activity_id.clone(),
+                            undo,
                             inbox_override: Some(inbox.to_string()),
                         },
                     )

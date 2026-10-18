@@ -37,6 +37,11 @@ pub enum StreamingEvent {
         followee_id: String,
     },
     MeUpdated { account_id: String },
+    /// The account was suspended (Batch M WP3): drop its open `/streaming`
+    /// connections (upstream publishes `userChangeSuspendedState`; the
+    /// pinned upstream only invalidates caches with it, so the socket drop
+    /// is a pinetree hardening — see `docs/endpoint-manifest.md` §23).
+    UserSuspended { account_id: String },
 }
 
 /// A `main`-channel event for one user (Phase 3 streaming). Built by the

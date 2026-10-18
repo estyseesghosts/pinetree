@@ -240,6 +240,23 @@ impl JobWorker {
                 }
                 Err(_) => Ok(Disposition::Retry { retry_after_ms: None }),
             },
+            // Silent unfollow sweep (Batch M WP3): remove one bounded batch
+            // of the account's outgoing follows (row + its `Undo(Follow)`
+            // job commit together); a full batch returns a continuation.
+            // Bad payloads quarantine; per-row conflicts converge as skips;
+            // only storage faults retry the job.
+            JobKind::UnfollowAll => {
+                match self.services.handle_unfollow_all(&job.payload) {
+                    Ok(None) => Ok(Disposition::Done),
+                    Ok(Some(continuation)) => {
+                        Ok(Disposition::Fanout(vec![continuation]))
+                    }
+                    Err(PortError::Validation(reason)) => {
+                        Ok(Disposition::Quarantine(format!("bad-payload: {reason}")))
+                    }
+                    Err(_) => Ok(Disposition::Retry { retry_after_ms: None }),
+                }
+            }
         }
     }
 

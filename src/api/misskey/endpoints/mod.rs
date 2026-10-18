@@ -1813,6 +1813,17 @@ async fn do_signin(
             return Err(ApiError::authentication_failed());
         }
     };
+    // Batch M WP3: suspended accounts cannot sign in (upstream
+    // `SigninApiService.ts:138` answers 403). Checked AFTER the password
+    // verifies so sign-in keeps pinetree's existence-hiding ordering (an
+    // unknown and a suspended username answer alike to a caller without
+    // the password) — DIVERGENCE from upstream, which reveals the account
+    // state before the password check. Upstream's per-endpoint error id
+    // (`e03a5f46-…`) is not copied: one UUID per code keeps pinetree's
+    // `USER_SUSPENDED` id (§16 convention).
+    if account.is_suspended {
+        return Err(ApiError::user_suspended());
+    }
     let raw_token = generate_random_token();
     state
         .services
@@ -3052,6 +3063,43 @@ fn api_dispatch_blocking(
                 );
             }
             Ok(Json(Value::Array(packed)).into_response())
+        }
+
+        // --- Batch M WP3: suspension ---------------------------------
+        // (upstream `admin/suspend-user.ts` / `admin/unsuspend-user.ts`:
+        // `credential` + `write:admin:suspend-user` / `write:admin:unsuspend-user`
+        // + the moderator role; `res` is void → 204.) The moderator-target
+        // refusal (upstream's own `cannot suspend moderator account`,
+        // `suspend-user.ts:46`), the `NO_SUCH_USER` miss, the `suspend`/
+        // `unsuspend` log row, and the bounded sweep jobs live in the
+        // application command — one transaction (§2.3). DIVERGENCE: the
+        // refusal is applied to `unsuspend-user` too (guide §3.1 blanket
+        // rule); upstream `unsuspend-user.ts` has no check there, and both
+        // upstream refusals throw untyped `Error`s (`500 INTERNAL_ERROR`
+        // via `ApiCallService.ts:#onExecError`) while pinetree answers
+        // `400 INVALID_PARAM` carrying the same message.
+        "admin/suspend-user" | "admin/unsuspend-user" => {
+            check_allowed_fields(&obj, &["userId"])?;
+            let caller = require_caller(caller)?;
+            let suspend = endpoint == "admin/suspend-user";
+            caller.require_permission(if suspend {
+                "write:admin:suspend-user"
+            } else {
+                "write:admin:unsuspend-user"
+            })?;
+            require_moderator(&caller)?;
+            let user_id = required_str(&obj, "userId")?;
+            let result = if suspend {
+                state
+                    .services
+                    .suspend_user(&caller.account.id, &user_id)
+            } else {
+                state
+                    .services
+                    .unsuspend_user(&caller.account.id, &user_id)
+            };
+            result.map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
         }
 
         // --- Batch M WP2: registration policy + invite codes -------------
@@ -11953,6 +12001,422 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+    }
+
+    /// Stub inbox on 127.0.0.1 that records each POST body verbatim (WP3
+    /// fan-out assertions). Answers `202 Accepted`, serves `max_requests`.
+    fn capture_inbox(max_requests: usize) -> (String, Arc<Mutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind capture inbox");
+        let addr = listener.local_addr().expect("capture inbox addr");
+        let bodies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = bodies.clone();
+        std::thread::spawn(move || {
+            for _ in 0..max_requests {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buf: Vec<u8> = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let mut body_start: Option<usize> = None;
+                let mut content_len = 0usize;
+                loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                            if body_start.is_none() {
+                                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                    let head =
+                                        String::from_utf8_lossy(&buf[..pos]).to_ascii_lowercase();
+                                    content_len = head
+                                        .lines()
+                                        .filter_map(|l| l.split_once(':'))
+                                        .find(|(k, _)| k.trim() == "content-length")
+                                        .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+                                        .unwrap_or(0);
+                                    body_start = Some(pos + 4);
+                                }
+                            }
+                            if let Some(start) = body_start {
+                                if buf.len() >= start + content_len {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if let Some(start) = body_start {
+                    let end = (start + content_len).min(buf.len());
+                    sink.lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&buf[start..end]).to_string());
+                }
+                let _ = stream.write_all(
+                    b"HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                );
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{addr}/inbox"), bodies)
+    }
+
+    #[tokio::test]
+    async fn wp3_suspend_unsuspend_endpoints() {
+        let (state, _) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (bob_id, bob_token) = signup_user(&state, "bob").await;
+        let (carol_id, _carol_token) = signup_user(&state, "carol").await;
+        let (dan_id, _dan_token) = signup_user(&state, "dan").await;
+
+        async fn actor_status(state: &ApiState, id: &str) -> StatusCode {
+            ap_actor::get_actor(State(state.services.clone()), Path(id.to_string()), HeaderMap::new())
+                .await
+                .status()
+        }
+
+        fn is_suspended(state: &ApiState, id: &str) -> bool {
+            state
+                .services
+                .accounts
+                .find_by_id(id)
+                .unwrap()
+                .unwrap()
+                .is_suspended
+        }
+
+        // Plain users are refused both admin actions (moderator role in the
+        // handler; scopes alone are not authorization).
+        for endpoint in ["admin/suspend-user", "admin/unsuspend-user"] {
+            let (status, value) = call(
+                &state,
+                endpoint,
+                serde_json::json!({ "userId": bob_id }),
+                Some(&bob_token),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{endpoint}: {value}");
+            assert_eq!(value["code"], "PERMISSION_DENIED");
+        }
+
+        state
+            .services
+            .set_role(None, &alice_id, false, true)
+            .expect("set role");
+
+        // Missing target: typed `NO_SUCH_USER` (upstream throws an untyped
+        // `user not found` here — its API layer answers 500; manifest §23).
+        let (status, value) = call(
+            &state,
+            "admin/suspend-user",
+            serde_json::json!({ "userId": "aidmissingmissingmi" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_USER");
+
+        // WP3 refusal rule (applied to both endpoints, guide §3.1): a
+        // moderator cannot act on an admin or another moderator. Upstream's
+        // own suspend message is carried verbatim.
+        state
+            .services
+            .set_role(None, &carol_id, false, true)
+            .expect("set role");
+        state
+            .services
+            .set_role(None, &dan_id, true, false)
+            .expect("set role");
+        for (endpoint, target, message) in [
+            (
+                "admin/suspend-user",
+                &carol_id,
+                "cannot suspend moderator account",
+            ),
+            (
+                "admin/suspend-user",
+                &dan_id,
+                "cannot suspend moderator account",
+            ),
+            (
+                "admin/unsuspend-user",
+                &carol_id,
+                "cannot unsuspend moderator account",
+            ),
+        ] {
+            let (status, value) = call(
+                &state,
+                endpoint,
+                serde_json::json!({ "userId": target }),
+                Some(&alice_token),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{endpoint}: {value}");
+            assert_eq!(value["code"], "INVALID_PARAM");
+            assert_eq!(value["error"]["message"], message);
+            assert!(!is_suspended(&state, target), "refusal must change nothing");
+        }
+
+        // Suspend bob: 204, and the enforcement surface flips together.
+        let (status, value) = call(
+            &state,
+            "admin/suspend-user",
+            serde_json::json!({ "userId": bob_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{value}");
+        assert!(is_suspended(&state, &bob_id));
+        // Existing token: 403 USER_SUSPENDED.
+        let (status, value) = call(&state, "i", serde_json::json!({}), Some(&bob_token)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{value}");
+        assert_eq!(value["code"], "USER_SUSPENDED");
+        // Sign-in refused (after the password verifies).
+        let (status, value) = call(
+            &state,
+            "signin",
+            serde_json::json!({ "username": "bob", "password": "s3cret-pw" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{value}");
+        assert_eq!(value["code"], "USER_SUSPENDED");
+        // AP actor fetch not served.
+        assert_eq!(actor_status(&state, &bob_id).await, StatusCode::NOT_FOUND);
+
+        // One log row per action, in the same commit (the refused calls
+        // wrote none).
+        let (status, logs) = call(
+            &state,
+            "admin/show-moderation-logs",
+            serde_json::json!({ "type": "suspend" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{logs}");
+        let rows = logs.as_array().unwrap();
+        assert_eq!(rows.len(), 1, "one suspend row: {logs}");
+        assert_eq!(rows[0]["type"], "suspend");
+        assert_eq!(rows[0]["userId"], serde_json::json!(alice_id));
+        assert_eq!(rows[0]["user"]["username"], "alice");
+        assert_eq!(rows[0]["info"]["userId"], serde_json::json!(bob_id));
+        assert_eq!(rows[0]["info"]["userUsername"], "bob");
+        assert_eq!(rows[0]["info"]["userHost"], Value::Null);
+
+        // Unsuspend restores the enforcement surface.
+        let (status, value) = call(
+            &state,
+            "admin/unsuspend-user",
+            serde_json::json!({ "userId": bob_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{value}");
+        assert!(!is_suspended(&state, &bob_id));
+        let (status, _) = call(&state, "i", serde_json::json!({}), Some(&bob_token)).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, value) = call(
+            &state,
+            "signin",
+            serde_json::json!({ "username": "bob", "password": "s3cret-pw" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(actor_status(&state, &bob_id).await, StatusCode::OK);
+        let (status, logs) = call(
+            &state,
+            "admin/show-moderation-logs",
+            serde_json::json!({ "type": "unsuspend" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{logs}");
+        let rows = logs.as_array().unwrap();
+        assert_eq!(rows.len(), 1, "one unsuspend row: {logs}");
+        assert_eq!(rows[0]["type"], "unsuspend");
+        assert_eq!(rows[0]["info"]["userId"], serde_json::json!(bob_id));
+    }
+
+    /// WP3 bounded fan-out: the suspend transaction queues ONE sweep job
+    /// per outbound concern and the worker expands them at run time —
+    /// `Delete(Person)` to every knowable shared inbox (upstream
+    /// `postSuspend`) and a silent `Undo(Follow)` per outgoing follow
+    /// (upstream `unFollowAll`). The removed follow requests and outgoing
+    /// follows stay removed after unsuspend (upstream parity).
+    #[tokio::test]
+    async fn wp3_suspend_fanout_sweep_and_follow_teardown() {
+        use std::time::{Duration, Instant};
+
+        use crate::application::ports::{AccountStore, CreateAccountInput, FollowStore};
+
+        let (inbox, bodies) = capture_inbox(16);
+        let (state, _) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (bob_id, _bob_token) = signup_user(&state, "bob").await;
+        let (carol_id, _carol_token) = signup_user(&state, "carol").await;
+        state
+            .services
+            .set_role(None, &alice_id, false, true)
+            .expect("set role");
+
+        // One remote account whose shared inbox is the stub: it is both the
+        // Delete(Person) target (known shared inbox) and the Undo(Follow)
+        // target (bob's outgoing follow to it).
+        let remote = state
+            .services
+            .accounts
+            .create_account(
+                CreateAccountInput {
+                    handle: "faraway".to_string(),
+                    host: Some("remote.example".to_string()),
+                    display_name: None,
+                    description: None,
+                    location: None,
+                    birthday: None,
+                    uri: Some("https://remote.example/users/faraway".to_string()),
+                    inbox: Some(inbox.clone()),
+                    shared_inbox: Some(inbox.clone()),
+                    is_bot: false,
+                    is_cat: false,
+                    is_locked: false,
+                    preserved_usernames: Vec::new(),
+                },
+                None,
+            )
+            .expect("remote account");
+
+        // Outgoing follows (removed by the sweep) and one incoming follow
+        // (kept — upstream `unFollowAll` is outgoing-only).
+        state
+            .services
+            .follows
+            .follow(&bob_id, &remote.id, false, None, Vec::new())
+            .expect("bob -> remote");
+        state
+            .services
+            .follows
+            .follow(&bob_id, &carol_id, false, None, Vec::new())
+            .expect("bob -> carol");
+        state
+            .services
+            .follows
+            .follow(&remote.id, &bob_id, false, None, Vec::new())
+            .expect("remote -> bob");
+        // Pending requests in both directions (torn down at suspend).
+        state
+            .services
+            .follows
+            .request_follow(&alice_id, &bob_id, false, None, Vec::new())
+            .expect("alice -> bob request");
+        state
+            .services
+            .follows
+            .request_follow(&bob_id, &alice_id, false, None, Vec::new())
+            .expect("bob -> alice request");
+
+        // Production runs the worker on a background loop; do the same here.
+        let _worker = state.worker.clone().spawn(Duration::from_millis(10));
+
+        let (status, value) = call(
+            &state,
+            "admin/suspend-user",
+            serde_json::json!({ "userId": bob_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{value}");
+        // Follow requests are gone in both directions in the same commit.
+        assert!(
+            state
+                .services
+                .follows
+                .get_follow_request(&alice_id, &bob_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            state
+                .services
+                .follows
+                .get_follow_request(&bob_id, &alice_id)
+                .unwrap()
+                .is_none()
+        );
+
+        // Poll until the sweep has fanned out: one Delete(Person) for the
+        // actor and one Undo(Follow) for the remote edge.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            {
+                let captured = bodies.lock().unwrap();
+                let has_delete = captured.iter().any(|b| {
+                    b.contains("\"type\":\"Delete\"") && b.contains(&format!("users/{bob_id}"))
+                });
+                let has_undo_follow = captured
+                    .iter()
+                    .any(|b| b.contains("\"type\":\"Undo\"") && b.contains("\"type\":\"Follow\""));
+                if has_delete && has_undo_follow {
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "suspend sweeps did not fan out: {:?}",
+                bodies.lock().unwrap()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Outgoing follows removed (local and remote), incoming kept.
+        assert!(!state.services.follows.is_following(&bob_id, &remote.id).unwrap());
+        assert!(!state.services.follows.is_following(&bob_id, &carol_id).unwrap());
+        assert!(state.services.follows.is_following(&remote.id, &bob_id).unwrap());
+
+        // Unsuspend: the same knowable shared inboxes get
+        // Undo(Delete(Person)); removed follows and requests stay removed.
+        let (status, value) = call(
+            &state,
+            "admin/unsuspend-user",
+            serde_json::json!({ "userId": bob_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{value}");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            {
+                let captured = bodies.lock().unwrap();
+                let has_undo_delete = captured.iter().any(|b| {
+                    b.contains("\"type\":\"Undo\"")
+                        && b.contains("\"type\":\"Delete\"")
+                        && b.contains(&format!("users/{bob_id}"))
+                });
+                if has_undo_delete {
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "unsuspend broadcast did not fan out: {:?}",
+                bodies.lock().unwrap()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!state.services.follows.is_following(&bob_id, &remote.id).unwrap());
+        assert!(!state.services.follows.is_following(&bob_id, &carol_id).unwrap());
+        assert!(
+            state
+                .services
+                .follows
+                .get_follow_request(&alice_id, &bob_id)
+                .unwrap()
+                .is_none(),
+            "removed follow requests stay removed"
+        );
     }
 
     #[tokio::test]

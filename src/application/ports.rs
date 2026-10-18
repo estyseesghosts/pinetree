@@ -154,6 +154,25 @@ pub trait AccountStore: Send + Sync {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<Account>, PortError>;
+    /// Bounded enumeration of every knowable remote shared-inbox URL (Batch
+    /// M WP3; upstream `UserSuspendService.postSuspend`/`postUnsuspend`
+    /// deliver `Delete(Person)` / `Undo(Delete)` to "all knowable
+    /// sharedInboxes", gathered there from the `followings` rows'
+    /// `followerSharedInbox`/`followeeSharedInbox` snapshots — pinetree
+    /// reads them from the cached remote accounts themselves).
+    ///
+    /// Scans at most `max_rows` account rows strictly after `after`
+    /// (`None` = from the start, id order) and returns the non-empty
+    /// `shared_inbox` values seen (duplicates can span pages; the caller
+    /// deduplicates) plus the next cursor — `None` once the table is
+    /// exhausted. Pages never truncate silently: the walk ends only at the
+    /// table end. Required (no default): the WP3 sweep fan-out depends on
+    /// it, so a backend that omits it must fail to compile.
+    fn remote_shared_inboxes(
+        &self,
+        after: Option<&str>,
+        max_rows: usize,
+    ) -> Result<(Vec<String>, Option<String>), PortError>;
     fn find_by_uri(&self, uri: &str) -> Result<Option<Account>, PortError> {
         let _ = uri;
         Ok(None)
@@ -735,6 +754,21 @@ pub enum JobKind {
     /// 64KiB file the endpoint guards admit). Reuses the worker's standard
     /// lease/backoff.
     Import,
+    /// Silent unfollow sweep (Batch M WP3; upstream
+    /// `UserSuspendService.unFollowAll`, which enqueues one `unfollow`
+    /// relationship job per outgoing follow of a suspended account). The
+    /// payload is [`UnfollowAllPayload`]. One sweep job is enqueued in the
+    /// suspend transaction and the worker expands it at run time: each run
+    /// removes one bounded batch of the account's outgoing follow rows
+    /// (each row deletion commits atomically with its own
+    /// [`JobKind::FederateDeliver`] `Undo(Follow)` job), and returns a
+    /// continuation job while more rows remain. Idempotent and crash-safe:
+    /// a re-run sees the already-removed rows gone, the cursor advances
+    /// over skipped rows, and each row's delete + delivery job is one
+    /// transaction. Upstream `silent: true` parity: no `unfollow`
+    /// streaming event, no notification. Reuses the worker's standard
+    /// lease/backoff.
+    UnfollowAll,
 }
 
 /// Maximum `fail()` retries before a job is auto-quarantined as
@@ -1455,6 +1489,18 @@ pub struct ReplyParentResolvePayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PollExpiryPayload {
     pub note_id: String,
+}
+
+/// Payload of a `JobKind::UnfollowAll` job (Batch M WP3): the suspended
+/// account whose outgoing follows are silently removed, plus the walk
+/// cursor. `after` is the last `followee_id` processed by the previous
+/// batch (`None` = start); it advances monotonically so a skipped row can
+/// never loop the sweep.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnfollowAllPayload {
+    pub account_id: String,
+    #[serde(default)]
+    pub after: Option<String>,
 }
 
 /// Payload of a `JobKind::PostScheduledDraft` job: the draft to post.

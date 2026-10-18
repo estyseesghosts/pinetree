@@ -195,6 +195,15 @@ async fn run_connection(socket: WebSocket, state: ApiState, caller: Option<Calle
             }
             hub_msg = hub_rx.recv() => {
                 match hub_msg {
+                    // WP3 stream close: a suspended account's open sockets
+                    // drop (the durable `UserSuspended` job fans out through
+                    // the hub). Other viewers — and anonymous sockets —
+                    // ignore the event.
+                    Ok(HubMessage::UserSuspended { account_id }) => {
+                        if viewer_id.as_deref() == Some(account_id.as_str()) {
+                            break;
+                        }
+                    }
                     Ok(msg) => {
                         dispatch_hub_message(
                             &state, &caller, viewer_id.as_deref(),
@@ -618,6 +627,10 @@ async fn dispatch_hub_message(
                 }
             }
         }
+        // Filtered out before dispatch: `run_connection` closes the socket
+        // when the suspended account is this connection's viewer. The arm
+        // exists for exhaustiveness only.
+        HubMessage::UserSuspended { .. } => {}
     }
 }
 

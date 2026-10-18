@@ -1102,6 +1102,29 @@ pub fn render_vote_activity(
     })
 }
 
+/// Render a `Delete(Person)` for a suspended local account (Batch M WP3;
+/// upstream `ApRendererService.renderDelete(genLocalUserUri(user.id), user)`
+/// parity: `object` is the actor URI string, no `to`/`cc`, `published` set).
+/// Unlike upstream (which renders no activity id) pinetree gives the
+/// activity an id so re-deliveries carry a stable id for receiver-side
+/// dedup; the unsuspend `Undo` is keyed off it as `{id}/undo`.
+pub fn render_delete_person_activity(
+    public_url: &str,
+    delete_id: &str,
+    actor_uri: &str,
+    now_ms: i64,
+) -> Value {
+    let base = public_url.trim_end_matches('/');
+    json!({
+        "@context": ap_context(),
+        "id": format!("{base}/activities/{delete_id}"),
+        "type": "Delete",
+        "actor": actor_uri,
+        "object": actor_uri,
+        "published": format_millis(now_ms),
+    })
+}
+
 /// Render a `Delete(Tombstone)` activity for a deleted note.
 pub fn render_delete_note_activity(
     public_url: &str,

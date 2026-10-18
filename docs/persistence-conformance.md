@@ -224,6 +224,7 @@ Backend-agnostic, same cases both adapters (FDB inherits). Atomicity rule (§2.3
 - **H2 unsuspend atomicity**: `set_suspended(false)` commits flag + `unsuspend` row + job together (same fail-closed rule); the removed follow requests stay removed.
 - **H3 concurrent suspend and unsuspend**: N threads alternate suspend/unsuspend on one account; every call lands, exactly one log row per call (none lost, none duplicated), account row still valid.
 - **H4 log append never lost**: `update_account_logged` commits patch + row + jobs together; an invalid row aborts all three; committed pairs survive reopen.
+- **H5 shared-inbox enumeration (WP3)**: `AccountStore::remote_shared_inboxes(after, max_rows)` walks every knowable remote `shared_inbox` in bounded pages with an exclusive cursor: scans ≤ `max_rows` account rows strictly after `after` (id order), returns the non-empty `shared_inbox` values seen plus the next cursor (`None` = table exhausted). Never truncates silently; duplicates can span pages and the caller dedupes (`federation::outbox::collect_known_shared_inboxes`). Executed: `tests/conformance.rs` `h5_shared_inbox_enumeration` (case `case_h5_shared_inbox_enumeration`) green 2026-10-18 against the redb adapter; FDB must implement the same walk semantics.
 
 ### Group I — registration and invites (executed: `tests/conformance.rs` `i1_invite_single_use`, `i2_consume_create_atomic`, `i3_registration_policy`, `i4_consume_happy_path`, 4/4 green 2026-10-17; ports: `InviteStore`)
 
