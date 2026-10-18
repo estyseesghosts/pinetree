@@ -31,6 +31,9 @@ pub const INVALID_PARAM_ID: &str = "3d81ceae-475f-4600-b2a8-2bc116157532";
 pub const UNSUPPORTED_FIELD_ID: &str = "9307f30c-4400-421c-bf2f-1e6a37d0f978";
 pub const NO_SUCH_NOTE_ID: &str = "24fcbfc6-2e37-42b6-8388-c29b3861a08d";
 pub const NO_SUCH_USER_ID: &str = "fcd2eef9-a9b2-4c4f-8624-038099e90aa5";
+pub const CANNOT_REPORT_YOURSELF_ID: &str = "1e13149e-b1e8-43cf-902e-c01dbfcb202f";
+pub const CANNOT_REPORT_THE_ADMIN_ID: &str = "35e166f5-05fb-4f87-a2d5-adb42676d48f";
+pub const NO_SUCH_ABUSE_REPORT_ID: &str = "ac3794dd-2ce4-d878-e546-73c60c06b398";
 pub const NO_SUCH_REPLY_TARGET_ID: &str = "749ee0f6-d3da-459a-bf02-282e2da4292c";
 pub const NO_SUCH_RENOTE_TARGET_ID: &str = "b5c90186-4ab0-49c8-9bba-a1f76c282ba4";
 pub const NO_SUCH_FILE_ID: &str = "b6992544-63e7-67f0-fa7f-32444b1b5306";
@@ -453,6 +456,9 @@ fn is_known_client_code(code: &str) -> bool {
         code,
         "NO_SUCH_NOTE"
             | "NO_SUCH_USER"
+            | "CANNOT_REPORT_YOURSELF"
+            | "CANNOT_REPORT_THE_ADMIN"
+            | "NO_SUCH_ABUSE_REPORT"
             | "NO_SUCH_INVITE_CODE"
             | "NO_SUCH_REPLY_TARGET"
             | "NO_SUCH_RENOTE_TARGET"
@@ -574,6 +580,9 @@ fn lookup_known_code(code: &str) -> Option<(&'static str, &'static str, u16, &'s
         ),
         "NO_SUCH_NOTE" => ("No such note.", NO_SUCH_NOTE_ID, 400, "client"),
         "NO_SUCH_USER" => ("No such user.", NO_SUCH_USER_ID, 400, "client"),
+        "CANNOT_REPORT_YOURSELF" => ("Cannot report yourself.", CANNOT_REPORT_YOURSELF_ID, 400, "client"),
+        "CANNOT_REPORT_THE_ADMIN" => ("Cannot report the admin.", CANNOT_REPORT_THE_ADMIN_ID, 400, "client"),
+        "NO_SUCH_ABUSE_REPORT" => ("No such abuse report.", NO_SUCH_ABUSE_REPORT_ID, 404, "server"),
         "NO_SUCH_INVITE_CODE" => (
             "No such invite code.",
             NO_SUCH_INVITE_CODE_ID,
