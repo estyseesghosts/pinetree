@@ -145,6 +145,23 @@ Follows Misskey `i/export-following|blocking|mute|notes|antennas|clips|favorites
 - `import-blocking` guards (`import-blocking.ts:53-86`): size/type checks, per-row validate, skip unresolvable, report counts. Same guard shape for `import-muting|following|antennas|user-lists`. Notes export = own notes only. Profile fields themselves are not part of Misskey export/import (they move via `i/update`, §0B).
 - Status (2026-10-16): LANDED + VERIFIED — commit 888f522 (all 8 exports + 5 imports, `JobKind::Export|Import`, `exportCompleted` notification, verbatim per-endpoint import UUIDs, manifest §20 documents payloads + DIVERGENCEs). CORRECTION: upstream `export-mute` writes `mute-*.csv` and `import-muting` consumes CSV (`ImportMutingProcessorService` errors "We need csv file.") — the "export-mute … JSON" wording in this section was a plan slip; shipped as CSV, upstream-verbatim. DIVERGENCE (decided): `excludeInactive` accepted+ignored (no last-active tracking); locals export bare `username`; remote resolution store-only; no-subsystem entities (lists/antennas/clips/favorites) export empty valid files and import zero rows; drive upload dedups on content (`force==false`) so retried exports converge.
 
+## 14. Moderation and daily-use batch (Batch M, pre-Phase 4)
+
+Guide: `docs/implementer-guide-batch-m.md` (status lines there are the spec; this section records what landed). Reference pins: Misskey `2026.10.1-alpha.0`, Sharkey `2025.4.7`. Per-WP status, newest session first.
+
+- §3 foundations (roles `is_admin`/`is_moderator`, `ModerationLogStore` + `InstanceSettingsStore` ports with compound atomic methods, redb tables, CLI `set-role`, `require_moderator`/`require_admin`, real packed `isAdmin`/`isModerator`, `viewer_is_moderator` wired) + conformance Group H1–H4.
+- WP1 — roles, guards, moderation log, `admin/show-moderation-logs`, and the `admin/reject-quotes` auth fix (live hole: any first-party credential could flag any account).
+  - Status (2026-10-17): LANDED + VERIFIED — commit e331d4f (`cargo test --offline` 532/532 green: 410 lib + 94 conformance incl. 4 new Group H cases + 38 integration; see `state/logs/2026-10-17-batch-m-foundations-wp1.md`).
+  - DIVERGENCEs (decided): log action names match upstream where they exist — `updateServerSettings` (guide §3.2 says `updateMeta`), `createInvitation` (guide: `createInvite`), and Sharkey's `acceptQuotesUser`/`rejectQuotesUser` for the quote toggle (guide: `updateUserRejectQuotes`); moderator-target refusals answer `400 INVALID_PARAM` carrying upstream's `cannot moderate moderator account` message (upstream throws an untyped `Error` → `500 INTERNAL_ERROR` generic, `ApiCallService.ts:#onExecError`); CLI `setRole` rows carry `user`/`userId` = `null` (upstream rows always have a user); `admin/show-moderation-logs` is moderator-only (upstream `requireAdmin`).
+- WP2 — registration policy, invites, `admin/accounts/create` fix: PENDING (conformance Group I cases land with it).
+- WP3 — suspension (setter + stream close + bounded undo-follow fan-out): PENDING. Open item: guide WP3 says one Undo-Follow job per outgoing follow in the suspend transaction, which is unbounded against `MAX_JOBS_PER_TXN` (500) and the FDB txn cap — plan is one sweep job the worker expands into per-recipient deliveries (§11 transaction-size rule).
+- WP4 — abuse reports + Flag forwarding: PENDING.
+- WP5 — instance blocks (`host_is_blocked` suffix-match rule already in `domain/instance.rs`): PENDING.
+- WP6 — admin read/user views: PENDING.
+- WP7–WP14 — favorites, emoji (+ WP8b remote emoji opt-in), self-service, follower removal, `followRequestAccepted`, `url-preview`, drive extras, self-delete: PENDING (conformance Group J lands with WP7/WP8).
+- WP15 antennas, WP16 user lists: PENDING.
+- §7 smoke-gate fix, §6 remaining docs (phase-3-profile §5 note, testing.md, wiki, AGENTS counts): PENDING, batch end.
+
 ## Build order
 
 1. §0A + §0B — unblocks everything (§0B includes the `rejectQuotes`/`defaultReaction` columns for §§3/6).

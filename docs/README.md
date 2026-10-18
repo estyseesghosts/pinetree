@@ -27,6 +27,7 @@ Each contract file carries a `Status:` line at the top: `Draft` or `Frozen`.
 | Quote posts + FEP-044f | Implementation guide (`docs/quote-posts.md`; reviewed 2026-10-16) | §9 |
 | Branched replies | Implementation guide (`docs/replies.md`; reviewed 2026-10-16) | §9 |
 | Misskey parity plan (backend only) | Draft (`docs/misskey-parity-plan.md`; 2026-10-16) | §6 |
+| Batch M implementer guide (moderation, registration policy, daily-use parity, pre-Phase 4) | Draft (`docs/implementer-guide-batch-m.md`; 2026-10-17) | §§6, 9 |
 | Wiki (overview, current state, roadmap, feature matrix) | Living docs (`docs/wiki/Home.md`) | all |
 
 Conventions: concrete over abstract (methods, fields, nullability, error shapes); record unsupported behavior explicitly; no implementation code in contracts.
