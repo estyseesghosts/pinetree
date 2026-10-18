@@ -3702,6 +3702,36 @@ impl AccountStore for RedbStore {
         Ok(matches.into_iter().skip(offset).take(limit).collect())
     }
 
+    fn all_accounts(
+        &self,
+        after: Option<&str>,
+        max_rows: usize,
+    ) -> Result<(Vec<Account>, Option<String>), PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(ACCOUNTS).map_err(map_redb_err)?;
+        let mut out = Vec::new();
+        let mut last: Option<String> = None;
+        let mut scanned = 0usize;
+        for entry in table.iter().map_err(map_redb_err)? {
+            let (k, v) = entry.map_err(map_redb_err)?;
+            let id = k.value().to_string();
+            if let Some(a) = after {
+                if id.as_str() <= a {
+                    continue;
+                }
+            }
+            if scanned >= max_rows {
+                break;
+            }
+            let acc: Account = decode_json(v.value())?;
+            out.push(acc);
+            last = Some(id);
+            scanned += 1;
+        }
+        let next = if scanned >= max_rows { last } else { None };
+        Ok((out, next))
+    }
+
     fn remote_shared_inboxes(
         &self,
         after: Option<&str>,

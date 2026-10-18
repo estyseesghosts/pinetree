@@ -653,6 +653,16 @@ mod tests {
         ) -> Result<Vec<Account>, PortError> {
             Ok(self.accounts.lock().unwrap().values().cloned().collect())
         }
+        fn all_accounts(&self, after: Option<&str>, max_rows: usize) -> Result<(Vec<Account>, Option<String>), PortError> {
+            let mut out: Vec<Account> = self.accounts.lock().unwrap().values().cloned().collect();
+            out.sort_by(|a, b| a.id.cmp(&b.id));
+            if let Some(a) = after {
+                out.retain(|x| x.id.as_str() > a);
+            }
+            let next = if out.len() > max_rows { Some(out[max_rows - 1].id.clone()) } else { None };
+            out.truncate(max_rows);
+            Ok((out, next))
+        }
         fn remote_shared_inboxes(
             &self,
             _after: Option<&str>,

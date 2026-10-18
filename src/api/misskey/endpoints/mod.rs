@@ -3051,8 +3051,18 @@ fn api_dispatch_blocking(
             let origin = opt_string(&obj, "origin")?.unwrap_or_else(|| "combined".to_string());
             let username_filter = opt_string(&obj, "username")?;
             let hostname_filter = opt_string(&obj, "hostname")?;
-            // Enumerate accounts bounded.
-            let mut accounts = state.services.accounts.search_accounts("", 0, 10_000).map_err(ApiError::from_port_error)?;
+            // Enumerate accounts bounded (all, including suspended/deleted).
+            let mut accounts = Vec::new();
+            let mut cursor = None;
+            loop {
+                let (page, next) = state.services.accounts.all_accounts(cursor.as_deref(), 1000).map_err(ApiError::from_port_error)?;
+                accounts.extend(page);
+                match next {
+                    Some(c) => cursor = Some(c),
+                    None => break,
+                }
+                if accounts.len() >= 10_000 { break; }
+            }
             // Filter.
             let mut filtered: Vec<_> = accounts.into_iter().filter(|a| {
                 if a.is_deleted { return false; }

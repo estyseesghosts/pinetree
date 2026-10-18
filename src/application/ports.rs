@@ -157,6 +157,14 @@ pub trait AccountStore: Send + Sync {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<Account>, PortError>;
+
+    /// Batch M WP6: bounded enumeration of ALL accounts (including
+    /// suspended and tombstoned) for admin read paths. Pages by id cursor.
+    fn all_accounts(
+        &self,
+        after: Option<&str>,
+        max_rows: usize,
+    ) -> Result<(Vec<Account>, Option<String>), PortError>;
     /// Bounded enumeration of every knowable remote shared-inbox URL (Batch
     /// M WP3; upstream `UserSuspendService.postSuspend`/`postUnsuspend`
     /// deliver `Delete(Person)` / `Undo(Delete)` to "all knowable

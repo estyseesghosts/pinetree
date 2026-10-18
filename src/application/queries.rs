@@ -1505,6 +1505,9 @@ mod timeline_tests {
         ) -> Result<Vec<Account>, PortError> {
             self.inner.search_accounts(query, offset, limit)
         }
+        fn all_accounts(&self, after: Option<&str>, max_rows: usize) -> Result<(Vec<Account>, Option<String>), PortError> {
+            self.inner.all_accounts(after, max_rows)
+        }
         fn remote_shared_inboxes(
             &self,
             after: Option<&str>,

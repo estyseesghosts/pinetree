@@ -1785,6 +1785,9 @@ mod tests {
         ) -> Result<Vec<Account>, PortError> {
             Ok(Vec::new())
         }
+        fn all_accounts(&self, _after: Option<&str>, _max_rows: usize) -> Result<(Vec<Account>, Option<String>), PortError> {
+            Ok((Vec::new(), None))
+        }
         fn remote_shared_inboxes(
             &self,
             _after: Option<&str>,
