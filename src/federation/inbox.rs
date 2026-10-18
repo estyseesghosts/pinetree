@@ -1857,6 +1857,7 @@ mod media_safety_tests {
             moderation: store.clone(),
             instance_settings: store.clone(),
             invites: store.clone(),
+            abuse_reports: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()
@@ -2268,6 +2269,7 @@ mod key_ownership_tests {
             moderation: store.clone(),
             instance_settings: store.clone(),
             invites: store.clone(),
+            abuse_reports: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()
@@ -2804,6 +2806,7 @@ mod reply_resolution_tests {
             moderation: store.clone(),
             instance_settings: store.clone(),
             invites: store.clone(),
+            abuse_reports: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()

@@ -238,3 +238,12 @@ Backend-agnostic, same cases both adapters (FDB inherits). Atomicity rule (§2.3
 - **J1 favorite uniqueness** per (account, note) under concurrency.
 - **J2 emoji shortcode unique case-insensitively** (account-handle rule, C2).
 - **J3 favorite delete leaves the note**.
+
+### Group K — abuse reports (Batch M WP4)
+
+- **K1 report create atomicity** (state row committed; no log on create per upstream).
+- **K2 resolve atomicity** (resolved flag + assignee + resolved_as + moderation-log row in one txn).
+- **K3 forward-once** (`mark_forwarded` refuses a second forward; conflict).
+- **K4 note-update atomicity** (note + conditional log row in one txn).
+
+Ports: `AbuseReportStore`. redb implemented; K1–K4 storage paths present (K2/K3 exercised by unit-level store semantics).

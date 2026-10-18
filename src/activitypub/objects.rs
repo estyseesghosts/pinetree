@@ -843,6 +843,27 @@ pub fn render_block_activity(
     })
 }
 
+/// Render a `Flag` activity (Batch M WP4; upstream
+/// `ApRendererService.renderFlag`: type Flag, actor = reporting (system)
+/// account, content = report comment, object = reported account URI).
+pub fn render_flag_activity(
+    public_url: &str,
+    flag_id: &str,
+    actor_uri: &str,
+    object_uri: &str,
+    content: &str,
+) -> Value {
+    let base = public_url.trim_end_matches('/');
+    json!({
+        "@context": ap_context(),
+        "id": format!("{base}/flags/{flag_id}"),
+        "type": "Flag",
+        "actor": actor_uri,
+        "content": content,
+        "object": object_uri,
+    })
+}
+
 /// Render a `Follow` activity.
 pub fn render_follow_activity(
     public_url: &str,
@@ -1859,6 +1880,7 @@ mod tests {
             moderation: store.clone(),
             instance_settings: store.clone(),
             invites: store.clone(),
+            abuse_reports: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()
@@ -2070,6 +2092,7 @@ mod quote_render_tests {
             moderation: store.clone(),
             instance_settings: store.clone(),
             invites: store.clone(),
+            abuse_reports: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()

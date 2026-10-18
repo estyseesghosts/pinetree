@@ -96,6 +96,7 @@ fn open_stack(dir: &Path) -> (Arc<RedbStore>, Arc<FsBlobStore>, Arc<AppServices>
         moderation: store.clone(),
         instance_settings: store.clone(),
         invites: store.clone(),
+            abuse_reports: store.clone(),
         streaming: Arc::new(NoopStreamingSink),
         dedup: store.clone() as Arc<dyn ActivityDedup>,
         federation_http: SafeHttpClient::new(SafeHttpConfig {

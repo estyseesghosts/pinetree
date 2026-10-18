@@ -210,6 +210,14 @@ pub enum FederateDeliverPayload {
         undo: bool,
         inbox_override: Option<String>,
     },
+    /// Deliver a `Flag` activity to a remote instance (Batch M WP4).
+    Flag {
+        flag_id: String,
+        actor_id: String,
+        target_account_id: String,
+        content: String,
+        inbox_url: String,
+    },
 }
 
 impl FederateDeliverPayload {
@@ -1174,6 +1182,33 @@ pub fn execute_federate_deliver(
                     )
                 }
             }
+        }
+
+        FederateDeliverPayload::Flag {
+            flag_id,
+            actor_id,
+            target_account_id,
+            content,
+            inbox_url,
+        } => {
+            let actor = match services.accounts.find_by_id(&actor_id)? {
+                Some(a) if a.is_local() => a,
+                _ => return Ok(DeliveryOutcome::Delivered),
+            };
+            let target = match services.accounts.find_by_id(&target_account_id)? {
+                Some(t) => t,
+                None => return Ok(DeliveryOutcome::Delivered),
+            };
+            let actor_uri = actor.actor_url(base);
+            let target_uri = target.actor_url(base);
+            let activity = crate::activitypub::objects::render_flag_activity(
+                base,
+                &flag_id,
+                &actor_uri,
+                &target_uri,
+                &content,
+            );
+            deliver_single(services, client, tracker, &actor_id, &inbox_url, &activity)
         }
     }
 }

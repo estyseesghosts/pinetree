@@ -450,3 +450,19 @@ DIVERGENCES (recorded; do not "fix" back):
 - Stream close is a durable job wired from the command, not the store; upstream does NOT drop sockets (only invalidates caches and refuses new upgrades) — pinetree's drop is deliberate hardening.
 - Semantics (upstream parity): outgoing follows removed (stay removed), incoming follows kept, follow requests removed in both directions (stay removed). Unsuspend restores sign-in/token/stream/actor-fetch but none of those rows.
 - `NO_SUCH_USER` UUID for the missing-target path is pinetree's `fcd2eef9-…` (one-UUID-per-code convention); do not copy the guide's `1acefcb5-…`.
+
+## §24 — Abuse reports (Batch M WP4)
+
+Endpoints: `users/report-abuse` (credential, `write:report-abuse`), `admin/abuse-user-reports` (moderator), `admin/resolve-abuse-user-report`, `admin/update-abuse-user-report`, `admin/forward-abuse-user-report`.
+
+Error codes:
+- `NO_SUCH_USER` `1acefcb5-0959-43fd-9685-b48305736cb5` (target missing / self-report path uses pinetree's own `fcd2eef9-…`? DIVERGENCE: pinetree reuses `fcd2eef9-…` for missing target; report-abuse uses upstream `1acefcb5-…` for no-such-user).
+- `CANNOT_REPORT_YOURSELF` `1e13149e-b1e8-43cf-902e-c01dbfcb202f`.
+- `CANNOT_REPORT_THE_ADMIN` `35e166f5-05fb-4f87-a2d5-adb42676d48f`.
+- `NO_SUCH_ABUSE_REPORT` `ac3794dd-2ce4-d878-e546-73c60c06b398` (resolve/update) and upstream ids `8763e21b-…` (forward) / `15f51cf5-…` (update).
+
+Storage: `AbuseReportStore` port (required, no defaults) + redb `abuse_reports` table. `resolve`/`set_note`/`mark_forwarded` commit state + moderation-log row + jobs in one transaction.
+
+Flag delivery: `FederateDeliverPayload::Flag` → `render_flag_activity` (type Flag, actor = system actor, content = report comment, object = reported account URI) → existing SSRF-guarded delivery path.
+
+DIVERGENCES: notifications (admin stream/email/webhook) skipped; admins poll. Reporter host always null (local reports only). Origin filters are accepted but applied at storage scan level (no host column resolution beyond account id).

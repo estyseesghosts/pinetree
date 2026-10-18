@@ -82,6 +82,7 @@ impl LiveServer {
             moderation: store.clone(),
             instance_settings: store.clone(),
             invites: store.clone(),
+            abuse_reports: store.clone(),
             streaming: streaming.clone(),
             dedup: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {

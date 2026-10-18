@@ -11,8 +11,8 @@ use crate::application::ports::{
     FollowStore, HostCapsStore, HostSoftware,
     IdGenerator, InsertMediaInput, InstanceSettingsPatch, InstanceSettingsStore, InviteListFilter,
     InviteSort, InviteStore, InviteTypeFilter,
-    Job, JobQueue, LegacyAuthSessionRecord, MediaStore, MiAuthSessionRecord, ModerationLogFilter,
-    ModerationLogStore, MuteStore, NewJob,
+    AbuseReportFilter, Job, JobQueue, LegacyAuthSessionRecord, MediaStore, MiAuthSessionRecord, ModerationLogFilter,
+    AbuseReportStore, ModerationLogStore, MuteStore, NewJob,
     NoteStore, NotificationStore, PollChoiceCount, PollStore, PortError, ReactionStore,
     RemotePublicKeyRecord, TimelineCursor, UpdateAccountPatch, MAX_JOBS_PER_TXN, MAX_JOB_ATTEMPTS,
 };
@@ -21,7 +21,7 @@ use crate::domain::blocking::Blocking;
 use crate::domain::draft::NoteDraft;
 use crate::domain::follow::{Follow, FollowNotify, FollowRequest};
 use crate::domain::instance::{InstanceSettings, InviteCode};
-use crate::domain::moderation::ModerationLogEntry;
+use crate::domain::moderation::{AbuseReport, AbuseReportResolution, ModerationLogEntry};
 use crate::domain::muting::{validate_mute_expiry, validate_mute_params, Muting, RenoteMuting};
 use crate::domain::id::{parse_aidx_time, AidxGenerator};
 use crate::domain::media::MediaMeta;
@@ -143,6 +143,7 @@ const HOST_SOFTWARE: TableDefinition<&str, &[u8]> = TableDefinition::new("host_s
 /// Moderation-log rows (Batch M §3.2; Misskey `ModerationLogs`), keyed by
 /// row id (aidx, time-ordered → reverse range reads newest-first).
 const MODERATION_LOGS: TableDefinition<&str, &[u8]> = TableDefinition::new("moderation_logs");
+const ABUSE_REPORTS: TableDefinition<&str, &[u8]> = TableDefinition::new("abuse_reports");
 /// Instance settings singleton row (Batch M §3.3; `InstanceSettingsStore`),
 /// keyed by `"settings"`. Absent row = [`InstanceSettings::default()`].
 const INSTANCE_SETTINGS: TableDefinition<&str, &[u8]> = TableDefinition::new("instance_settings");
@@ -297,6 +298,7 @@ impl RedbStore {
             .map_err(map_redb_err)?;
         let _ = write_txn.open_table(HOST_SOFTWARE).map_err(map_redb_err)?;
         let _ = write_txn.open_table(MODERATION_LOGS).map_err(map_redb_err)?;
+        let _ = write_txn.open_table(ABUSE_REPORTS).map_err(map_redb_err)?;
         let _ = write_txn
             .open_table(INSTANCE_SETTINGS)
             .map_err(map_redb_err)?;
@@ -2740,6 +2742,172 @@ impl ModerationLogStore for RedbStore {
             }
         }
         Ok(out)
+    }
+}
+
+impl AbuseReportStore for RedbStore {
+    fn create(&self, report: AbuseReport) -> Result<AbuseReport, PortError> {
+        report.validate()?;
+        let write_txn = self.begin_write()?;
+        {
+            let mut table = write_txn.open_table(ABUSE_REPORTS).map_err(map_redb_err)?;
+            let bytes = encode_json(&report)?;
+            table
+                .insert(report.id.as_str(), bytes.as_slice())
+                .map_err(map_redb_err)?;
+        }
+        self.commit_write(write_txn)?;
+        Ok(report)
+    }
+
+    fn get(&self, id: &str) -> Result<Option<AbuseReport>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(ABUSE_REPORTS).map_err(map_redb_err)?;
+        match table.get(id).map_err(map_redb_err)? {
+            Some(g) => Ok(Some(decode_json(g.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn list(
+        &self,
+        filter: &AbuseReportFilter,
+        cursor: &TimelineCursor,
+    ) -> Result<Vec<AbuseReport>, PortError> {
+        let limit = if cursor.limit == 0 { 10 } else { cursor.limit };
+        const SCAN_CAP: usize = 10_000;
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(ABUSE_REPORTS).map_err(map_redb_err)?;
+        let mut out = Vec::new();
+        let mut scanned = 0usize;
+        for entry in table.range(""..).map_err(map_redb_err)?.rev() {
+            scanned += 1;
+            if scanned > SCAN_CAP {
+                break;
+            }
+            let (_, v) = entry.map_err(map_redb_err)?;
+            let report: AbuseReport = decode_json(v.value())?;
+            if !matches_cursor(&report.id, cursor) {
+                continue;
+            }
+            // state filter
+            match filter.state.as_deref() {
+                Some("resolved") if !report.resolved => continue,
+                Some("unresolved") if report.resolved => continue,
+                _ => {}
+            }
+            // reporter origin: remote if reporter account host != None. We
+            // cannot resolve host here without account store; pinetree stores
+            // reporter as account id only and the domain report has no host.
+            // DIVERGENCE: origin filters are applied at the API layer via
+            // account lookup; storage keeps all rows. For now accept all.
+            let _ = (&filter.reporter_origin, &filter.target_origin);
+            out.push(report);
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    fn resolve(
+        &self,
+        id: &str,
+        resolved_as: Option<AbuseReportResolution>,
+        assignee: Option<String>,
+        log: ModerationLogEntry,
+        jobs: Vec<NewJob>,
+    ) -> Result<AbuseReport, PortError> {
+        for job in &jobs {
+            job.validate()?;
+        }
+        let write_txn = self.begin_write()?;
+        let mut report: AbuseReport = {
+            let table = write_txn.open_table(ABUSE_REPORTS).map_err(map_redb_err)?;
+            match table.get(id).map_err(map_redb_err)? {
+                Some(g) => decode_json(g.value())?,
+                None => return Err(PortError::NotFound("NO_SUCH_ABUSE_REPORT".to_string())),
+            }
+        };
+        report.resolved = true;
+        report.resolved_as = resolved_as;
+        report.assignee = assignee;
+        report.validate()?;
+        {
+            let mut table = write_txn.open_table(ABUSE_REPORTS).map_err(map_redb_err)?;
+            let bytes = encode_json(&report)?;
+            table.insert(id, bytes.as_slice()).map_err(map_redb_err)?;
+        }
+        self.append_log_in_txn(&write_txn, &log)?;
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)?;
+        Ok(report)
+    }
+
+    fn set_note(
+        &self,
+        id: &str,
+        note: String,
+        log: Option<ModerationLogEntry>,
+        jobs: Vec<NewJob>,
+    ) -> Result<AbuseReport, PortError> {
+        for job in &jobs {
+            job.validate()?;
+        }
+        let write_txn = self.begin_write()?;
+        let mut report: AbuseReport = {
+            let table = write_txn.open_table(ABUSE_REPORTS).map_err(map_redb_err)?;
+            match table.get(id).map_err(map_redb_err)? {
+                Some(g) => decode_json(g.value())?,
+                None => return Err(PortError::NotFound("NO_SUCH_ABUSE_REPORT".to_string())),
+            }
+        };
+        report.moderation_note = note;
+        report.validate()?;
+        {
+            let mut table = write_txn.open_table(ABUSE_REPORTS).map_err(map_redb_err)?;
+            let bytes = encode_json(&report)?;
+            table.insert(id, bytes.as_slice()).map_err(map_redb_err)?;
+        }
+        if let Some(entry) = log {
+            self.append_log_in_txn(&write_txn, &entry)?;
+        }
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)?;
+        Ok(report)
+    }
+
+    fn mark_forwarded(
+        &self,
+        id: &str,
+        log: ModerationLogEntry,
+        jobs: Vec<NewJob>,
+    ) -> Result<AbuseReport, PortError> {
+        for job in &jobs {
+            job.validate()?;
+        }
+        let write_txn = self.begin_write()?;
+        let mut report: AbuseReport = {
+            let table = write_txn.open_table(ABUSE_REPORTS).map_err(map_redb_err)?;
+            match table.get(id).map_err(map_redb_err)? {
+                Some(g) => decode_json(g.value())?,
+                None => return Err(PortError::NotFound("NO_SUCH_ABUSE_REPORT".to_string())),
+            }
+        };
+        if report.forwarded {
+            return Err(PortError::Conflict("already forwarded".to_string()));
+        }
+        report.forwarded = true;
+        report.validate()?;
+        {
+            let mut table = write_txn.open_table(ABUSE_REPORTS).map_err(map_redb_err)?;
+            let bytes = encode_json(&report)?;
+            table.insert(id, bytes.as_slice()).map_err(map_redb_err)?;
+        }
+        self.append_log_in_txn(&write_txn, &log)?;
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)?;
+        Ok(report)
     }
 }
 

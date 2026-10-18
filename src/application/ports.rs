@@ -8,7 +8,7 @@ use crate::domain::blocking::Blocking;
 use crate::domain::draft::NoteDraft;
 use crate::domain::follow::{Follow, FollowNotify, FollowRequest};
 use crate::domain::instance::{InstanceSettings, InviteCode, RegistrationPolicy};
-use crate::domain::moderation::{ModerationAction, ModerationLogEntry};
+use crate::domain::moderation::{AbuseReport, AbuseReportResolution, ModerationAction, ModerationLogEntry};
 use crate::domain::muting::{Muting, RenoteMuting};
 pub use crate::domain::id::{Clock, DomainError, IdGenerator, PortError};
 use crate::domain::media::{MediaMeta, MediaProperties};
@@ -2076,6 +2076,63 @@ impl Default for InviteListFilter {
             offset: 0,
         }
     }
+}
+
+/// Abuse reports (Batch M WP4; upstream `AbuseUserReport`). Whole-port
+/// methods: state change + moderation-log row + outbound jobs commit in
+/// ONE transaction (§2.3). `create` carries no log (upstream logs only
+/// on resolve/forward/note-update); `resolve`/`set_note`/`mark_forwarded`
+/// are compound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AbuseReportFilter {
+    /// Upstream `state`: "resolved" | "unresolved" | None (all).
+    pub state: Option<String>,
+    /// Upstream `reporterOrigin`: combined/local/remote.
+    pub reporter_origin: String,
+    /// Upstream `targetUserOrigin`: combined/local/remote.
+    pub target_origin: String,
+}
+
+pub trait AbuseReportStore: Send + Sync {
+    fn create(&self, report: AbuseReport) -> Result<AbuseReport, PortError>;
+
+    fn get(&self, id: &str) -> Result<Option<AbuseReport>, PortError>;
+
+    fn list(
+        &self,
+        filter: &AbuseReportFilter,
+        cursor: &TimelineCursor,
+    ) -> Result<Vec<AbuseReport>, PortError>;
+
+    /// Resolve: flip resolved/resolved_as/assignee, append `log`, enqueue
+    /// `jobs` — one transaction.
+    fn resolve(
+        &self,
+        id: &str,
+        resolved_as: Option<AbuseReportResolution>,
+        assignee: Option<String>,
+        log: ModerationLogEntry,
+        jobs: Vec<NewJob>,
+    ) -> Result<AbuseReport, PortError>;
+
+    /// Set the moderation note. `log` is `Some` only when the note actually
+    /// changed (upstream logs `updateAbuseReportNote` conditionally).
+    fn set_note(
+        &self,
+        id: &str,
+        note: String,
+        log: Option<ModerationLogEntry>,
+        jobs: Vec<NewJob>,
+    ) -> Result<AbuseReport, PortError>;
+
+    /// Mark forwarded; commits with `log` + `jobs` (the Flag delivery) in
+    /// one transaction. Returns the updated report.
+    fn mark_forwarded(
+        &self,
+        id: &str,
+        log: ModerationLogEntry,
+        jobs: Vec<NewJob>,
+    ) -> Result<AbuseReport, PortError>;
 }
 
 /// Invite codes (Batch M WP2). Whole-port methods: any `log` row commits

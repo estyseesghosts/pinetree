@@ -2013,6 +2013,15 @@ mod tests {
         }
     }
 
+    impl crate::application::ports::AbuseReportStore for Mem {
+        fn create(&self, _report: crate::domain::moderation::AbuseReport) -> Result<crate::domain::moderation::AbuseReport, PortError> { unavailable("create") }
+        fn get(&self, _id: &str) -> Result<Option<crate::domain::moderation::AbuseReport>, PortError> { unavailable("get") }
+        fn list(&self, _filter: &crate::application::ports::AbuseReportFilter, _cursor: &crate::application::ports::TimelineCursor) -> Result<Vec<crate::domain::moderation::AbuseReport>, PortError> { unavailable("list") }
+        fn resolve(&self, _id: &str, _resolved_as: Option<crate::domain::moderation::AbuseReportResolution>, _assignee: Option<String>, _log: crate::domain::moderation::ModerationLogEntry, _jobs: Vec<crate::application::ports::NewJob>) -> Result<crate::domain::moderation::AbuseReport, PortError> { unavailable("resolve") }
+        fn set_note(&self, _id: &str, _note: String, _log: Option<crate::domain::moderation::ModerationLogEntry>, _jobs: Vec<crate::application::ports::NewJob>) -> Result<crate::domain::moderation::AbuseReport, PortError> { unavailable("set_note") }
+        fn mark_forwarded(&self, _id: &str, _log: crate::domain::moderation::ModerationLogEntry, _jobs: Vec<crate::application::ports::NewJob>) -> Result<crate::domain::moderation::AbuseReport, PortError> { unavailable("mark_forwarded") }
+    }
+
     impl MuteStore for Mem {
         fn mute(
             &self,
@@ -2400,6 +2409,7 @@ mod tests {
             moderation: mem.clone(),
             instance_settings: mem.clone(),
             invites: mem.clone(),
+            abuse_reports: mem.clone(),
             federation_http: crate::federation::delivery::SafeHttpClient::new(
                 crate::federation::delivery::SafeHttpConfig {
                     allow_private_ips: true,
