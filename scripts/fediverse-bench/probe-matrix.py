@@ -7,10 +7,12 @@ R3: home-timeline census on every node: markers per source instance.
 """
 import json, sys, time
 from concurrent.futures import ThreadPoolExecutor
-sys.path.insert(0, "/tmp/opencode/bench")
+sys.path.insert(0, "/tmp/bench")
 from lib import load_nodes
 
 nodes = load_nodes()
+# Filter to nodes that have accounts (reference impls may not have tokens)
+nodes = {k: v for k, v in nodes.items() if len(v.users) > 0}
 TAG = "PR" + str(int(time.time()))[-5:]
 
 # R1: probes
@@ -89,5 +91,5 @@ with ThreadPoolExecutor(max_workers=5) as ex:
         print(f"{dst:9} items={total:4}  " + "  ".join(f"{k}:{v}" for k, v in sorted(per.items())))
 
 json.dump({"probe_fails": fails, "pair_results": results},
-          open("/tmp/opencode/bench/probes.json", "w"), indent=1)
+          open("/tmp/bench/probes.json", "w"), indent=1)
 print("\nPROBES_DONE" if not fails else f"\nPROBES_DONE_WITH_FAILURES={len(fails)}")

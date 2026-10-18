@@ -3,13 +3,14 @@
 
 Features: post, cw, reply, reaction(+undo), renote/boost(+undo), quote,
 poll(+remote vote), media federation, followers-only, delete, mention.
-Records per-check results into /tmp/opencode/bench/features.json + prints a matrix.
+Records per-check results into /tmp/bench/features.json + prints a matrix.
 """
 import json, sys, time, threading
-sys.path.insert(0, "/tmp/opencode/bench")
+sys.path.insert(0, "/tmp/bench")
 from lib import load_nodes, HOSTS, fetch_bytes, sha
 
 nodes = load_nodes()
+nodes = {k: v for k, v in nodes.items() if len(v.users) > 0}
 PAIRS = [(a, b) for a in nodes for b in nodes if a != b]
 RESULTS = []            # {feature, src, dst, ok, detail, secs}
 LOCK = threading.Lock()
@@ -310,7 +311,7 @@ def main():
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=4) as ex:
         list(ex.map(lambda p: pair_worker(PAIRS.index(p), *p), PAIRS))
-    json.dump(RESULTS, open("/tmp/opencode/bench/features.json", "w"), indent=1)
+    json.dump(RESULTS, open("/tmp/bench/features.json", "w"), indent=1)
     # matrix summary
     feats = sorted({r["feature"] for r in RESULTS})
     print("\n=== FEATURE MATRIX (rows=feature, cols=src->dst) ===")

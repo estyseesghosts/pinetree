@@ -8,20 +8,21 @@ S4 media burst     60 uploads+posts, hash-verified remote copies
 S5 reply storm     300 cross-node replies
 S6 churn           60 post+delete cycles (zero residue) + reaction RTT timing
 S7 big text        2900-char posts from every node
-Results -> /tmp/opencode/bench/stress.json
+Results -> /tmp/bench/stress.json
 """
 import json, sys, time, threading, statistics
 from concurrent.futures import ThreadPoolExecutor
-sys.path.insert(0, "/tmp/opencode/bench")
+sys.path.insert(0, "/tmp/bench")
 from lib import load_nodes, HOSTS, fetch_bytes, sha
 
 nodes = load_nodes()
+nodes = {k: v for k, v in nodes.items() if len(v.users) > 0}
 import os
-if os.environ.get("SKIP_S1") and os.path.exists("/tmp/opencode/bench/stress.tag"):
-    TAG = open("/tmp/opencode/bench/stress.tag").read().strip()
+if os.environ.get("SKIP_S1") and os.path.exists("/tmp/bench/stress.tag"):
+    TAG = open("/tmp/bench/stress.tag").read().strip()
 else:
     TAG = "S" + str(int(time.time()))[-6:]
-    open("/tmp/opencode/bench/stress.tag", "w").write(TAG)
+    open("/tmp/bench/stress.tag", "w").write(TAG)
 R = {"tag": TAG, "phases": {}}
 LOCK = threading.Lock()
 
@@ -449,7 +450,7 @@ def main():
         s1()
     s2(); s3(); s4(); s5(); s6(); s7()
     R["wall_total_s"] = round(time.time() - t0, 1)
-    json.dump(R, open("/tmp/opencode/bench/stress.json", "w"), indent=1)
+    json.dump(R, open("/tmp/bench/stress.json", "w"), indent=1)
     print("STRESS_DONE", json.dumps({k: v.get("wall_s") for k, v in R["phases"].items()}))
 
 if __name__ == "__main__":

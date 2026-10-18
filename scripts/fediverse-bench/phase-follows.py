@@ -5,11 +5,12 @@ Warms pinetree RSA keys first (lazy generation is slow in dev builds and can
 time out a peer's first signed fetch). Verifies each user's follower set.
 """
 import json, sys, time, urllib.request
-sys.path.insert(0, "/tmp/opencode/bench")
+sys.path.insert(0, "/tmp/bench")
 from lib import load_nodes, HOSTS, fetch_bytes
 
 nodes = load_nodes()
-assert len(nodes) == 5, nodes.keys()
+nodes = {k: v for k, v in nodes.items() if len(v.users) > 0}
+assert len(nodes) >= 5, f"Expected at least 5 nodes with accounts, got {len(nodes)}: {nodes.keys()}"
 
 # 1. warm RSA keys on both pinetree nodes (AP fetch of every local actor)
 for n in ("pt-ks", "pt-mk"):
@@ -61,7 +62,7 @@ while True:
     time.sleep(20)
 
 json.dump({"missing": missing, "total_follows": total, "errors": errs},
-          open("/tmp/opencode/bench/follows.json", "w"), indent=1)
+          open("/tmp/bench/follows.json", "w"), indent=1)
 if missing:
     print("MISSING EDGES:")
     for k, v in list(missing.items())[:20]: print(" ", k, "->", v)
