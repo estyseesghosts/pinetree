@@ -1018,12 +1018,17 @@ impl AppServices {
     // --- Phase 3 follow lists ----------------------------------------------
 
     /// Moderator bypass for the §§1–2 visibility gates (Misskey
-    /// `RoleService.isModerator` parity). Pinetree has no roles
-    /// infrastructure yet, so this is always false and every gate applies
-    /// to every requester. DIVERGENCE (deferred): wire this to the roles
-    /// store when it lands; all gate call sites already consult it.
-    pub fn viewer_is_moderator(&self, _viewer_id: Option<&str>) -> bool {
-        false
+    /// `RoleService.isModerator` parity): an admin implies moderator
+    /// (Batch M §3.1, `Account::has_moderator_powers`).
+    pub fn viewer_is_moderator(&self, viewer_id: Option<&str>) -> Result<bool, PortError> {
+        let Some(viewer_id) = viewer_id else {
+            return Ok(false);
+        };
+        Ok(self
+            .accounts
+            .find_by_id(viewer_id)?
+            .map(|account| account.has_moderator_powers())
+            .unwrap_or(false))
     }
 
     /// §1 visibility gate shared by the Misskey `users/followers` +
@@ -1048,7 +1053,7 @@ impl AppServices {
         if visibility == FollowVisibility::Public {
             return Ok(());
         }
-        if self.viewer_is_moderator(viewer_id) {
+        if self.viewer_is_moderator(viewer_id)? {
             return Ok(());
         }
         match visibility {
@@ -1164,7 +1169,7 @@ impl AppServices {
         cursor: &TimelineCursor,
     ) -> Result<Vec<ReactionWithNote>, PortError> {
         let target = self.users_show_by_id(user_id)?;
-        if !self.viewer_is_moderator(viewer_id) {
+        if !self.viewer_is_moderator(viewer_id)? {
             if !target.is_local() {
                 return Err(PortError::Validation("IS_REMOTE_USER".to_string()));
             }
@@ -1358,6 +1363,8 @@ mod timeline_tests {
             streaming: Arc::new(NoopStreamingSink),
             dedup: store.clone() as Arc<dyn ActivityDedup>,
             host_caps: store.clone(),
+            moderation: store.clone(),
+            instance_settings: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()

@@ -85,6 +85,14 @@ pub struct Account {
     pub is_locked: bool,
     pub is_bot: bool,
     pub is_suspended: bool,
+    /// Fixed built-in role (Batch M §3.1): instance administrator.
+    /// Implies moderator powers. No custom roles/policies (§8).
+    #[serde(default)]
+    pub is_admin: bool,
+    /// Fixed built-in role (Batch M §3.1): moderator. Moderators cannot
+    /// act on admins or other moderators (WP3 refusal rule).
+    #[serde(default)]
+    pub is_moderator: bool,
     pub is_explorable: bool,
     pub is_deleted: bool,
     pub is_cat: bool,
@@ -399,6 +407,8 @@ impl Account {
             is_locked: false,
             is_bot: false,
             is_suspended: false,
+            is_admin: false,
+            is_moderator: false,
             is_explorable: true,
             is_deleted: false,
             is_cat: false,
@@ -440,6 +450,12 @@ impl Account {
 
     pub fn is_local(&self) -> bool {
         self.host.is_none()
+    }
+
+    /// Moderator powers (Batch M §3.1): an admin implies moderator, so both
+    /// roles pass a `require_moderator` guard.
+    pub fn has_moderator_powers(&self) -> bool {
+        self.is_admin || self.is_moderator
     }
 
     pub fn validate(&self) -> Result<(), DomainError> {
@@ -605,6 +621,8 @@ mod tests {
             is_locked: false,
             is_bot: false,
             is_suspended: false,
+            is_admin: false,
+            is_moderator: false,
             is_explorable: false,
             is_deleted: false,
             is_cat: false,
@@ -651,6 +669,7 @@ mod tests {
         assert_eq!(a.host, None);
         assert!(a.is_explorable);
         assert!(!a.is_locked && !a.is_bot && !a.is_suspended && !a.is_deleted && !a.is_cat);
+        assert!(!a.is_admin && !a.is_moderator && !a.has_moderator_powers());
         assert_eq!((a.followers_count, a.following_count, a.notes_count), (0, 0, 0));
         assert!(a.validate().is_ok());
     }
@@ -795,6 +814,8 @@ mod tests {
         assert!(!a.require_signin_to_view_contents);
         assert!(!a.enable_word_mute);
         assert!(!a.reject_quotes);
+        assert!(!a.is_admin);
+        assert!(!a.is_moderator);
         assert_eq!(a.default_reaction, None);
         assert!(a.validate().is_ok());
         // Serde round-trip preserves the defaults (old rows without the new
@@ -834,6 +855,8 @@ mod tests {
         assert!(decoded.inject_featured_note);
         assert!(decoded.receive_announcement_email);
         assert_eq!(decoded.chat_scope, ChatScope::Mutual);
+        // Rows written before Batch M carry no role keys: both default off.
+        assert!(!decoded.is_admin && !decoded.is_moderator);
         assert!(decoded.validate().is_ok());
     }
 
@@ -902,5 +925,17 @@ mod tests {
             user_list_id: None,
         };
         assert!(good.validate().is_ok());
+    }
+
+    #[test]
+    fn roles_default_off_and_admin_implies_moderator() {
+        let mut a = local_account();
+        assert!(!a.has_moderator_powers());
+        a.is_moderator = true;
+        assert!(a.has_moderator_powers());
+        a.is_moderator = false;
+        a.is_admin = true;
+        assert!(a.has_moderator_powers());
+        assert!(a.validate().is_ok());
     }
 }

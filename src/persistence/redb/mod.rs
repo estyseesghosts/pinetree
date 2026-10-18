@@ -8,8 +8,9 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, WriteTran
 use crate::application::ports::{
     AccountStore, ActivityDedup, ActorKeypairRecord, ApiTokenRecord, AuthStore, BlockStore, Clock,
     CreateAccountInput, CreateNoteInput, EditNoteInput, FollowStore, HostCapsStore, HostSoftware,
-    IdGenerator, InsertMediaInput,
-    Job, JobQueue, LegacyAuthSessionRecord, MediaStore, MiAuthSessionRecord, MuteStore, NewJob,
+    IdGenerator, InsertMediaInput, InstanceSettingsPatch, InstanceSettingsStore,
+    Job, JobQueue, LegacyAuthSessionRecord, MediaStore, MiAuthSessionRecord, ModerationLogFilter,
+    ModerationLogStore, MuteStore, NewJob,
     NoteStore, NotificationStore, PollChoiceCount, PollStore, PortError, ReactionStore,
     RemotePublicKeyRecord, TimelineCursor, UpdateAccountPatch, MAX_JOBS_PER_TXN, MAX_JOB_ATTEMPTS,
 };
@@ -17,6 +18,8 @@ use crate::domain::account::{validate_local_username, Account};
 use crate::domain::blocking::Blocking;
 use crate::domain::draft::NoteDraft;
 use crate::domain::follow::{Follow, FollowNotify, FollowRequest};
+use crate::domain::instance::InstanceSettings;
+use crate::domain::moderation::ModerationLogEntry;
 use crate::domain::muting::{validate_mute_expiry, validate_mute_params, Muting, RenoteMuting};
 use crate::domain::id::{parse_aidx_time, AidxGenerator};
 use crate::domain::media::MediaMeta;
@@ -135,6 +138,12 @@ const NOTE_EDITS_BY_NOTE: TableDefinition<(&str, &str), u8> =
 /// Cached per-host ActivityPub software names (§6 `docs/misskey-parity-plan.md`;
 /// `HostCapsStore` parity): lowercased host → JSON [`HostSoftware`] row.
 const HOST_SOFTWARE: TableDefinition<&str, &[u8]> = TableDefinition::new("host_software");
+/// Moderation-log rows (Batch M §3.2; Misskey `ModerationLogs`), keyed by
+/// row id (aidx, time-ordered → reverse range reads newest-first).
+const MODERATION_LOGS: TableDefinition<&str, &[u8]> = TableDefinition::new("moderation_logs");
+/// Instance settings singleton row (Batch M §3.3; `InstanceSettingsStore`),
+/// keyed by `"settings"`. Absent row = [`InstanceSettings::default()`].
+const INSTANCE_SETTINGS: TableDefinition<&str, &[u8]> = TableDefinition::new("instance_settings");
 
 /// `NOTES_BY_REPLY` backfill version marker: present with value
 /// [`REPLY_INDEX_DONE_VALUE`] once every stored note has been indexed.
@@ -278,6 +287,10 @@ impl RedbStore {
             .open_table(NOTE_EDITS_BY_NOTE)
             .map_err(map_redb_err)?;
         let _ = write_txn.open_table(HOST_SOFTWARE).map_err(map_redb_err)?;
+        let _ = write_txn.open_table(MODERATION_LOGS).map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(INSTANCE_SETTINGS)
+            .map_err(map_redb_err)?;
         let _ = write_txn.open_table(META).map_err(map_redb_err)?;
         write_txn.commit().map_err(map_redb_err)?;
         Ok(())
@@ -2506,6 +2519,277 @@ fn notification_order_key(id: &str) -> &str {
     id.rsplit(':').next().unwrap_or(id)
 }
 
+// --- Batch M: moderation log + instance settings (§3.2, §3.3) -------------
+
+impl RedbStore {
+    /// Append one moderation-log row inside an open write transaction so a
+    /// moderation action's state change and its log row commit together
+    /// (§2.3; conformance H4).
+    fn append_log_in_txn(
+        &self,
+        write_txn: &WriteTransaction,
+        entry: &ModerationLogEntry,
+    ) -> Result<(), PortError> {
+        entry.validate()?;
+        let mut table = write_txn.open_table(MODERATION_LOGS).map_err(map_redb_err)?;
+        let bytes = encode_json(entry)?;
+        table
+            .insert(entry.id.as_str(), bytes.as_slice())
+            .map_err(map_redb_err)?;
+        Ok(())
+    }
+
+    /// Delete every follow request involving `account_id` in either
+    /// direction (upstream `postSuspend`). Returns the number of request
+    /// pairs removed.
+    fn delete_follow_requests_involving_in_txn(
+        &self,
+        write_txn: &WriteTransaction,
+        account_id: &str,
+    ) -> Result<u64, PortError> {
+        // Collect pairs first: the range scan borrows the table (redb
+        // borrow rules), and each pair must then be dropped from both
+        // index tables via `delete_follow_request_rows`.
+        let mut pairs: Vec<(String, String)> = Vec::new(); // (follower, followee)
+        {
+            let fwd = write_txn
+                .open_table(FOLLOW_REQ_FORWARD)
+                .map_err(map_redb_err)?;
+            for entry in fwd
+                .range((account_id, "")..=(account_id, "\u{10ffff}"))
+                .map_err(map_redb_err)?
+            {
+                let (k, _) = entry.map_err(map_redb_err)?;
+                let (follower, followee) = k.value();
+                pairs.push((follower.to_string(), followee.to_string()));
+            }
+        }
+        {
+            let rev = write_txn
+                .open_table(FOLLOW_REQ_REVERSE)
+                .map_err(map_redb_err)?;
+            for entry in rev
+                .range((account_id, "")..=(account_id, "\u{10ffff}"))
+                .map_err(map_redb_err)?
+            {
+                // Reverse keys are (followee, follower).
+                let (k, _) = entry.map_err(map_redb_err)?;
+                let (followee, follower) = k.value();
+                pairs.push((follower.to_string(), followee.to_string()));
+            }
+        }
+        let mut removed = 0u64;
+        for (follower, followee) in pairs {
+            if self.delete_follow_request_rows(write_txn, &follower, &followee)? {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Load + patch + re-validate one account row inside an open write
+    /// transaction.
+    fn set_account_flags_in_txn<F>(
+        &self,
+        write_txn: &WriteTransaction,
+        account_id: &str,
+        apply: F,
+    ) -> Result<Account, PortError>
+    where
+        F: FnOnce(&mut Account),
+    {
+        let mut accounts_table = write_txn.open_table(ACCOUNTS).map_err(map_redb_err)?;
+        let mut account: Account = match accounts_table.get(account_id).map_err(map_redb_err)? {
+            Some(g) => decode_json(g.value())?,
+            None => {
+                return Err(PortError::NotFound(format!(
+                    "account {account_id} not found"
+                )))
+            }
+        };
+        apply(&mut account);
+        account.validate()?;
+        let bytes = encode_json(&account)?;
+        accounts_table
+            .insert(account.id.as_str(), bytes.as_slice())
+            .map_err(map_redb_err)?;
+        Ok(account)
+    }
+}
+
+impl ModerationLogStore for RedbStore {
+    fn set_suspended(
+        &self,
+        account_id: &str,
+        suspended: bool,
+        log: ModerationLogEntry,
+        jobs: Vec<NewJob>,
+    ) -> Result<Account, PortError> {
+        for job in &jobs {
+            job.validate()?;
+        }
+        let write_txn = self.begin_write()?;
+        if suspended {
+            self.delete_follow_requests_involving_in_txn(&write_txn, account_id)?;
+        }
+        let updated = self.set_account_flags_in_txn(&write_txn, account_id, |account| {
+            account.is_suspended = suspended;
+        })?;
+        self.append_log_in_txn(&write_txn, &log)?;
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)?;
+        Ok(updated)
+    }
+
+    fn set_role(
+        &self,
+        account_id: &str,
+        is_admin: bool,
+        is_moderator: bool,
+        log: ModerationLogEntry,
+    ) -> Result<Account, PortError> {
+        let write_txn = self.begin_write()?;
+        let updated = self.set_account_flags_in_txn(&write_txn, account_id, |account| {
+            account.is_admin = is_admin;
+            account.is_moderator = is_moderator;
+        })?;
+        self.append_log_in_txn(&write_txn, &log)?;
+        self.commit_write(write_txn)?;
+        Ok(updated)
+    }
+
+    fn update_account_logged(
+        &self,
+        account_id: &str,
+        patch: UpdateAccountPatch,
+        log: ModerationLogEntry,
+        jobs: Vec<NewJob>,
+    ) -> Result<Account, PortError> {
+        let write_txn = self.begin_write()?;
+        let updated = self.update_account_in_txn(&write_txn, account_id, patch, jobs)?;
+        self.append_log_in_txn(&write_txn, &log)?;
+        self.commit_write(write_txn)?;
+        Ok(updated)
+    }
+
+    fn append(&self, entry: ModerationLogEntry) -> Result<(), PortError> {
+        let write_txn = self.begin_write()?;
+        self.append_log_in_txn(&write_txn, &entry)?;
+        self.commit_write(write_txn)
+    }
+
+    fn list_logs(
+        &self,
+        filter: &ModerationLogFilter,
+        cursor: &TimelineCursor,
+    ) -> Result<Vec<ModerationLogEntry>, PortError> {
+        let limit = if cursor.limit == 0 { 10 } else { cursor.limit };
+        // Bounded scan (conformance F2): filtered listings stop after this
+        // many rows even when more exist.
+        const SCAN_CAP: usize = 10_000;
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(MODERATION_LOGS).map_err(map_redb_err)?;
+        let mut out = Vec::new();
+        let mut scanned = 0usize;
+        for entry in table.range(""..).map_err(map_redb_err)?.rev() {
+            scanned += 1;
+            if scanned > SCAN_CAP {
+                break;
+            }
+            let (_, v) = entry.map_err(map_redb_err)?;
+            let stored: ModerationLogEntry = decode_json(v.value())?;
+            if !matches_cursor(&stored.id, cursor) {
+                continue;
+            }
+            if let Some(action) = filter.action {
+                if stored.action != action {
+                    continue;
+                }
+            }
+            if let Some(actor) = &filter.actor {
+                if stored.actor_account.as_deref() != Some(actor.as_str()) {
+                    continue;
+                }
+            }
+            if let Some(target) = &filter.target {
+                if stored.target.as_deref() != Some(target.as_str()) {
+                    continue;
+                }
+            }
+            if let Some(search) = &filter.search {
+                let needle = search.to_ascii_lowercase();
+                let haystack = stored.details.to_string().to_ascii_lowercase();
+                if !haystack.contains(&needle) {
+                    continue;
+                }
+            }
+            out.push(stored);
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl InstanceSettingsStore for RedbStore {
+    fn get(&self) -> Result<InstanceSettings, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn
+            .open_table(INSTANCE_SETTINGS)
+            .map_err(map_redb_err)?;
+        match table.get("settings").map_err(map_redb_err)? {
+            Some(g) => decode_json(g.value()),
+            None => Ok(InstanceSettings::default()),
+        }
+    }
+
+    fn update(
+        &self,
+        patch: InstanceSettingsPatch,
+        log: ModerationLogEntry,
+    ) -> Result<InstanceSettings, PortError> {
+        let write_txn = self.begin_write()?;
+        let updated = {
+            let current = {
+                let table = write_txn
+                    .open_table(INSTANCE_SETTINGS)
+                    .map_err(map_redb_err)?;
+                match table.get("settings").map_err(map_redb_err)? {
+                    Some(g) => decode_json(g.value())?,
+                    None => InstanceSettings::default(),
+                }
+            };
+            let mut settings = current;
+            if let Some(registration) = patch.registration {
+                settings.registration = registration;
+            }
+            if let Some(blocked_hosts) = patch.blocked_hosts {
+                settings.blocked_hosts = InstanceSettings::normalize_blocked_hosts(&blocked_hosts);
+            }
+            if let Some(name) = patch.name {
+                settings.name = name;
+            }
+            if let Some(description) = patch.description {
+                settings.description = description;
+            }
+            if let Some(max_note_text_length) = patch.max_note_text_length {
+                settings.max_note_text_length = max_note_text_length;
+            }
+            settings.validate()?;
+            let mut table = write_txn
+                .open_table(INSTANCE_SETTINGS)
+                .map_err(map_redb_err)?;
+            let bytes = encode_json(&settings)?;
+            table.insert("settings", bytes.as_slice()).map_err(map_redb_err)?;
+            settings
+        };
+        self.append_log_in_txn(&write_txn, &log)?;
+        self.commit_write(write_txn)?;
+        Ok(updated)
+    }
+}
+
 fn matches_cursor(note_id: &str, cursor: &TimelineCursor) -> bool {
     if let Some(since_id) = &cursor.since_id {
         if note_id <= since_id.as_str() {
@@ -2572,6 +2856,8 @@ impl AccountStore for RedbStore {
             is_locked: input.is_locked,
             is_bot: input.is_bot,
             is_suspended: false,
+            is_admin: false,
+            is_moderator: false,
             is_explorable: true,
             is_deleted: false,
             is_cat: input.is_cat,

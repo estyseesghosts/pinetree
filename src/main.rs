@@ -49,6 +49,8 @@ fn build_services(cfg: &Config) -> Result<(Arc<AppServices>, pinetree::streaming
         streaming,
         dedup: store.clone() as Arc<dyn ActivityDedup>,
         host_caps: store.clone(),
+        moderation: store.clone(),
+        instance_settings: store.clone(),
         federation_http: SafeHttpClient::new(SafeHttpConfig::default()),
         public_url: cfg.normalized_public_url(),
         max_file_size: cfg.max_file_size,
@@ -98,6 +100,77 @@ fn run_create_account(args: &[String], cfg: &Config) -> ! {
         }
         Err(err) => {
             eprintln!("create account {username}: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `set-role --username=<name> (--admin|--moderator)[=false]`: set the
+/// fixed built-in role flags on a local account from the CLI (Batch M
+/// §3.1). This is how the first admin is created (§9.9). Flags not named
+/// keep their current values. Writes a `setRole` moderation-log row with
+/// no actor account (operator action).
+fn run_set_role(args: &[String], cfg: &Config) -> ! {
+    fn parse_flag(name: &str, rest: &str) -> bool {
+        match rest {
+            "" | "=true" => true,
+            "=false" => false,
+            _ => {
+                eprintln!("usage: set-role --username=<name> (--admin|--moderator)[=false]");
+                eprintln!("bad flag value: {name}{rest}");
+                std::process::exit(2);
+            }
+        }
+    }
+    let mut username: Option<String> = None;
+    let mut is_admin: Option<bool> = None;
+    let mut is_moderator: Option<bool> = None;
+    for arg in args {
+        if let Some(value) = arg.strip_prefix("--username=") {
+            username = Some(value.to_string());
+        } else if let Some(rest) = arg.strip_prefix("--admin") {
+            is_admin = Some(parse_flag("--admin", rest));
+        } else if let Some(rest) = arg.strip_prefix("--moderator") {
+            is_moderator = Some(parse_flag("--moderator", rest));
+        } else {
+            eprintln!("unknown set-role argument: {arg}");
+            std::process::exit(2);
+        }
+    }
+    let (Some(username), true) = (username, is_admin.is_some() || is_moderator.is_some()) else {
+        eprintln!("usage: set-role --username=<name> (--admin|--moderator)[=false]");
+        std::process::exit(2);
+    };
+    let services = build_services(cfg).unwrap_or_else(|err| {
+        eprintln!("{err}");
+        std::process::exit(1);
+    }).0;
+    let account = match services
+        .accounts
+        .find_by_username_and_host(&username, None)
+    {
+        Ok(Some(account)) => account,
+        Ok(None) => {
+            eprintln!("no local account {username}");
+            std::process::exit(1);
+        }
+        Err(err) => {
+            eprintln!("lookup {username}: {err}");
+            std::process::exit(1);
+        }
+    };
+    let new_is_admin = is_admin.unwrap_or(account.is_admin);
+    let new_is_moderator = is_moderator.unwrap_or(account.is_moderator);
+    match services.set_role(None, &account.id, new_is_admin, new_is_moderator) {
+        Ok(account) => {
+            println!(
+                "account {} id={} isAdmin={} isModerator={}",
+                account.username, account.id, account.is_admin, account.is_moderator
+            );
+            std::process::exit(0);
+        }
+        Err(err) => {
+            eprintln!("set role {username}: {err}");
             std::process::exit(1);
         }
     }
@@ -159,6 +232,8 @@ async fn main() {
 
     if positional.first().is_some_and(|cmd| cmd == "create-account") {
         run_create_account(&positional[1..], &cfg);
+    } else if positional.first().is_some_and(|cmd| cmd == "set-role") {
+        run_set_role(&positional[1..], &cfg);
     } else if let Some(cmd) = positional.first() {
         eprintln!("unknown subcommand: {cmd}");
         std::process::exit(2);

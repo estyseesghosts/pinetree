@@ -763,6 +763,62 @@ mod tests {
         }
     }
 
+    impl crate::application::ports::ModerationLogStore for Mem {
+        fn set_suspended(
+            &self,
+            _account_id: &str,
+            _suspended: bool,
+            _log: crate::domain::moderation::ModerationLogEntry,
+            _jobs: Vec<NewJob>,
+        ) -> Result<Account, PortError> {
+            unavailable("set_suspended")
+        }
+        fn set_role(
+            &self,
+            _account_id: &str,
+            _is_admin: bool,
+            _is_moderator: bool,
+            _log: crate::domain::moderation::ModerationLogEntry,
+        ) -> Result<Account, PortError> {
+            unavailable("set_role")
+        }
+        fn update_account_logged(
+            &self,
+            _account_id: &str,
+            _patch: UpdateAccountPatch,
+            _log: crate::domain::moderation::ModerationLogEntry,
+            _jobs: Vec<NewJob>,
+        ) -> Result<Account, PortError> {
+            unavailable("update_account_logged")
+        }
+        fn append(
+            &self,
+            _entry: crate::domain::moderation::ModerationLogEntry,
+        ) -> Result<(), PortError> {
+            unavailable("append")
+        }
+        fn list_logs(
+            &self,
+            _filter: &crate::application::ports::ModerationLogFilter,
+            _cursor: &TimelineCursor,
+        ) -> Result<Vec<crate::domain::moderation::ModerationLogEntry>, PortError> {
+            unavailable("list_logs")
+        }
+    }
+
+    impl crate::application::ports::InstanceSettingsStore for Mem {
+        fn get(&self) -> Result<crate::domain::instance::InstanceSettings, PortError> {
+            unavailable("instance_settings get")
+        }
+        fn update(
+            &self,
+            _patch: crate::application::ports::InstanceSettingsPatch,
+            _log: crate::domain::moderation::ModerationLogEntry,
+        ) -> Result<crate::domain::instance::InstanceSettings, PortError> {
+            unavailable("instance_settings update")
+        }
+    }
+
     impl MuteStore for Mem {
         fn mute(
             &self,
@@ -1077,6 +1133,8 @@ mod tests {
             streaming: mem.clone(),
             dedup: mem.clone() as Arc<dyn ActivityDedup>,
             host_caps: mem.clone(),
+            moderation: mem.clone(),
+            instance_settings: mem.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()

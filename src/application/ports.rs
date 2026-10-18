@@ -7,6 +7,8 @@ use crate::domain::account::{
 use crate::domain::blocking::Blocking;
 use crate::domain::draft::NoteDraft;
 use crate::domain::follow::{Follow, FollowNotify, FollowRequest};
+use crate::domain::instance::{InstanceSettings, RegistrationPolicy};
+use crate::domain::moderation::{ModerationAction, ModerationLogEntry};
 use crate::domain::muting::{Muting, RenoteMuting};
 pub use crate::domain::id::{Clock, DomainError, IdGenerator, PortError};
 use crate::domain::media::{MediaMeta, MediaProperties};
@@ -1825,4 +1827,105 @@ impl StreamingSink for NoopStreamingSink {
     fn publish(&self, _event_type: &str, _payload: &[u8]) -> Result<(), PortError> {
         Ok(())
     }
+}
+
+// --- Batch M: moderation, registration policy, instance settings -----------
+//
+// New ports carry ONLY required methods (guide §2 rule 4): a backend that
+// omits one must fail to compile. The atomicity contract (§2.3, conformance
+// groups H/I) is structural like the rest of this file: pinetree ports have
+// no transaction handle, so a moderation action's state change, its
+// moderation-log row, and its outbound jobs are committed together by ONE
+// port call — the compound methods below. `append` is only for log rows
+// that are the whole action.
+
+/// [`ModerationLogStore::list_logs`] filter (upstream
+/// `admin/show-moderation-logs` params).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModerationLogFilter {
+    /// Upstream `type`.
+    pub action: Option<ModerationAction>,
+    /// The moderator who performed the action (upstream `userId`).
+    pub actor: Option<String>,
+    /// The account or entity acted on (pinetree extra).
+    pub target: Option<String>,
+    /// Case-insensitive substring match on the details JSON (upstream
+    /// `search`: `info::text ILIKE`).
+    pub search: Option<String>,
+}
+
+pub trait ModerationLogStore: Send + Sync {
+    /// WP3 suspension: flip `is_suspended`, delete follow requests in both
+    /// directions when suspending (upstream `postSuspend`), append `log`,
+    /// and enqueue `jobs` — one transaction (conformance H1/H2/H3). The
+    /// refusal rule (never act on a moderator/admin) is application logic
+    /// and lives in the command, not here.
+    fn set_suspended(
+        &self,
+        account_id: &str,
+        suspended: bool,
+        log: ModerationLogEntry,
+        jobs: Vec<NewJob>,
+    ) -> Result<Account, PortError>;
+
+    /// §3.1 roles: set the fixed built-in role flags and append `log` in
+    /// one transaction. This is the ONLY write path for `is_admin`/
+    /// `is_moderator`; `UpdateAccountPatch` deliberately cannot set them.
+    fn set_role(
+        &self,
+        account_id: &str,
+        is_admin: bool,
+        is_moderator: bool,
+        log: ModerationLogEntry,
+    ) -> Result<Account, PortError>;
+
+    /// Account patch + moderation-log row + jobs in one transaction
+    /// (conformance H4). Used by every Batch M admin action that changes an
+    /// account (`admin/reject-quotes`, `admin/update-user-note`, …).
+    fn update_account_logged(
+        &self,
+        account_id: &str,
+        patch: UpdateAccountPatch,
+        log: ModerationLogEntry,
+        jobs: Vec<NewJob>,
+    ) -> Result<Account, PortError>;
+
+    /// Append one log row in its own transaction. Only for rows that ARE
+    /// the action (nothing else commits with them); moderation actions use
+    /// the compound methods above so a log row can never be lost against
+    /// its action (H4).
+    fn append(&self, entry: ModerationLogEntry) -> Result<(), PortError>;
+
+    /// Newest-first page of log rows matching `filter`, cursor-paged by id
+    /// (`TimelineCursor` since/until + limit).
+    fn list_logs(
+        &self,
+        filter: &ModerationLogFilter,
+        cursor: &TimelineCursor,
+    ) -> Result<Vec<ModerationLogEntry>, PortError>;
+}
+
+/// [`InstanceSettingsStore::update`] patch (upstream `admin/update-meta`
+/// subset used by Batch M). `blocked_hosts` is normalized by the store:
+/// lowercased, trimmed, deduplicated, empties dropped.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstanceSettingsPatch {
+    /// Maps to upstream `disableRegistration` (true = [`RegistrationPolicy::Closed`]).
+    pub registration: Option<RegistrationPolicy>,
+    pub blocked_hosts: Option<Vec<String>>,
+    pub name: Option<Option<String>>,
+    pub description: Option<Option<String>>,
+    pub max_note_text_length: Option<usize>,
+}
+
+pub trait InstanceSettingsStore: Send + Sync {
+    /// Current settings; a fresh store returns [`InstanceSettings::default()`]
+    /// (registration open, no blocked hosts, `maxNoteTextLength` 3000).
+    fn get(&self) -> Result<InstanceSettings, PortError>;
+    /// Apply `patch` and append `log` in one transaction (§3.3).
+    fn update(
+        &self,
+        patch: InstanceSettingsPatch,
+        log: ModerationLogEntry,
+    ) -> Result<InstanceSettings, PortError>;
 }

@@ -30,13 +30,14 @@ use crate::application::commands::pins::FeaturedCache;
 use crate::application::commands::AppServices;
 use crate::application::ports::{
     ApiTokenRecord, CreateDraftInput, CreateNoteInput, EditNoteInput, ExportEntity, ImportEntity,
-    LegacyAuthSessionRecord, MiAuthSessionRecord, PortError, TimelineCursor, UpdateAccountPatch,
-    UpdateDraftPatch,
+    LegacyAuthSessionRecord, MiAuthSessionRecord, ModerationLogFilter, PortError, TimelineCursor,
+    UpdateAccountPatch, UpdateDraftPatch,
 };
 use crate::domain::account::{
     Account, AvatarDecoration, ChatScope, FollowVisibility, MutedWord,
     NotificationRecieveConfig, ProfileField,
 };
+use crate::domain::moderation::ModerationAction;
 use crate::domain::note::{
     ReactionAcceptance, Visibility, MAX_CW_API_CHARS, MAX_NOTE_TEXT_CHARS,
 };
@@ -51,13 +52,14 @@ use crate::streaming::server::streaming_handler;
 
 use super::auth::{
     authenticate, extract_raw_token, generate_random_token, hash_password_async, hash_token,
-    is_safe_callback_url, needs_rehash, render_miauth_page, verify_password_async,
-    AuthenticatedCaller, SESSION_COOKIE_NAME,
+    is_safe_callback_url, needs_rehash, render_miauth_page, require_moderator,
+    verify_password_async, AuthenticatedCaller, SESSION_COOKIE_NAME,
 };
 use super::errors::ApiError;
 use super::packers::{
     pack_blocking, pack_drive_file, pack_following, pack_me_detailed,
-    pack_meta, pack_muting, pack_note, pack_note_draft, pack_note_reaction_with_note,
+    pack_meta, pack_moderation_log, pack_muting, pack_note, pack_note_draft,
+    pack_note_reaction_with_note,
     pack_notification, pack_renote_muting, pack_user_detailed_not_me, pack_user_lite,
     pack_user_relation,
 };
@@ -2823,18 +2825,19 @@ fn api_dispatch_blocking(
 
         // §3 `admin/reject-quotes` (Sharkey `admin/reject-quotes.ts`
         // parity): moderation toggle for one user's `rejectQuotes` flag.
-        // `credential` + `write:admin:reject-quotes` (first-party callers
-        // pass). DIVERGENCE: pinetree has no moderator-role infra, so any
-        // first-party credential may call it (TODO: gate on a moderator
-        // role when roles land). No moderation-log row exists yet either
-        // (TODO: `ModerationLogService` equivalent). The `MeUpdated`
-        // streaming job commits atomically (the `localUserUpdated`
-        // equivalent); unlike `i/update` a moderation toggle never
+        // `credential` + `write:admin:reject-quotes` + the moderator role
+        // (Batch M WP1: scopes alone are not authorization). The
+        // moderator-target refusal (WP3 refusal rule) and the Sharkey
+        // `acceptQuotesUser`/`rejectQuotesUser` moderation-log row live in
+        // the application command; the log row and the `MeUpdated`
+        // streaming job commit atomically (the `localUserUpdated`
+        // equivalent). Unlike `i/update` a moderation toggle never
         // federates `Update(Person)`.
         "admin/reject-quotes" => {
             check_allowed_fields(&obj, &["userId", "rejectQuotes"])?;
             let caller = require_caller(caller)?;
             caller.require_permission("write:admin:reject-quotes")?;
+            require_moderator(&caller)?;
             let user_id = required_str(&obj, "userId")?;
             let reject = match obj.get("rejectQuotes") {
                 Some(Value::Bool(b)) => *b,
@@ -2847,11 +2850,70 @@ fn api_dispatch_blocking(
             };
             let account = state
                 .services
-                .set_reject_quotes(&user_id, reject)
+                .set_reject_quotes(&caller.account.id, &user_id, reject)
                 .map_err(ApiError::from_port_error)?;
             let packed = pack_me_detailed(&account, caller.is_first_party, &state.services)
                 .map_err(ApiError::from_port_error)?;
             Ok(Json(packed).into_response())
+        }
+
+        // Batch M §3.2 `admin/show-moderation-logs` (upstream file of the
+        // same name): cursor-paged moderation log with `type`/`userId`/
+        // `search` filters. DIVERGENCE: upstream requires admin
+        // (`requireAdmin`); pinetree lets moderators read the log (guide
+        // §3.2).
+        "admin/show-moderation-logs" => {
+            check_allowed_fields(
+                &obj,
+                &[
+                    "limit",
+                    "sinceId",
+                    "untilId",
+                    "sinceDate",
+                    "untilDate",
+                    "type",
+                    "userId",
+                    "search",
+                ],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:admin:show-moderation-log")?;
+            require_moderator(&caller)?;
+            let cursor = TimelineCursor {
+                since_id: opt_string(&obj, "sinceId")?,
+                until_id: opt_string(&obj, "untilId")?,
+                since_date: opt_i64(&obj, "sinceDate")?,
+                until_date: opt_i64(&obj, "untilDate")?,
+                limit: get_limit(&obj)?,
+            };
+            // An unknown `type` name matches no rows upstream
+            // (`log.type = :type`); answer `[]` the same way.
+            let action = match obj.get("type") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(name)) => match ModerationAction::parse(name) {
+                    Some(action) => Some(action),
+                    None => return Ok(Json(Value::Array(Vec::new())).into_response()),
+                },
+                Some(_) => return Err(ApiError::invalid_param("type", "must be a string")),
+            };
+            let filter = ModerationLogFilter {
+                action,
+                actor: opt_string(&obj, "userId")?,
+                target: None,
+                search: opt_string(&obj, "search")?,
+            };
+            let rows = state
+                .services
+                .list_moderation_logs(filter, &cursor)
+                .map_err(ApiError::from_port_error)?;
+            let mut packed = Vec::with_capacity(rows.len());
+            for row in &rows {
+                packed.push(
+                    pack_moderation_log(row, Some(&caller.account.id), &state.services)
+                        .map_err(ApiError::from_port_error)?,
+                );
+            }
+            Ok(Json(Value::Array(packed)).into_response())
         }
 
         // §13 profile import/export (Misskey `i/export-*` + `i/import-*`
@@ -5227,6 +5289,8 @@ mod tests {
             streaming: streaming.clone(),
             dedup: store.clone() as Arc<dyn ActivityDedup>,
             host_caps: store.clone(),
+            moderation: store.clone(),
+            instance_settings: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()
@@ -10824,9 +10888,9 @@ mod tests {
     #[tokio::test]
     async fn parity_reject_quotes_end_to_end() {
         let (state, _) = test_state();
-        let (_, alice_token) = signup_user(&state, "alice").await;
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
         let (bob_id, bob_token) = signup_user(&state, "bob").await;
-        let (_, carol_token) = signup_user(&state, "carol").await;
+        let (carol_id, carol_token) = signup_user(&state, "carol").await;
 
         // Alice posts a note for bob to quote; bob posts the target for
         // alice's and carol's quotes.
@@ -10892,7 +10956,10 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{quote}");
 
         // (b) Moderation toggle: bob quotes alice's note BEFORE the flag is
-        // set, then `admin/reject-quotes` flags him.
+        // set. Batch M WP1: a plain user cannot call `admin/reject-quotes`
+        // (403, no state change), a moderator can (and the action writes a
+        // Sharkey-shaped moderation-log row in the same commit), and a
+        // moderator cannot act on another moderator (WP3 refusal rule).
         let (status, bob_quote) = call(
             &state,
             "notes/create",
@@ -10902,6 +10969,33 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{bob_quote}");
         let bob_quote_id = bob_quote["createdNote"]["id"].as_str().unwrap().to_string();
+
+        // Plain user: refused, nothing changes.
+        let (status, value) = call(
+            &state,
+            "admin/reject-quotes",
+            serde_json::json!({ "userId": bob_id, "rejectQuotes": true }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{value}");
+        assert_eq!(value["code"], "PERMISSION_DENIED");
+        assert!(
+            !state
+                .services
+                .accounts
+                .find_by_id(&bob_id)
+                .unwrap()
+                .unwrap()
+                .reject_quotes,
+            "a refused call must not change state"
+        );
+
+        // Make alice a moderator (the CLI `set-role` path) and retry.
+        state
+            .services
+            .set_role(None, &alice_id, false, true)
+            .expect("set role");
         let (status, packed) = call(
             &state,
             "admin/reject-quotes",
@@ -10911,6 +11005,48 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{packed}");
         assert_eq!(packed["rejectQuotes"], serde_json::json!(true));
+        // The moderation-log row is in the same commit: it is readable
+        // through `admin/show-moderation-logs` immediately.
+        let (status, logs) = call(
+            &state,
+            "admin/show-moderation-logs",
+            serde_json::json!({ "type": "rejectQuotesUser" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{logs}");
+        let rows = logs.as_array().unwrap();
+        assert_eq!(rows.len(), 1, "one log row: {logs}");
+        assert_eq!(rows[0]["type"], "rejectQuotesUser");
+        assert_eq!(rows[0]["userId"], serde_json::json!(alice_id));
+        assert_eq!(rows[0]["user"]["username"], "alice");
+        assert_eq!(rows[0]["info"]["userId"], serde_json::json!(bob_id));
+        assert_eq!(rows[0]["info"]["userUsername"], "bob");
+
+        // WP3 refusal rule: a moderator cannot act on a moderator.
+        state
+            .services
+            .set_role(None, &carol_id, false, true)
+            .expect("set role");
+        let (status, value) = call(
+            &state,
+            "admin/reject-quotes",
+            serde_json::json!({ "userId": carol_id, "rejectQuotes": true }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert!(
+            !state
+                .services
+                .accounts
+                .find_by_id(&carol_id)
+                .unwrap()
+                .unwrap()
+                .reject_quotes,
+            "a refused call must not change state"
+        );
+
         // New quotes fail...
         let (status, value) = call(
             &state,
@@ -10960,6 +11096,95 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{quote}");
+    }
+
+    /// Batch M §3.2 `admin/show-moderation-logs`: moderator-only, upstream
+    /// packing, cursor paging, and the upstream `type`-miss behavior.
+    #[tokio::test]
+    async fn admin_show_moderation_logs_moderator_only() {
+        let (state, _) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (bob_id, bob_token) = signup_user(&state, "bob").await;
+
+        // Plain users are refused the log itself.
+        let (status, value) = call(
+            &state,
+            "admin/show-moderation-logs",
+            serde_json::json!({}),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{value}");
+        assert_eq!(value["code"], "PERMISSION_DENIED");
+
+        // Two moderator actions generate two rows (the `setRole` row and
+        // the `rejectQuotesUser` row).
+        state
+            .services
+            .set_role(None, &alice_id, false, true)
+            .expect("set role");
+        let (status, _) = call(
+            &state,
+            "admin/reject-quotes",
+            serde_json::json!({ "userId": bob_id, "rejectQuotes": true }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, logs) = call(
+            &state,
+            "admin/show-moderation-logs",
+            serde_json::json!({}),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{logs}");
+        let rows = logs.as_array().unwrap();
+        assert_eq!(rows.len(), 2, "newest first: {logs}");
+        assert_eq!(rows[0]["type"], "rejectQuotesUser");
+        assert_eq!(rows[1]["type"], "setRole");
+        assert_eq!(rows[1]["info"]["isModerator"], serde_json::json!(true));
+        assert_eq!(rows[1]["user"], serde_json::json!(null)); // operator (CLI) row
+        for row in rows {
+            for key in ["id", "createdAt", "type", "info", "userId", "user"] {
+                assert!(row.get(key).is_some(), "row has {key}: {row}");
+            }
+        }
+
+        // `userId` filters on the acting moderator; an unknown `type`
+        // matches no rows (upstream `log.type = :type`).
+        let (status, logs) = call(
+            &state,
+            "admin/show-moderation-logs",
+            serde_json::json!({ "userId": alice_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{logs}");
+        assert_eq!(logs.as_array().unwrap().len(), 1, "{logs}");
+        let (status, logs) = call(
+            &state,
+            "admin/show-moderation-logs",
+            serde_json::json!({ "type": "noSuchAction" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{logs}");
+        assert!(logs.as_array().unwrap().is_empty(), "{logs}");
+
+        // Cursor paging: `untilId` at the newest row returns the older one.
+        let newest_id = rows[0]["id"].as_str().unwrap();
+        let (status, logs) = call(
+            &state,
+            "admin/show-moderation-logs",
+            serde_json::json!({ "untilId": newest_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{logs}");
+        let page = logs.as_array().unwrap();
+        assert_eq!(page.len(), 1, "{logs}");
+        assert_eq!(page[0]["type"], "setRole");
     }
 
     /// §6 per-user `defaultReaction` heart-click (`docs/misskey-parity-plan.md`

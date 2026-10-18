@@ -237,6 +237,26 @@ impl AuthenticatedCaller {
     }
 }
 
+/// Batch M §3.1 guard: the caller must hold moderator powers (moderator or
+/// admin — an admin implies moderator). Role checks live here, not in token
+/// scopes: scopes alone are not authorization.
+pub fn require_moderator(caller: &AuthenticatedCaller) -> Result<(), ApiError> {
+    if caller.account.has_moderator_powers() {
+        Ok(())
+    } else {
+        Err(ApiError::permission_denied())
+    }
+}
+
+/// Batch M §3.1 guard: the caller must be an admin.
+pub fn require_admin(caller: &AuthenticatedCaller) -> Result<(), ApiError> {
+    if caller.account.is_admin {
+        Ok(())
+    } else {
+        Err(ApiError::permission_denied())
+    }
+}
+
 /// Resolve `raw_token` to its caller: token-hash lookup, account load,
 /// suspended/deleted gating. Storage faults surface as 500 `ApiError`s.
 pub fn authenticate(services: &AppServices, raw_token: &str) -> Result<AuthenticatedCaller, ApiError> {

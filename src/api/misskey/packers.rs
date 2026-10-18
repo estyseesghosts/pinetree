@@ -17,6 +17,7 @@ use crate::domain::draft::NoteDraft;
 use crate::domain::follow::Follow;
 use crate::domain::muting::{Muting, RenoteMuting};
 use crate::domain::media::MediaMeta;
+use crate::domain::moderation::ModerationLogEntry;
 use crate::domain::note::{Note, Visibility};
 use crate::domain::notification::{Notification, NotificationKind};
 use crate::domain::reaction::Reaction;
@@ -452,6 +453,37 @@ pub fn pack_following(
     }))
 }
 
+/// `ModerationLog` (upstream `ModerationLogEntityService.pack`):
+/// `{id, createdAt, type, info, userId, user}` with `user` as
+/// `UserDetailedNotMe`. DIVERGENCE: operator (CLI) rows have no acting
+/// account, so `userId`/`user` are `Null` there (upstream rows always
+/// carry a user).
+pub fn pack_moderation_log(
+    entry: &ModerationLogEntry,
+    viewer_id: Option<&str>,
+    services: &AppServices,
+) -> Result<Value, PortError> {
+    let created_at = format_millis(entry.created_at_ms);
+    let (user_id, user) = match &entry.actor_account {
+        Some(actor) => {
+            let packed = match services.accounts.find_by_id(actor)? {
+                Some(account) => pack_user_detailed_not_me(&account, viewer_id, services)?,
+                None => Value::Null,
+            };
+            (Value::String(actor.clone()), packed)
+        }
+        None => (Value::Null, Value::Null),
+    };
+    Ok(serde_json::json!({
+        "id": entry.id,
+        "createdAt": created_at,
+        "type": entry.action.as_str(),
+        "info": entry.details,
+        "userId": user_id,
+        "user": user,
+    }))
+}
+
 /// `NoteReaction` + `Note` (`note-reaction.ts`
 /// `packedNoteReactionWithNoteSchema`):
 /// `{id, createdAt, user: UserLite, type, note: Note}`. `createdAt`
@@ -675,8 +707,13 @@ pub fn pack_me_detailed(
             .unwrap_or(Value::Null),
     );
     obj.insert("followedMessage".to_string(), opt_string(&account.followed_message));
-    obj.insert("isModerator".to_string(), Value::Bool(false));
-    obj.insert("isAdmin".to_string(), Value::Bool(false));
+    // Batch M §3.1: real role flags. Upstream packs `isModerator` as
+    // `RoleService.isModerator`, which is true for admins too.
+    obj.insert(
+        "isModerator".to_string(),
+        Value::Bool(account.has_moderator_powers()),
+    );
+    obj.insert("isAdmin".to_string(), Value::Bool(account.is_admin));
     obj.insert(
         "injectFeaturedNote".to_string(),
         Value::Bool(account.inject_featured_note),
@@ -1828,6 +1865,62 @@ mod tests {
         }
     }
 
+    impl crate::application::ports::ModerationLogStore for Mem {
+        fn set_suspended(
+            &self,
+            _account_id: &str,
+            _suspended: bool,
+            _log: crate::domain::moderation::ModerationLogEntry,
+            _jobs: Vec<NewJob>,
+        ) -> Result<Account, PortError> {
+            unavailable("set_suspended")
+        }
+        fn set_role(
+            &self,
+            _account_id: &str,
+            _is_admin: bool,
+            _is_moderator: bool,
+            _log: crate::domain::moderation::ModerationLogEntry,
+        ) -> Result<Account, PortError> {
+            unavailable("set_role")
+        }
+        fn update_account_logged(
+            &self,
+            _account_id: &str,
+            _patch: UpdateAccountPatch,
+            _log: crate::domain::moderation::ModerationLogEntry,
+            _jobs: Vec<NewJob>,
+        ) -> Result<Account, PortError> {
+            unavailable("update_account_logged")
+        }
+        fn append(
+            &self,
+            _entry: crate::domain::moderation::ModerationLogEntry,
+        ) -> Result<(), PortError> {
+            unavailable("append")
+        }
+        fn list_logs(
+            &self,
+            _filter: &crate::application::ports::ModerationLogFilter,
+            _cursor: &crate::application::ports::TimelineCursor,
+        ) -> Result<Vec<crate::domain::moderation::ModerationLogEntry>, PortError> {
+            unavailable("list_logs")
+        }
+    }
+
+    impl crate::application::ports::InstanceSettingsStore for Mem {
+        fn get(&self) -> Result<crate::domain::instance::InstanceSettings, PortError> {
+            unavailable("instance_settings get")
+        }
+        fn update(
+            &self,
+            _patch: crate::application::ports::InstanceSettingsPatch,
+            _log: crate::domain::moderation::ModerationLogEntry,
+        ) -> Result<crate::domain::instance::InstanceSettings, PortError> {
+            unavailable("instance_settings update")
+        }
+    }
+
     impl MuteStore for Mem {
         fn mute(
             &self,
@@ -2212,6 +2305,8 @@ mod tests {
             streaming: mem.clone(),
             dedup: mem.clone() as Arc<dyn ActivityDedup>,
             host_caps: mem.clone(),
+            moderation: mem.clone(),
+            instance_settings: mem.clone(),
             federation_http: crate::federation::delivery::SafeHttpClient::new(
                 crate::federation::delivery::SafeHttpConfig {
                     allow_private_ips: true,

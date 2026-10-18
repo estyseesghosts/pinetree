@@ -13,3 +13,5 @@ pub mod media;
 pub mod visibility;
 pub mod policy;
 pub mod notification;
+pub mod moderation;
+pub mod instance;

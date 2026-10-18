@@ -175,3 +175,19 @@ New application operations (`src/application/commands/pins.rs`):
 ## Superseding note — §10 notification grouping (2026-10-16, `docs/misskey-parity-plan.md`)
 
 Pure pack-layer change — no port or storage change. `pack_grouped_notifications` (packers) implements the upstream `i/notifications-grouped.ts:106-153` merge over the same flat newest-first page `i/notifications` fetches; the endpoint shares `parse_notification_query` with `i/notifications` and truncates the grouped page to `limit` after packing.
+
+## Superseding note — Batch M moderation + instance settings ports (2026-10-17, `docs/implementer-guide-batch-m.md`)
+
+Status: LANDED (redb adapter green). **All methods below are required — no `Err`/`unimplemented!()` defaults (guide §2 rule 4), so the FDB adapter does not compile until it implements them.** Atomicity is structural like the rest of this file: ports carry no transaction handle, so each compound method commits its state change, its moderation-log row, and its jobs in ONE storage transaction (§2.3; conformance groups H/I).
+
+- `ModerationLogStore` (`src/application/ports.rs`):
+  - `set_suspended(account_id, suspended, log, jobs) -> Account` — flag + follow-request teardown in both directions on suspend (upstream `postSuspend`) + log row + jobs, one transaction (conformance H1/H2/H3). The moderator-target refusal rule is application logic (the command), not storage.
+  - `set_role(account_id, is_admin, is_moderator, log) -> Account` — the ONLY write path for the built-in role flags (`UpdateAccountPatch` cannot set them); log row in the same transaction.
+  - `update_account_logged(account_id, patch, log, jobs) -> Account` — account patch + log row + jobs, one transaction (conformance H4).
+  - `append(entry)` — standalone row for log entries that ARE the action (nothing else commits with them). Actions use the compound methods so a row can never be lost against its action.
+  - `list_logs(filter, cursor) -> [ModerationLogEntry]` — newest-first, `TimelineCursor` since/until paging, `ModerationLogFilter { action, actor, target, search }` (upstream `admin/show-moderation-logs` params). Bounded scan (F2).
+- `InstanceSettingsStore`:
+  - `get() -> InstanceSettings` — fresh store = defaults (registration open, no blocked hosts, `maxNoteTextLength` 3000).
+  - `update(patch, log) -> InstanceSettings` — patch + moderation-log row in one transaction (§3.3). `blockedHosts` normalize in the store: lowercased, trimmed, deduplicated, empties dropped (upstream `admin/update-meta.ts:260`). Blocked-host matching is the domain rule `domain::instance::host_is_blocked` (upstream `UtilityService.isBlockedHost` suffix match).
+- Row types are domain (`domain/moderation.rs`, `domain/instance.rs`): `ModerationLogEntry { id, actor_account?, action, target?, details, created_at_ms }` (`details` is upstream `ModerationLogs.info` JSON), `AbuseReport`, `InstanceSettings`, `RegistrationPolicy`, `InviteCode`.
+- Coming with later WPs (same rules): `InviteStore` (WP2, consume + account create atomic, conformance I), `AbuseReportStore` (WP4), favorites/emoji stores (WP7/WP8, conformance J).

@@ -7,6 +7,7 @@ use crate::domain::account::{
     AVATAR_DECORATION_LIMIT_DEFAULT, MutedWord, WORD_MUTE_LIMIT_DEFAULT,
 };
 use crate::domain::account::Account;
+use crate::domain::moderation::{ModerationAction, ModerationLogEntry};
 
 impl AppServices {
     pub fn create_account(
@@ -37,15 +38,20 @@ impl AppServices {
     }
 
     /// Set the Sharkey-style quote-rejection flag (§3; Sharkey
-    /// `admin/reject-quotes.ts` parity minus the moderation log). Works for
-    /// local and cached remote accounts. A no-change call is a no-op
-    /// success (upstream skips the update when the flag already matches).
-    /// Commits the `MeUpdated` streaming job atomically (the
-    /// `localUserUpdated` equivalent — there is no moderation-log store
-    /// yet, see the TODO on the endpoint). No federation: unlike
-    /// `update_profile`, a moderation toggle never emits `Update(Person)`.
+    /// `admin/reject-quotes.ts` parity). Works for local and cached remote
+    /// accounts. A no-change call is a no-op success (upstream skips both
+    /// the update and the log when the flag already matches).
+    ///
+    /// Batch M WP1: `moderator_id` is the acting moderator. The action is
+    /// refused on moderator/admin targets (WP3 refusal rule) and logs as
+    /// Sharkey's `acceptQuotesUser`/`rejectQuotesUser` with Sharkey's
+    /// `{userId, userUsername, userHost}` payload. The moderation-log row,
+    /// the flag write, and the `MeUpdated` streaming job commit in one
+    /// transaction (§2.3). No federation: unlike `update_profile`, a
+    /// moderation toggle never emits `Update(Person)`.
     pub fn set_reject_quotes(
         &self,
+        moderator_id: &str,
         account_id: &str,
         reject: bool,
     ) -> Result<Account, PortError> {
@@ -54,9 +60,30 @@ impl AppServices {
             .accounts
             .find_by_id(account_id)?
             .ok_or_else(|| PortError::NotFound("NO_SUCH_USER".to_string()))?;
+        if current.has_moderator_powers() {
+            return Err(PortError::Validation(
+                "cannot moderate moderator account".to_string(),
+            ));
+        }
         if current.reject_quotes == reject {
             return Ok(current);
         }
+        let log = ModerationLogEntry::new(
+            self.ids.generate(),
+            Some(moderator_id.to_string()),
+            if reject {
+                ModerationAction::RejectQuotesUser
+            } else {
+                ModerationAction::AcceptQuotesUser
+            },
+            Some(account_id.to_string()),
+            serde_json::json!({
+                "userId": account_id,
+                "userUsername": current.username,
+                "userHost": current.host,
+            }),
+            self.clock.now_ms(),
+        )?;
         let jobs = vec![self.streaming_job(
             &crate::application::events::StreamingEvent::MeUpdated {
                 account_id: account_id.to_string(),
@@ -67,7 +94,8 @@ impl AppServices {
             reject_quotes: Some(reject),
             ..Default::default()
         };
-        self.accounts.update_account(account_id, patch, jobs)
+        self.moderation
+            .update_account_logged(account_id, patch, log, jobs)
     }
 
     /// Full-profile update (`i/update.ts` handler parity; all 39 params plus

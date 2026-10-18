@@ -1833,6 +1833,8 @@ mod tests {
             streaming: Arc::new(NoopStreamingSink),
             dedup: store.clone() as Arc<dyn ActivityDedup>,
             host_caps: store.clone(),
+            moderation: store.clone(),
+            instance_settings: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()
@@ -2041,6 +2043,8 @@ mod quote_render_tests {
             streaming: Arc::new(NoopStreamingSink),
             dedup: store.clone() as Arc<dyn ActivityDedup>,
             host_caps: store.clone(),
+            moderation: store.clone(),
+            instance_settings: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()

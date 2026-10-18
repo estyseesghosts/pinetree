@@ -213,3 +213,27 @@ so the late `Create` stored the note and it stayed live.
   It failed on the pre-fix code with grouped output.
 - **FDB (Phase 4):** the per-user index must also be keyed by the time-ordered suffix.
   Keying it by the full id reproduces the bug.
+
+## 17. Groups H/I/J — moderation, registration/invites, favorites/emoji (Batch M §3.4; added 2026-10-17; Draft)
+
+Backend-agnostic, same cases both adapters (FDB inherits). Atomicity rule (§2.3 of the guide): a moderation action's state change, its moderation-log row, and its outbound jobs commit in ONE transaction. The cases prove it through the pure port interface by forcing the log append to fail inside the action (invalid row) and asserting nothing else committed.
+
+### Group H — moderation (executed: `tests/conformance.rs` `h1_suspend_atomicity`, `h2_unsuspend_atomicity`, `h3_suspend_unsuspend_race`, `h4_log_never_lost`, 4/4 green 2026-10-17)
+
+- **H1 suspend atomicity**: `set_suspended(true)` commits `is_suspended`, the follow-request teardown in both directions (upstream `postSuspend`), the `suspend` log row, and the outbox job together. With an invalid log row the whole action fails: flag unchanged, no row, no job.
+- **H2 unsuspend atomicity**: `set_suspended(false)` commits flag + `unsuspend` row + job together (same fail-closed rule); the removed follow requests stay removed.
+- **H3 concurrent suspend and unsuspend**: N threads alternate suspend/unsuspend on one account; every call lands, exactly one log row per call (none lost, none duplicated), account row still valid.
+- **H4 log append never lost**: `update_account_logged` commits patch + row + jobs together; an invalid row aborts all three; committed pairs survive reopen.
+
+### Group I — registration and invites (cases land with WP2; ports: `InviteStore`)
+
+- **I1 single-use invite race**: one invite consumed by N concurrent signups → exactly one succeeds.
+- **I2 consume + create atomicity**: no account without a consumed invite and no consumed invite without an account (one transaction).
+- **I3 expired invite rejected**.
+- **I4 closed registration without invite rejected**.
+
+### Group J — favorites and emoji (cases land with WP7/WP8)
+
+- **J1 favorite uniqueness** per (account, note) under concurrency.
+- **J2 emoji shortcode unique case-insensitively** (account-handle rule, C2).
+- **J3 favorite delete leaves the note**.
