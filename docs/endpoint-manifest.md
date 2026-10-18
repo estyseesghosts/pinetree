@@ -466,3 +466,18 @@ Storage: `AbuseReportStore` port (required, no defaults) + redb `abuse_reports` 
 Flag delivery: `FederateDeliverPayload::Flag` → `render_flag_activity` (type Flag, actor = system actor, content = report comment, object = reported account URI) → existing SSRF-guarded delivery path.
 
 DIVERGENCES: notifications (admin stream/email/webhook) skipped; admins poll. Reporter host always null (local reports only). Origin filters are accepted but applied at storage scan level (no host column resolution beyond account id).
+
+## §25 — Instance blocks (Batch M WP5)
+
+Behavior (no new endpoints; reuses `admin/update-meta` and `admin/meta`):
+- `admin/update-meta` accepts `blockedHosts` (already wired in §22/§23): list is normalized via `InstanceSettings::normalize_blocked_hosts` (trim, lowercase, dedup, empty-drop). Replaces the whole list.
+- `admin/meta` returns `blockedHosts` from the store.
+
+Semantics (upstream `UtilityService.isBlockedHost`): a host is blocked when it equals a blocked entry OR is a subdomain (`host` ends with `.` + blocked entry). Matching is case-insensitive (entries stored lowercased). Subdomain matching applies consistently in:
+- Read path: notes whose author, reply author, or renote author sits on a blocked host (or subdomain) are hidden (`queries.rs` `suspended_or_host_blocked`, all three author slots, upstream `FanoutTimelineEndpointService.ts:145–148`). Restored on unblock with no data loss.
+- Inbound: activities from a blocked host (or subdomain) are dropped before any state write or dedup record (all activity types: Create, Update, Delete, Like, Follow, Block, actor update). No dedup row is written, so re-sending after unblock is processed.
+- Outbound: delivery-time check in `federation/outbox.rs` `deliver_single`; deliveries to blocked hosts are skipped and the job completes (`Delivered`) rather than retrying.
+
+Storage: `InstanceSettingsStore::get/update` (required, no defaults) + `InstanceSettings::blocked_hosts`. `queries.rs::blocked_hosts()` now reads the store (no second copy).
+
+DIVERGENCES: none new. `federation/instances` endpoint (upstream) not implemented (optional; skipped, recorded here).

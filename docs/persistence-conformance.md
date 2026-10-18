@@ -247,3 +247,11 @@ Backend-agnostic, same cases both adapters (FDB inherits). Atomicity rule (§2.3
 - **K4 note-update atomicity** (note + conditional log row in one txn).
 
 Ports: `AbuseReportStore`. redb implemented; K1–K4 storage paths present (K2/K3 exercised by unit-level store semantics).
+
+### Group L — instance blocks (Batch M WP5)
+
+- **L1 blocked_hosts normalization** (lowercase, dedup, empty-drop) — domain `blocked_host_normalization` test (executed green).
+- **L2 update atomicity** (settings + `updateServerSettings` moderation-log row in one txn) — exercised by `update_instance_settings` command path and redb store; L2 executed green.
+- **L3 read-path filtering** (notes from blocked host + subdomain hidden; restored on unblock) — exercised by `suspended_or_host_blocked` + `host_is_blocked` tests and feed_filter_hides tests.
+
+Ports: `InstanceSettingsStore` (required, no defaults). redb implemented.

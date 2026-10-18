@@ -18,6 +18,9 @@ impl AppServices {
         followee_id: &str,
         with_replies: bool,
     ) -> Result<Option<Follow>, PortError> {
+        if self.inbound_host_blocked(follower_id) {
+            return Ok(None);
+        }
         let locked_local = self
             .accounts
             .find_by_id(followee_id)?
@@ -126,6 +129,9 @@ impl AppServices {
         follower_id: &str,
         followee_id: &str,
     ) -> Result<bool, PortError> {
+        if self.inbound_host_blocked(follower_id) {
+            return Ok(false);
+        }
         let jobs = vec![self.streaming_job(
             &StreamingEvent::Unfollowed {
                 follower_id: follower_id.to_string(),
@@ -154,6 +160,9 @@ impl AppServices {
         followee_id: &str,
         with_replies: bool,
     ) -> Result<Option<Follow>, PortError> {
+        if self.inbound_host_blocked(follower_id) {
+            return Ok(None);
+        }
         let jobs = vec![self.streaming_job(
             &StreamingEvent::MeUpdated {
                 account_id: followee_id.to_string(),

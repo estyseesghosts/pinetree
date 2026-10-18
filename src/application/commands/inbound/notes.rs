@@ -20,6 +20,10 @@ impl AppServices {
         input: CreateNoteInput,
         extra_jobs: Vec<NewJob>,
     ) -> Result<Option<Note>, PortError> {
+        // Instance block (WP5): drop before any state write or dedup record.
+        if self.inbound_host_blocked(&input.author_id) {
+            return Ok(None);
+        }
         let mut jobs = Vec::new();
         // One `Notify` per user (mirrors the local `create_note` dedup):
         // a remote note that is both a reply and a mention must not emit
@@ -244,6 +248,9 @@ impl AppServices {
         note_id: &str,
         reaction: &str,
     ) -> Result<Option<Reaction>, PortError> {
+        if self.inbound_host_blocked(user_id) {
+            return Ok(None);
+        }
         let note = match self.notes.get_note(note_id)? {
             None => return Err(PortError::NotFound("NO_SUCH_NOTE".to_string())),
             Some(note) => note,

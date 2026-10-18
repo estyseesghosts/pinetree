@@ -353,6 +353,9 @@ fn handle_follow(
         return Ok(accepted());
     };
     let follower = resolve_remote_account(services, actor_uri)?;
+    if services.inbound_host_blocked(&follower.id) {
+        return Ok(accepted());
+    }
     let Some(followee) = resolve_local_account(services, &object_uri)? else {
         return Ok(accepted());
     };
@@ -375,6 +378,9 @@ fn handle_block(
         return Ok(accepted());
     };
     let blocker = resolve_remote_account(services, actor_uri)?;
+    if services.inbound_host_blocked(&blocker.id) {
+        return Ok(accepted());
+    }
     let Some(blockee) = resolve_local_account(services, &object_uri)? else {
         return Ok(accepted());
     };
@@ -685,6 +691,9 @@ fn handle_undo(
                 return Ok(accepted());
             }
             let actor_account = resolve_remote_account(services, actor_uri)?;
+            if services.inbound_host_blocked(&actor_account.id) {
+                return Ok(accepted());
+            }
             match find_note_by_uri(services, uri)? {
                 Some(note)
                     if note.author_id == actor_account.id && note.renote_id.is_some() =>
@@ -727,6 +736,9 @@ fn handle_undo(
                 }
                 "Like" => {
                     let liker = resolve_remote_account(services, actor_uri)?;
+                    if services.inbound_host_blocked(&liker.id) {
+                        return Ok(accepted());
+                    }
                     let Some(target_uri) = extract_object_uri(map.get("object")) else {
                         return Ok(accepted());
                     };
@@ -835,6 +847,9 @@ fn handle_create(
         return Ok(unauthorized());
     }
     let author = resolve_remote_account(services, actor_uri)?;
+    if services.inbound_host_blocked(&author.id) {
+        return Ok(accepted());
+    }
     // §4 remote votes (Misskey `ApNoteService` vote branch parity): a
     // content-less `Create(Note)` carrying `inReplyTo` (the poll note) plus
     // `name` (the choice text) records a vote instead of a note. Misskey

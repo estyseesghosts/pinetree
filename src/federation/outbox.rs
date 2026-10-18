@@ -1334,6 +1334,16 @@ fn deliver_single(
     inbox_url: &str,
     activity: &Value,
 ) -> Result<DeliveryOutcome, PortError> {
+    // Instance block (WP5): check at delivery time, not enqueue time. Skip
+    // without failing the job so it completes rather than retrying.
+    if let Some(host) = crate::federation::host_caps::host_of_url(inbox_url) {
+        if crate::domain::instance::host_is_blocked(&services.blocked_hosts(), &host) {
+            crate::fed_debug!(
+                "out skip inbox={inbox_url:?} reason=blocked-host"
+            );
+            return Ok(DeliveryOutcome::Delivered);
+        }
+    }
     let now_ms = services.clock.now_ms();
     let kind = activity.get("type").and_then(Value::as_str).unwrap_or("?");
     if let Some(until_ms) = tracker.cooldown_until(inbox_url, now_ms) {

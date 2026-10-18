@@ -122,11 +122,26 @@ impl AppServices {
     }
 
     /// Instance-level blocked hosts (§0A `generateBlockedHostQueryForNote`
-    /// parity). Pinetree has no instance block list yet (no `blockedHosts`
-    /// config); this is the single extension point §1–2 read when one
-    /// lands. Always empty today.
+    /// parity). Reads the store (Batch M WP5); entries are already
+    /// normalized (lowercased, deduped, empties dropped).
     pub fn blocked_hosts(&self) -> Vec<String> {
-        Vec::new()
+        self.instance_settings.get().map(|s| s.blocked_hosts).unwrap_or_default()
+    }
+
+    /// True when `account_id` sits on a blocked host (or subdomain).
+    /// Used by inbound handlers to drop before any state write or dedup
+    /// record (Batch M WP5). Fail-open on lookup errors.
+    pub fn inbound_host_blocked(&self, account_id: &str) -> bool {
+        match self.accounts.find_by_id(account_id) {
+            Ok(Some(acc)) => {
+                if let Some(host) = acc.host.as_deref() {
+                    crate::domain::instance::host_is_blocked(&self.blocked_hosts(), host)
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
     }
 
     /// True when `note` must be hidden from the filter's viewer (§0A;
@@ -261,7 +276,7 @@ impl AppServices {
                 return Ok(true);
             }
             if let Some(host) = account.host.as_deref() {
-                if blocked_hosts.iter().any(|h| h == host) {
+                if crate::domain::instance::host_is_blocked(&blocked_hosts, host) {
                     return Ok(true);
                 }
             }

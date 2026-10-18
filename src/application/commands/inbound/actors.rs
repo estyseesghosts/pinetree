@@ -11,6 +11,9 @@ impl AppServices {
         account_id: &str,
         patch: UpdateAccountPatch,
     ) -> Result<Option<Account>, PortError> {
+        if self.inbound_host_blocked(account_id) {
+            return Ok(None);
+        }
         self.dedup
             .record_update_account_activity(activity_id, account_id, patch, vec![])
     }
