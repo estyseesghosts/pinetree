@@ -102,6 +102,12 @@ impl RateLimiter {
             .with_limit("drive/files/find-by-hash", 60, HOUR_MS, None)
             // Upstream `users/lists/push.ts` 1h/30 rate bucket.
             .with_limit("users/lists/push", 30, HOUR_MS, None)
+            // Federated clips + pages handoff (upstream buckets):
+            // `clips/add-note` 20/h, `pages/create` 10/h, `pages/update`
+            // 300/h.
+            .with_limit("clips/add-note", 20, HOUR_MS, None)
+            .with_limit("pages/create", 10, HOUR_MS, None)
+            .with_limit("pages/update", 300, HOUR_MS, None)
             .with_limit("blocking/create", 20, HOUR_MS, None)
             .with_limit("blocking/delete", 100, HOUR_MS, None)
             .with_limit("mute/create", 20, HOUR_MS, None)

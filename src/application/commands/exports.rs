@@ -27,11 +27,12 @@
 //! - Remote users are resolved from the local account store only: pinetree
 //!   has no remote-user resolver, so unresolvable rows are skipped (upstream
 //!   fetches them over federation).
-//! - User lists and clips have no subsystem in
-//!   pinetree (no stores). Their export endpoints ship Misskey-shaped but
-//!   empty files, and their import endpoints parse + validate rows but apply
-//!   zero rows. Favorites (Batch N WS2) and antennas (Batch N WS4) have
-//!   subsystems and export/import real rows.
+//! - User lists have a subsystem and export/import real rows. Clips have
+//!   one too (federated clips + pages handoff, Phase 1): `export-clips`
+//!   writes the upstream `serializeClip` shape, and the pinetree-only
+//!   `i/import-clips` consumes that same shape (find-or-create by name;
+//!   upstream has no import-clips endpoint). Favorites (Batch N WS2) and
+//!   antennas (Batch N WS4) have subsystems and export/import real rows.
 //! - Drive upload dedups on content (`force == false`, unlike upstream
 //!   `force: true`) so a crashed-and-retried export converges on the same
 //!   file instead of orphaning a duplicate.
@@ -239,6 +240,17 @@ impl AppServices {
                     user.id,
                 );
             }
+            // pinetree-only clip import (no upstream endpoint exists):
+            // consume our own `export-clips` format — find-or-create each
+            // clip by name, attach resolvable + visible notes.
+            ImportEntity::Clips => {
+                let text = String::from_utf8_lossy(&bytes);
+                let (applied, skipped) = self.apply_clip_import(&user.id, &text)?;
+                eprintln!(
+                    "import-clips for {}: applied={applied} skipped={skipped}",
+                    user.id,
+                );
+            }
         }
         Ok(())
     }
@@ -426,9 +438,89 @@ impl AppServices {
                     PortError::StorageUnavailable(format!("export antennas serialize failed: {e}"))
                 })
             }
-            // No clip subsystem: valid empty JSON array (upstream writes
-            // `[` + `]` for zero clips).
-            ExportEntity::Clips => Ok(b"[]".to_vec()),            // Favorites now have a subsystem: JSON array of
+            // Clips now have a subsystem (federated clips + pages handoff,
+            // Phase 1): JSON array of upstream
+            // `serializeClip`/`serializeClipNote` shape — `{id, name,
+            // description, lastClippedAt, clipNotes: [{id, createdAt,
+            // note: {...}}]}` — id-ASC order. Notes invisible to the
+            // exporter or gone are skipped (visibility-query parity);
+            // federation columns (`tier`, `federate`, approvers) are never
+            // exported (local backup format, not a federation vector).
+            ExportEntity::Clips => {
+                let mut clips = self.clips.clips_by_owner(user_id)?;
+                clips.sort_by(|a, b| a.id.cmp(&b.id));
+                let mut items = Vec::with_capacity(clips.len());
+                for clip in &clips {
+                    let mut clip_notes = Vec::new();
+                    for note_id in self.clips.clip_note_ids(&clip.id)? {
+                        let Some(note) = self.notes.get_note(&note_id)? else {
+                            continue;
+                        };
+                        if note.is_deleted {
+                            continue;
+                        }
+                        if !self.note_visible_to(&note, user_id)? {
+                            continue;
+                        }
+                        let Some(author) = self.accounts.find_by_id(&note.author_id)? else {
+                            continue;
+                        };
+                        let note_created_at = self
+                            .ids
+                            .parse_time(&note.id)
+                            .map(crate::activitypub::format_millis)
+                            .unwrap_or_else(|_| {
+                                crate::activitypub::format_millis(self.now_ms())
+                            });
+                        let poll = match self.polls.get_poll(&note.id)? {
+                            Some(p) => serde_json::json!({
+                                "choices": p.choices,
+                                "votes": p.votes,
+                                "multiple": p.multiple,
+                                "expiresAt": p.expires_at_ms.map(crate::activitypub::format_millis),
+                            }),
+                            None => serde_json::Value::Null,
+                        };
+                        clip_notes.push(serde_json::json!({
+                            "id": format!("export-{}-{}", clip.id, note.id),
+                            "createdAt": note_created_at,
+                            "note": {
+                                "id": note.id,
+                                "text": note.text,
+                                "createdAt": note_created_at,
+                                "fileIds": note.file_ids,
+                                "replyId": note.reply_id,
+                                "renoteId": note.renote_id,
+                                "poll": poll,
+                                "cw": note.cw,
+                                "visibility": note.visibility,
+                                "visibleUserIds": note.visible_user_ids,
+                                "localOnly": note.local_only,
+                                "reactionAcceptance": note.reaction_acceptance,
+                                "uri": note.uri,
+                                "url": note.url,
+                                "user": {
+                                    "id": author.id,
+                                    "name": author.display_name,
+                                    "username": author.username,
+                                    "host": author.host,
+                                    "uri": author.uri,
+                                },
+                            },
+                        }));
+                    }
+                    items.push(serde_json::json!({
+                        "id": clip.id,
+                        "name": clip.name,
+                        "description": clip.description,
+                        "lastClippedAt": clip.last_clipped_at_ms.map(crate::activitypub::format_millis),
+                        "clipNotes": clip_notes,
+                    }));
+                }
+                serde_json::to_vec(&items).map_err(|e| {
+                    PortError::StorageUnavailable(format!("export clips serialize failed: {e}"))
+                })
+            }            // Favorites now have a subsystem: JSON array of
             // `{id, createdAt, note: {...}}` (upstream
             // `ExportFavoritesProcessorService.serialize` parity), id-ASC
             // order. Invisible/gone notes are skipped (visibility query
@@ -690,9 +782,11 @@ impl AppServices {
                     .mute(user_id, &target_id, None)
                     .map(|_| ())
                     .map_err(skip_as_skipped),
-                ImportEntity::UserLists | ImportEntity::Antennas => unreachable!(
-                    "apply_relation_import only serves Following/Blocking/Muting"
-                ),
+                ImportEntity::UserLists | ImportEntity::Antennas | ImportEntity::Clips => {
+                    unreachable!(
+                        "apply_relation_import only serves Following/Blocking/Muting"
+                    )
+                }
             };
             match outcome {
                 Ok(()) => applied += 1,
@@ -939,6 +1033,119 @@ impl AppServices {
         Ok((applied, skipped))
     }
 
+    /// Read-time visibility of one note for the exporter/importer
+    /// (export-clips visibility-query parity): local-user viewer with the
+    /// real follow edge.
+    fn note_visible_to(
+        &self,
+        note: &crate::domain::note::Note,
+        viewer_id: &str,
+    ) -> Result<bool, PortError> {
+        use crate::domain::visibility::{ViewerContext, is_visible};
+        let follows = note.author_id == viewer_id
+            || self.follows.is_following(viewer_id, &note.author_id)?;
+        Ok(is_visible(note, &ViewerContext::local_user(viewer_id, follows)))
+    }
+
+    /// pinetree-only clip import (no upstream endpoint exists): consume our
+    /// own `export-clips` JSON (`[{name, description?, clipNotes?}]`).
+    /// Each entry find-or-creates the caller's clip by name (first match
+    /// wins; invalid entries skip); each member note attaches when the
+    /// note exists, is not deleted, and is visible to the importer
+    /// (per-row try/catch parity — only storage faults abort). `applied`
+    /// counts clips created + notes attached; `skipped` counts invalid
+    /// entries + unattachable notes.
+    fn apply_clip_import(&self, user_id: &str, text: &str) -> Result<(usize, usize), PortError> {
+        let parsed: serde_json::Value = match serde_json::from_str(text) {
+            Ok(value) => value,
+            Err(_) => return Ok((0, 1)),
+        };
+        let entries = match parsed.as_array() {
+            Some(entries) => entries,
+            None => return Ok((0, 1)),
+        };
+        let mut applied = 0usize;
+        let mut skipped = 0usize;
+        for entry in entries {
+            let Some(map) = entry.as_object() else {
+                skipped += 1;
+                continue;
+            };
+            let Some(name) = map.get("name").and_then(|v| v.as_str()) else {
+                skipped += 1;
+                continue;
+            };
+            if crate::domain::clip::Clip::validate_name(name).is_err() {
+                skipped += 1;
+                continue;
+            }
+            let description = map
+                .get("description")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            // Find-or-create by name (upstream user-list import parity:
+            // names are not unique, first match wins).
+            let clip = match self
+                .clips
+                .clips_by_owner(user_id)?
+                .into_iter()
+                .find(|c| c.name == name)
+            {
+                Some(clip) => clip,
+                None => match self.create_clip(
+                    user_id,
+                    name.to_string(),
+                    false,
+                    description,
+                    None,
+                    false,
+                    Vec::new(),
+                ) {
+                    Ok(clip) => {
+                        applied += 1;
+                        clip
+                    }
+                    Err(e @ PortError::StorageUnavailable(_)) => return Err(e),
+                    Err(_) => {
+                        skipped += 1;
+                        continue;
+                    }
+                },
+            };
+            let members = map
+                .get("clipNotes")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            for member in &members {
+                let note_id = member
+                    .get("note")
+                    .and_then(|n| n.get("id"))
+                    .and_then(|v| v.as_str())
+                    .or_else(|| member.get("noteId").and_then(|v| v.as_str()));
+                let Some(note_id) = note_id else {
+                    skipped += 1;
+                    continue;
+                };
+                let visible = match self.notes.get_note(note_id)? {
+                    Some(note) if !note.is_deleted => self.note_visible_to(&note, user_id)?,
+                    _ => false,
+                };
+                if !visible {
+                    skipped += 1;
+                    continue;
+                }
+                match self.add_clip_note(user_id, &clip.id, note_id) {
+                    Ok(()) => applied += 1,
+                    Err(e @ PortError::StorageUnavailable(_)) => return Err(e),
+                    Err(_) => skipped += 1,
+                }
+            }
+        }
+        Ok((applied, skipped))
+    }
+
     /// Apply user-list import rows (`listName,acct[,key=value]`, upstream
     /// `ImportUserListsProcessorService` parity): find-or-create the
     /// caller's list by name, resolve the acct locally (remote/unresolvable
@@ -1081,6 +1288,7 @@ fn import_entity_tag(entity: ImportEntity) -> &'static str {
         ImportEntity::Muting => "muting",
         ImportEntity::UserLists => "user-lists",
         ImportEntity::Antennas => "antennas",
+        ImportEntity::Clips => "clips",
     }
 }
 

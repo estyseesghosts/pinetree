@@ -168,6 +168,46 @@ pub const DRIVE_SHOW_FILE_NO_SUCH_FILE_ID: &str = "caf3ca38-c6e5-472e-a30c-b0537
 pub const CANNOT_REPLY_TO_A_PURE_RENOTE_ID: &str = "3ac74a84-8fd5-4bb0-870f-01804f82ce15";
 pub const CANNOT_CREATE_ALREADY_EXPIRED_SCHEDULE_ID: &str = "8a9bfb90-fc7e-4878-a3e8-d97faaf5fb07";
 pub const SCHEDULE_NOTE_MAX_ID: &str = "168707c3-e7da-4031-989e-f42aa3a274b2";
+/// Misskey `clips/*` idents (verbatim upstream UUIDs; federated clips +
+/// pages handoff, Phase 1). One UUID per endpoint per code (upstream
+/// convention): `NO_SUCH_CLIP` has a different UUID on every endpoint.
+pub const CLIP_CREATE_TOO_MANY_ID: &str = "920f7c2d-6208-4b76-8082-e632020f5883";
+pub const CLIP_UPDATE_NO_SUCH_CLIP_ID: &str = "b4d92d70-b216-46fa-9a3f-a8c811699257";
+pub const CLIP_DELETE_NO_SUCH_CLIP_ID: &str = "70ca08ba-6865-4630-b6fb-8494759aa754";
+pub const CLIP_SHOW_NO_SUCH_CLIP_ID: &str = "c3c5fe33-d62c-44d2-9ea5-d997703f5c20";
+pub const CLIP_NOTES_NO_SUCH_CLIP_ID: &str = "1d7645e6-2b6d-4635-b0fe-fe22b0e72e00";
+pub const CLIP_ADD_NOTE_NO_SUCH_CLIP_ID: &str = "d6e76cc0-a1b5-4c7c-a287-73fa9c716dcf";
+pub const CLIP_ADD_NOTE_NO_SUCH_NOTE_ID: &str = "fc8c0b49-c7a3-4664-a0a6-b418d386bb8b";
+pub const CLIP_ALREADY_CLIPPED_ID: &str = "734806c4-542c-463a-9311-15c512803965";
+pub const CLIP_TOO_MANY_CLIP_NOTES_ID: &str = "f0dba960-ff73-4615-8df4-d6ac5d9dc118";
+pub const CLIP_REMOVE_NOTE_NO_SUCH_CLIP_ID: &str = "b80525c6-97f7-49d7-a42d-ebccd49cfd52";
+pub const CLIP_REMOVE_NOTE_NO_SUCH_NOTE_ID: &str = "aff017de-190e-434b-893e-33a9ff5049d8";
+pub const CLIP_FAVORITE_NO_SUCH_CLIP_ID: &str = "4c2aaeae-80d8-4250-9606-26cb1fdb77a5";
+pub const CLIP_ALREADY_FAVORITED_ID: &str = "92658936-c625-4273-8326-2d790129256e";
+pub const CLIP_UNFAVORITE_NO_SUCH_CLIP_ID: &str = "2603966e-b865-426c-94a7-af4a01241dc1";
+pub const CLIP_NOT_FAVORITED_ID: &str = "90c3a9e8-b321-4dae-bf57-2bf79bbcc187";
+/// Misskey `pages/*` idents (verbatim upstream UUIDs; federated clips +
+/// pages handoff, Phase 3 local). One UUID per endpoint per code.
+pub const PAGE_CREATE_NO_SUCH_FILE_ID: &str = "b7b97489-0f66-4b12-a5ff-b21bd63f6e1c";
+pub const PAGE_CREATE_NAME_ALREADY_EXISTS_ID: &str = "4650348e-301c-499a-83c9-6aa988c66bc1";
+pub const PAGE_UPDATE_NO_SUCH_PAGE_ID: &str = "21149b9e-3616-4778-9592-c4ce89f5a864";
+pub const PAGE_UPDATE_ACCESS_DENIED_ID: &str = "3c15cd52-3b4b-4274-967d-6456fc4f792b";
+pub const PAGE_UPDATE_NO_SUCH_FILE_ID: &str = "cfc23c7c-3887-490e-af30-0ed576703c82";
+pub const PAGE_UPDATE_NAME_ALREADY_EXISTS_ID: &str = "2298a392-d4a1-44c5-9ebb-ac1aeaa5a9ab";
+pub const PAGE_DELETE_NO_SUCH_PAGE_ID: &str = "eb0c6e1d-d519-4764-9486-52a7e1c6392a";
+pub const PAGE_DELETE_ACCESS_DENIED_ID: &str = "8b741b3e-2c22-44b3-a15f-29949aa1601e";
+pub const PAGE_SHOW_NO_SUCH_PAGE_ID: &str = "222120c0-3ead-4528-811b-b96f233388d7";
+pub const PAGE_LIKE_NO_SUCH_PAGE_ID: &str = "cc98a8a2-0dc3-4123-b198-62c71df18ed3";
+pub const PAGE_YOUR_PAGE_ID: &str = "28800466-e6db-40f2-8fae-bf9e82aa92b8";
+pub const PAGE_ALREADY_LIKED_ID: &str = "d4c1edbe-7da2-4eae-8714-1acfd2d63941";
+pub const PAGE_UNLIKE_NO_SUCH_PAGE_ID: &str = "a0d41e20-1993-40bd-890e-f6e560ae648e";
+pub const PAGE_NOT_LIKED_ID: &str = "f5e586b0-ce93-4050-b0e3-7f31af5259ee";
+/// pinetree `i/import-clips` idents (no upstream endpoint exists; the
+/// import consumes the pinetree export format, so these UUIDs are
+/// pinetree-fixed and never change).
+pub const IMPORT_CLIPS_NO_SUCH_FILE_ID: &str = "7c1d9e02-4b5a-4f6e-9d1a-2c3e5f6a7b81";
+pub const IMPORT_CLIPS_EMPTY_FILE_ID: &str = "8d2e0f13-5c6b-4a7f-8e2b-3d4f6a7b8c92";
+pub const IMPORT_CLIPS_TOO_BIG_FILE_ID: &str = "9e3f1a24-6d7c-4b8a-9f3c-4e5a6b7c9da3";
 /// Sharkey per-endpoint UUIDs (same wire code as a pinetree code, different
 /// endpoint UUID — verbatim per the handoff).
 pub const SHARKEY_CANNOT_RERENOTE_ID: &str = "fd4cc33e-2a37-48dd-99cc-9b806eb2031a";
@@ -384,6 +424,7 @@ impl ApiError {
             "i/import-muting" => IMPORT_MUTING_NO_SUCH_FILE_ID,
             "i/import-user-lists" => IMPORT_USER_LISTS_NO_SUCH_FILE_ID,
             "i/import-antennas" => IMPORT_ANTENNAS_NO_SUCH_FILE_ID,
+            "i/import-clips" => IMPORT_CLIPS_NO_SUCH_FILE_ID,
             _ => NO_SUCH_FILE_ID,
         };
         Self::client("No such file.", "NO_SUCH_FILE", id, 400)
@@ -398,6 +439,7 @@ impl ApiError {
             "i/import-muting" => IMPORT_MUTING_EMPTY_FILE_ID.to_string(),
             "i/import-user-lists" => IMPORT_USER_LISTS_EMPTY_FILE_ID.to_string(),
             "i/import-antennas" => IMPORT_ANTENNAS_EMPTY_FILE_ID.to_string(),
+            "i/import-clips" => IMPORT_CLIPS_EMPTY_FILE_ID.to_string(),
             _ => new_id_for("EMPTY_FILE"),
         };
         Self::client("That file is empty.", "EMPTY_FILE", &id, 400)
@@ -412,6 +454,7 @@ impl ApiError {
             "i/import-following" => IMPORT_FOLLOWING_TOO_BIG_FILE_ID.to_string(),
             "i/import-muting" => IMPORT_MUTING_TOO_BIG_FILE_ID.to_string(),
             "i/import-user-lists" => IMPORT_USER_LISTS_TOO_BIG_FILE_ID.to_string(),
+            "i/import-clips" => IMPORT_CLIPS_TOO_BIG_FILE_ID.to_string(),
             _ => new_id_for("TOO_BIG_FILE"),
         };
         Self::client("That file is too big.", "TOO_BIG_FILE", &id, 400)
@@ -804,6 +847,167 @@ impl ApiError {
     /// verbatim UUID `caf3ca38-…`).
     pub fn drive_show_file_no_such_file() -> Self {
         Self::client("No such file.", "NO_SUCH_FILE", DRIVE_SHOW_FILE_NO_SUCH_FILE_ID, 400)
+    }
+
+    /// Misskey `clips/*` `NO_SUCH_CLIP` (`No such clip.`, verbatim
+    /// per-endpoint UUID — upstream assigns one UUID per endpoint).
+    pub fn clip_no_such_clip(endpoint: &str) -> Self {
+        let id = match endpoint {
+            "clips/create" => CLIP_CREATE_TOO_MANY_ID,
+            "clips/update" => CLIP_UPDATE_NO_SUCH_CLIP_ID,
+            "clips/delete" => CLIP_DELETE_NO_SUCH_CLIP_ID,
+            "clips/show" => CLIP_SHOW_NO_SUCH_CLIP_ID,
+            "clips/notes" => CLIP_NOTES_NO_SUCH_CLIP_ID,
+            "clips/add-note" => CLIP_ADD_NOTE_NO_SUCH_CLIP_ID,
+            "clips/remove-note" => CLIP_REMOVE_NOTE_NO_SUCH_CLIP_ID,
+            "clips/favorite" => CLIP_FAVORITE_NO_SUCH_CLIP_ID,
+            "clips/unfavorite" => CLIP_UNFAVORITE_NO_SUCH_CLIP_ID,
+            _ => CLIP_SHOW_NO_SUCH_CLIP_ID,
+        };
+        // `clips/create` never emits `NO_SUCH_CLIP` (it emits
+        // `TOO_MANY_CLIPS`); the arm above is unreachable defensively.
+        Self::client("No such clip.", "NO_SUCH_CLIP", id, 400)
+    }
+
+    /// Misskey `clips/create` `TOO_MANY_CLIPS` (verbatim).
+    pub fn clip_too_many_clips() -> Self {
+        Self::client(
+            "You cannot create clip any more.",
+            "TOO_MANY_CLIPS",
+            CLIP_CREATE_TOO_MANY_ID,
+            400,
+        )
+    }
+
+    /// Misskey `clips/{add-note,remove-note}` `NO_SUCH_NOTE` (`No such
+    /// note.`, verbatim per-endpoint UUID).
+    pub fn clip_no_such_note(endpoint: &str) -> Self {
+        let id = match endpoint {
+            "clips/remove-note" => CLIP_REMOVE_NOTE_NO_SUCH_NOTE_ID,
+            _ => CLIP_ADD_NOTE_NO_SUCH_NOTE_ID,
+        };
+        Self::client("No such note.", "NO_SUCH_NOTE", id, 400)
+    }
+
+    /// Misskey `clips/add-note` `ALREADY_CLIPPED` (verbatim).
+    pub fn clip_already_clipped() -> Self {
+        Self::client(
+            "The note has already been clipped.",
+            "ALREADY_CLIPPED",
+            CLIP_ALREADY_CLIPPED_ID,
+            400,
+        )
+    }
+
+    /// Misskey `clips/add-note` `TOO_MANY_CLIP_NOTES` (verbatim).
+    pub fn clip_too_many_clip_notes() -> Self {
+        Self::client(
+            "You cannot add notes to the clip any more.",
+            "TOO_MANY_CLIP_NOTES",
+            CLIP_TOO_MANY_CLIP_NOTES_ID,
+            400,
+        )
+    }
+
+    /// Misskey `clips/favorite` `ALREADY_FAVORITED` (verbatim).
+    pub fn clip_already_favorited() -> Self {
+        Self::client(
+            "The clip has already been favorited.",
+            "ALREADY_FAVORITED",
+            CLIP_ALREADY_FAVORITED_ID,
+            400,
+        )
+    }
+
+    /// Misskey `clips/unfavorite` `NOT_FAVORITED` (verbatim).
+    pub fn clip_not_favorited() -> Self {
+        Self::client(
+            "You have not favorited the clip.",
+            "NOT_FAVORITED",
+            CLIP_NOT_FAVORITED_ID,
+            400,
+        )
+    }
+
+    /// Misskey `pages/*` `NO_SUCH_PAGE` (`No such page.`, verbatim
+    /// per-endpoint UUID).
+    pub fn page_no_such_page(endpoint: &str) -> Self {
+        let id = match endpoint {
+            "pages/create" => PAGE_CREATE_NO_SUCH_FILE_ID,
+            "pages/update" => PAGE_UPDATE_NO_SUCH_PAGE_ID,
+            "pages/delete" => PAGE_DELETE_NO_SUCH_PAGE_ID,
+            "pages/show" => PAGE_SHOW_NO_SUCH_PAGE_ID,
+            "pages/like" => PAGE_LIKE_NO_SUCH_PAGE_ID,
+            "pages/unlike" => PAGE_UNLIKE_NO_SUCH_PAGE_ID,
+            _ => PAGE_SHOW_NO_SUCH_PAGE_ID,
+        };
+        // `pages/create` never emits `NO_SUCH_PAGE`; defensive arm only.
+        Self::client("No such page.", "NO_SUCH_PAGE", id, 400)
+    }
+
+    /// Misskey `pages/{update,delete}` `ACCESS_DENIED` (`Access denied.`,
+    /// verbatim per-endpoint UUID).
+    pub fn page_access_denied(endpoint: &str) -> Self {
+        let id = match endpoint {
+            "pages/delete" => PAGE_DELETE_ACCESS_DENIED_ID,
+            _ => PAGE_UPDATE_ACCESS_DENIED_ID,
+        };
+        Self::permission("Access denied.", "ACCESS_DENIED", id, 403)
+    }
+
+    /// Misskey `pages/{create,update}` `NO_SUCH_FILE` (`No such file.`,
+    /// verbatim per-endpoint UUID — the eye-catch image must be owned).
+    pub fn page_no_such_file(endpoint: &str) -> Self {
+        let id = match endpoint {
+            "pages/update" => PAGE_UPDATE_NO_SUCH_FILE_ID,
+            _ => PAGE_CREATE_NO_SUCH_FILE_ID,
+        };
+        Self::client("No such file.", "NO_SUCH_FILE", id, 400)
+    }
+
+    /// Misskey `pages/{create,update}` `NAME_ALREADY_EXISTS` (`Specified
+    /// name already exists.`, verbatim per-endpoint UUID).
+    pub fn page_name_already_exists(endpoint: &str) -> Self {
+        let id = match endpoint {
+            "pages/update" => PAGE_UPDATE_NAME_ALREADY_EXISTS_ID,
+            _ => PAGE_CREATE_NAME_ALREADY_EXISTS_ID,
+        };
+        Self::client(
+            "Specified name already exists.",
+            "NAME_ALREADY_EXISTS",
+            id,
+            400,
+        )
+    }
+
+    /// Misskey `pages/like` `YOUR_PAGE` (verbatim).
+    pub fn page_your_page() -> Self {
+        Self::client(
+            "You cannot like your page.",
+            "YOUR_PAGE",
+            PAGE_YOUR_PAGE_ID,
+            400,
+        )
+    }
+
+    /// Misskey `pages/like` `ALREADY_LIKED` (verbatim).
+    pub fn page_already_liked() -> Self {
+        Self::client(
+            "The page has already been liked.",
+            "ALREADY_LIKED",
+            PAGE_ALREADY_LIKED_ID,
+            400,
+        )
+    }
+
+    /// Misskey `pages/unlike` `NOT_LIKED` (verbatim).
+    pub fn page_not_liked() -> Self {
+        Self::client(
+            "You have not liked that page.",
+            "NOT_LIKED",
+            PAGE_NOT_LIKED_ID,
+            400,
+        )
     }
 
     /// 500 `INTERNAL_ERROR`.

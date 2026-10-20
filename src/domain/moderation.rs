@@ -63,6 +63,8 @@ pub enum ModerationAction {
     /// `deleteAllFilesOfAUser` — pinetree action name (upstream
     /// `admin/delete-all-files-of-a-user` writes no log row).
     DeleteAllFilesOfAUser,
+    /// `deletePage` (upstream; moderator page deletes log it).
+    DeletePage,
 }
 
 impl ModerationAction {
@@ -88,6 +90,7 @@ impl ModerationAction {
             Self::UnsetUserAvatar => "unsetUserAvatar",
             Self::UnsetUserBanner => "unsetUserBanner",
             Self::DeleteAllFilesOfAUser => "deleteAllFilesOfAUser",
+            Self::DeletePage => "deletePage",
         }
     }
 
@@ -113,6 +116,7 @@ impl ModerationAction {
             "unsetUserAvatar" => Self::UnsetUserAvatar,
             "unsetUserBanner" => Self::UnsetUserBanner,
             "deleteAllFilesOfAUser" => Self::DeleteAllFilesOfAUser,
+            "deletePage" => Self::DeletePage,
             _ => return None,
         })
     }

@@ -1834,6 +1834,8 @@ mod timeline_tests {
             signin: store.clone(),
             password_resets: store.clone(),
             registry: store.clone(),
+            clips: store.clone(),
+            pages: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()

@@ -26,6 +26,7 @@ use http_body_util::{BodyExt, Limited};
 use serde_json::{Map, Value};
 
 use crate::activitypub::{actor as ap_actor, objects as ap_objects, webfinger as ap_webfinger};
+use crate::activitypub::federated_collections as ap_collections;
 use crate::application::commands::invites::SignupRejection;
 use crate::application::commands::pins::FeaturedCache;
 use crate::application::commands::AppServices;
@@ -60,10 +61,10 @@ use super::auth::{
 };
 use super::errors::ApiError;
 use super::packers::{
-    pack_abuse_report, pack_antenna, pack_blocking, pack_drive_file, pack_emoji_detailed, pack_emoji_simple,
+    pack_abuse_report, pack_antenna, pack_blocking, pack_clip, pack_drive_file, pack_emoji_detailed, pack_emoji_simple,
     pack_following, pack_invite_code, pack_me_detailed,
     pack_meta, pack_moderation_log, pack_muting, pack_note, pack_note_draft,
-    pack_note_reaction_with_note, pack_scheduled_note,
+    pack_note_reaction_with_note, pack_page, pack_scheduled_note,
     pack_notification, pack_renote_muting, pack_user_detailed_not_me, pack_user_list,
     pack_user_lite,
     pack_user_relation,
@@ -134,6 +135,12 @@ pub fn build_router(state: ApiState) -> Router {
             get(ap_objects::get_note_activity_ap),
         )
         .route("/users/{id}/stamps/{stamp}", get(ap_objects::get_quote_stamp))
+        // Federated clips + pages (pinetree-first DIVERGENCE): fetch-gated
+        // `OrderedCollection` clips, the advertised clips index, and
+        // `Article` pages. Global switches off ⇒ 404 on all three.
+        .route("/clips/{id}", get(ap_collections::get_clip_collection))
+        .route("/users/{id}/clips", get(ap_collections::get_clips_index))
+        .route("/pages/{id}", get(ap_collections::get_page_article))
         .route("/inbox", post(fed_inbox::inbox_handler))
         .route("/users/{id}/inbox", post(fed_inbox::user_inbox_handler))
         .with_state(services);
@@ -964,6 +971,55 @@ fn map_list_error(err: PortError, endpoint: &str) -> ApiError {
         PortError::Conflict(msg) if msg == "ALREADY_ADDED" => ApiError::user_list_already_added(),
         PortError::Conflict(msg) if msg == "TOO_MANY_USERS" => ApiError::user_list_too_many_users(),
         PortError::Conflict(msg) if msg == "TOO_MANY_USERLISTS" => ApiError::user_list_too_many(),
+        _ => ApiError::from_port_error(err),
+    }
+}
+
+/// Map a clip-op [`PortError`] to the caller's per-endpoint verbatim
+/// upstream error (federated clips + pages handoff, Phase 1: one UUID per
+/// endpoint per code).
+fn map_clip_error(err: PortError, endpoint: &str) -> ApiError {
+    match &err {
+        PortError::NotFound(msg) if msg == "NO_SUCH_CLIP" => {
+            ApiError::clip_no_such_clip(endpoint)
+        }
+        PortError::NotFound(msg) if msg == "NO_SUCH_NOTE" => {
+            ApiError::clip_no_such_note(endpoint)
+        }
+        PortError::Conflict(msg) if msg == "TOO_MANY_CLIPS" => ApiError::clip_too_many_clips(),
+        PortError::Conflict(msg) if msg == "ALREADY_CLIPPED" => ApiError::clip_already_clipped(),
+        PortError::Conflict(msg) if msg == "TOO_MANY_CLIP_NOTES" => {
+            ApiError::clip_too_many_clip_notes()
+        }
+        PortError::Conflict(msg) if msg == "ALREADY_FAVORITED" => {
+            ApiError::clip_already_favorited()
+        }
+        PortError::Conflict(msg) if msg == "NOT_FAVORITED" => ApiError::clip_not_favorited(),
+        _ => ApiError::from_port_error(err),
+    }
+}
+
+/// Map a page-op [`PortError`] to the caller's per-endpoint verbatim
+/// upstream error (federated clips + pages handoff, Phase 3 local: one
+/// UUID per endpoint per code). `NO_SUCH_FILE`/`NAME_ALREADY_EXISTS` take
+/// the create/update arm by endpoint; `ACCESS_DENIED` takes update/delete.
+fn map_page_error(err: PortError, endpoint: &str) -> ApiError {
+    match &err {
+        PortError::NotFound(msg) if msg == "NO_SUCH_PAGE" => {
+            ApiError::page_no_such_page(endpoint)
+        }
+        PortError::NotFound(msg) if msg == "NO_SUCH_FILE" => {
+            ApiError::page_no_such_file(endpoint)
+        }
+        PortError::Conflict(msg) if msg == "NAME_ALREADY_EXISTS" => {
+            ApiError::page_name_already_exists(endpoint)
+        }
+        PortError::Conflict(msg) if msg == "ALREADY_LIKED" => ApiError::page_already_liked(),
+        PortError::Conflict(msg) if msg == "NOT_LIKED" => ApiError::page_not_liked(),
+        PortError::Validation(msg) if msg == "YOUR_PAGE" => ApiError::page_your_page(),
+        PortError::Validation(msg) if msg == "ACCESS_DENIED" => {
+            ApiError::page_access_denied(endpoint)
+        }
         _ => ApiError::from_port_error(err),
     }
 }
@@ -3270,6 +3326,552 @@ fn api_dispatch_blocking(
             Ok(StatusCode::NO_CONTENT.into_response())
         }
 
+        // --- Federated clips + pages handoff: Phase 1 (local clips) ---
+        // `clips/create {name!, isPublic=false, description?}` (+ pinetree
+        // federation extension `visibility?`, `federate?`,
+        // `approvedActorUris?`; all default closed) → 200 packed `Clip`.
+        "clips/create" => {
+            check_allowed_fields(
+                &obj,
+                &[
+                    "name",
+                    "isPublic",
+                    "description",
+                    "visibility",
+                    "federate",
+                    "approvedActorUris",
+                ],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            let name = required_string(&obj, "name", 1, 100)?;
+            let is_public = opt_bool(&obj, "isPublic", false)?;
+            let description = match obj.get("description") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => {
+                    if s.chars().count() > 2048 {
+                        return Err(ApiError::invalid_param(
+                            "description",
+                            "must be <=2048 chars",
+                        ));
+                    }
+                    Some(s.clone())
+                }
+                Some(_) => {
+                    return Err(ApiError::invalid_param("description", "must be a string"));
+                }
+            };
+            let visibility = opt_string(&obj, "visibility")?;
+            let federate = opt_bool(&obj, "federate", false)?;
+            let approved = opt_str_array(&obj, "approvedActorUris")?.unwrap_or_default();
+            let clip = state
+                .services
+                .create_clip(
+                    &caller.account.id,
+                    name,
+                    is_public,
+                    description,
+                    visibility,
+                    federate,
+                    approved,
+                )
+                .map_err(|e| map_clip_error(e, "clips/create"))?;
+            let packed = pack_clip(&clip, Some(&caller.account.id), &state.services)
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(packed).into_response())
+        }
+
+        // `clips/update {clipId!, name?, isPublic?, description?}` (+ the
+        // same federation extension fields) → 200 packed `Clip`.
+        "clips/update" => {
+            check_allowed_fields(
+                &obj,
+                &[
+                    "clipId",
+                    "name",
+                    "isPublic",
+                    "description",
+                    "visibility",
+                    "federate",
+                    "approvedActorUris",
+                ],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            let clip_id = required_str(&obj, "clipId")?;
+            let name = opt_bounded_string(&obj, "name", 1, 100)?;
+            let is_public = match obj.get("isPublic") {
+                None | Some(Value::Null) => None,
+                Some(Value::Bool(b)) => Some(*b),
+                Some(_) => {
+                    return Err(ApiError::invalid_param("isPublic", "must be a boolean"));
+                }
+            };
+            let description = update_string_field(&obj, "description")?;
+            if let Some(Some(d)) = &description {
+                if d.chars().count() > 2048 {
+                    return Err(ApiError::invalid_param(
+                        "description",
+                        "must be <=2048 chars",
+                    ));
+                }
+            }
+            let visibility = opt_string(&obj, "visibility")?;
+            let federate = match obj.get("federate") {
+                None | Some(Value::Null) => None,
+                Some(Value::Bool(b)) => Some(*b),
+                Some(_) => {
+                    return Err(ApiError::invalid_param("federate", "must be a boolean"));
+                }
+            };
+            let approved = opt_str_array(&obj, "approvedActorUris")?;
+            let clip = state
+                .services
+                .update_clip(
+                    &caller.account.id,
+                    &clip_id,
+                    name,
+                    is_public,
+                    description,
+                    visibility,
+                    federate,
+                    approved,
+                )
+                .map_err(|e| map_clip_error(e, "clips/update"))?;
+            let packed = pack_clip(&clip, Some(&caller.account.id), &state.services)
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(packed).into_response())
+        }
+
+        // `clips/delete {clipId!}` → 204 (membership + favorite cascade).
+        "clips/delete" => {
+            check_allowed_fields(&obj, &["clipId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            let clip_id = required_str(&obj, "clipId")?;
+            state
+                .services
+                .delete_clip(&caller.account.id, &clip_id)
+                .map_err(|e| map_clip_error(e, "clips/delete"))?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // `clips/list` (own clips, newest-first, cursor-paged, limit
+        // 1–100 default 10) → 200 packed `Clip[]`.
+        "clips/list" => {
+            check_allowed_fields(
+                &obj,
+                &["limit", "sinceId", "untilId", "sinceDate", "untilDate"],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:account")?;
+            let cursor = parse_cursor(&obj)?;
+            let clips = state
+                .services
+                .list_clips(
+                    &caller.account.id,
+                    cursor.limit,
+                    cursor.since_id.as_deref(),
+                    cursor.until_id.as_deref(),
+                    cursor.since_date,
+                    cursor.until_date,
+                )
+                .map_err(ApiError::from_port_error)?;
+            let mut out = Vec::with_capacity(clips.len());
+            for clip in &clips {
+                out.push(
+                    pack_clip(clip, Some(&caller.account.id), &state.services)
+                        .map_err(ApiError::from_port_error)?,
+                );
+            }
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        // `clips/show {clipId!}` → 200 packed `Clip`. Private clips hide
+        // as `NO_SUCH_CLIP` from anonymous and non-owner readers.
+        "clips/show" => {
+            check_allowed_fields(&obj, &["clipId"])?;
+            if let Some(c) = &caller {
+                c.require_permission("read:account")?;
+            }
+            let clip_id = required_str(&obj, "clipId")?;
+            let viewer_id = caller.as_ref().map(|c| c.account.id.as_str());
+            let clip = state
+                .services
+                .visible_clip(&clip_id, viewer_id)
+                .map_err(|e| map_clip_error(e, "clips/show"))?;
+            let packed = pack_clip(&clip, viewer_id, &state.services)
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(packed).into_response())
+        }
+
+        // `clips/notes {clipId!, ...}` → 200 packed `Note[]` (visibility /
+        // mute / block filtered, per-word text/cw search).
+        "clips/notes" => {
+            check_allowed_fields(
+                &obj,
+                &[
+                    "clipId",
+                    "limit",
+                    "sinceId",
+                    "untilId",
+                    "sinceDate",
+                    "untilDate",
+                    "search",
+                ],
+            )?;
+            if let Some(c) = &caller {
+                c.require_permission("read:account")?;
+            }
+            let clip_id = required_str(&obj, "clipId")?;
+            let cursor = parse_cursor(&obj)?;
+            let search = opt_string(&obj, "search")?;
+            if let Some(s) = &search {
+                let n = s.chars().count();
+                if n == 0 || n > 100 {
+                    return Err(ApiError::invalid_param("search", "must be 1..=100 chars"));
+                }
+            }
+            let viewer_id = caller.as_ref().map(|c| c.account.id.as_str());
+            let ids = state
+                .services
+                .clip_member_note_ids(
+                    &clip_id,
+                    viewer_id,
+                    cursor.limit,
+                    cursor.since_id.as_deref(),
+                    cursor.until_id.as_deref(),
+                    cursor.since_date,
+                    cursor.until_date,
+                )
+                .map_err(|e| map_clip_error(e, "clips/notes"))?;
+            let words: Vec<String> = search
+                .as_deref()
+                .map(|s| {
+                    s.split_whitespace()
+                        .map(|w| w.to_lowercase())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut out = Vec::new();
+            for id in &ids {
+                let Some(note) = state
+                    .services
+                    .notes
+                    .get_note(id)
+                    .map_err(ApiError::from_port_error)?
+                else {
+                    continue;
+                };
+                if note.is_deleted {
+                    continue;
+                }
+                // Visibility gate (private clips already gated the reader;
+                // per-note visibility still applies).
+                {
+                    use crate::domain::policy::{ViewerContext, is_visible};
+                    let (vid, follows) = match &caller {
+                        Some(c) => (
+                            Some(c.account.id.as_str()),
+                            note.author_id == c.account.id
+                                || state
+                                    .services
+                                    .follows
+                                    .is_following(&c.account.id, &note.author_id)
+                                    .map_err(ApiError::from_port_error)?,
+                        ),
+                        None => (None, false),
+                    };
+                    let viewer = match vid {
+                        Some(v) => ViewerContext::local_user(v, follows),
+                        None => ViewerContext::anonymous(),
+                    };
+                    if !is_visible(&note, &viewer) {
+                        continue;
+                    }
+                }
+                // Mute/block filter (both directions hide, like timelines).
+                if let Some(c) = &caller {
+                    if c.account.id != note.author_id {
+                        if state
+                            .services
+                            .mutes
+                            .is_muting(&c.account.id, &note.author_id)
+                            .map_err(ApiError::from_port_error)?
+                        {
+                            continue;
+                        }
+                        if state
+                            .services
+                            .blocks
+                            .is_blocking(&c.account.id, &note.author_id)
+                            .map_err(ApiError::from_port_error)?
+                            || state
+                                .services
+                                .blocks
+                                .is_blocking(&note.author_id, &c.account.id)
+                                .map_err(ApiError::from_port_error)?
+                        {
+                            continue;
+                        }
+                    }
+                }
+                // Per-word text/cw substring search (upstream ILIKE parity).
+                if !words.is_empty() {
+                    let haystack = format!(
+                        "{} {}",
+                        note.text.as_deref().unwrap_or(""),
+                        note.cw.as_deref().unwrap_or("")
+                    )
+                    .to_lowercase();
+                    if !words.iter().all(|w| haystack.contains(w)) {
+                        continue;
+                    }
+                }
+                out.push(
+                    pack_note(&note, viewer_id, &state.services, 0)
+                        .map_err(ApiError::from_port_error)?,
+                );
+            }
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        // `clips/add-note {clipId!, noteId!}` → 204 (20/hr rate bucket,
+        // upstream parity).
+        "clips/add-note" => {
+            check_allowed_fields(&obj, &["clipId", "noteId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state.rate_limiter.check(&rate_key, "clips/add-note")?;
+            let clip_id = required_str(&obj, "clipId")?;
+            let note_id = required_str(&obj, "noteId")?;
+            state
+                .services
+                .add_clip_note(&caller.account.id, &clip_id, &note_id)
+                .map_err(|e| map_clip_error(e, "clips/add-note"))?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // `clips/remove-note {clipId!, noteId!}` → 204.
+        "clips/remove-note" => {
+            check_allowed_fields(&obj, &["clipId", "noteId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            let clip_id = required_str(&obj, "clipId")?;
+            let note_id = required_str(&obj, "noteId")?;
+            state
+                .services
+                .remove_clip_note(&caller.account.id, &clip_id, &note_id)
+                .map_err(|e| map_clip_error(e, "clips/remove-note"))?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // `clips/favorite {clipId!}` → 204 (private clips hide as
+        // `NO_SUCH_CLIP` from non-owners).
+        "clips/favorite" => {
+            check_allowed_fields(&obj, &["clipId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:clip-favorite")?;
+            let clip_id = required_str(&obj, "clipId")?;
+            state
+                .services
+                .favorite_clip(&caller.account.id, &clip_id)
+                .map_err(|e| map_clip_error(e, "clips/favorite"))?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // `clips/unfavorite {clipId!}` → 204 (no visibility check,
+        // upstream parity).
+        "clips/unfavorite" => {
+            check_allowed_fields(&obj, &["clipId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:clip-favorite")?;
+            let clip_id = required_str(&obj, "clipId")?;
+            state
+                .services
+                .unfavorite_clip(&caller.account.id, &clip_id)
+                .map_err(|e| map_clip_error(e, "clips/unfavorite"))?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // `clips/my-favorites` → 200 packed `Clip[]` (no pagination,
+        // upstream parity).
+        "clips/my-favorites" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:clip-favorite")?;
+            let clips = state
+                .services
+                .clip_favorites(&caller.account.id)
+                .map_err(ApiError::from_port_error)?;
+            let mut out = Vec::with_capacity(clips.len());
+            for clip in &clips {
+                out.push(
+                    pack_clip(clip, Some(&caller.account.id), &state.services)
+                        .map_err(ApiError::from_port_error)?,
+                );
+            }
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        // --- Federated clips + pages handoff: Phase 3 (local pages) ---
+        // `pages/create` (full body required, upstream param set; + the
+        // same federation extension fields) → 200 packed `Page` (10/hr).
+        "pages/create" => {
+            check_allowed_fields(
+                &obj,
+                &[
+                    "title",
+                    "name",
+                    "summary",
+                    "content",
+                    "variables",
+                    "script",
+                    "eyeCatchingImageId",
+                    "font",
+                    "alignCenter",
+                    "hideTitleWhenPinned",
+                    "visibility",
+                    "federate",
+                    "approvedActorUris",
+                ],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:pages")?;
+            state.rate_limiter.check(&rate_key, "pages/create")?;
+            let body = parse_page_body(&obj, true)?;
+            let page = state
+                .services
+                .create_page(&caller.account.id, body)
+                .map_err(|e| map_page_error(e, "pages/create"))?;
+            let packed = pack_page(&page, Some(&caller.account.id), &state.services)
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(packed).into_response())
+        }
+
+        // `pages/update {pageId!, ...}` (partial merge) → 204 void
+        // (upstream parity; 300/hr).
+        "pages/update" => {
+            check_allowed_fields(
+                &obj,
+                &[
+                    "pageId",
+                    "title",
+                    "name",
+                    "summary",
+                    "content",
+                    "variables",
+                    "script",
+                    "eyeCatchingImageId",
+                    "font",
+                    "alignCenter",
+                    "hideTitleWhenPinned",
+                    "visibility",
+                    "federate",
+                    "approvedActorUris",
+                ],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:pages")?;
+            state.rate_limiter.check(&rate_key, "pages/update")?;
+            let page_id = required_str(&obj, "pageId")?;
+            let body = parse_page_body(&obj, false)?;
+            state
+                .services
+                .update_page(&caller.account.id, &page_id, body)
+                .map_err(|e| map_page_error(e, "pages/update"))?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // `pages/delete {pageId!}` → 204 (owner or moderator; moderator
+        // deletes write a `deletePage` log row in the op).
+        "pages/delete" => {
+            check_allowed_fields(&obj, &["pageId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:pages")?;
+            let page_id = required_str(&obj, "pageId")?;
+            state
+                .services
+                .delete_page(&caller.account.id, &page_id)
+                .map_err(|e| map_page_error(e, "pages/delete"))?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // `pages/show {pageId} | {name, username}` → 200 packed `Page`
+        // (no credential; `username` resolves local users only).
+        "pages/show" => {
+            check_allowed_fields(&obj, &["pageId", "name", "username"])?;
+            let viewer_id = caller.as_ref().map(|c| c.account.id.as_str());
+            let page = match (obj.get("pageId"), obj.get("name"), obj.get("username")) {
+                (Some(Value::String(id)), _, _) if !id.is_empty() => state
+                    .services
+                    .show_page_by_id(id)
+                    .map_err(|e| map_page_error(e, "pages/show"))?,
+                (_, Some(Value::String(name)), Some(Value::String(username))) => state
+                    .services
+                    .show_page_by_name(name, username)
+                    .map_err(|e| map_page_error(e, "pages/show"))?,
+                _ => {
+                    return Err(ApiError::invalid_param(
+                        "pageId",
+                        "either pageId or name+username is required",
+                    ));
+                }
+            };
+            let packed = pack_page(&page, viewer_id, &state.services)
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(packed).into_response())
+        }
+
+        // `pages/like {pageId!}` → 204.
+        "pages/like" => {
+            check_allowed_fields(&obj, &["pageId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:page-likes")?;
+            let page_id = required_str(&obj, "pageId")?;
+            state
+                .services
+                .like_page(&caller.account.id, &page_id)
+                .map_err(|e| map_page_error(e, "pages/like"))?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // `pages/unlike {pageId!}` → 204.
+        "pages/unlike" => {
+            check_allowed_fields(&obj, &["pageId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:page-likes")?;
+            let page_id = required_str(&obj, "pageId")?;
+            state
+                .services
+                .unlike_page(&caller.account.id, &page_id)
+                .map_err(|e| map_page_error(e, "pages/unlike"))?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // `pages/featured` → 200 packed `Page[]`: upstream
+        // `featured.ts` is a pure query (top 10 by `likedCount`, no
+        // admin-curation surface), implemented as such. The handoff
+        // assumed an admin surface and prescribed 404; the upstream
+        // source shows otherwise (recorded in the manifest §36).
+        "pages/featured" => {
+            check_allowed_fields(&obj, &[])?;
+            let viewer_id = caller.as_ref().map(|c| c.account.id.as_str());
+            let pages = state
+                .services
+                .pages
+                .featured_pages()
+                .map_err(ApiError::from_port_error)?;
+            let mut out = Vec::with_capacity(pages.len());
+            for page in &pages {
+                out.push(
+                    pack_page(page, viewer_id, &state.services)
+                        .map_err(ApiError::from_port_error)?,
+                );
+            }
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
         // `notes/user-list-timeline {listId!, ...}` → 200 packed notes.
         // Owner-only pull read (verbatim timeline `NO_SUCH_LIST`).
         "notes/user-list-timeline" => {
@@ -4767,12 +5369,22 @@ fn api_dispatch_blocking(
                     "blockedHosts".to_string(),
                     serde_json::json!(settings.blocked_hosts),
                 );
+                // Federated clips + pages handoff: admin federation
+                // kill-switches (default OFF).
+                map.insert(
+                    "federateClips".to_string(),
+                    serde_json::json!(settings.federate_clips),
+                );
+                map.insert(
+                    "federatePages".to_string(),
+                    serde_json::json!(settings.federate_pages),
+                );
             }
             Ok(Json(meta).into_response())
         }
 
         "admin/update-meta" => {
-            check_allowed_fields(&obj, &["disableRegistration", "blockedHosts"])?;
+            check_allowed_fields(&obj, &["disableRegistration", "blockedHosts", "federateClips", "federatePages"])?;
             let caller = require_caller(caller)?;
             caller.require_permission("write:admin:meta")?;
             require_admin(&caller)?;
@@ -4816,6 +5428,8 @@ fn api_dispatch_blocking(
                     &caller.account.id,
                     disable_registration,
                     blocked_hosts,
+                    update_bool_field(&obj, "federateClips")?,
+                    update_bool_field(&obj, "federatePages")?,
                     state.services.clock.now_ms(),
                 )
                 .map_err(ApiError::from_port_error)?;
@@ -5006,6 +5620,25 @@ fn api_dispatch_blocking(
             state
                 .services
                 .enqueue_import(&caller.account.id, ImportEntity::UserLists, &file_id, None)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // `i/import-clips {fileId!}` → 204 (pinetree-only: no upstream
+        // endpoint exists; consumes the pinetree `export-clips` format —
+        // find-or-create clips by name, attach visible notes).
+        "i/import-clips" => {
+            check_allowed_fields(&obj, &["fileId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state.rate_limiter.check(&rate_key, "i/import-clips")?;
+            let file_id = required_str(&obj, "fileId")?;
+            if let Err(err) = state.services.check_import_file(&caller.account.id, &file_id) {
+                return Err(map_import_file_error(err, "i/import-clips"));
+            }
+            state
+                .services
+                .enqueue_import(&caller.account.id, ImportEntity::Clips, &file_id, None)
                 .map_err(ApiError::from_port_error)?;
             Ok(StatusCode::NO_CONTENT.into_response())
         }
@@ -8667,6 +9300,139 @@ fn update_bool_field(obj: &Map<String, Value>, key: &str) -> Result<Option<bool>
     }
 }
 
+/// Parse a `pages/create` (full body, `require_all = true`) or
+/// `pages/update` (partial, `require_all = false`) body into a
+/// [`PageBody`](crate::application::commands::pages::PageBody).
+/// Upstream `create.ts`/`update.ts` param shapes: `title`, `name`
+/// (1–256 + slug rules), `summary?` (nullable ≤256), `content`
+/// (array of `{type, ...}` blocks), `variables` (array), `script`
+/// (string, empty allowed), `eyeCatchingImageId?` (nullable),
+/// `font` (`serif`|`sans-serif`), `alignCenter`, `hideTitleWhenPinned`
+/// (booleans) — plus the pinetree federation extension `visibility?`,
+/// `federate?`, `approvedActorUris?`.
+fn parse_page_body(
+    obj: &Map<String, Value>,
+    require_all: bool,
+) -> Result<crate::application::commands::pages::PageBody, ApiError> {
+    use crate::application::commands::pages::PageBody;
+    let get_req = |key: &str| -> Result<Option<Value>, ApiError> {
+        match obj.get(key) {
+            None | Some(Value::Null) if !require_all => Ok(None),
+            None if require_all => Err(ApiError::invalid_param(key, "this field is required")),
+            None => Ok(None),
+            Some(v) => Ok(Some(v.clone())),
+        }
+    };
+    // `title`: required string 1–256 (create); optional on update.
+    let title = match get_req("title")? {
+        None => None,
+        Some(Value::String(s)) => {
+            let n = s.chars().count();
+            if n == 0 || n > 256 {
+                return Err(ApiError::invalid_param("title", "must be 1..=256 chars"));
+            }
+            Some(s)
+        }
+        Some(_) => return Err(ApiError::invalid_param("title", "must be a string")),
+    };
+    // `name`: required slug 1–256 + reserved-char rules (create).
+    let name = match get_req("name")? {
+        None => None,
+        Some(Value::String(s)) => {
+            crate::domain::page::validate_page_name(&s).map_err(|_| {
+                ApiError::invalid_param("name", "must be 1..=256 chars without reserved characters")
+            })?;
+            Some(s)
+        }
+        Some(_) => return Err(ApiError::invalid_param("name", "must be a string")),
+    };
+    let summary = match obj.get("summary") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::String(s)) => {
+            if s.chars().count() > 256 {
+                return Err(ApiError::invalid_param("summary", "must be <=256 chars"));
+            }
+            Some(Some(s.clone()))
+        }
+        Some(_) => return Err(ApiError::invalid_param("summary", "must be a string or null")),
+    };
+    // `content`: required array of `{type: string, ...}` blocks (create).
+    let content = match get_req("content")? {
+        None => None,
+        Some(Value::Array(blocks)) => {
+            for block in &blocks {
+                let ok = block
+                    .as_object()
+                    .is_some_and(|o| o.get("type").and_then(Value::as_str).is_some());
+                if !ok {
+                    return Err(ApiError::invalid_param(
+                        "content",
+                        "blocks must be objects with a string type",
+                    ));
+                }
+            }
+            Some(Value::Array(blocks))
+        }
+        Some(_) => return Err(ApiError::invalid_param("content", "must be an array")),
+    };
+    // `variables`: required array (create).
+    let variables = match get_req("variables")? {
+        None => None,
+        Some(Value::Array(vars)) => Some(Value::Array(vars)),
+        Some(_) => return Err(ApiError::invalid_param("variables", "must be an array")),
+    };
+    // `script`: required string, empty allowed (create).
+    let script = match get_req("script")? {
+        None => None,
+        Some(Value::String(s)) => {
+            if s.chars().count() > crate::domain::page::PAGE_SCRIPT_MAX {
+                return Err(ApiError::invalid_param("script", "must be <=16384 chars"));
+            }
+            Some(s)
+        }
+        Some(_) => return Err(ApiError::invalid_param("script", "must be a string")),
+    };
+    let eye_catching_image_id = match obj.get("eyeCatchingImageId") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::String(s)) => Some(Some(s.clone())),
+        Some(_) => {
+            return Err(ApiError::invalid_param(
+                "eyeCatchingImageId",
+                "must be a string or null",
+            ));
+        }
+    };
+    let font = match opt_string(obj, "font")? {
+        None => None,
+        Some(f) if f == "serif" || f == "sans-serif" => Some(f),
+        Some(_) => {
+            return Err(ApiError::invalid_param("font", "must be serif or sans-serif"));
+        }
+    };
+    let visibility = opt_string(obj, "visibility")?;
+    if let Some(v) = &visibility {
+        crate::domain::collection::validate_tier_name(v)
+            .map_err(|_| ApiError::invalid_param("visibility", "unknown tier"))?;
+    }
+    Ok(PageBody {
+        title,
+        name,
+        summary,
+        content,
+        variables,
+        script,
+        eye_catching_image_id,
+        font,
+        align_center: update_bool_field(obj, "alignCenter")?,
+        hide_title_when_pinned: update_bool_field(obj, "hideTitleWhenPinned")?,
+        visibility,
+        federate: update_bool_field(obj, "federate")?,
+        approved_actor_uris: opt_str_array(obj, "approvedActorUris")?,
+    })
+}
+
 /// Parse the full `i/update` body into an [`UpdateAccountPatch`]
 /// (`i/update.ts` `paramDef` parity: all 39 params plus the DIVERGENCE
 /// `rejectQuotes`/`defaultReaction`). Length/enum shapes are enforced here
@@ -9194,6 +9960,8 @@ mod tests {
             signin: store.clone(),
             password_resets: store.clone(),
             registry: store.clone(),
+            clips: store.clone(),
+            pages: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()
@@ -9874,7 +10642,8 @@ mod tests {
             "INVALID_PARAM",
         )
         .await;
-        // No pages store yet: any non-null page is missing.
+        // Unknown page id → NO_SUCH_PAGE (upstream `update.ts:436`
+        // parity; the pages store now exists).
         expect_code(
             &state,
             &token,
@@ -9882,6 +10651,34 @@ mod tests {
             "NO_SUCH_PAGE",
         )
         .await;
+        // A real owned page pins; a foreign page is NO_SUCH_PAGE.
+        let (status, page) = call(
+            &state,
+            "pages/create",
+            serde_json::json!({"title": "T", "name": "t", "content": [], "variables": [], "script": ""}),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        let page_id = page["id"].as_str().unwrap().to_string();
+        let (status, me) = call(
+            &state,
+            "i/update",
+            serde_json::json!({"pinnedPageId": page_id}),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{me}");
+        let (bob_id, bob_token) = signup_user(&state, "bob").await;
+        let (status, value) = call(
+            &state,
+            "i/update",
+            serde_json::json!({"pinnedPageId": page_id}),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_PAGE");
         expect_code(
             &state,
             &token,
@@ -19751,5 +20548,670 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
         assert_eq!(value["code"], "UNAVAILABLE");
         let _ = (alice_id, bob_id, carol_id);
+    }
+
+    #[tokio::test]
+    async fn clips_crud_caps_favorites_and_notes() {
+        let (state, _) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (bob_id, bob_token) = signup_user(&state, "bob").await;
+
+        // create → 200 packed; name bounds → INVALID_PARAM.
+        let (status, value) = call(
+            &state,
+            "clips/create",
+            serde_json::json!({ "name": "" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "INVALID_PARAM");
+        let (status, clip) = call(
+            &state,
+            "clips/create",
+            serde_json::json!({ "name": "reading", "isPublic": true, "description": "d" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{clip}");
+        assert_eq!(clip["name"], "reading");
+        assert_eq!(clip["isPublic"], true);
+        assert_eq!(clip["description"], "d");
+        assert_eq!(clip["favoritedCount"], 0);
+        assert!(clip.get("isFavorited").is_some());
+        assert!(clip.get("notesCount").is_some());
+        assert!(clip.get("tier").is_none(), "federation columns stay internal: {clip}");
+        let clip_id = clip["id"].as_str().unwrap().to_string();
+
+        // Second clip (private). Cap: 10 clips per owner → TOO_MANY_CLIPS.
+        let (status, priv_clip) = call(
+            &state,
+            "clips/create",
+            serde_json::json!({ "name": "mine" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{priv_clip}");
+        assert_eq!(priv_clip["isPublic"], false);
+        let priv_id = priv_clip["id"].as_str().unwrap().to_string();
+        for n in 0..8 {
+            let (status, _) = call(
+                &state,
+                "clips/create",
+                serde_json::json!({ "name": format!("c{n}") }),
+                Some(&alice_token),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{n}");
+        }
+        let (status, value) = call(
+            &state,
+            "clips/create",
+            serde_json::json!({ "name": "overflow" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "TOO_MANY_CLIPS");
+        assert_eq!(value["error"]["id"], "920f7c2d-6208-4b76-8082-e632020f5883");
+
+        // show: owner sees; stranger sees the public one but the private
+        // one hides as NO_SUCH_CLIP (verbatim show UUID).
+        let (status, _) = call(
+            &state,
+            "clips/show",
+            serde_json::json!({ "clipId": clip_id }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, value) = call(
+            &state,
+            "clips/show",
+            serde_json::json!({ "clipId": priv_id }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_CLIP");
+        assert_eq!(value["error"]["id"], "c3c5fe33-d62c-44d2-9ea5-d997703f5c20");
+        // Anonymous readers see the public clip without isFavorited.
+        let (status, anon) = call(
+            &state,
+            "clips/show",
+            serde_json::json!({ "clipId": clip_id }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{anon}");
+        assert!(anon.get("isFavorited").is_none());
+
+        // Foreign update/delete → NO_SUCH_CLIP (verbatim ids).
+        let (status, value) = call(
+            &state,
+            "clips/update",
+            serde_json::json!({ "clipId": clip_id, "name": "hijacked" }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["error"]["id"], "b4d92d70-b216-46fa-9a3f-a8c811699257");
+        let (status, value) = call(
+            &state,
+            "clips/delete",
+            serde_json::json!({ "clipId": priv_id }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["error"]["id"], "70ca08ba-6865-4630-b6fb-8494759aa754");
+
+        // update own clip (rename + privatize + extension fields).
+        let (status, updated) = call(
+            &state,
+            "clips/update",
+            serde_json::json!({ "clipId": clip_id, "name": "reading2", "isPublic": false, "visibility": "unlisted", "federate": true }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{updated}");
+        assert_eq!(updated["name"], "reading2");
+        assert_eq!(updated["isPublic"], false);
+
+        // Notes: create two notes, clip both.
+        let n1 = create_note(&state, serde_json::json!({ "text": "hello world" }), &alice_token).await;
+        let n2 = create_note(&state, serde_json::json!({ "text": "second note" }), &bob_token).await;
+        for note_id in [&n1, &n2] {
+            let (status, _) = call(
+                &state,
+                "clips/add-note",
+                serde_json::json!({ "clipId": priv_id, "noteId": note_id }),
+                Some(&alice_token),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+        }
+        // Duplicate → ALREADY_CLIPPED; unknown note → NO_SUCH_NOTE;
+        // unknown clip → NO_SUCH_CLIP (verbatim ids).
+        let (status, value) = call(
+            &state,
+            "clips/add-note",
+            serde_json::json!({ "clipId": priv_id, "noteId": n1 }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "ALREADY_CLIPPED");
+        assert_eq!(value["error"]["id"], "734806c4-542c-463a-9311-15c512803965");
+        let (status, value) = call(
+            &state,
+            "clips/add-note",
+            serde_json::json!({ "clipId": priv_id, "noteId": "aaaaaaaaaaaaaaaa" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_NOTE");
+        assert_eq!(value["error"]["id"], "fc8c0b49-c7a3-4664-a0a6-b418d386bb8b");
+        let (status, value) = call(
+            &state,
+            "clips/notes",
+            serde_json::json!({ "clipId": "aaaaaaaaaaaaaaaa" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["error"]["id"], "1d7645e6-2b6d-4635-b0fe-fe22b0e72e00");
+
+        // notes listing + word search.
+        let (status, notes) = call(
+            &state,
+            "clips/notes",
+            serde_json::json!({ "clipId": priv_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{notes}");
+        assert_eq!(notes.as_array().unwrap().len(), 2);
+        let (status, notes) = call(
+            &state,
+            "clips/notes",
+            serde_json::json!({ "clipId": priv_id, "search": "second" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{notes}");
+        assert_eq!(notes.as_array().unwrap().len(), 1);
+
+        // remove-note; missing pair → NO_SUCH_NOTE (verbatim remove id).
+        let (status, _) = call(
+            &state,
+            "clips/remove-note",
+            serde_json::json!({ "clipId": priv_id, "noteId": n2 }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, value) = call(
+            &state,
+            "clips/remove-note",
+            serde_json::json!({ "clipId": priv_id, "noteId": n2 }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_NOTE");
+        assert_eq!(value["error"]["id"], "aff017de-190e-434b-893e-33a9ff5049d8");
+
+        // Favorites: bob favorites alice's private clip? No — private
+        // hides as NO_SUCH_CLIP. Favorite the (now private) reading2 clip
+        // as owner, then my-favorites round-trip.
+        let (status, value) = call(
+            &state,
+            "clips/favorite",
+            serde_json::json!({ "clipId": priv_id }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["error"]["id"], "4c2aaeae-80d8-4250-9606-26cb1fdb77a5");
+        // Make reading2 public again and favorite as bob.
+        let (status, _) = call(
+            &state,
+            "clips/update",
+            serde_json::json!({ "clipId": clip_id, "isPublic": true }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(
+            &state,
+            "clips/favorite",
+            serde_json::json!({ "clipId": clip_id }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, value) = call(
+            &state,
+            "clips/favorite",
+            serde_json::json!({ "clipId": clip_id }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "ALREADY_FAVORITED");
+        assert_eq!(value["error"]["id"], "92658936-c625-4273-8326-2d790129256e");
+        let (status, favs) = call(
+            &state,
+            "clips/my-favorites",
+            serde_json::json!({}),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{favs}");
+        assert_eq!(favs.as_array().unwrap().len(), 1);
+        assert_eq!(favs[0]["id"], clip_id);
+        // unfavorite; repeat → NOT_FAVORITED (verbatim id).
+        let (status, _) = call(
+            &state,
+            "clips/unfavorite",
+            serde_json::json!({ "clipId": clip_id }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, value) = call(
+            &state,
+            "clips/unfavorite",
+            serde_json::json!({ "clipId": clip_id }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NOT_FAVORITED");
+        assert_eq!(value["error"]["id"], "90c3a9e8-b321-4dae-bf57-2bf79bbcc187");
+        // unfavorite of an unknown clip → NO_SUCH_CLIP (verbatim id, no
+        // visibility check).
+        let (status, value) = call(
+            &state,
+            "clips/unfavorite",
+            serde_json::json!({ "clipId": "aaaaaaaaaaaaaaaa" }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["error"]["id"], "2603966e-b865-426c-94a7-af4a01241dc1");
+
+        // list shows all 10 own clips; delete cascades.
+        let (status, lists) = call(
+            &state,
+            "clips/list",
+            serde_json::json!({}),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{lists}");
+        assert_eq!(lists.as_array().unwrap().len(), 10);
+        let (status, _) = call(
+            &state,
+            "clips/delete",
+            serde_json::json!({ "clipId": priv_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, lists) = call(
+            &state,
+            "clips/list",
+            serde_json::json!({ "limit": 100 }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{lists}");
+        assert_eq!(lists.as_array().unwrap().len(), 9);
+        let _ = (alice_id, bob_id);
+    }
+
+    #[tokio::test]
+    async fn pages_crud_likes_and_featured() {
+        let (state, _) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (bob_id, bob_token) = signup_user(&state, "bob").await;
+
+        let body = |title: &str, name: &str| {
+            serde_json::json!({
+                "title": title,
+                "name": name,
+                "content": [{ "type": "text", "text": "hello" }],
+                "variables": [],
+                "script": "let x = 1",
+            })
+        };
+        // create → 200 packed; bad slug → INVALID_PARAM.
+        let (status, value) = call(&state, "pages/create", body("T", "bad name"), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "INVALID_PARAM");
+        let (status, page) = call(&state, "pages/create", body("Hello", "hello"), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["title"], "Hello");
+        assert_eq!(page["name"], "hello");
+        assert_eq!(page["font"], "sans-serif");
+        assert_eq!(page["alignCenter"], false);
+        assert_eq!(page["likedCount"], 0);
+        assert!(page.get("isLiked").is_some());
+        assert_eq!(page["script"], "let x = 1");
+        let page_id = page["id"].as_str().unwrap().to_string();
+        // Duplicate slug → NAME_ALREADY_EXISTS (verbatim create UUID).
+        let (status, value) = call(&state, "pages/create", body("Other", "hello"), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NAME_ALREADY_EXISTS");
+        assert_eq!(value["error"]["id"], "4650348e-301c-499a-83c9-6aa988c66bc1");
+
+        // show by id (anonymous) and by name+username.
+        let (status, shown) = call(
+            &state,
+            "pages/show",
+            serde_json::json!({ "pageId": page_id }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{shown}");
+        assert_eq!(shown["title"], "Hello");
+        assert!(shown.get("isLiked").is_none());
+        let (status, shown) = call(
+            &state,
+            "pages/show",
+            serde_json::json!({ "name": "hello", "username": "alice" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{shown}");
+        assert_eq!(shown["id"], page_id);
+        // Unknown id / name → NO_SUCH_PAGE (verbatim show UUID).
+        let (status, value) = call(
+            &state,
+            "pages/show",
+            serde_json::json!({ "pageId": "aaaaaaaaaaaaaaaa" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["error"]["id"], "222120c0-3ead-4528-811b-b96f233388d7");
+
+        // update (partial): rename + clear summary + set eye-catch later.
+        let (status, _) = call(
+            &state,
+            "pages/update",
+            serde_json::json!({ "pageId": page_id, "title": "Hello 2", "summary": "s", "font": "serif" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, shown) = call(
+            &state,
+            "pages/show",
+            serde_json::json!({ "pageId": page_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{shown}");
+        assert_eq!(shown["title"], "Hello 2");
+        assert_eq!(shown["font"], "serif");
+        assert_eq!(shown["summary"], "s");
+        // Foreign update → NO_SUCH_PAGE (upstream: owner-only).
+        let (status, value) = call(
+            &state,
+            "pages/update",
+            serde_json::json!({ "pageId": page_id, "title": "hijacked" }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_PAGE");
+        assert_eq!(value["error"]["id"], "21149b9e-3616-4778-9592-c4ce89f5a864");
+        // Foreign delete → ACCESS_DENIED (verbatim delete UUID, 403).
+        let (status, value) = call(
+            &state,
+            "pages/delete",
+            serde_json::json!({ "pageId": page_id }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{value}");
+        assert_eq!(value["code"], "ACCESS_DENIED");
+        assert_eq!(value["error"]["id"], "8b741b3e-2c22-44b3-a15f-29949aa1601e");
+
+        // like: own page → YOUR_PAGE; bob likes → ALREADY_LIKED on
+        // repeat; unlike flows.
+        let (status, value) = call(
+            &state,
+            "pages/like",
+            serde_json::json!({ "pageId": page_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "YOUR_PAGE");
+        assert_eq!(value["error"]["id"], "28800466-e6db-40f2-8fae-bf9e82aa92b8");
+        let (status, _) = call(
+            &state,
+            "pages/like",
+            serde_json::json!({ "pageId": page_id }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, value) = call(
+            &state,
+            "pages/like",
+            serde_json::json!({ "pageId": page_id }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "ALREADY_LIKED");
+        assert_eq!(value["error"]["id"], "d4c1edbe-7da2-4eae-8714-1acfd2d63941");
+        let (status, _) = call(
+            &state,
+            "pages/unlike",
+            serde_json::json!({ "pageId": page_id }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, value) = call(
+            &state,
+            "pages/unlike",
+            serde_json::json!({ "pageId": page_id }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NOT_LIKED");
+        assert_eq!(value["error"]["id"], "f5e586b0-ce93-4050-b0e3-7f31af5259ee");
+        // featured: empty until a like lands (query-based, upstream parity).
+        let (status, featured) = call(&state, "pages/featured", serde_json::json!({}), None).await;
+        assert_eq!(status, StatusCode::OK, "{featured}");
+        assert_eq!(featured.as_array().unwrap().len(), 0);
+        let (status, _) = call(
+            &state,
+            "pages/like",
+            serde_json::json!({ "pageId": page_id }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, featured) = call(&state, "pages/featured", serde_json::json!({}), None).await;
+        assert_eq!(status, StatusCode::OK, "{featured}");
+        assert_eq!(featured.as_array().unwrap().len(), 1);
+        assert_eq!(featured[0]["id"], page_id);
+
+        // delete by owner → show 404s after.
+        let (status, _) = call(
+            &state,
+            "pages/delete",
+            serde_json::json!({ "pageId": page_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, value) = call(
+            &state,
+            "pages/show",
+            serde_json::json!({ "pageId": page_id }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_PAGE");
+        let _ = (alice_id, bob_id);
+    }
+
+    #[tokio::test]
+    async fn clips_export_import_round_trip() {
+        let (state, _) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+
+        let n1 = create_note(&state, serde_json::json!({ "text": "export me" }), &alice_token).await;
+        let (status, clip) = call(
+            &state,
+            "clips/create",
+            serde_json::json!({ "name": "backup", "description": "d" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{clip}");
+        let clip_id = clip["id"].as_str().unwrap().to_string();
+        let (status, _) = call(
+            &state,
+            "clips/add-note",
+            serde_json::json!({ "clipId": clip_id, "noteId": n1 }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // Export → real upstream-shaped data (not an empty file).
+        let (status, _) = call(
+            &state,
+            "i/export-clips",
+            serde_json::json!({}),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        state.worker.drain(100).unwrap();
+        let notes = export_completed_notifications(&state, &alice_token).await;
+        assert_eq!(notes[0]["exportedEntity"], "clip");
+        let file_id = notes[0]["fileId"].as_str().unwrap().to_string();
+        let bytes = read_export_bytes(&state, &file_id).await;
+        let items: Vec<Value> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["name"], "backup");
+        assert_eq!(items[0]["description"], "d");
+        assert!(items[0].get("lastClippedAt").is_some());
+        let members = items[0]["clipNotes"].as_array().unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0]["note"]["id"], n1);
+        assert!(members[0]["note"].get("text").is_some());
+        assert!(members[0]["note"]["user"].get("username").is_some());
+
+        // Import guards: unknown → NO_SUCH_FILE, empty → EMPTY_FILE
+        // (pinetree-fixed UUIDs; no upstream endpoint exists).
+        let (status, value) = call(
+            &state,
+            "i/import-clips",
+            serde_json::json!({ "fileId": "mid00000000000999" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_FILE");
+        assert_eq!(value["error"]["id"], "7c1d9e02-4b5a-4f6e-9d1a-2c3e5f6a7b81");
+        let empty = state
+            .services
+            .upload_media(&alice_id, "empty.json".to_string(), b"", None, false, true)
+            .unwrap();
+        let (status, value) = call(
+            &state,
+            "i/import-clips",
+            serde_json::json!({ "fileId": empty.id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "EMPTY_FILE");
+        assert_eq!(value["error"]["id"], "8d2e0f13-5c6b-4a7f-8e2b-3d4f6a7b8c92");
+
+        // Delete the clip, then re-import the export: find-or-create by
+        // name restores the clip and re-attaches the visible note.
+        let (status, _) = call(
+            &state,
+            "clips/delete",
+            serde_json::json!({ "clipId": clip_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let reimport = state
+            .services
+            .upload_media(&alice_id, "clips-import.json".to_string(), &bytes, None, false, true)
+            .unwrap();
+        let (status, _) = call(
+            &state,
+            "i/import-clips",
+            serde_json::json!({ "fileId": reimport.id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        state.worker.drain(100).unwrap();
+        let (status, lists) = call(
+            &state,
+            "clips/list",
+            serde_json::json!({}),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{lists}");
+        assert_eq!(lists.as_array().unwrap().len(), 1);
+        assert_eq!(lists[0]["name"], "backup");
+        let restored_id = lists[0]["id"].as_str().unwrap().to_string();
+        assert_ne!(restored_id, clip_id, "re-import creates a fresh clip row");
+        let (status, notes) = call(
+            &state,
+            "clips/notes",
+            serde_json::json!({ "clipId": restored_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{notes}");
+        assert_eq!(notes.as_array().unwrap().len(), 1);
+        assert_eq!(notes[0]["id"], n1);
+
+        // Malformed import files converge quietly (whole file skipped).
+        let bad = state
+            .services
+            .upload_media(&alice_id, "bad.json".to_string(), b"not json", None, false, true)
+            .unwrap();
+        let (status, _) = call(
+            &state,
+            "i/import-clips",
+            serde_json::json!({ "fileId": bad.id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        state.worker.drain(100).unwrap();
+        let (status, lists) = call(
+            &state,
+            "clips/list",
+            serde_json::json!({}),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{lists}");
+        assert_eq!(lists.as_array().unwrap().len(), 1, "bad import applied nothing");
     }
 }

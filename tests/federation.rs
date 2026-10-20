@@ -79,6 +79,12 @@ struct FedNode {
     host: String,
     addr: SocketAddr,
     serve_handle: Option<tokio::task::JoinHandle<()>>,
+    // Dedicated runtime per node (instead of the shared test runtime):
+    // production nodes never share a runtime, and sharing one makes a
+    // blocking network call in any node's handler able to starve the
+    // others' scheduling. Holding the runtime keeps it alive.
+    #[allow(dead_code)]
+    runtime: Option<Arc<tokio::runtime::Runtime>>,
 }
 
 /// Federation routes (now wired in `build_router` in `src/`).
@@ -108,13 +114,36 @@ async fn wait_ready(client: &SafeHttpClient, base_url: &str, tag: &str) {
     }
 }
 
-async fn boot_node(tag: &'static str) -> FedNode {
+fn boot_node(tag: &'static str) -> FedNode {
+    // Boot on a raw OS thread: building a runtime panics inside a
+    // runtime context, and the callers run on the shared test runtime.
+    // Each node gets a DEDICATED runtime (production nodes never share
+    // one): a blocking network call in one node's handler must not be
+    // able to starve another node's scheduling. The runtime is stored on
+    // the node to keep it alive.
+    std::thread::Builder::new()
+        .name(format!("fed-boot-{tag}"))
+        .spawn(move || boot_node_inner(tag))
+        .expect("spawn fed boot thread")
+        .join()
+        .expect("fed boot thread")
+}
+
+fn boot_node_inner(tag: &'static str) -> FedNode {
+    let rt = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .thread_name(format!("fed-{tag}"))
+            .enable_all()
+            .build()
+            .expect("build fed runtime"),
+    );
     let n = NODE_COUNTER.fetch_add(1, Ordering::SeqCst);
     let dir = std::env::temp_dir().join(format!("pinetree-fed-{tag}-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create fed temp dir");
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
+    let listener = rt
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
         .expect("bind fed listener");
     let addr = listener.local_addr().expect("listener addr");
     let base_url = format!("http://{addr}");
@@ -156,10 +185,17 @@ async fn boot_node(tag: &'static str) -> FedNode {
             signin: store.clone(),
             password_resets: store.clone(),
             registry: store.clone(),
+            clips: store.clone(),
+            pages: store.clone(),
         streaming: Arc::new(NoopStreamingSink),
         dedup: store.clone() as Arc<dyn ActivityDedup>,
         federation_http: SafeHttpClient::new(SafeHttpConfig {
             allow_private_ips: true,
+            // Generous ceiling (mirrors `test_client`): dev-profile RSA
+            // keygen + parallel test binaries can stall loopback responses
+            // for seconds; production defaults stay tight.
+            timeout: Duration::from_secs(300),
+            total_timeout: Duration::from_secs(300),
             ..Default::default()
         }),
         public_url: base_url.clone(),
@@ -197,7 +233,7 @@ async fn boot_node(tag: &'static str) -> FedNode {
         featured_cache: std::sync::Arc::new(pinetree::application::commands::pins::FeaturedCache::default()),
     };
     let app = federation_router(state.clone());
-    let serve_handle = tokio::spawn(async move {
+    let serve_handle = rt.spawn(async move {
         let _ = axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -213,10 +249,11 @@ async fn boot_node(tag: &'static str) -> FedNode {
         host,
         addr,
         serve_handle: Some(serve_handle),
+        runtime: Some(rt.clone()),
     };
     let client = test_client();
     let base = node.base_url.clone();
-    wait_ready(&client, &base, node.tag).await;
+    rt.block_on(wait_ready(&client, &base, node.tag));
     node
 }
 
@@ -227,34 +264,68 @@ impl FedNode {
         }
     }
 
-    async fn start_server(&mut self) {
-        let start = Instant::now();
-        let listener = loop {
-            match tokio::net::TcpListener::bind(self.addr).await {
-                Ok(l) => break l,
-                Err(_) => {
-                    assert!(
-                        start.elapsed() < Duration::from_secs(10),
-                        "{} could not rebind {}",
-                        self.tag,
-                        self.addr
-                    );
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
+    /// Release the node: abort the server task and shut the dedicated
+    /// runtime down without blocking (dropping a runtime from async
+    /// context panics, so this must be explicit).
+    fn shutdown(&mut self) {
+        self.stop_server();
+        if let Some(rt) = self.runtime.take() {
+            if let Ok(rt) = Arc::try_unwrap(rt) {
+                rt.shutdown_background();
             }
-        };
-        let app = federation_router(self.state.clone());
-        self.serve_handle = Some(tokio::spawn(async move {
-            let _ = axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await;
-        }));
-        let client = test_client();
-        let base = self.base_url.clone();
+            // Else: another owner exists (should not happen in tests);
+            // dropping our Arc is still safe, the runtime lives on.
+        }
+    }
+}
+
+impl Drop for FedNode {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+impl FedNode {
+    fn start_server(&mut self) {
+        // Same raw-thread discipline as `boot_node`: `block_on` must not
+        // run on the test runtime's workers.
+        let rt = self.runtime.clone().expect("node runtime");
+        let state = self.state.clone();
+        let addr = self.addr;
         let tag = self.tag;
-        wait_ready(&client, &base, tag).await;
+        let base = self.base_url.clone();
+        let serve_handle = std::thread::Builder::new()
+            .name(format!("fed-rebind-{tag}"))
+            .spawn(move || {
+                let start = Instant::now();
+                let listener = loop {
+                    match rt.block_on(tokio::net::TcpListener::bind(addr)) {
+                        Ok(l) => break l,
+                        Err(_) => {
+                            assert!(
+                                start.elapsed() < Duration::from_secs(10),
+                                "{tag} could not rebind {addr}"
+                            );
+                            std::thread::sleep(Duration::from_millis(100));
+                        }
+                    }
+                };
+                let app = federation_router(state);
+                let serve_handle = rt.spawn(async move {
+                    let _ = axum::serve(
+                        listener,
+                        app.into_make_service_with_connect_info::<SocketAddr>(),
+                    )
+                    .await;
+                });
+                let client = test_client();
+                rt.block_on(wait_ready(&client, &base, tag));
+                serve_handle
+            })
+            .expect("spawn fed rebind thread")
+            .join()
+            .expect("fed rebind thread");
+        self.serve_handle = Some(serve_handle);
     }
 }
 
@@ -436,8 +507,8 @@ fn spawn_png_server(png: Vec<u8>, max_hits: usize) -> SocketAddr {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
 async fn federation_two_node_end_to_end() {
-    let a = boot_node("a").await;
-    let b = boot_node("b").await;
+    let a = boot_node("a");
+    let b = boot_node("b");
     let client = test_client();
     let phase_deadline = Duration::from_secs(25);
 
@@ -1309,7 +1380,7 @@ async fn federation_two_node_end_to_end() {
         a.services.jobs.pending_count().expect("pending") >= 1,
         "failed delivery stays queued while B is down"
     );
-    b.start_server().await;
+    b.start_server();
     tokio::time::sleep(Duration::from_millis(600)).await; // pass the 50 ms backoff
     let retry_uri_clone = retry_uri.clone();
     pump_until(&a, &b, "retry note delivered", phase_deadline, &mut || {
@@ -1380,6 +1451,8 @@ fn federation_remote_media_cache() {
             signin: store.clone(),
             password_resets: store.clone(),
             registry: store.clone(),
+            clips: store.clone(),
+            pages: store.clone(),
         streaming: Arc::new(NoopStreamingSink),
         dedup: store.clone() as Arc<dyn ActivityDedup>,
         federation_http: SafeHttpClient::new(SafeHttpConfig {
@@ -1461,8 +1534,8 @@ fn federation_remote_media_cache() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
 async fn federation_account_move() {
-    let a = boot_node("move-a").await;
-    let b = boot_node("move-b").await;
+    let a = boot_node("move-a");
+    let b = boot_node("move-b");
     let client = test_client();
     let deadline = Duration::from_secs(25);
 
@@ -1644,4 +1717,512 @@ async fn federation_account_move() {
         Some(carol_uri.as_str()),
         "forgery changes nothing on the receiver"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Federated clips (handoff gate 5): two-local-pinetree clip federation.
+// Listed collection resolves with per-item gating; unlisted works by
+// capability URI and stays unadvertised; remote-approved refuses strangers
+// (403) and 404s unknown/unsigned fetchers; TTL revalidation + Add/Remove
+// converge; switches/flags off ⇒ zero remote footprint.
+// ---------------------------------------------------------------------------
+
+/// Signed ActivityPub GET from `sender_id` (mirrors `signed_post_to_inbox`).
+fn signed_get_to_url(
+    client: &SafeHttpClient,
+    sender: &Arc<AppServices>,
+    sender_id: &str,
+    url: &str,
+    accept: &str,
+) -> SafeHttpResponse {
+    let keypair = sender
+        .ensure_actor_keypair(sender_id)
+        .expect("sender keypair");
+    let base = sender.public_url.trim_end_matches('/').to_string();
+    let key_id = format!("{base}/users/{sender_id}#main-key");
+    let parsed = parse_http_url(url).expect("parse get url");
+    let date = format_http_date(sender.clock.now_ms());
+    let sig = sign_request_headers(
+        "GET",
+        &parsed.path_and_query,
+        &parsed.host_header,
+        &date,
+        None,
+        &key_id,
+        &keypair.private_key_pem,
+    )
+    .expect("sign get");
+    let headers = [
+        ("Host", parsed.host_header.as_str()),
+        ("Date", sig.date.as_str()),
+        ("Signature", sig.signature.as_str()),
+        ("Accept", accept),
+    ];
+    client
+        .send("GET", url, &headers, None, MAX_AP_JSON_BYTES)
+        .unwrap_or_else(|e| panic!("signed GET {url} failed: {e}"))
+}
+
+fn clip_items(resp: &SafeHttpResponse, what: &str) -> Vec<String> {
+    clip_items_signed(resp, what, None)
+}
+
+/// `clip_items` that re-signs the `first`-page hop as `signer` (a real
+/// client signs every page fetch; an unsigned hop degrades to the
+/// anonymous view — which is exactly what the gate asserts elsewhere).
+fn clip_items_signed(
+    resp: &SafeHttpResponse,
+    what: &str,
+    signer: Option<(&Arc<AppServices>, &str)>,
+) -> Vec<String> {
+    assert!(
+        (200..300).contains(&resp.status),
+        "{what}: HTTP {} body {}",
+        resp.status,
+        String::from_utf8_lossy(&resp.body)
+    );
+    let doc: Value = serde_json::from_slice(&resp.body).expect("collection json");
+    if let Some(items) = doc.get("orderedItems").and_then(|v| v.as_array()) {
+        return items
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+    }
+    // Index form: follow `first` (with the signer's signature when given).
+    let first = doc
+        .get("first")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("{what}: no orderedItems/first in {doc}"))
+        .to_string();
+    first_to_items(&first, what, signer)
+}
+
+fn first_to_items(
+    first: &str,
+    what: &str,
+    signer: Option<(&Arc<AppServices>, &str)>,
+) -> Vec<String> {
+    let client = test_client();
+    let resp = match signer {
+        Some((services, id)) => {
+            signed_get_to_url(&client, services, id, first, "application/activity+json")
+        }
+        None => http_get(&client, first, "application/activity+json"),
+    };
+    assert!(
+        (200..300).contains(&resp.status),
+        "{what}: page HTTP {} body {}",
+        resp.status,
+        String::from_utf8_lossy(&resp.body)
+    );
+    let doc: Value = serde_json::from_slice(&resp.body).expect("page json");
+    doc.get("orderedItems")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_else(|| panic!("{what}: no orderedItems in {doc}"))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+async fn federation_clips_listed_unlisted_approved_and_sync() {
+    use pinetree::activitypub::federated_collections::{
+        remote_clip_cached_uris, resolve_remote_clip,
+    };
+
+    let a = boot_node("clips-a");
+    let b = boot_node("clips-b");
+    let client = test_client();
+    let deadline = Duration::from_secs(25);
+
+    // Signup: alice@A, bob + mallory@B.
+    let v = api_json(
+        &api_post(&client, &format!("{}/api/signup", a.base_url), None, &json!({"username": "alice", "password": "s3cret-pw"})),
+        "A signup alice",
+    );
+    let alice_id = v["id"].as_str().unwrap().to_string();
+    let alice_token = v["token"].as_str().unwrap().to_string();
+    let v = api_json(
+        &api_post(&client, &format!("{}/api/signup", b.base_url), None, &json!({"username": "bob", "password": "s3cret-pw"})),
+        "B signup bob",
+    );
+    let bob_id = v["id"].as_str().unwrap().to_string();
+    let bob_token = v["token"].as_str().unwrap().to_string();
+    let v = api_json(
+        &api_post(&client, &format!("{}/api/signup", b.base_url), None, &json!({"username": "mallory", "password": "s3cret-pw"})),
+        "B signup mallory",
+    );
+    let mallory_id = v["id"].as_str().unwrap().to_string();
+    let mallory_token = v["token"].as_str().unwrap().to_string();
+    a.services.ensure_actor_keypair(&alice_id).expect("alice key");
+    b.services.ensure_actor_keypair(&bob_id).expect("bob key");
+    b.services.ensure_actor_keypair(&mallory_id).expect("mallory key");
+    let alice_uri = format!("{}/users/{}", a.base_url, alice_id);
+    let bob_uri = format!("{}/users/{}", b.base_url, bob_id);
+
+    // Federation switches ON on A (B serves nothing in this test).
+    a.services
+        .update_instance_settings(&alice_id, None, None, Some(true), None, a.services.clock.now_ms())
+        .expect("federateClips on");
+
+    // Alice: public note + followers-only note + listed federated clip.
+    let n1 = api_json(
+        &api_post(&client, &format!("{}/api/notes/create", a.base_url), Some(&alice_token), &json!({"text": "clip me"})),
+        "A note n1",
+    )["createdNote"]["id"].as_str().unwrap().to_string();
+    let n2 = api_json(
+        &api_post(&client, &format!("{}/api/notes/create", a.base_url), Some(&alice_token), &json!({"text": "followers only", "visibility": "followers"})),
+        "A note n2",
+    )["createdNote"]["id"].as_str().unwrap().to_string();
+    let n1_uri = format!("{}/notes/{}", a.base_url, n1);
+    let n2_uri = format!("{}/notes/{}", a.base_url, n2);
+    let clip = api_json(
+        &api_post(&client, &format!("{}/api/clips/create", a.base_url), Some(&alice_token),
+            &json!({"name": "x", "isPublic": true, "visibility": "listed", "federate": true})),
+        "A clip create",
+    );
+    let clip_id = clip["id"].as_str().unwrap().to_string();
+    let clip_uri = format!("{}/clips/{}", a.base_url, clip_id);
+    for note_id in [&n1, &n2] {
+        let r = api_post(&client, &format!("{}/api/clips/add-note", a.base_url), Some(&alice_token),
+            &json!({"clipId": clip_id, "noteId": note_id}));
+        assert_eq!(r.status, 204, "add-note {note_id}: {}", String::from_utf8_lossy(&r.body));
+    }
+
+    // Bob@B follows alice@A (per-item gating needs the follow edge on A).
+    let v = api_json(
+        &api_post(&client, &format!("{}/api/users/show", b.base_url), Some(&bob_token), &json!({"username": "alice", "host": a.host})),
+        "B resolves alice",
+    );
+    let alice_on_b = v["id"].as_str().unwrap().to_string();
+    let r = api_post(&client, &format!("{}/api/following/create", b.base_url), Some(&bob_token), &json!({"userId": alice_on_b}));
+    assert!((200..300).contains(&r.status), "bob follow alice: {}", r.status);
+    pump_until(&a, &b, "A sees bob as follower", deadline, &mut || {
+        a.services.accounts.find_by_uri(&bob_uri).expect("lookup bob")
+            .map(|acc| a.services.follows.is_following(&acc.id, &alice_id).unwrap_or(false))
+            .unwrap_or(false)
+    })
+    .await;
+
+    // Anonymous fetch: listed collection serves, but only the public item.
+    let items = clip_items(
+        &http_get(&client, &clip_uri, "application/activity+json"),
+        "anon listed",
+    );
+    assert_eq!(items, vec![n1_uri.clone()], "anonymous sees public items only");
+    // Signed fetch as bob (follower): per-item gate admits the followers note.
+    let items = clip_items_signed(
+        &signed_get_to_url(&client, &b.services, &bob_id, &clip_uri, "application/activity+json"),
+        "bob listed",
+        Some((&b.services, &bob_id)),
+    );
+    assert!(items.contains(&n1_uri), "bob sees {items:?}");
+    assert!(items.contains(&n2_uri), "follower sees followers item: {items:?}");
+    // Signed fetch as mallory (stranger): followers item withheld.
+    let r = signed_get_to_url(&client, &b.services, &mallory_id, &clip_uri, "application/activity+json");
+    let items = clip_items(&r, "mallory listed");
+    assert_eq!(items, vec![n1_uri.clone()], "stranger sees public only: {items:?}");
+
+    // Advertisement: actor doc references the clips index; index lists it.
+    let actor_doc: Value = serde_json::from_slice(
+        &http_get(&client, &alice_uri, "application/activity+json").body,
+    ).expect("actor json");
+    let index_url = actor_doc["clips"].as_str().expect("actor clips ref").to_string();
+    assert_eq!(index_url, format!("{}/users/{}/clips", a.base_url, alice_id));
+    let index_items = clip_items(
+        &http_get(&client, &index_url, "application/activity+json"),
+        "clips index",
+    );
+    assert_eq!(index_items, vec![clip_uri.clone()]);
+
+    // Unlisted clip: capability URI serves, index stays silent.
+    let unlisted = api_json(
+        &api_post(&client, &format!("{}/api/clips/create", a.base_url), Some(&alice_token),
+            &json!({"name": "u", "isPublic": false, "visibility": "unlisted", "federate": true})),
+        "A unlisted create",
+    );
+    let unlisted_id = unlisted["id"].as_str().unwrap().to_string();
+    let unlisted_uri = format!("{}/clips/{}", a.base_url, unlisted_id);
+    let r = api_post(&client, &format!("{}/api/clips/add-note", a.base_url), Some(&alice_token),
+        &json!({"clipId": unlisted_id, "noteId": n1}));
+    assert_eq!(r.status, 204);
+    let items = clip_items(&http_get(&client, &unlisted_uri, "application/activity+json"), "anon unlisted");
+    assert_eq!(items, vec![n1_uri.clone()], "bearer capability serves");
+    let index_items = clip_items(&http_get(&client, &index_url, "application/activity+json"), "index hides unlisted");
+    assert_eq!(index_items, vec![clip_uri.clone()], "unlisted never advertised");
+
+    // Remote-approved clip: stranger signed → 403; unknown/unsigned → 404.
+    let approved = api_json(
+        &api_post(&client, &format!("{}/api/clips/create", a.base_url), Some(&alice_token),
+            &json!({"name": "r", "isPublic": false, "visibility": "remote_approved", "federate": true, "approvedActorUris": [bob_uri]})),
+        "A approved create",
+    );
+    let approved_uri = format!("{}/clips/{}", a.base_url, approved["id"].as_str().unwrap());
+    let r = signed_get_to_url(&client, &b.services, &mallory_id, &approved_uri, "application/activity+json");
+    assert_eq!(r.status, 403, "stranger refused: {}", String::from_utf8_lossy(&r.body));
+    let r = http_get(&client, &approved_uri, "application/activity+json");
+    assert_eq!(r.status, 404, "unsigned gets no existence signal");
+    let r = clip_items_signed(
+        &signed_get_to_url(&client, &b.services, &bob_id, &approved_uri, "application/activity+json"),
+        "approver",
+        Some((&b.services, &bob_id)),
+    );
+    assert!(r.is_empty(), "approver served, zero members: {r:?}");
+    // Private clip: 404 for everyone remote.
+    let private = api_json(
+        &api_post(&client, &format!("{}/api/clips/create", a.base_url), Some(&alice_token),
+            &json!({"name": "p", "federate": true})),
+        "A private create",
+    );
+    let private_uri = format!("{}/clips/{}", a.base_url, private["id"].as_str().unwrap());
+    let r = signed_get_to_url(&client, &b.services, &bob_id, &private_uri, "application/activity+json");
+    assert_eq!(r.status, 404, "private never leaves");
+    let _ = mallory_token;
+
+    // Membership sync: B primes its cache, then Add/Remove converge.
+    // Alice follows bob so bob's public note reaches A for clipping.
+    let v = api_json(
+        &api_post(&client, &format!("{}/api/users/show", a.base_url), Some(&alice_token), &json!({"username": "bob", "host": b.host})),
+        "A resolves bob",
+    );
+    let bob_on_a = v["id"].as_str().unwrap().to_string();
+    let r = api_post(&client, &format!("{}/api/following/create", a.base_url), Some(&alice_token), &json!({"userId": bob_on_a}));
+    assert!((200..300).contains(&r.status), "alice follow bob: {}", r.status);
+    pump_until(&a, &b, "B sees alice as follower", deadline, &mut || {
+        b.services.accounts.find_by_uri(&alice_uri).expect("lookup alice")
+            .map(|acc| b.services.follows.is_following(&acc.id, &bob_id).unwrap_or(false))
+            .unwrap_or(false)
+    })
+    .await;
+    // B primes the cache (anonymous pull: public items only).
+    let pulled = resolve_remote_clip(&b.services, &clip_uri).expect("prime pull");
+    assert_eq!(pulled, vec![n1_uri.clone()]);
+    assert!(remote_clip_cached_uris().contains(&clip_uri));
+    // Bob posts; alice (follower) ingests; alice clips it.
+    let m1_b = api_json(
+        &api_post(&client, &format!("{}/api/notes/create", b.base_url), Some(&bob_token), &json!({"text": "clip this too"})),
+        "B note m1",
+    )["createdNote"]["id"].as_str().unwrap().to_string();
+    let m1_uri = format!("{}/notes/{}", b.base_url, m1_b);
+    pump_until(&a, &b, "A ingests m1", deadline, &mut || {
+        a.services.notes.find_by_uri(&m1_uri).expect("lookup m1").is_some()
+    })
+    .await;
+    let m1_on_a = a.services.notes.find_by_uri(&m1_uri).expect("m1 row").unwrap().id.clone();
+    let r = api_post(&client, &format!("{}/api/clips/add-note", a.base_url), Some(&alice_token),
+        &json!({"clipId": clip_id, "noteId": m1_on_a}));
+    assert_eq!(r.status, 204, "clip remote note: {}", String::from_utf8_lossy(&r.body));
+    // The Add reaches B's inbox and evicts the cache; the re-pull converges.
+    pump_until(&a, &b, "B cache evicted by Add", deadline, &mut || {
+        drain_all(&a, &b);
+        !remote_clip_cached_uris().contains(&clip_uri)
+    })
+    .await;
+    let pulled = resolve_remote_clip(&b.services, &clip_uri).expect("re-pull");
+    assert!(pulled.contains(&n1_uri) && pulled.contains(&m1_uri), "Add converged: {pulled:?}");
+    // Remove converges the same way.
+    let r = api_post(&client, &format!("{}/api/clips/remove-note", a.base_url), Some(&alice_token),
+        &json!({"clipId": clip_id, "noteId": m1_on_a}));
+    assert_eq!(r.status, 204);
+    pump_until(&a, &b, "B cache evicted by Remove", deadline, &mut || {
+        drain_all(&a, &b);
+        !remote_clip_cached_uris().contains(&clip_uri)
+    })
+    .await;
+    let pulled = resolve_remote_clip(&b.services, &clip_uri).expect("re-pull 2");
+    assert_eq!(pulled, vec![n1_uri.clone()], "Remove converged: {pulled:?}");
+
+    // Switch off ⇒ zero footprint: routes 404, advertisement gone.
+    a.services
+        .update_instance_settings(&alice_id, None, None, Some(false), None, a.services.clock.now_ms())
+        .expect("federateClips off");
+    let r = http_get(&client, &clip_uri, "application/activity+json");
+    assert_eq!(r.status, 404, "switch off 404s collections");
+    let r = http_get(&client, &index_url, "application/activity+json");
+    assert_eq!(r.status, 404, "switch off 404s the index");
+    let actor_doc: Value = serde_json::from_slice(
+        &http_get(&client, &alice_uri, "application/activity+json").body,
+    ).expect("actor json 2");
+    assert!(actor_doc.get("clips").is_none(), "no advertisement when off");
+    // Evict B's cached resolution first: the switch-off must break the
+    // NETWORK path (a warm cache legitimately serves without fetching).
+    pinetree::activitypub::federated_collections::evict_remote_clip_cache(&clip_uri);
+    assert!(resolve_remote_clip(&b.services, &clip_uri).is_err(), "no resolution when off");
+}
+
+// ---------------------------------------------------------------------------
+// Federated pages (handoff gate 6): two-local-pinetree page federation.
+// Article round-trip (title/summary/content/eye-catch), Update(Article)
+// converges, scripted page federates as static-only (no script bytes in
+// ANY federated payload), page-like round-trip, inbound Article fixture
+// renders sanitized.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+async fn federation_pages_article_round_trip_update_and_likes() {
+    use pinetree::application::ports::PageStore;
+
+    let a = boot_node("pages-a");
+    let b = boot_node("pages-b");
+    let client = test_client();
+    let deadline = Duration::from_secs(25);
+
+    let v = api_json(
+        &api_post(&client, &format!("{}/api/signup", a.base_url), None, &json!({"username": "alice", "password": "s3cret-pw"})),
+        "A signup alice",
+    );
+    let alice_id = v["id"].as_str().unwrap().to_string();
+    let alice_token = v["token"].as_str().unwrap().to_string();
+    let v = api_json(
+        &api_post(&client, &format!("{}/api/signup", b.base_url), None, &json!({"username": "bob", "password": "s3cret-pw"})),
+        "B signup bob",
+    );
+    let bob_id = v["id"].as_str().unwrap().to_string();
+    let bob_token = v["token"].as_str().unwrap().to_string();
+    a.services.ensure_actor_keypair(&alice_id).expect("alice key");
+    b.services.ensure_actor_keypair(&bob_id).expect("bob key");
+    let alice_uri = format!("{}/users/{}", a.base_url, alice_id);
+    let bob_uri = format!("{}/users/{}", b.base_url, bob_id);
+
+    // Federation switches ON on A.
+    a.services
+        .update_instance_settings(&alice_id, None, None, None, Some(true), a.services.clock.now_ms())
+        .expect("federatePages on");
+
+    // Bob follows alice BEFORE the page exists (fan-out resolves at send).
+    let v = api_json(
+        &api_post(&client, &format!("{}/api/users/show", b.base_url), Some(&bob_token), &json!({"username": "alice", "host": a.host})),
+        "B resolves alice",
+    );
+    let alice_on_b = v["id"].as_str().unwrap().to_string();
+    let r = api_post(&client, &format!("{}/api/following/create", b.base_url), Some(&bob_token), &json!({"userId": alice_on_b}));
+    assert!((200..300).contains(&r.status), "bob follow alice: {}", r.status);
+    pump_until(&a, &b, "A sees bob as follower", deadline, &mut || {
+        a.services.accounts.find_by_uri(&bob_uri).expect("lookup bob")
+            .map(|acc| a.services.follows.is_following(&acc.id, &alice_id).unwrap_or(false))
+            .unwrap_or(false)
+    })
+    .await;
+
+    // Alice creates a scripted federated page.
+    let page = api_json(
+        &api_post(&client, &format!("{}/api/pages/create", a.base_url), Some(&alice_token),
+            &json!({
+                "title": "Hello",
+                "name": "hello",
+                "content": [{ "type": "text", "text": "federated body" }],
+                "variables": [],
+                "script": "let s3cret = `run()`;",
+                "federate": true,
+            })),
+        "A page create",
+    );
+    let page_id = page["id"].as_str().unwrap().to_string();
+    let article_uri = format!("{}/pages/{}", a.base_url, page_id);
+
+    // B receives Create(Article) → materializes a remote page (not a
+    // note): title/content fidelity, script never stored.
+    pump_until(&a, &b, "B ingests the Article", deadline, &mut || {
+        drain_all(&a, &b);
+        b.services.pages.get_page_by_uri(&article_uri).expect("lookup article").is_some()
+    })
+    .await;
+    let stored = b.services.pages.get_page_by_uri(&article_uri).expect("article page").unwrap();
+    assert_eq!(stored.title, "Hello");
+    assert_eq!(stored.script, "", "remote script never stored");
+    assert_eq!(stored.uri.as_deref(), Some(article_uri.as_str()));
+    assert!(stored.owner_id != alice_id, "remote-owned row");
+    let content = serde_json::to_string(&stored.content).unwrap();
+    assert!(content.contains("federated body"), "body survived: {content:?}");
+    assert!(!content.contains("s3cret") && !content.contains("run()`"), "no script: {content:?}");
+    // No note row shadows the page.
+    assert!(b.services.notes.find_by_uri(&article_uri).expect("note lookup").is_none());
+
+    // The served Article itself carries no script bytes anywhere.
+    let article: Value = serde_json::from_slice(
+        &http_get(&client, &article_uri, "application/activity+json").body,
+    ).expect("article json");
+    assert_eq!(article["type"], "Article");
+    assert_eq!(article["name"], "Hello");
+    assert!(article["content"].as_str().unwrap().contains("federated body"));
+    let wire = serde_json::to_string(&article).unwrap();
+    assert!(!wire.contains("s3cret") && !wire.contains("run()`"), "wire has no script");
+
+    // Update converges: alice edits → Update(Article) → B's page updates.
+    let r = api_post(&client, &format!("{}/api/pages/update", a.base_url), Some(&alice_token),
+        &json!({"pageId": page_id, "title": "Hello 2", "content": [{ "type": "text", "text": "updated body" }]}));
+    assert_eq!(r.status, 204, "page update: {}", String::from_utf8_lossy(&r.body));
+    pump_until(&a, &b, "B page updated", deadline, &mut || {
+        drain_all(&a, &b);
+        b.services.pages.get_page_by_uri(&article_uri).expect("lookup").map(|p| {
+            p.title == "Hello 2"
+                && serde_json::to_string(&p.content).unwrap().contains("updated body")
+        }).unwrap_or(false)
+    })
+    .await;
+
+    // Page-like round-trip: bob's Like(page URI) → A's inbox → count bumps.
+    let like = json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": format!("{}/likes/bob-1", b.base_url),
+        "type": "Like",
+        "actor": bob_uri,
+        "object": article_uri,
+    });
+    let body = serde_json::to_vec(&like).unwrap();
+    let r = signed_post_to_inbox(&client, &b.services, &bob_id, &format!("{}/inbox", a.base_url), &body, None);
+    assert!((200..300).contains(&r.status), "like POST: {}", r.status);
+    let count = a.services.pages.get_page(&page_id).expect("page").unwrap().liked_count;
+    assert_eq!(count, 1, "page like recorded");
+    // Replay converges (no double count).
+    let r = signed_post_to_inbox(&client, &b.services, &bob_id, &format!("{}/inbox", a.base_url), &body, None);
+    assert!((200..300).contains(&r.status));
+    let count = a.services.pages.get_page(&page_id).expect("page").unwrap().liked_count;
+    assert_eq!(count, 1, "replay converges");
+    // Unknown-page likes are ignored, not errors.
+    let like_unknown = json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": format!("{}/likes/bob-2", b.base_url),
+        "type": "Like",
+        "actor": bob_uri,
+        "object": format!("{}/pages/aaaaaaaaaaaaaaaa", a.base_url),
+    });
+    let body = serde_json::to_vec(&like_unknown).unwrap();
+    let r = signed_post_to_inbox(&client, &b.services, &bob_id, &format!("{}/inbox", a.base_url), &body, None);
+    assert!((200..300).contains(&r.status));
+
+    // Inbound Article fixture with hostile markup materializes as a
+    // sanitized page (never a note, never executable).
+    let evil = json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": format!("{}/articles/evil-1", b.base_url),
+        "type": "Create",
+        "actor": bob_uri,
+        "object": {
+            "id": format!("{}/articles/evil-1", b.base_url),
+            "type": "Article",
+            "attributedTo": bob_uri,
+            "name": "evil",
+            "content": "<p>hi</p><script>alert(1)</script><img src=x onerror=alert(2)>",
+            "to": ["https://www.w3.org/ns/activitystreams#Public"],
+        },
+    });
+    let body = serde_json::to_vec(&evil).unwrap();
+    let r = signed_post_to_inbox(&client, &b.services, &bob_id, &format!("{}/inbox", a.base_url), &body, None);
+    assert!((200..300).contains(&r.status), "evil article POST: {}", r.status);
+    let stored = a
+        .services
+        .pages
+        .get_page_by_uri(&format!("{}/articles/evil-1", b.base_url))
+        .expect("evil lookup")
+        .expect("evil stored as page");
+    assert_eq!(stored.script, "");
+    let content = serde_json::to_string(&stored.content).unwrap();
+    assert!(!content.contains("<script") && !content.contains("onerror"), "sanitized: {content:?}");
+    assert!(content.contains("hi"), "readable content kept: {content:?}");
+    assert!(a.services.notes.find_by_uri(&format!("{}/articles/evil-1", b.base_url)).expect("evil note lookup").is_none(),
+        "no shadow note row");
 }

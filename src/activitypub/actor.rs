@@ -546,6 +546,22 @@ pub fn render_actor_document(
     // `alsoKnownAs`/`movedTo` parity): omitted when unset, so old
     // documents keep their shape.
     if let Some(map) = doc.as_object_mut() {
+        // Federated clips advertisement (pinetree-first DIVERGENCE):
+        // listed clips surface through `{actor}/clips`; the reference is
+        // omitted while the global switch is off (zero protocol
+        // footprint) and never advertises unlisted clips (the index
+        // itself filters to listed + federate-enabled).
+        let federate_clips = services
+            .instance_settings
+            .get()
+            .map(|s| s.federate_clips)
+            .unwrap_or(false);
+        if federate_clips {
+            map.insert(
+                "clips".to_string(),
+                Value::String(format!("{actor_url}/clips")),
+            );
+        }
         if let Some(uris) = account.also_known_as.as_deref().filter(|uris| !uris.is_empty()) {
             map.insert(
                 "alsoKnownAs".to_string(),
@@ -1116,6 +1132,8 @@ mod tests {
             signin: store.clone(),
             password_resets: store.clone(),
             registry: store.clone(),
+            clips: store.clone(),
+            pages: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()

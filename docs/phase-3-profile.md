@@ -82,8 +82,8 @@ public (documented deviation; Misskey `FORBIDDEN` cases do not apply).
 ## 5. Explicitly OUT of the profile (non-goals)
 
 - `drive/folders/*` + non-null `folderId` (no folder model;
-  `drive/files*` requires null, documented), `clips`, `channels/*`,
-  `chat*`, `pages`, Reversi, `hashtag`, `roleTimeline`, `serverStats`,
+  `drive/files*` requires null, documented), `channels/*`,
+  `chat*`, Reversi, `hashtag`, `roleTimeline`, `serverStats`,
   `queueStats`, `drive` streaming channel, `i/notifications-grouped`,
   `notes/featured`, `users/featured-notes`,
   `notes/reactions` (list),
@@ -104,7 +104,10 @@ public (documented deviation; Misskey `FORBIDDEN` cases do not apply).
   notification utilities + discovery + versions + translate (§35 Batch P;
   `pinned-users` answers `[]`, hashtag timeline stays out — upstream has
   none — `fetch-rss` is a documented subset, email/translate transports
-  dormant).
+  dormant), federated clips + pages (§36: local `clips/*` + `pages/*`
+  parity, `export-clips` real + pinetree-only `i/import-clips`, AP
+  `OrderedCollection`/`Article` wire + fetch gate; federation switches
+  default OFF).
 - `notes/search` `offset`/`channelId`/`rangeStartAt|EndAt`: rejected as
   `UNSUPPORTED_FIELD` (Keystone never sends them).
 

@@ -61,6 +61,8 @@ fn build_services(cfg: &Config) -> Result<(Arc<AppServices>, pinetree::streaming
             signin: store.clone(),
             password_resets: store.clone(),
             registry: store.clone(),
+            clips: store.clone(),
+            pages: store.clone(),
         federation_http: SafeHttpClient::new(SafeHttpConfig::default()),
         public_url: cfg.normalized_public_url(),
         max_file_size: cfg.max_file_size,

@@ -285,6 +285,8 @@ impl AppServices {
         actor: &str,
         disable_registration: Option<bool>,
         blocked_hosts: Option<Vec<String>>,
+        federate_clips: Option<bool>,
+        federate_pages: Option<bool>,
         now_ms: i64,
     ) -> Result<InstanceSettings, PortError> {
         let current = self.instance_settings.get()?;
@@ -295,11 +297,19 @@ impl AppServices {
         if let Some(hosts) = blocked_hosts {
             patch.blocked_hosts = Some(InstanceSettings::normalize_blocked_hosts(&hosts));
         }
+        if let Some(federate_clips) = federate_clips {
+            patch.federate_clips = Some(federate_clips);
+        }
+        if let Some(federate_pages) = federate_pages {
+            patch.federate_pages = Some(federate_pages);
+        }
         let next_registration = patch.registration.unwrap_or(current.registration);
         let next_blocked_hosts = patch
             .blocked_hosts
             .clone()
             .unwrap_or_else(|| current.blocked_hosts.clone());
+        let next_federate_clips = patch.federate_clips.unwrap_or(current.federate_clips);
+        let next_federate_pages = patch.federate_pages.unwrap_or(current.federate_pages);
         let log = ModerationLogEntry::new(
             self.ids.generate(),
             Some(actor.to_string()),
@@ -309,10 +319,14 @@ impl AppServices {
                 "before": {
                     "disableRegistration": current.registration.disable_registration(),
                     "blockedHosts": current.blocked_hosts,
+                    "federateClips": current.federate_clips,
+                    "federatePages": current.federate_pages,
                 },
                 "after": {
                     "disableRegistration": next_registration.disable_registration(),
                     "blockedHosts": next_blocked_hosts,
+                    "federateClips": next_federate_clips,
+                    "federatePages": next_federate_pages,
                 },
             }),
             now_ms,

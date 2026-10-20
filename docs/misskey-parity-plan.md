@@ -190,6 +190,7 @@ Guide: `docs/implementer-guide-batch-m.md` (status lines there are the spec; thi
 - Batch N tail: Sharkey `notes/schedule/*` shim LANDED (thin alias over drafts; manifest §32). MiAuth audit + hardening LANDED (expiry, GET-no-write, suspended-submit gate, required gen-token params; manifest §33). Server-side word mutes LANDED (matcher + hard-drop + soft flag; `docs/word-mutes.md`, manifest §31).
 - §7 smoke-gate fix, §6 remaining docs (phase-3-profile §5 note, testing.md, wiki, AGENTS counts): PENDING, batch end.
 - Batch P (email/move/registry/reads/mentions/notifications/discovery/versions/translate): LANDED 2026-10-20 — all eight handoff workstreams, solo build; manifest §35; conformance Group W (W1–W2) green; `federation_account_move` live two-node test green; `cargo test --offline` 466 lib + 110 conformance + integration green (see `state/logs/2026-10-20-batch-p.md`).
+- Federated clips + pages (handoff `docs/handoff-federated-clips-pages.md`): LANDED 2026-10-20 — Phase 0 generic fetch gate (`fetch_gate.rs`, shared with the community track; matrix test green), Phase 1 local clips (11 endpoints, verbatim UUIDs; Group X green), Phase 3 local pages (7 endpoints incl. `featured` as the upstream pure query; Group Y green), clip/page AP wire (`OrderedCollection` + `Article`, script structurally excluded) + delivery/inbox paths, inbound `Article`s materialize as remote pages (public only; updates/deletes/likes by URI), two-pinetree protocol tests green (gates 5 + 6); manifest §36.
 
 ## Build order
 

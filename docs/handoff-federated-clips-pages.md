@@ -19,7 +19,7 @@ Suggested split (parallel investigation, then serial build):
 ## Phase 0 — authenticated fetch (prerequisite, no shortcuts)
 
 - Verify HTTP Signatures on inbound GETs for designated non-public object routes (clip collections, unlisted/listed-but-gated pages, remote-approved items). Known signer + authorized → serve; known signer + not authorized → 403; unknown/unsigned → 404 (existence unconfirmed).
-- This is shared infrastructure: build it once, use for both types. Tests: matrix of {public, unlisted-capability, approved-remote, stranger, unsigned} × {serve, 403, 404}.
+- This is shared infrastructure, not a clips feature: `docs/community-planning.md` (private communities: "private fetch requires follower-instance signature") depends on this same gate. Build it generic — signature verification plus a serve/403/404 decision interface that community membership checks can reuse — and say so in `docs/federated-collections.md`. Do not shape the API around clips. Tests: matrix of {public, unlisted-capability, approved-remote, stranger, unsigned} × {serve, 403, 404}.
 
 ## Phase 1 — local clips (Misskey parity)
 
@@ -39,11 +39,11 @@ Suggested split (parallel investigation, then serial build):
 
 ## Phase 3 — local + federated pages (Article, script rule)
 
-- Store the full Misskey shape (`title`, per-user-unique `name` slug, `summary`, `content` blocks, `variables`, **`script`**, `eyeCatchImageId`, font/align flags): local parity for Keystone.
-- Endpoints: `create|update|delete|show` (show by name+username), `like|unlike`. `featured`: SKIP (admin-curation surface; record 404 + reason).
+- Store the full Misskey shape (`title`, per-user-unique `name` slug, `summary`, `content` block array, `variables`, **`script`**, `eyeCatchImageId`, font/align flags): local parity for Keystone.
+- Endpoints: `create|update|delete|show` (show by name+username), `like|unlike`. `featured`: implemented as the upstream pure query (evidence-backed override of the handoff SKIP — see manifest §36).
 - Federate as **`Article`** (existing type — Misskey `validPost` includes it, our inbox already dispatches it): `name`=title, `content`=server-rendered sanitized HTML, `summary`, `url`=page URL, `attributedTo`, `published`/`updated`, `attachment`=[eye-catch image]. `source` carries content blocks + `variables` for pinetree↔pinetree fidelity — **`script` is NEVER serialized into any federated field, structurally** (not a flag: the serializer has no code path that emits it). Updates ride the existing `Update(Article)` delivery path.
-- Inbound `Article`: resolve through the note pipeline (type already accepted; work is storage + long-form render handoff to Keystone). Render ONLY from sanitized `content`, or re-sanitize `source` server-side on ingest — never execute, never trust remote `source`. Same four privacy tiers + same advertisement rules + `federatePages` switch (default OFF) + per-page flag (default OFF) as clips.
-- Page likes: store + count; federate as `Like(Page-target)` only pinetree↔pinetree (degrades to nothing elsewhere — fine).
+- Inbound `Article`: **materialize as pages, not notes** (owner decision 2026-10-20 — supersedes the note-pipeline line below for public Articles; non-public Articles keep the note pipeline, which enforces visibility). Public inbound `Article` → remote page row (canonical `uri`, content from `source` blocks or sanitized synthesis, `script` never stored, slug derived + disambiguated). Updates/deletes/likes correlate by URI. (Previous plan said "resolve through the note pipeline" for all inbound Articles — that now applies only to non-public ones.)
+- Page likes: store + count; federate as `Like(Page-target)` both directions (inbound recorded remote-attributed; likes on materialized remote pages delivered back to the origin). Local co-located likes need no delivery.
 
 ## Privacy tiers (both types, one model)
 

@@ -30,10 +30,10 @@ use pinetree::application::commands::AppServices;
 use pinetree::application::ports::{
     AccountStore, ActivityDedup, AntennaNoteStore, AntennaStore, BlockStore, BlobStore, ConsumeInviteInput, CreateAccountInput,
     CreateInviteInput, CreateNoteInput,
-    EditNoteInput, EmojiStore, FavoriteStore, FollowStore, InsertMediaInput, InstanceSettingsPatch, InstanceSettingsStore,
+    EditNoteInput, ClipStore, EmojiStore, FavoriteStore, FollowStore, InsertMediaInput, InstanceSettingsPatch, InstanceSettingsStore,
     InviteStore, JobKind, JobQueue,
     MediaStore, ModerationLogFilter, ModerationLogStore, MuteStore, NewJob,
-    NoopStreamingSink, NoteStore, NotificationStore, PasswordResetRequest, PasswordResetStore, PollExpiryPayload, PollStore, PortError,
+    NoopStreamingSink, NoteStore, NotificationStore, PageStore, PasswordResetRequest, PasswordResetStore, PollExpiryPayload, PollStore, PortError,
     ReactionStore, RegistryItem, RegistryStore, ReplyParentResolvePayload, ScheduledDraftPayload, SigninRecord, SigninStore, StreamingSink, TimelineCursor,
     UpdateAccountPatch, UserListStore, MAX_JOBS_PER_TXN, MAX_JOB_ATTEMPTS, MAX_JOB_PAYLOAD_BYTES, MAX_SIGNIN_ROWS_PER_USER,
 };
@@ -44,6 +44,9 @@ use pinetree::domain::poll::{PollInput, PollVote};
 use pinetree::domain::draft::NoteDraft;
 use pinetree::domain::note::{Note, Visibility};
 use pinetree::domain::favorite::NoteFavorite;
+use pinetree::domain::clip::{Clip, ClipFavorite, ClipNote, CLIP_LIMIT_PER_OWNER, CLIP_NOTES_PER_CLIP};
+use pinetree::domain::collection::CollectionTier;
+use pinetree::domain::page::{Page, PageFont, PageLike};
 use pinetree::domain::pinning::UserNotePining;
 use pinetree::domain::policy::{
     ViewerContext, is_eligible_for_federated_timeline, is_eligible_for_federation_delivery,
@@ -1033,6 +1036,8 @@ fn open_worker_stack(
             signin: store.clone(),
             password_resets: store.clone(),
             registry: store.clone(),
+            clips: store.clone(),
+            pages: store.clone(),
         streaming: Arc::new(NoopStreamingSink),
         dedup: store.clone() as Arc<dyn ActivityDedup>,
         federation_http: SafeHttpClient::new(SafeHttpConfig {
@@ -7029,4 +7034,297 @@ fn w2_registry_store_isolation() {
     let clock = test_clock();
     let store = factory.open(clock.clone());
     case_w2_registry_store(&*store, &clock);
+}
+
+// ---------------------------------------------------------------------------
+// Group X (federated clips + pages handoff, Phase 1): clips, clip-notes,
+// clip favorites. Cap checks + inserts commit atomically; delete cascades
+// memberships + favorites in the same commit; foreign-owner deletes are
+// misses, not deletes.
+
+fn k_clip(owner: &str, name: &str) -> Clip {
+    Clip {
+        id: format!("kclip-{owner}-{name}"),
+        owner_id: owner.to_string(),
+        name: name.to_string(),
+        description: None,
+        is_public: false,
+        tier: CollectionTier::Private,
+        federate: false,
+        approved_actor_uris: Vec::new(),
+        created_at_ms: 1,
+        last_clipped_at_ms: None,
+    }
+}
+
+fn k_clip_note(clip_id: &str, note_id: &str) -> ClipNote {
+    ClipNote {
+        id: format!("kcn-{clip_id}-{note_id}"),
+        clip_id: clip_id.to_string(),
+        note_id: note_id.to_string(),
+        created_at_ms: 1,
+    }
+}
+
+fn k_clip_fav(user: &str, clip_id: &str) -> ClipFavorite {
+    ClipFavorite {
+        id: format!("kcf-{user}-{clip_id}"),
+        user_id: user.to_string(),
+        clip_id: clip_id.to_string(),
+        created_at_ms: 1,
+    }
+}
+
+/// X1: clip CRUD is owner-scoped; the per-owner cap holds under a thread
+/// race (exactly the cap wins, losers report `TOO_MANY_CLIPS`).
+#[test]
+fn x1_clip_crud_and_cap_race() {
+    let factory = RedbFactory::fresh("x1");
+    let clock = test_clock();
+    let store = factory.open(clock);
+    let clip = store.create_clip(k_clip("alice", "a")).expect("create");
+    assert_eq!(clip.owner_id, "alice");
+    // Owner-scoped update; foreign update is a miss.
+    let mut renamed = clip.clone();
+    renamed.name = "a2".to_string();
+    assert!(store.update_clip(renamed).expect("update").is_some());
+    let mut foreign = clip.clone();
+    foreign.owner_id = "mallory".to_string();
+    assert!(store.update_clip(foreign).expect("foreign").is_none());
+    assert_eq!(store.clips_by_owner("alice").expect("list").len(), 1);
+    // Cap race.
+    let results: Vec<_> = std::thread::scope(|scope| {
+        (0..(CLIP_LIMIT_PER_OWNER + 4))
+            .map(|i| {
+                let store = store.clone();
+                scope.spawn(move || {
+                    store
+                        .create_clip(k_clip("bob", &format!("c{i:02}")))
+                        .map(|_| ())
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect()
+    });
+    assert_eq!(
+        results.iter().filter(|r| r.is_ok()).count(),
+        CLIP_LIMIT_PER_OWNER,
+        "exactly the cap wins"
+    );
+    assert!(
+        results
+            .iter()
+            .all(|r| r.is_ok() || matches!(r, Err(PortError::Conflict(msg)) if msg == "TOO_MANY_CLIPS")),
+        "losers report TOO_MANY_CLIPS"
+    );
+    // Foreign-owner delete is a miss, not a delete.
+    assert!(!store.delete_clip("mallory", "kclip-alice-a").expect("foreign"));
+    assert!(store.get_clip("kclip-alice-a").expect("get").is_some());
+}
+
+/// X2: clip-note membership (unique pair, per-clip cap, last-clipped
+/// touch) + favorite lifecycle + delete cascade.
+#[test]
+fn x2_clip_notes_favorites_and_cascade() {
+    let factory = RedbFactory::fresh("x2");
+    let clock = test_clock();
+    let store = factory.open(clock);
+    store.create_clip(k_clip("alice", "a")).expect("create");
+    // Duplicate pair converges on ALREADY_CLIPPED.
+    store
+        .add_clip_note(k_clip_note("kclip-alice-a", "n1"), 100, Vec::new())
+        .expect("add");
+    let dup = store.add_clip_note(k_clip_note("kclip-alice-a", "n1"), 101, Vec::new());
+    assert!(matches!(dup, Err(PortError::Conflict(msg)) if msg == "ALREADY_CLIPPED"));
+    // last_clipped_at touched on add only.
+    assert_eq!(
+        store
+            .get_clip("kclip-alice-a")
+            .expect("get")
+            .unwrap()
+            .last_clipped_at_ms,
+        Some(100)
+    );
+    assert!(store.remove_clip_note("kclip-alice-a", "n1", Vec::new()).expect("remove"));
+    assert!(!store.remove_clip_note("kclip-alice-a", "n1", Vec::new()).expect("re-remove"));
+    assert!(
+        store
+            .get_clip("kclip-alice-a")
+            .expect("get")
+            .unwrap()
+            .last_clipped_at_ms
+            == Some(100),
+        "remove never clears last_clipped_at"
+    );
+    // Per-clip cap holds.
+    for i in 0..CLIP_NOTES_PER_CLIP {
+        store
+            .add_clip_note(k_clip_note("kclip-alice-a", &format!("m{i:03}")), 200, Vec::new())
+            .expect("fill");
+    }
+    let over = store.add_clip_note(k_clip_note("kclip-alice-a", "overflow"), 201, Vec::new());
+    assert!(matches!(over, Err(PortError::Conflict(msg)) if msg == "TOO_MANY_CLIP_NOTES"));
+    assert_eq!(store.count_clip_notes("kclip-alice-a").expect("count"), CLIP_NOTES_PER_CLIP as u64);
+    // Newest-first member ids.
+    let ids = store.clip_note_ids("kclip-alice-a").expect("ids");
+    assert_eq!(ids.len(), CLIP_NOTES_PER_CLIP);
+    assert!(ids[0] > ids[ids.len() - 1], "newest-first");
+    // Favorites: idempotent insert, count, cascade on delete.
+    assert!(store.favorite_clip(k_clip_fav("bob", "kclip-alice-a")).expect("fav"));
+    assert!(!store.favorite_clip(k_clip_fav("bob", "kclip-alice-a")).expect("dup"));
+    assert!(store.is_clip_favorited("bob", "kclip-alice-a").expect("check"));
+    assert_eq!(store.clip_favorite_count("kclip-alice-a").expect("count"), 1);
+    assert_eq!(store.clip_favorites_by_user("bob").expect("favs").len(), 1);
+    assert!(store.unfavorite_clip("bob", "kclip-alice-a").expect("unfav"));
+    assert!(!store.unfavorite_clip("bob", "kclip-alice-a").expect("re-unfav"));
+    store.favorite_clip(k_clip_fav("bob", "kclip-alice-a")).expect("re-fav");
+    assert!(store.delete_clip("alice", "kclip-alice-a").expect("delete"));
+    assert!(store.clip_note_ids("kclip-alice-a").expect("ids").is_empty(), "memberships cascaded");
+    assert_eq!(store.clip_favorite_count("kclip-alice-a").expect("count"), 0, "favorites cascaded");
+    assert!(store.clip_favorites_by_user("bob").expect("favs").is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Group Y (federated clips + pages handoff, Phase 3 local): pages and page
+// likes. Slug uniqueness holds atomically; like/unlike bump the counter
+// in the same transaction; `featured_pages` is the upstream top-10 query.
+
+fn k_page(owner: &str, name: &str) -> Page {
+    Page {
+        id: format!("kpage-{owner}-{name}"),
+        owner_id: owner.to_string(),
+        title: format!("Title {name}"),
+        name: name.to_string(),
+        summary: None,
+        content: serde_json::json!([{ "type": "text", "text": "hi" }]),
+        variables: serde_json::json!([]),
+        script: String::new(),
+        eye_catching_image_id: None,
+        font: PageFont::SansSerif,
+        align_center: false,
+        hide_title_when_pinned: false,
+        tier: CollectionTier::Listed,
+        federate: false,
+        approved_actor_uris: Vec::new(),
+        uri: None,
+        remote_attachments: Vec::new(),
+        liked_count: 0,
+        created_at_ms: 1,
+        updated_at_ms: 1,
+    }
+}
+
+fn k_page_like(user: &str, page_id: &str) -> PageLike {
+    PageLike {
+        id: format!("kpl-{user}-{page_id}"),
+        user_id: user.to_string(),
+        page_id: page_id.to_string(),
+        created_at_ms: 1,
+    }
+}
+
+/// Y1: page CRUD is id/slug addressed; slug uniqueness holds under a
+/// thread race; slug moves conflict; delete cascades likes.
+#[test]
+fn y1_page_crud_and_slug_race() {
+    let factory = RedbFactory::fresh("y1");
+    let clock = test_clock();
+    let store = factory.open(clock);
+    store.create_page(k_page("alice", "hello"), Vec::new()).expect("create");
+    assert!(store.get_page_by_name("alice", "hello").expect("by-name").is_some());
+    assert!(store.get_page_by_name("alice", "missing").expect("by-name").is_none());
+    // Other owners may reuse the slug.
+    store.create_page(k_page("bob", "hello"), Vec::new()).expect("same slug, other owner");
+    // Slug race on one owner: exactly one wins.
+    let results: Vec<_> = std::thread::scope(|scope| {
+        (0..8)
+            .map(|_| {
+                let store = store.clone();
+                scope.spawn(move || store.create_page(k_page("carol", "race"), Vec::new()).map(|_| ()))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect()
+    });
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+    assert!(
+        results
+            .iter()
+            .all(|r| r.is_ok() || matches!(r, Err(PortError::Conflict(msg)) if msg == "NAME_ALREADY_EXISTS")),
+        "losers report NAME_ALREADY_EXISTS"
+    );
+    // Slug move onto a sibling slug conflicts; same-slug rewrite is fine.
+    let mut moved = store.get_page_by_name("alice", "hello").expect("get").unwrap();
+    moved.name = "hello".to_string();
+    assert!(store.update_page(moved.clone(), Vec::new()).expect("same").is_some());
+    store.create_page(k_page("alice", "other"), Vec::new()).expect("sibling");
+    moved.name = "other".to_string();
+    let clash = store.update_page(moved, Vec::new());
+    assert!(matches!(clash, Err(PortError::Conflict(msg)) if msg == "NAME_ALREADY_EXISTS"));
+    // Like, then delete cascades the like row.
+    assert!(store.like_page(k_page_like("bob", "kpage-alice-hello"), Vec::new()).expect("like"));
+    assert!(store.delete_page("kpage-alice-hello").expect("delete"));
+    assert!(store.get_page("kpage-alice-hello").expect("get").is_none());
+    assert!(store.get_page_by_name("alice", "hello").expect("by-name").is_none());
+    assert!(!store.is_page_liked("bob", "kpage-alice-hello").expect("liked"));
+}
+
+/// Y2: like/unlike are idempotent and move the counter; `featured_pages`
+/// returns only liked pages, highest count first, at most 10.
+#[test]
+fn y2_page_likes_and_featured() {
+    let factory = RedbFactory::fresh("y2");
+    let clock = test_clock();
+    let store = factory.open(clock);
+    for i in 0..12 {
+        store.create_page(k_page("alice", &format!("p{i:02}")), Vec::new()).expect("create");
+    }
+    // p00 gets 3 likes, p01 gets 1; the rest stay at 0 (unfeatured).
+    for (user, page) in [("u1", "p00"), ("u2", "p00"), ("u3", "p00"), ("u1", "p01")] {
+        assert!(store.like_page(k_page_like(user, &format!("kpage-alice-{page}")), Vec::new()).expect("like"));
+    }
+    assert!(!store.like_page(k_page_like("u1", "kpage-alice-p00"), Vec::new()).expect("dup"));
+    assert_eq!(
+        store.get_page("kpage-alice-p00").expect("get").unwrap().liked_count,
+        3
+    );
+    assert!(store.unlike_page("u3", "kpage-alice-p00").expect("unlike"));
+    assert!(!store.unlike_page("u3", "kpage-alice-p00").expect("re-unlike"));
+    assert_eq!(
+        store.get_page("kpage-alice-p00").expect("get").unwrap().liked_count,
+        2
+    );
+    let featured = store.featured_pages().expect("featured");
+    assert_eq!(featured.len(), 2);
+    assert_eq!(featured[0].name, "p00");
+    assert_eq!(featured[0].liked_count, 2);
+    assert_eq!(featured[1].name, "p01");
+}
+
+/// Y3: canonical-URI index for materialized remote pages — URI lookup,
+/// rebind on URI change, and index cleanup on delete.
+#[test]
+fn y3_page_uri_index_round_trip() {
+    let factory = RedbFactory::fresh("y3");
+    let clock = test_clock();
+    let store = factory.open(clock);
+    let mut page = k_page("alice", "remote");
+    page.uri = Some("https://remote.example/pages/1".to_string());
+    store.create_page(page, Vec::new()).expect("create");
+    let found = store
+        .get_page_by_uri("https://remote.example/pages/1")
+        .expect("by-uri")
+        .expect("found");
+    assert_eq!(found.name, "remote");
+    assert!(store.get_page_by_uri("https://remote.example/pages/2").expect("miss").is_none());
+    // Update keeps the row addressable; delete drops the index.
+    let mut renamed = found.clone();
+    renamed.name = "remote2".to_string();
+    store.update_page(renamed, Vec::new()).expect("update");
+    assert!(store.get_page_by_uri("https://remote.example/pages/1").expect("by-uri").is_some());
+    assert!(store.delete_page(&found.id).expect("delete"));
+    assert!(store.get_page_by_uri("https://remote.example/pages/1").expect("gone").is_none());
 }

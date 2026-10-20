@@ -1802,6 +1802,10 @@ pub enum ImportEntity {
     Muting,
     UserLists,
     Antennas,
+    /// pinetree-only (no upstream `i/import-clips` exists): consumes the
+    /// pinetree `export-clips` format (DIVERGENCE, documented in the
+    /// endpoint manifest §36).
+    Clips,
 }
 
 /// Payload of a `JobKind::Export` job: which entity of `user_id` to export
@@ -2262,6 +2266,130 @@ pub trait UserListStore: Send + Sync {
     fn list_favorite_count(&self, list_id: &str) -> Result<u64, PortError>;
 }
 
+/// Clips (Misskey `MiClip`/`MiClipNote`/`MiClipFavorite` parity + pinetree
+/// federation columns). Count checks + inserts commit atomically in ONE
+/// port call (same discipline as `UserListStore`); FDB inherits this path.
+pub trait ClipStore: Send + Sync {
+    /// Insert one clip; `Conflict(TOO_MANY_CLIPS)` when the owner already
+    /// holds [`crate::domain::clip::CLIP_LIMIT_PER_OWNER`] clips. Count
+    /// check + insert commit atomically.
+    fn create_clip(
+        &self,
+        clip: crate::domain::clip::Clip,
+    ) -> Result<crate::domain::clip::Clip, PortError>;
+    /// Owner-scoped rewrite. `None` on miss (endpoint maps to
+    /// per-endpoint `NO_SUCH_CLIP`).
+    fn update_clip(
+        &self,
+        clip: crate::domain::clip::Clip,
+    ) -> Result<Option<crate::domain::clip::Clip>, PortError>;
+    /// Owner-scoped delete with clip-note + favorite cascade, one
+    /// transaction. Returns true when a row existed.
+    fn delete_clip(&self, owner_id: &str, clip_id: &str) -> Result<bool, PortError>;
+    fn get_clip(&self, clip_id: &str) -> Result<Option<crate::domain::clip::Clip>, PortError>;
+    /// Owner's clips, newest-first (bounded by the per-owner cap).
+    fn clips_by_owner(
+        &self,
+        owner_id: &str,
+    ) -> Result<Vec<crate::domain::clip::Clip>, PortError>;
+    /// Add one `(clip, note)` pair; `Conflict(ALREADY_CLIPPED)` on a
+    /// duplicate pair, `Conflict(TOO_MANY_CLIP_NOTES)` past
+    /// [`crate::domain::clip::CLIP_NOTES_PER_CLIP`] members. Cap check +
+    /// insert + `last_clipped_at` touch + `jobs` commit atomically.
+    fn add_clip_note(
+        &self,
+        row: crate::domain::clip::ClipNote,
+        now_ms: i64,
+        jobs: Vec<NewJob>,
+    ) -> Result<crate::domain::clip::ClipNote, PortError>;
+    /// Remove one pair (idempotent) with `jobs`, one transaction.
+    /// Returns true when a row existed.
+    fn remove_clip_note(
+        &self,
+        clip_id: &str,
+        note_id: &str,
+        jobs: Vec<NewJob>,
+    ) -> Result<bool, PortError>;
+    /// Newest-first note ids of one clip (bounded by the per-clip cap).
+    fn clip_note_ids(&self, clip_id: &str) -> Result<Vec<String>, PortError>;
+    fn count_clip_notes(&self, clip_id: &str) -> Result<u64, PortError>;
+    /// Favorite one clip (idempotent insert). Returns true when the row
+    /// was newly added.
+    fn favorite_clip(&self, fav: crate::domain::clip::ClipFavorite) -> Result<bool, PortError>;
+    /// Unfavorite (idempotent). Returns true when a row existed.
+    fn unfavorite_clip(&self, user_id: &str, clip_id: &str) -> Result<bool, PortError>;
+    fn is_clip_favorited(&self, user_id: &str, clip_id: &str) -> Result<bool, PortError>;
+    fn clip_favorite_count(&self, clip_id: &str) -> Result<u64, PortError>;
+    /// Newest-first favorites of one user (clip ids bounded by the
+    /// per-owner clip cap × small fan-out; favorites of deleted clips are
+    /// skipped by the caller).
+    fn clip_favorites_by_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<crate::domain::clip::ClipFavorite>, PortError>;
+}
+
+/// Pages (Misskey `MiPage`/`MiPageLike` parity + pinetree federation
+/// columns). Name-uniqueness checks + inserts commit atomically in ONE
+/// port call; like/unlike bump `liked_count` in the same transaction.
+pub trait PageStore: Send + Sync {
+    /// Insert one page with `jobs` (federation fan-out); one
+    /// transaction. `Conflict(NAME_ALREADY_EXISTS)` when the owner
+    /// already holds `name`.
+    fn create_page(
+        &self,
+        page: crate::domain::page::Page,
+        jobs: Vec<NewJob>,
+    ) -> Result<crate::domain::page::Page, PortError>;
+    /// Rewrite by id (owner checked by the caller via `get_page`) with
+    /// `jobs`, one transaction. `None` on miss;
+    /// `Conflict(NAME_ALREADY_EXISTS)` when `name` moves onto another
+    /// page of the same owner. Callers only pass `jobs` when the row is
+    /// known to exist (owner-scoped pre-read), so a `None` miss never
+    /// enqueues phantom fan-out.
+    fn update_page(
+        &self,
+        page: crate::domain::page::Page,
+        jobs: Vec<NewJob>,
+    ) -> Result<Option<crate::domain::page::Page>, PortError>;
+    /// Delete by id with like cascade, one transaction. Returns true when
+    /// a row existed.
+    fn delete_page(&self, page_id: &str) -> Result<bool, PortError>;
+    fn get_page(&self, page_id: &str) -> Result<Option<crate::domain::page::Page>, PortError>;
+    fn get_page_by_name(
+        &self,
+        owner_id: &str,
+        name: &str,
+    ) -> Result<Option<crate::domain::page::Page>, PortError>;
+    /// Look up a page by its canonical remote URI (inbound `Article` /
+    /// `Update(Article)` / `Like` / `Delete` correlation for materialized
+    /// remote pages; local pages carry `None`). `None` on miss.
+    fn get_page_by_uri(
+        &self,
+        uri: &str,
+    ) -> Result<Option<crate::domain::page::Page>, PortError>;
+    /// Owner's pages, newest-first.
+    fn pages_by_owner(
+        &self,
+        owner_id: &str,
+    ) -> Result<Vec<crate::domain::page::Page>, PortError>;
+    /// Like one page (idempotent insert + `liked_count` bump +
+    /// `jobs`, one transaction). Returns true when the row was newly
+    /// added.
+    fn like_page(
+        &self,
+        like: crate::domain::page::PageLike,
+        jobs: Vec<NewJob>,
+    ) -> Result<bool, PortError>;
+    /// Unlike (idempotent delete + `liked_count` decrement floor 0, one
+    /// transaction). Returns true when a row existed.
+    fn unlike_page(&self, user_id: &str, page_id: &str) -> Result<bool, PortError>;
+    fn is_page_liked(&self, user_id: &str, page_id: &str) -> Result<bool, PortError>;
+    /// Upstream `pages/featured` parity: at most 10 pages with
+    /// `liked_count > 0`, highest count first.
+    fn featured_pages(&self) -> Result<Vec<crate::domain::page::Page>, PortError>;
+}
+
 pub trait StreamingSink: Send + Sync {
     fn publish(&self, event_type: &str, payload: &[u8]) -> Result<(), PortError>;
     /// Fan out one `main`-channel event. The default is a no-op so
@@ -2431,6 +2559,10 @@ pub struct InstanceSettingsPatch {
     pub name: Option<Option<String>>,
     pub description: Option<Option<String>>,
     pub max_note_text_length: Option<usize>,
+    /// Federated clips + pages handoff: admin `federateClips` switch.
+    pub federate_clips: Option<bool>,
+    /// Federated clips + pages handoff: admin `federatePages` switch.
+    pub federate_pages: Option<bool>,
 }
 
 pub trait InstanceSettingsStore: Send + Sync {

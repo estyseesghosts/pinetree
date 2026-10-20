@@ -14,7 +14,7 @@ use crate::application::ports::{
     AbuseReportFilter, Job, JobQueue, LegacyAuthSessionRecord, MediaStore, MiAuthSessionRecord, ModerationLogFilter,
     AbuseReportStore, ModerationLogStore, MuteStore, NewJob,
     NoteStore, NotificationStore, PasswordResetRequest, PasswordResetStore, PollChoiceCount, PollStore, PortError, ReactionStore, FavoriteStore, EmojiStore, AntennaStore, AntennaNoteStore,
-    RegistryItem, RegistryStore,
+    RegistryItem, RegistryStore, ClipStore, PageStore,
     RemotePublicKeyRecord, TimelineCursor, UpdateAccountPatch, SigninRecord, SigninStore, UserListStore, MAX_JOBS_PER_TXN, MAX_JOB_ATTEMPTS, MAX_SIGNIN_ROWS_PER_USER,
 };
 use crate::domain::account::{validate_local_username, Account};
@@ -123,6 +123,35 @@ const USER_LIST_MEMBERSHIPS: TableDefinition<(&str, &str), &[u8]> =
 /// List favorites `(owner_id, list_id)` (upstream `MiUserListFavorite`).
 const USER_LIST_FAVORITES: TableDefinition<(&str, &str), u8> =
     TableDefinition::new("user_list_favorites");
+/// Clips by id (federated clips + pages handoff, Phase 1). Values are JSON
+/// [`Clip`](crate::domain::clip::Clip) rows.
+const CLIPS: TableDefinition<&str, &[u8]> = TableDefinition::new("clips");
+/// Owner index `(owner_id, clip_id)` (listing + per-owner cap).
+const CLIPS_BY_OWNER: TableDefinition<(&str, &str), u8> =
+    TableDefinition::new("clips_by_owner");
+/// Clip memberships `(clip_id, note_id)` → JSON
+/// [`ClipNote`](crate::domain::clip::ClipNote) row (aidx row ids are
+/// time-ordered, so id-desc sorts read newest-first).
+const CLIP_NOTES: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new("clip_notes");
+/// Clip favorites `(clip_id, user_id)` → JSON
+/// [`ClipFavorite`](crate::domain::clip::ClipFavorite) row.
+const CLIP_FAVORITES: TableDefinition<(&str, &str), &[u8]> =
+    TableDefinition::new("clip_favorites");
+/// Pages by id (federated clips + pages handoff, Phase 3 local). Values are
+/// JSON [`Page`](crate::domain::page::Page) rows.
+const PAGES: TableDefinition<&str, &[u8]> = TableDefinition::new("pages");
+/// Owner index `(owner_id, page_id)` (listing).
+const PAGES_BY_OWNER: TableDefinition<(&str, &str), u8> =
+    TableDefinition::new("pages_by_owner");
+/// Page slug index `(owner_id, name)` → page id (per-user slug uniqueness).
+const PAGES_BY_OWNER_NAME: TableDefinition<(&str, &str), &str> =
+    TableDefinition::new("pages_by_owner_name");
+/// Canonical remote-URI index `uri` → page id (remote-page correlation
+/// for inbound `Article`/`Update`/`Like`/`Delete`).
+const PAGES_BY_URI: TableDefinition<&str, &str> = TableDefinition::new("pages_by_uri");
+/// Page likes `(page_id, user_id)` → JSON
+/// [`PageLike`](crate::domain::page::PageLike) row.
+const PAGE_LIKES: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new("page_likes");
 /// Polls by note id (`docs/misskey-parity-plan.md` §4; Misskey `MiPoll`).
 const POLLS: TableDefinition<&str, &[u8]> = TableDefinition::new("polls");
 /// Poll votes keyed `(user_id, note_id, choice)` (`UNIQUE(user,note,choice)`
@@ -355,6 +384,25 @@ impl RedbStore {
         let _ = write_txn
             .open_table(USER_LIST_FAVORITES)
             .map_err(map_redb_err)?;
+        let _ = write_txn.open_table(CLIPS).map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(CLIPS_BY_OWNER)
+            .map_err(map_redb_err)?;
+        let _ = write_txn.open_table(CLIP_NOTES).map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(CLIP_FAVORITES)
+            .map_err(map_redb_err)?;
+        let _ = write_txn.open_table(PAGES).map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(PAGES_BY_OWNER)
+            .map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(PAGES_BY_OWNER_NAME)
+            .map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(PAGES_BY_URI)
+            .map_err(map_redb_err)?;
+        let _ = write_txn.open_table(PAGE_LIKES).map_err(map_redb_err)?;
         let _ = write_txn.open_table(POLLS).map_err(map_redb_err)?;
         let _ = write_txn.open_table(POLL_VOTES).map_err(map_redb_err)?;
         let _ = write_txn.open_table(JOBS).map_err(map_redb_err)?;
@@ -3272,6 +3320,12 @@ impl InstanceSettingsStore for RedbStore {
             if let Some(max_note_text_length) = patch.max_note_text_length {
                 settings.max_note_text_length = max_note_text_length;
             }
+            if let Some(federate_clips) = patch.federate_clips {
+                settings.federate_clips = federate_clips;
+            }
+            if let Some(federate_pages) = patch.federate_pages {
+                settings.federate_pages = federate_pages;
+            }
             settings.validate()?;
             let mut table = write_txn
                 .open_table(INSTANCE_SETTINGS)
@@ -6065,6 +6119,739 @@ impl UserListStore for RedbStore {
             }
         }
         Ok(count)
+    }
+}
+
+impl ClipStore for RedbStore {
+    fn create_clip(
+        &self,
+        clip: crate::domain::clip::Clip,
+    ) -> Result<crate::domain::clip::Clip, PortError> {
+        use crate::domain::clip::CLIP_LIMIT_PER_OWNER;
+        let write_txn = self.begin_write()?;
+        {
+            let by_owner = write_txn
+                .open_table(CLIPS_BY_OWNER)
+                .map_err(map_redb_err)?;
+            let owned = by_owner
+                .range((clip.owner_id.as_str(), "")..=(clip.owner_id.as_str(), "\u{10ffff}"))
+                .map_err(map_redb_err)?
+                .count();
+            if owned >= CLIP_LIMIT_PER_OWNER {
+                return Err(PortError::Conflict("TOO_MANY_CLIPS".to_string()));
+            }
+            drop(by_owner);
+            let mut clips = write_txn.open_table(CLIPS).map_err(map_redb_err)?;
+            let mut by_owner = write_txn
+                .open_table(CLIPS_BY_OWNER)
+                .map_err(map_redb_err)?;
+            let encoded = encode_json(&clip)?;
+            clips
+                .insert(clip.id.as_str(), encoded.as_slice())
+                .map_err(map_redb_err)?;
+            by_owner
+                .insert((clip.owner_id.as_str(), clip.id.as_str()), &1u8)
+                .map_err(map_redb_err)?;
+        }
+        self.commit_write(write_txn)?;
+        Ok(clip)
+    }
+
+    fn update_clip(
+        &self,
+        clip: crate::domain::clip::Clip,
+    ) -> Result<Option<crate::domain::clip::Clip>, PortError> {
+        let write_txn = self.begin_write()?;
+        let updated = {
+            let mut clips = write_txn.open_table(CLIPS).map_err(map_redb_err)?;
+            let existing: Option<crate::domain::clip::Clip> =
+                match clips.get(clip.id.as_str()).map_err(map_redb_err)? {
+                    Some(g) => Some(decode_json(g.value())?),
+                    None => None,
+                };
+            match existing {
+                Some(prev) if prev.owner_id == clip.owner_id => {
+                    let encoded = encode_json(&clip)?;
+                    clips
+                        .insert(clip.id.as_str(), encoded.as_slice())
+                        .map_err(map_redb_err)?;
+                    Some(clip)
+                }
+                _ => None,
+            }
+        };
+        self.commit_write(write_txn)?;
+        Ok(updated)
+    }
+
+    fn delete_clip(&self, owner_id: &str, clip_id: &str) -> Result<bool, PortError> {
+        let write_txn = self.begin_write()?;
+        let removed = {
+            let mut clips = write_txn.open_table(CLIPS).map_err(map_redb_err)?;
+            let existing: Option<crate::domain::clip::Clip> =
+                match clips.get(clip_id).map_err(map_redb_err)? {
+                    Some(g) => Some(decode_json(g.value())?),
+                    None => None,
+                };
+            let Some(prev) = existing else {
+                return Ok(false);
+            };
+            if prev.owner_id != owner_id {
+                return Ok(false);
+            }
+            clips.remove(clip_id).map_err(map_redb_err)?;
+            drop(clips);
+            let mut by_owner = write_txn
+                .open_table(CLIPS_BY_OWNER)
+                .map_err(map_redb_err)?;
+            by_owner
+                .remove((owner_id, clip_id))
+                .map_err(map_redb_err)?;
+            drop(by_owner);
+            // Cascade memberships + favorites (same transaction).
+            let mut notes = write_txn.open_table(CLIP_NOTES).map_err(map_redb_err)?;
+            let stale_notes: Vec<(String, String)> = notes
+                .range((clip_id, "")..=(clip_id, "\u{10ffff}"))
+                .map_err(map_redb_err)?
+                .filter_map(|entry| {
+                    entry.ok().map(|(k, _)| {
+                        let (c, n) = k.value();
+                        (c.to_string(), n.to_string())
+                    })
+                })
+                .collect();
+            for (c, n) in stale_notes {
+                notes
+                    .remove((c.as_str(), n.as_str()))
+                    .map_err(map_redb_err)?;
+            }
+            drop(notes);
+            let mut favs = write_txn
+                .open_table(CLIP_FAVORITES)
+                .map_err(map_redb_err)?;
+            let stale_favs: Vec<(String, String)> = favs
+                .range((clip_id, "")..=(clip_id, "\u{10ffff}"))
+                .map_err(map_redb_err)?
+                .filter_map(|entry| {
+                    entry.ok().map(|(k, _)| {
+                        let (c, u) = k.value();
+                        (c.to_string(), u.to_string())
+                    })
+                })
+                .collect();
+            for (c, u) in stale_favs {
+                favs.remove((c.as_str(), u.as_str()))
+                    .map_err(map_redb_err)?;
+            }
+            true
+        };
+        self.commit_write(write_txn)?;
+        Ok(removed)
+    }
+
+    fn get_clip(&self, clip_id: &str) -> Result<Option<crate::domain::clip::Clip>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(CLIPS).map_err(map_redb_err)?;
+        match table.get(clip_id).map_err(map_redb_err)? {
+            Some(g) => Ok(Some(decode_json(g.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn clips_by_owner(
+        &self,
+        owner_id: &str,
+    ) -> Result<Vec<crate::domain::clip::Clip>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let by_owner = read_txn
+            .open_table(CLIPS_BY_OWNER)
+            .map_err(map_redb_err)?;
+        let table = read_txn.open_table(CLIPS).map_err(map_redb_err)?;
+        let mut ids: Vec<String> = by_owner
+            .range((owner_id, "")..=(owner_id, "\u{10ffff}"))
+            .map_err(map_redb_err)?
+            .filter_map(|entry| {
+                entry.ok().map(|(k, _)| {
+                    let (_, c) = k.value();
+                    c.to_string()
+                })
+            })
+            .collect();
+        ids.sort_by(|a, b| b.cmp(a));
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some(g) = table.get(id.as_str()).map_err(map_redb_err)? {
+                out.push(decode_json(g.value())?);
+            }
+        }
+        Ok(out)
+    }
+
+    fn add_clip_note(
+        &self,
+        row: crate::domain::clip::ClipNote,
+        now_ms: i64,
+        jobs: Vec<NewJob>,
+    ) -> Result<crate::domain::clip::ClipNote, PortError> {
+        use crate::domain::clip::CLIP_NOTES_PER_CLIP;
+        let write_txn = self.begin_write()?;
+        {
+            self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+            let mut notes = write_txn.open_table(CLIP_NOTES).map_err(map_redb_err)?;
+            if notes
+                .get((row.clip_id.as_str(), row.note_id.as_str()))
+                .map_err(map_redb_err)?
+                .is_some()
+            {
+                return Err(PortError::Conflict("ALREADY_CLIPPED".to_string()));
+            }
+            let count = notes
+                .range((row.clip_id.as_str(), "")..=(row.clip_id.as_str(), "\u{10ffff}"))
+                .map_err(map_redb_err)?
+                .count();
+            if count >= CLIP_NOTES_PER_CLIP {
+                return Err(PortError::Conflict("TOO_MANY_CLIP_NOTES".to_string()));
+            }
+            let encoded = encode_json(&row)?;
+            notes
+                .insert(
+                    (row.clip_id.as_str(), row.note_id.as_str()),
+                    encoded.as_slice(),
+                )
+                .map_err(map_redb_err)?;
+            drop(notes);
+            // Upstream `lastClippedAt` parity: touched on add only. Read
+            // the row out first so the table borrow ends before the write.
+            let prev: Option<crate::domain::clip::Clip> = {
+                let clips = write_txn.open_table(CLIPS).map_err(map_redb_err)?;
+                match clips.get(row.clip_id.as_str()).map_err(map_redb_err)? {
+                    Some(g) => Some(decode_json(g.value())?),
+                    None => None,
+                }
+            };
+            if let Some(mut clip) = prev {
+                clip.last_clipped_at_ms = Some(now_ms);
+                let encoded = encode_json(&clip)?;
+                let mut clips = write_txn.open_table(CLIPS).map_err(map_redb_err)?;
+                clips
+                    .insert(clip.id.as_str(), encoded.as_slice())
+                    .map_err(map_redb_err)?;
+            }
+        }
+        self.commit_write(write_txn)?;
+        Ok(row)
+    }
+
+    fn remove_clip_note(
+        &self,
+        clip_id: &str,
+        note_id: &str,
+        jobs: Vec<NewJob>,
+    ) -> Result<bool, PortError> {
+        let write_txn = self.begin_write()?;
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        let removed = {
+            let mut notes = write_txn.open_table(CLIP_NOTES).map_err(map_redb_err)?;
+            notes
+                .remove((clip_id, note_id))
+                .map_err(map_redb_err)?
+                .is_some()
+        };
+        self.commit_write(write_txn)?;
+        Ok(removed)
+    }
+
+    fn clip_note_ids(&self, clip_id: &str) -> Result<Vec<String>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(CLIP_NOTES).map_err(map_redb_err)?;
+        let mut rows: Vec<(String, String)> = table
+            .range((clip_id, "")..=(clip_id, "\u{10ffff}"))
+            .map_err(map_redb_err)?
+            .filter_map(|entry| {
+                entry.ok().map(|(k, v)| {
+                    let (_, n) = k.value();
+                    let row: crate::domain::clip::ClipNote =
+                        decode_json(v.value()).unwrap_or(crate::domain::clip::ClipNote {
+                            id: String::new(),
+                            clip_id: clip_id.to_string(),
+                            note_id: n.to_string(),
+                            created_at_ms: 0,
+                        });
+                    (row.id, n.to_string())
+                })
+            })
+            .collect();
+        // aidx row ids are time-ordered: id-desc reads newest-first.
+        rows.sort_by(|a, b| b.0.cmp(&a.0));
+        Ok(rows.into_iter().map(|(_, n)| n).collect())
+    }
+
+    fn count_clip_notes(&self, clip_id: &str) -> Result<u64, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(CLIP_NOTES).map_err(map_redb_err)?;
+        Ok(table
+            .range((clip_id, "")..=(clip_id, "\u{10ffff}"))
+            .map_err(map_redb_err)?
+            .count() as u64)
+    }
+
+    fn favorite_clip(&self, fav: crate::domain::clip::ClipFavorite) -> Result<bool, PortError> {
+        let write_txn = self.begin_write()?;
+        let added = {
+            let mut favs = write_txn
+                .open_table(CLIP_FAVORITES)
+                .map_err(map_redb_err)?;
+            if favs
+                .get((fav.clip_id.as_str(), fav.user_id.as_str()))
+                .map_err(map_redb_err)?
+                .is_some()
+            {
+                false
+            } else {
+                let encoded = encode_json(&fav)?;
+                favs.insert(
+                    (fav.clip_id.as_str(), fav.user_id.as_str()),
+                    encoded.as_slice(),
+                )
+                .map_err(map_redb_err)?;
+                true
+            }
+        };
+        self.commit_write(write_txn)?;
+        Ok(added)
+    }
+
+    fn unfavorite_clip(&self, user_id: &str, clip_id: &str) -> Result<bool, PortError> {
+        let write_txn = self.begin_write()?;
+        let removed = {
+            let mut favs = write_txn
+                .open_table(CLIP_FAVORITES)
+                .map_err(map_redb_err)?;
+            favs.remove((clip_id, user_id))
+                .map_err(map_redb_err)?
+                .is_some()
+        };
+        self.commit_write(write_txn)?;
+        Ok(removed)
+    }
+
+    fn is_clip_favorited(&self, user_id: &str, clip_id: &str) -> Result<bool, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn
+            .open_table(CLIP_FAVORITES)
+            .map_err(map_redb_err)?;
+        Ok(table
+            .get((clip_id, user_id))
+            .map_err(map_redb_err)?
+            .is_some())
+    }
+
+    fn clip_favorite_count(&self, clip_id: &str) -> Result<u64, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn
+            .open_table(CLIP_FAVORITES)
+            .map_err(map_redb_err)?;
+        Ok(table
+            .range((clip_id, "")..=(clip_id, "\u{10ffff}"))
+            .map_err(map_redb_err)?
+            .count() as u64)
+    }
+
+    fn clip_favorites_by_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<crate::domain::clip::ClipFavorite>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn
+            .open_table(CLIP_FAVORITES)
+            .map_err(map_redb_err)?;
+        let mut rows: Vec<crate::domain::clip::ClipFavorite> = table
+            .iter()
+            .map_err(map_redb_err)?
+            .filter_map(|entry| {
+                entry.ok().and_then(|(k, v)| {
+                    let (_, u) = k.value();
+                    (u == user_id).then(|| decode_json(v.value()).ok())?
+                })
+            })
+            .collect();
+        rows.sort_by(|a, b| b.id.cmp(&a.id));
+        Ok(rows)
+    }
+}
+
+impl PageStore for RedbStore {
+    fn create_page(
+        &self,
+        page: crate::domain::page::Page,
+        jobs: Vec<NewJob>,
+    ) -> Result<crate::domain::page::Page, PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+            let by_name = write_txn
+                .open_table(PAGES_BY_OWNER_NAME)
+                .map_err(map_redb_err)?;
+            if by_name
+                .get((page.owner_id.as_str(), page.name.as_str()))
+                .map_err(map_redb_err)?
+                .is_some()
+            {
+                return Err(PortError::Conflict("NAME_ALREADY_EXISTS".to_string()));
+            }
+            drop(by_name);
+            let mut pages = write_txn.open_table(PAGES).map_err(map_redb_err)?;
+            let mut by_owner = write_txn
+                .open_table(PAGES_BY_OWNER)
+                .map_err(map_redb_err)?;
+            let mut by_name = write_txn
+                .open_table(PAGES_BY_OWNER_NAME)
+                .map_err(map_redb_err)?;
+            let encoded = encode_json(&page)?;
+            pages
+                .insert(page.id.as_str(), encoded.as_slice())
+                .map_err(map_redb_err)?;
+            by_owner
+                .insert((page.owner_id.as_str(), page.id.as_str()), &1u8)
+                .map_err(map_redb_err)?;
+            by_name
+                .insert(
+                    (page.owner_id.as_str(), page.name.as_str()),
+                    page.id.as_str(),
+                )
+                .map_err(map_redb_err)?;
+            if let Some(uri) = page.uri.as_deref() {
+                let mut by_uri = write_txn
+                    .open_table(PAGES_BY_URI)
+                    .map_err(map_redb_err)?;
+                by_uri
+                    .insert(uri, page.id.as_str())
+                    .map_err(map_redb_err)?;
+            }
+        }
+        self.commit_write(write_txn)?;
+        Ok(page)
+    }
+
+    fn update_page(
+        &self,
+        page: crate::domain::page::Page,
+        jobs: Vec<NewJob>,
+    ) -> Result<Option<crate::domain::page::Page>, PortError> {
+        let write_txn = self.begin_write()?;
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        let updated = {
+            let mut pages = write_txn.open_table(PAGES).map_err(map_redb_err)?;
+            let existing: Option<crate::domain::page::Page> =
+                match pages.get(page.id.as_str()).map_err(map_redb_err)? {
+                    Some(g) => Some(decode_json(g.value())?),
+                    None => None,
+                };
+            let Some(prev) = existing else {
+                return Ok(None);
+            };
+            if prev.owner_id != page.owner_id {
+                return Ok(None);
+            }
+            // Slug move: the target slug must not belong to another page of
+            // the same owner (pre-check + race both surface as the conflict;
+            // the redb single writer makes the check atomic here).
+            if prev.name != page.name {
+                let by_name = write_txn
+                    .open_table(PAGES_BY_OWNER_NAME)
+                    .map_err(map_redb_err)?;
+                if let Some(g) = by_name
+                    .get((page.owner_id.as_str(), page.name.as_str()))
+                    .map_err(map_redb_err)?
+                {
+                    if g.value() != page.id.as_str() {
+                        return Err(PortError::Conflict("NAME_ALREADY_EXISTS".to_string()));
+                    }
+                }
+                drop(by_name);
+                let mut by_name = write_txn
+                    .open_table(PAGES_BY_OWNER_NAME)
+                    .map_err(map_redb_err)?;
+                by_name
+                    .remove((page.owner_id.as_str(), prev.name.as_str()))
+                    .map_err(map_redb_err)?;
+                by_name
+                    .insert(
+                        (page.owner_id.as_str(), page.name.as_str()),
+                        page.id.as_str(),
+                    )
+                    .map_err(map_redb_err)?;
+            }
+            let encoded = encode_json(&page)?;
+            pages
+                .insert(page.id.as_str(), encoded.as_slice())
+                .map_err(map_redb_err)?;
+            // Canonical-URI index follows the row (remote pages are
+            // immutable-addressed; a changed URI rebinds here).
+            if prev.uri.as_deref() != page.uri.as_deref() {
+                let mut by_uri = write_txn
+                    .open_table(PAGES_BY_URI)
+                    .map_err(map_redb_err)?;
+                if let Some(old) = prev.uri.as_deref() {
+                    by_uri.remove(old).map_err(map_redb_err)?;
+                }
+                if let Some(uri) = page.uri.as_deref() {
+                    by_uri
+                        .insert(uri, page.id.as_str())
+                        .map_err(map_redb_err)?;
+                }
+            }
+            Some(page)
+        };
+        self.commit_write(write_txn)?;
+        Ok(updated)
+    }
+
+    fn delete_page(&self, page_id: &str) -> Result<bool, PortError> {
+        let write_txn = self.begin_write()?;
+        let removed = {
+            let mut pages = write_txn.open_table(PAGES).map_err(map_redb_err)?;
+            let existing: Option<crate::domain::page::Page> =
+                match pages.get(page_id).map_err(map_redb_err)? {
+                    Some(g) => Some(decode_json(g.value())?),
+                    None => None,
+                };
+            let Some(prev) = existing else {
+                return Ok(false);
+            };
+            pages.remove(page_id).map_err(map_redb_err)?;
+            drop(pages);
+            let mut by_owner = write_txn
+                .open_table(PAGES_BY_OWNER)
+                .map_err(map_redb_err)?;
+            by_owner
+                .remove((prev.owner_id.as_str(), page_id))
+                .map_err(map_redb_err)?;
+            drop(by_owner);
+            let mut by_name = write_txn
+                .open_table(PAGES_BY_OWNER_NAME)
+                .map_err(map_redb_err)?;
+            by_name
+                .remove((prev.owner_id.as_str(), prev.name.as_str()))
+                .map_err(map_redb_err)?;
+            drop(by_name);
+            if let Some(uri) = prev.uri.as_deref() {
+                let mut by_uri = write_txn
+                    .open_table(PAGES_BY_URI)
+                    .map_err(map_redb_err)?;
+                by_uri.remove(uri).map_err(map_redb_err)?;
+                drop(by_uri);
+            }
+            let mut likes = write_txn.open_table(PAGE_LIKES).map_err(map_redb_err)?;
+            let stale: Vec<(String, String)> = likes
+                .range((page_id, "")..=(page_id, "\u{10ffff}"))
+                .map_err(map_redb_err)?
+                .filter_map(|entry| {
+                    entry.ok().map(|(k, _)| {
+                        let (p, u) = k.value();
+                        (p.to_string(), u.to_string())
+                    })
+                })
+                .collect();
+            for (p, u) in stale {
+                likes
+                    .remove((p.as_str(), u.as_str()))
+                    .map_err(map_redb_err)?;
+            }
+            true
+        };
+        self.commit_write(write_txn)?;
+        Ok(removed)
+    }
+
+    fn get_page(&self, page_id: &str) -> Result<Option<crate::domain::page::Page>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(PAGES).map_err(map_redb_err)?;
+        match table.get(page_id).map_err(map_redb_err)? {
+            Some(g) => Ok(Some(decode_json(g.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn get_page_by_name(
+        &self,
+        owner_id: &str,
+        name: &str,
+    ) -> Result<Option<crate::domain::page::Page>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let by_name = read_txn
+            .open_table(PAGES_BY_OWNER_NAME)
+            .map_err(map_redb_err)?;
+        let Some(g) = by_name
+            .get((owner_id, name))
+            .map_err(map_redb_err)?
+        else {
+            return Ok(None);
+        };
+        let id = g.value().to_string();
+        drop(by_name);
+        let table = read_txn.open_table(PAGES).map_err(map_redb_err)?;
+        match table.get(id.as_str()).map_err(map_redb_err)? {
+            Some(g) => Ok(Some(decode_json(g.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn get_page_by_uri(
+        &self,
+        uri: &str,
+    ) -> Result<Option<crate::domain::page::Page>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let by_uri = read_txn.open_table(PAGES_BY_URI).map_err(map_redb_err)?;
+        let Some(g) = by_uri.get(uri).map_err(map_redb_err)? else {
+            return Ok(None);
+        };
+        let id = g.value().to_string();
+        drop(by_uri);
+        let table = read_txn.open_table(PAGES).map_err(map_redb_err)?;
+        match table.get(id.as_str()).map_err(map_redb_err)? {
+            Some(g) => Ok(Some(decode_json(g.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn pages_by_owner(
+        &self,
+        owner_id: &str,
+    ) -> Result<Vec<crate::domain::page::Page>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let by_owner = read_txn
+            .open_table(PAGES_BY_OWNER)
+            .map_err(map_redb_err)?;
+        let table = read_txn.open_table(PAGES).map_err(map_redb_err)?;
+        let mut ids: Vec<String> = by_owner
+            .range((owner_id, "")..=(owner_id, "\u{10ffff}"))
+            .map_err(map_redb_err)?
+            .filter_map(|entry| {
+                entry.ok().map(|(k, _)| {
+                    let (_, p) = k.value();
+                    p.to_string()
+                })
+            })
+            .collect();
+        ids.sort_by(|a, b| b.cmp(a));
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some(g) = table.get(id.as_str()).map_err(map_redb_err)? {
+                out.push(decode_json(g.value())?);
+            }
+        }
+        Ok(out)
+    }
+
+    fn like_page(
+        &self,
+        like: crate::domain::page::PageLike,
+        jobs: Vec<NewJob>,
+    ) -> Result<bool, PortError> {
+        let write_txn = self.begin_write()?;
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        let added = {
+            let mut likes = write_txn.open_table(PAGE_LIKES).map_err(map_redb_err)?;
+            if likes
+                .get((like.page_id.as_str(), like.user_id.as_str()))
+                .map_err(map_redb_err)?
+                .is_some()
+            {
+                false
+            } else {
+                let encoded = encode_json(&like)?;
+                likes
+                    .insert(
+                        (like.page_id.as_str(), like.user_id.as_str()),
+                        encoded.as_slice(),
+                    )
+                    .map_err(map_redb_err)?;
+                drop(likes);
+                let prev: Option<crate::domain::page::Page> = {
+                    let pages = write_txn.open_table(PAGES).map_err(map_redb_err)?;
+                    match pages
+                        .get(like.page_id.as_str())
+                        .map_err(map_redb_err)?
+                    {
+                        Some(g) => Some(decode_json(g.value())?),
+                        None => None,
+                    }
+                };
+                if let Some(mut page) = prev {
+                    page.liked_count = page.liked_count.saturating_add(1);
+                    let encoded = encode_json(&page)?;
+                    let mut pages = write_txn.open_table(PAGES).map_err(map_redb_err)?;
+                    pages
+                        .insert(page.id.as_str(), encoded.as_slice())
+                        .map_err(map_redb_err)?;
+                }
+                true
+            }
+        };
+        self.commit_write(write_txn)?;
+        Ok(added)
+    }
+
+    fn unlike_page(&self, user_id: &str, page_id: &str) -> Result<bool, PortError> {
+        let write_txn = self.begin_write()?;
+        let removed = {
+            let mut likes = write_txn.open_table(PAGE_LIKES).map_err(map_redb_err)?;
+            if likes
+                .remove((page_id, user_id))
+                .map_err(map_redb_err)?
+                .is_none()
+            {
+                false
+            } else {
+                drop(likes);
+                let prev: Option<crate::domain::page::Page> = {
+                    let pages = write_txn.open_table(PAGES).map_err(map_redb_err)?;
+                    match pages.get(page_id).map_err(map_redb_err)? {
+                        Some(g) => Some(decode_json(g.value())?),
+                        None => None,
+                    }
+                };
+                if let Some(mut page) = prev {
+                    page.liked_count = page.liked_count.saturating_sub(1);
+                    let encoded = encode_json(&page)?;
+                    let mut pages = write_txn.open_table(PAGES).map_err(map_redb_err)?;
+                    pages
+                        .insert(page.id.as_str(), encoded.as_slice())
+                        .map_err(map_redb_err)?;
+                }
+                true
+            }
+        };
+        self.commit_write(write_txn)?;
+        Ok(removed)
+    }
+
+    fn is_page_liked(&self, user_id: &str, page_id: &str) -> Result<bool, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(PAGE_LIKES).map_err(map_redb_err)?;
+        Ok(table
+            .get((page_id, user_id))
+            .map_err(map_redb_err)?
+            .is_some())
+    }
+
+    fn featured_pages(&self) -> Result<Vec<crate::domain::page::Page>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(PAGES).map_err(map_redb_err)?;
+        let mut rows: Vec<crate::domain::page::Page> = table
+            .iter()
+            .map_err(map_redb_err)?
+            .filter_map(|entry| {
+                entry.ok().and_then(|(_, v)| {
+                    let page: crate::domain::page::Page = decode_json(v.value()).ok()?;
+                    (page.liked_count > 0).then_some(page)
+                })
+            })
+            .collect();
+        rows.sort_by(|a, b| b.liked_count.cmp(&a.liked_count).then(b.id.cmp(&a.id)));
+        rows.truncate(10);
+        Ok(rows)
     }
 }
 

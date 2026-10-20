@@ -276,6 +276,12 @@ fn check_object_authority(
     match activity_type {
         "Follow" | "Accept" | "Reject" | "Undo" | "Announce" | "Like" | "Delete" | "Block"
         | "QuoteRequest" => true,
+        // `Add`/`Remove` for clip collections pass through: dispatch
+        // re-validates (local targets are never mutated remotely; remote
+        // targets require the signer to be the collection owner, verified
+        // by fetching the collection) — a blanket host match here would
+        // 401 legitimate owner-signed membership sync.
+        "Add" | "Remove" => true,
         "Create" => {
             let Some(object_uri) = extract_object_uri(activity.get("object")) else {
                 return true; // dispatch ignores activities without an object
@@ -338,6 +344,12 @@ fn dispatch(
         "EmojiReact" => handle_like(services, activity, activity_id, actor_uri),
         "Delete" => handle_delete(services, activity, activity_id, actor_uri),
         "Update" => handle_update(services, activity, activity_id, actor_uri),
+        // Clip membership sync (federated clips + pages handoff, Phase 2):
+        // prompt cache invalidation; full-state pulls converge.
+        "Add" => handle_clip_membership(services, activity, activity_id, actor_uri, true),
+        "Remove" => {
+            handle_clip_membership(services, activity, activity_id, actor_uri, false)
+        }
         // Batch P `i/move` federation half: the mover's old followers learn
         // the new account URI and refollow (Misskey `ApInboxService.move`
         // parity, plus the forged-move rejection the handoff requires).
@@ -419,6 +431,53 @@ fn handle_flag(
     let content = activity.get("content").and_then(Value::as_str);
     services.handle_inbound_flag(activity_id, &reporter.id, &uris, content)?;
     Ok(accepted())
+}
+
+/// Inbound `Add`/`Remove` for clip collections (federated clips + pages
+/// handoff, Phase 2): prompt cache invalidation for the federation
+/// resolver. Semantics:
+/// * Target is a LOCAL `/clips/{id}` URI ⇒ ignore (remote actors never
+///   mutate our collections; the owner is local and we never deliver to
+///   ourselves). A remote actor claiming ownership of our collection is
+///   forged — also ignored, never an error.
+/// * Target is remote ⇒ verify the signer IS the collection owner by
+///   fetching the collection and comparing `attributedTo` (authority =
+///   collection owner). Verified ⇒ evict the cached membership (the next
+///   resolve re-pulls full state); unverifiable ⇒ ignore. Eviction is
+///   idempotent, so Add/Remove converge even under replay (replays skip
+///   via the read-only replay gate, without network I/O).
+fn handle_clip_membership(
+    services: &AppServices,
+    activity: &Value,
+    activity_id: &str,
+    actor_uri: &str,
+    _added: bool,
+) -> Result<Response, PortError> {
+    use crate::activitypub::federated_collections::{
+        evict_remote_clip_cache, fetch_collection_owner,
+    };
+    // Replay gate before any network I/O (same discipline as deletes).
+    if services.dedup.is_recorded(activity_id)? {
+        return Ok(accepted());
+    }
+    let Some(target_uri) = extract_object_uri(activity.get("target")) else {
+        return Ok(accepted());
+    };
+    let base = services.public_url.trim_end_matches('/');
+    if target_uri.starts_with(&format!("{base}/clips/")) {
+        // Our own collection: never mutated remotely.
+        return Ok(accepted());
+    }
+    if !target_uri.contains("/clips/") {
+        return Ok(accepted());
+    }
+    match fetch_collection_owner(services, &target_uri) {
+        Some(owner) if owner == actor_uri => {
+            evict_remote_clip_cache(&target_uri);
+            Ok(accepted())
+        }
+        _ => Ok(accepted()),
+    }
 }
 
 /// Inbound `Block` (Misskey `ApInboxService.block()` parity): the remote
@@ -1027,6 +1086,21 @@ fn handle_create(
     if services.inbound_host_blocked(&author.id) {
         return Ok(accepted());
     }
+    // Federated pages (Phase 3): public `Article`s materialize as pages,
+    // not notes. Non-public Articles (or invalid ones) return `None` and
+    // keep the note pipeline below, which enforces visibility.
+    if activity
+        .get("object")
+        .and_then(|o| o.get("type"))
+        .and_then(Value::as_str)
+        == Some("Article")
+    {
+        if let Some(obj) = activity.get("object") {
+            if services.ingest_remote_article(&author.id, obj)?.is_some() {
+                return Ok(accepted());
+            }
+        }
+    }
     // §4 remote votes (Misskey `ApNoteService` vote branch parity): a
     // content-less `Create(Note)` carrying `inReplyTo` (the poll note) plus
     // `name` (the choice text) records a vote instead of a note. Misskey
@@ -1166,7 +1240,27 @@ fn handle_like(
     let Some(target_uri) = extract_object_uri(activity.get("object")) else {
         return Ok(accepted());
     };
+    let base = services.public_url.trim_end_matches('/').to_string();
     let liker = resolve_remote_account(services, actor_uri)?;
+    // Page-target likes (federated clips + pages handoff, Phase 3): a
+    // `Like` whose object is a page URI records a remote-attributed like
+    // (counter bump commits in-txn; replays converge). Local pages match
+    // by `/pages/{id}` URL; materialized remote pages match by canonical
+    // URI. Unknown pages are ignored.
+    if let Some(page_id) = target_uri
+        .strip_prefix(&format!("{base}/pages/"))
+        .map(|rest| rest.split(['/', '?', '#']).next().unwrap_or("").trim())
+        .filter(|id| !id.is_empty())
+    {
+        if services.pages.get_page(page_id)?.is_some() {
+            services.handle_inbound_page_like(activity_id, &liker.id, page_id)?;
+        }
+        return Ok(accepted());
+    }
+    if let Some(page) = services.pages.get_page_by_uri(&target_uri)? {
+        services.handle_inbound_page_like(activity_id, &liker.id, &page.id)?;
+        return Ok(accepted());
+    }
     let Some(target_id) = resolve_note_target_id(services, &target_uri)? else {
         return Ok(accepted());
     };
@@ -1189,6 +1283,27 @@ fn handle_delete(
     let Some(object_uri) = extract_object_uri(activity.get("object")) else {
         return Ok(accepted());
     };
+    // Federated pages (Phase 3): `Delete(Article-URI)` from the page
+    // owner retracts a materialized remote page (cascade drops its
+    // likes). Local `/pages/` URLs are owner-deleted locally only.
+    // Authority is the page owner throughout; anything else is ignored.
+    {
+        let base = services.public_url.trim_end_matches('/').to_string();
+        if !object_uri.starts_with(&format!("{base}/pages/")) {
+            if let Some(page) = services.pages.get_page_by_uri(&object_uri)? {
+                let owner_ok = match services.accounts.find_by_id(&page.owner_id)? {
+                    Some(owner) => owner.actor_url(&base) == actor_uri,
+                    None => false,
+                };
+                if owner_ok && !services.dedup.check_and_record(activity_id)? {
+                    services.pages.delete_page(&page.id)?;
+                }
+                return Ok(accepted());
+            }
+            // Not a materialized page: fall through to the note / stamp /
+            // tombstone paths below.
+        }
+    }
     // Path 1: a known note → existing author/host authority + delete.
     if let Some(note) = find_note_by_uri(services, &object_uri)? {
         // Authority: the deleter must be the note's author, or share the note's
@@ -1449,6 +1564,39 @@ fn handle_update_note(
     activity_id: &str,
     actor_uri: &str,
 ) -> Result<Response, PortError> {
+    // Federated pages (Phase 3): `Update(Article)` for a materialized
+    // remote page refreshes the page row, never the note pipeline. Local
+    // `/pages/` URLs are owner-updated locally only — a remote signer is
+    // never authoritative for them.
+    if doc.get("type").and_then(Value::as_str) == Some("Article") {
+        let base = services.public_url.trim_end_matches('/').to_string();
+        let doc_id = doc
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        if doc_id.starts_with(&format!("{base}/pages/")) {
+            return Ok(accepted());
+        }
+        if !doc_id.is_empty() {
+            if let Some(page) = services.pages.get_page_by_uri(doc_id)? {
+                let owner_ok = match services.accounts.find_by_id(&page.owner_id)? {
+                    Some(owner) => owner.actor_url(&base) == actor_uri,
+                    None => false,
+                };
+                if !owner_ok {
+                    return Ok(accepted());
+                }
+                if services.inbound_host_blocked(&page.owner_id) {
+                    return Ok(accepted());
+                }
+                services.ingest_remote_article(&page.owner_id, doc)?;
+                return Ok(accepted());
+            }
+        }
+        // No materialized page for this URI: fall through to the note
+        // pipeline (covers non-public Articles, same as Create).
+    }
     // Attribution defaults to the signer when absent (same rule as the
     // `Question` arm and Misskey's `getOneApId ... ?? user.uri` fallback).
     let attributed_to = match doc.get("attributedTo") {
@@ -2069,6 +2217,8 @@ mod media_safety_tests {
             signin: store.clone(),
             password_resets: store.clone(),
             registry: store.clone(),
+            clips: store.clone(),
+            pages: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()
@@ -2485,6 +2635,8 @@ mod flag_tests {
             signin: store.clone(),
             password_resets: store.clone(),
             registry: store.clone(),
+            clips: store.clone(),
+            pages: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()
@@ -2694,6 +2846,8 @@ mod key_ownership_tests {
             signin: store.clone(),
             password_resets: store.clone(),
             registry: store.clone(),
+            clips: store.clone(),
+            pages: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()
@@ -3239,6 +3393,8 @@ mod reply_resolution_tests {
             signin: store.clone(),
             password_resets: store.clone(),
             registry: store.clone(),
+            clips: store.clone(),
+            pages: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()

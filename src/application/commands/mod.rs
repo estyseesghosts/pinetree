@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use crate::application::ports::{
-    AbuseReportStore, AccountStore, ActivityDedup, AntennaNoteStore, AntennaStore, AuthStore, BlobStore, BlockStore, Clock, EmojiStore, FavoriteStore, FollowStore, HostCapsStore,
+    AbuseReportStore, AccountStore, ActivityDedup, AntennaNoteStore, AntennaStore, AuthStore, BlobStore, BlockStore, ClipStore, Clock, EmojiStore, FavoriteStore, FollowStore, HostCapsStore,
     IdGenerator, InstanceSettingsStore, InviteStore, JobQueue, MediaStore, ModerationLogStore,
-    MuteStore, NoteStore, NotificationStore, PasswordResetStore, PollStore, ReactionStore, RegistryStore, SigninStore, StreamingSink, UserListStore,
+    MuteStore, NoteStore, NotificationStore, PageStore, PasswordResetStore, PollStore, ReactionStore, RegistryStore, SigninStore, StreamingSink, UserListStore,
 };
 use crate::federation::delivery::SafeHttpClient;
 
@@ -26,6 +26,8 @@ pub mod notifications;
 pub mod notes;
 pub mod pins;
 pub mod polls;
+pub mod clips;
+pub mod pages;
 pub mod user_lists;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -74,6 +76,10 @@ pub struct AppServices {
     pub password_resets: Arc<dyn PasswordResetStore>,
     /// Client key-value registry (Batch P; `i/registry/*`).
     pub registry: Arc<dyn RegistryStore>,
+    /// Clips (federated clips + pages handoff, Phase 1).
+    pub clips: Arc<dyn ClipStore>,
+    /// Pages (federated clips + pages handoff, Phase 3 local).
+    pub pages: Arc<dyn PageStore>,
     pub federation_http: SafeHttpClient,
     pub public_url: String,
     pub max_file_size: u64,

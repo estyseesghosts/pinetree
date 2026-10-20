@@ -242,6 +242,27 @@ check("notes/delete own", s == 204, f"s={s}")
 s, ae = api("antennas/list", {}, TA)
 check("antennas/list 200 empty", s == 200 and ae == [], f"s={s} body={json.dumps(ae)[:200]}")
 
+# clips + pages are real (federated clips + pages handoff): Keystone's clip
+# UI calls these (previously 404). Smoke: create → show → favorite →
+# my-favorites → page create → page show.
+s, clip = api("clips/create", {"name": "reading", "isPublic": True}, TA)
+check("clips/create", s == 200 and clip.get("name") == "reading", f"s={s}")
+CID = clip["id"] if s == 200 else "x"
+s, shown = api("clips/show", {"clipId": CID}, TA)
+check("clips/show", s == 200 and shown.get("id") == CID, f"s={s}")
+s, _ = api("clips/favorite", {"clipId": CID}, TB)
+check("clips/favorite", s == 204, f"s={s}")
+s, favs = api("clips/my-favorites", {}, TB)
+check("clips/my-favorites", s == 200 and len(favs) == 1, f"s={s}")
+s, page = api("pages/create", {"title": "T", "name": "t",
+    "content": [{"type": "text", "text": "hi"}], "variables": [], "script": ""}, TA)
+check("pages/create", s == 200 and page.get("name") == "t", f"s={s}")
+PID = page["id"] if s == 200 else "x"
+s, pshown = api("pages/show", {"pageId": PID})
+check("pages/show anon", s == 200 and pshown.get("title") == "T", f"s={s}")
+s, feat = api("pages/featured", {})
+check("pages/featured empty", s == 200 and feat == [], f"s={s}")
+
 # revoke last (kills the token)
 s, second = api("signin", {"username": "bob", "password": "password123"})
 T2 = second["token"]

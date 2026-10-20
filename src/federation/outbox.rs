@@ -205,6 +205,43 @@ pub enum FederateDeliverPayload {
         added: bool,
         inbox_override: Option<String>,
     },
+    /// Deliver `Add`/`Remove` of a note to/from a federated clip
+    /// collection (`/clips/{id}`) to the note author's inbox (promptness
+    /// for membership sync; full-state pulls converge). `activity_id` is
+    /// the bare id segment, minted at enqueue so replays re-deliver the
+    /// SAME id and receivers dedupe.
+    ClipMembershipChanged {
+        activity_id: String,
+        actor_id: String,
+        clip_id: String,
+        note_uri: String,
+        added: bool,
+        inbox_url: String,
+    },
+    /// Deliver `Create(Article)` for a new federated page to the author's
+    /// remote follower inboxes.
+    PageCreated {
+        page_id: String,
+        author_id: String,
+        inbox_override: Option<String>,
+    },
+    /// Deliver `Update(Article)` for an edited federated page to the
+    /// author's remote follower inboxes (existing `Update` delivery path).
+    PageUpdated {
+        page_id: String,
+        author_id: String,
+        inbox_override: Option<String>,
+    },
+    /// Deliver `Like` targeting a page URI to the origin's inbox (likes
+    /// on materialized remote pages; co-located likes need no delivery).
+    /// `activity_id` is the bare id segment, minted at enqueue.
+    PageLiked {
+        activity_id: String,
+        actor_id: String,
+        actor_uri: String,
+        page_uri: String,
+        inbox_url: String,
+    },
     /// Deliver `Delete(Person)` (suspend) or `Undo(Delete(Person))`
     /// (unsuspend) for a local account to every knowable shared inbox
     /// (Batch M WP3; upstream `UserSuspendService.postSuspend`/
@@ -1187,6 +1224,77 @@ pub fn execute_federate_deliver(
             }
         }
 
+        FederateDeliverPayload::ClipMembershipChanged {
+            activity_id,
+            actor_id,
+            clip_id,
+            note_uri,
+            added,
+            inbox_url,
+        } => {
+            use crate::activitypub::federated_collections::{
+                clip_collection_uri, federation_switch_on, render_clip_membership_activity,
+            };
+            let actor = match services.accounts.find_by_id(&actor_id)? {
+                Some(a) if a.is_local() => a,
+                _ => return Ok(DeliveryOutcome::Delivered),
+            };
+            let clip = match services.clips.get_clip(&clip_id)? {
+                Some(c) if c.owner_id == actor_id => c,
+                _ => return Ok(DeliveryOutcome::Delivered),
+            };
+            // Stale job (clip unfederated after enqueue): skip quietly —
+            // the collection fetch gate enforces the same switches.
+            if !clip.federate || !federation_switch_on(services, "clips") {
+                return Ok(DeliveryOutcome::Delivered);
+            }
+            let actor_uri = actor.actor_url(base);
+            let activity = render_clip_membership_activity(
+                base,
+                &activity_id,
+                &actor_uri,
+                &note_uri,
+                &clip_collection_uri(base, &clip.id),
+                added,
+            );
+            deliver_single(services, client, tracker, &actor_id, &inbox_url, &activity)
+        }
+
+        FederateDeliverPayload::PageCreated {
+            page_id,
+            author_id,
+            inbox_override,
+        } => deliver_page_create_or_update(
+            services, client, tracker, job_key, base, &page_id, &author_id, false,
+            inbox_override,
+        ),
+
+        FederateDeliverPayload::PageUpdated {
+            page_id,
+            author_id,
+            inbox_override,
+        } => deliver_page_create_or_update(
+            services, client, tracker, job_key, base, &page_id, &author_id, true,
+            inbox_override,
+        ),
+
+        FederateDeliverPayload::PageLiked {
+            activity_id,
+            actor_id,
+            actor_uri,
+            page_uri,
+            inbox_url,
+        } => {
+            use crate::activitypub::federated_collections::render_page_like_activity;
+            // Stale job (liker gone) converges quietly.
+            if services.accounts.find_by_id(&actor_id)?.is_none() {
+                return Ok(DeliveryOutcome::Delivered);
+            }
+            let activity =
+                render_page_like_activity(base, &activity_id, &actor_uri, &page_uri);
+            deliver_single(services, client, tracker, &actor_id, &inbox_url, &activity)
+        }
+
         FederateDeliverPayload::SuspendBroadcast {
             account_id,
             activity_id,
@@ -1318,6 +1426,99 @@ fn quote_note_extras(
 /// `Split` (or `Delivered`) it completes, so a single slow or failing inbox
 /// cannot cause the already-delivered inboxes to be sent again.
 #[allow(clippy::too_many_arguments)]
+/// Shared `Create(Article)` / `Update(Article)` fan-out for federated
+/// pages (mirrors the `NoteUpdated` arm: author must be local, page must
+/// still exist and still federate, else the stale job converges quietly).
+#[allow(clippy::too_many_arguments)]
+fn deliver_page_create_or_update(
+    services: &AppServices,
+    client: &SafeHttpClient,
+    tracker: &DestinationTracker,
+    job_key: &str,
+    base: &str,
+    page_id: &str,
+    author_id: &str,
+    updated: bool,
+    inbox_override: Option<String>,
+) -> Result<DeliveryOutcome, PortError> {
+    use crate::activitypub::federated_collections::{
+        federation_switch_on, render_page_activity, render_page_article,
+    };
+    let author = match services.accounts.find_by_id(author_id)? {
+        Some(a) if a.is_local() => a,
+        _ => return Ok(DeliveryOutcome::Delivered),
+    };
+    let page = match services.pages.get_page(page_id)? {
+        Some(p) if p.owner_id == author_id => p,
+        _ => return Ok(DeliveryOutcome::Delivered),
+    };
+    if !page.federate
+        || page.tier != crate::domain::collection::CollectionTier::Listed
+        || !federation_switch_on(services, "pages")
+    {
+        return Ok(DeliveryOutcome::Delivered);
+    }
+    let actor_uri = author.actor_url(base);
+    let followers_uri = format!("{actor_uri}/followers");
+    let article = render_page_article(services, &page)?;
+    let activity_id = format!(
+        "page-{}-{page_id}-{}",
+        if updated { "update" } else { "create" },
+        services.ids.generate()
+    );
+    let activity = render_page_activity(
+        base,
+        &activity_id,
+        &actor_uri,
+        &article,
+        updated,
+        &followers_uri,
+    );
+    match inbox_override {
+        Some(inbox) => deliver_single(services, client, tracker, author_id, &inbox, &activity),
+        None => {
+            let inboxes =
+                collect_recipient_inboxes_for_author(services, author_id, &[], true)?;
+            let constructor = if updated {
+                FederateDeliverPayload::PageUpdated {
+                    page_id: page_id.to_string(),
+                    author_id: author_id.to_string(),
+                    inbox_override: None,
+                }
+            } else {
+                FederateDeliverPayload::PageCreated {
+                    page_id: page_id.to_string(),
+                    author_id: author_id.to_string(),
+                    inbox_override: None,
+                }
+            };
+            fan_out(
+                services,
+                client,
+                tracker,
+                job_key,
+                author_id,
+                &inboxes,
+                &activity,
+                &|inbox: &str| match &constructor {
+                    FederateDeliverPayload::PageUpdated { .. } => {
+                        FederateDeliverPayload::PageUpdated {
+                            page_id: page_id.to_string(),
+                            author_id: author_id.to_string(),
+                            inbox_override: Some(inbox.to_string()),
+                        }
+                    }
+                    _ => FederateDeliverPayload::PageCreated {
+                        page_id: page_id.to_string(),
+                        author_id: author_id.to_string(),
+                        inbox_override: Some(inbox.to_string()),
+                    },
+                },
+            )
+        }
+    }
+}
+
 fn fan_out(
     services: &AppServices,
     client: &SafeHttpClient,

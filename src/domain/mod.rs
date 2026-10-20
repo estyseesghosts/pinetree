@@ -20,3 +20,6 @@ pub mod word_mute;
 pub mod moderation;
 pub mod instance;
 pub mod user_list;
+pub mod collection;
+pub mod clip;
+pub mod page;

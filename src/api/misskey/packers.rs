@@ -695,6 +695,182 @@ pub fn pack_user_list(
     })
 }
 
+/// Clip pack (federated clips + pages handoff, Phase 1; upstream
+/// `ClipEntityService.pack` parity): `{id, createdAt, lastClippedAt|null,
+/// userId, user: UserLite, name, description|null, isPublic,
+/// favoritedCount, isFavorited? (only when authed), notesCount? (only
+/// when the viewer owns the clip)}`. Federation columns (`tier`,
+/// `federate`, approvers) are internal-only, never packed.
+pub fn pack_clip(
+    clip: &crate::domain::clip::Clip,
+    viewer_id: Option<&str>,
+    services: &AppServices,
+) -> Result<Value, PortError> {
+    let owner = services
+        .accounts
+        .find_by_id(&clip.owner_id)?
+        .ok_or_else(|| PortError::NotFound("NO_SUCH_USER".to_string()))?;
+    let created_at = format_millis(
+        services
+            .ids
+            .parse_time(&clip.id)
+            .unwrap_or_else(|_| services.clock.now_ms()),
+    );
+    let mut obj = Map::new();
+    obj.insert("id".to_string(), Value::String(clip.id.clone()));
+    obj.insert("createdAt".to_string(), Value::String(created_at));
+    obj.insert(
+        "lastClippedAt".to_string(),
+        clip.last_clipped_at_ms
+            .map(format_millis)
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+    obj.insert("userId".to_string(), Value::String(clip.owner_id.clone()));
+    obj.insert(
+        "user".to_string(),
+        pack_user_lite(&owner, &services.public_url, services.clock.now_ms()),
+    );
+    obj.insert("name".to_string(), Value::String(clip.name.clone()));
+    obj.insert(
+        "description".to_string(),
+        clip.description
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+    obj.insert("isPublic".to_string(), Value::Bool(clip.is_public));
+    obj.insert(
+        "favoritedCount".to_string(),
+        Value::from(services.clips.clip_favorite_count(&clip.id)?),
+    );
+    if let Some(viewer) = viewer_id {
+        obj.insert(
+            "isFavorited".to_string(),
+            Value::Bool(services.clips.is_clip_favorited(viewer, &clip.id)?),
+        );
+        if viewer == clip.owner_id.as_str() {
+            obj.insert(
+                "notesCount".to_string(),
+                Value::from(services.clips.count_clip_notes(&clip.id)?),
+            );
+        }
+    }
+    Ok(Value::Object(obj))
+}
+
+/// Collect `fileId`s from `image`-type page blocks (recursive over
+/// `section.children`). Referenced *notes* in `note`-blocks are not
+/// tracked or packed (pinetree renders quote links at federation time).
+fn collect_page_file_ids(content: &Value, out: &mut Vec<String>) {
+    let Some(arr) = content.as_array() else {
+        return;
+    };
+    for block in arr {
+        let Some(obj) = block.as_object() else {
+            continue;
+        };
+        match obj.get("type").and_then(Value::as_str) {
+            Some("image") => {
+                if let Some(id) = obj.get("fileId").and_then(Value::as_str) {
+                    out.push(id.to_string());
+                }
+            }
+            Some("section") => {
+                if let Some(children) = obj.get("children") {
+                    collect_page_file_ids(children, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Page pack (federated clips + pages handoff, Phase 3 local; upstream
+/// `PageEntityService.pack` + `packedPageSchema` parity): `{id, createdAt,
+/// updatedAt, userId, user: UserLite, content, variables, title, name,
+/// summary?, hideTitleWhenPinned, alignCenter, font, script,
+/// eyeCatchingImageId, eyeCatchingImage?, attachedFiles, likedCount,
+/// isLiked? (only when authed)}`. Legacy `textInput`/`numberInput` block
+/// migration is a no-op: pinetree never wrote the legacy shapes.
+pub fn pack_page(
+    page: &crate::domain::page::Page,
+    viewer_id: Option<&str>,
+    services: &AppServices,
+) -> Result<Value, PortError> {
+    let owner = services
+        .accounts
+        .find_by_id(&page.owner_id)?
+        .ok_or_else(|| PortError::NotFound("NO_SUCH_USER".to_string()))?;
+    let now_ms = services.clock.now_ms();
+    let created_at = format_millis(
+        services.ids.parse_time(&page.id).unwrap_or(now_ms),
+    );
+    let mut file_ids = Vec::new();
+    collect_page_file_ids(&page.content, &mut file_ids);
+    let mut attached = Vec::new();
+    for fid in &file_ids {
+        if let Some(meta) = services.media.get(fid)? {
+            attached.push(pack_drive_file(&meta, services));
+        }
+    }
+    let mut obj = Map::new();
+    obj.insert("id".to_string(), Value::String(page.id.clone()));
+    obj.insert("createdAt".to_string(), Value::String(created_at));
+    obj.insert(
+        "updatedAt".to_string(),
+        Value::String(format_millis(page.updated_at_ms)),
+    );
+    obj.insert("userId".to_string(), Value::String(page.owner_id.clone()));
+    obj.insert(
+        "user".to_string(),
+        pack_user_lite(&owner, &services.public_url, now_ms),
+    );
+    obj.insert("content".to_string(), page.content.clone());
+    obj.insert("variables".to_string(), page.variables.clone());
+    obj.insert("title".to_string(), Value::String(page.title.clone()));
+    obj.insert("name".to_string(), Value::String(page.name.clone()));
+    if let Some(summary) = &page.summary {
+        obj.insert("summary".to_string(), Value::String(summary.clone()));
+    }
+    obj.insert(
+        "hideTitleWhenPinned".to_string(),
+        Value::Bool(page.hide_title_when_pinned),
+    );
+    obj.insert("alignCenter".to_string(), Value::Bool(page.align_center));
+    obj.insert(
+        "font".to_string(),
+        Value::String(page.font.as_str().to_string()),
+    );
+    obj.insert("script".to_string(), Value::String(page.script.clone()));
+    obj.insert(
+        "eyeCatchingImageId".to_string(),
+        page.eye_catching_image_id
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+    let mut eye_image = Value::Null;
+    if let Some(id) = &page.eye_catching_image_id {
+        if let Some(meta) = services.media.get(id)? {
+            eye_image = pack_drive_file(&meta, services);
+        }
+    }
+    obj.insert("eyeCatchingImage".to_string(), eye_image);
+    obj.insert("attachedFiles".to_string(), Value::Array(attached));
+    obj.insert(
+        "likedCount".to_string(),
+        Value::from(page.liked_count as u64),
+    );
+    if let Some(viewer) = viewer_id {
+        obj.insert(
+            "isLiked".to_string(),
+            Value::Bool(services.pages.is_page_liked(viewer, &page.id)?),
+        );
+    }
+    Ok(Value::Object(obj))
+}
+
 /// Antenna pack (Batch N WS4; upstream `AntennaEntityService.pack`
 /// parity): `{id, createdAt, name, keywords, excludeKeywords, src,
 /// userListId, users, caseSensitive, localOnly, excludeBots, withReplies,
@@ -3136,6 +3312,135 @@ mod tests {
         }
     }
 
+    impl crate::application::ports::ClipStore for Mem {
+        fn create_clip(
+            &self,
+            _clip: crate::domain::clip::Clip,
+        ) -> Result<crate::domain::clip::Clip, PortError> {
+            unavailable("create_clip")
+        }
+        fn update_clip(
+            &self,
+            _clip: crate::domain::clip::Clip,
+        ) -> Result<Option<crate::domain::clip::Clip>, PortError> {
+            Ok(None)
+        }
+        fn delete_clip(&self, _owner_id: &str, _clip_id: &str) -> Result<bool, PortError> {
+            Ok(false)
+        }
+        fn get_clip(&self, _clip_id: &str) -> Result<Option<crate::domain::clip::Clip>, PortError> {
+            Ok(None)
+        }
+        fn clips_by_owner(
+            &self,
+            _owner_id: &str,
+        ) -> Result<Vec<crate::domain::clip::Clip>, PortError> {
+            Ok(Vec::new())
+        }
+        fn add_clip_note(
+            &self,
+            _row: crate::domain::clip::ClipNote,
+            _now_ms: i64,
+            _jobs: Vec<NewJob>,
+        ) -> Result<crate::domain::clip::ClipNote, PortError> {
+            unavailable("add_clip_note")
+        }
+        fn remove_clip_note(
+            &self,
+            _clip_id: &str,
+            _note_id: &str,
+            _jobs: Vec<NewJob>,
+        ) -> Result<bool, PortError> {
+            Ok(false)
+        }
+        fn clip_note_ids(&self, _clip_id: &str) -> Result<Vec<String>, PortError> {
+            Ok(Vec::new())
+        }
+        fn count_clip_notes(&self, _clip_id: &str) -> Result<u64, PortError> {
+            Ok(0)
+        }
+        fn favorite_clip(
+            &self,
+            _fav: crate::domain::clip::ClipFavorite,
+        ) -> Result<bool, PortError> {
+            Ok(false)
+        }
+        fn unfavorite_clip(&self, _user_id: &str, _clip_id: &str) -> Result<bool, PortError> {
+            Ok(false)
+        }
+        fn is_clip_favorited(&self, _user_id: &str, _clip_id: &str) -> Result<bool, PortError> {
+            Ok(false)
+        }
+        fn clip_favorite_count(&self, _clip_id: &str) -> Result<u64, PortError> {
+            Ok(0)
+        }
+        fn clip_favorites_by_user(
+            &self,
+            _user_id: &str,
+        ) -> Result<Vec<crate::domain::clip::ClipFavorite>, PortError> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl crate::application::ports::PageStore for Mem {
+        fn create_page(
+            &self,
+            _page: crate::domain::page::Page,
+            _jobs: Vec<NewJob>,
+        ) -> Result<crate::domain::page::Page, PortError> {
+            unavailable("create_page")
+        }
+        fn update_page(
+            &self,
+            _page: crate::domain::page::Page,
+            _jobs: Vec<NewJob>,
+        ) -> Result<Option<crate::domain::page::Page>, PortError> {
+            Ok(None)
+        }
+        fn delete_page(&self, _page_id: &str) -> Result<bool, PortError> {
+            Ok(false)
+        }
+        fn get_page(&self, _page_id: &str) -> Result<Option<crate::domain::page::Page>, PortError> {
+            Ok(None)
+        }
+        fn get_page_by_name(
+            &self,
+            _owner_id: &str,
+            _name: &str,
+        ) -> Result<Option<crate::domain::page::Page>, PortError> {
+            Ok(None)
+        }
+        fn get_page_by_uri(
+            &self,
+            _uri: &str,
+        ) -> Result<Option<crate::domain::page::Page>, PortError> {
+            Ok(None)
+        }
+        fn pages_by_owner(
+            &self,
+            _owner_id: &str,
+        ) -> Result<Vec<crate::domain::page::Page>, PortError> {
+            Ok(Vec::new())
+        }
+        fn like_page(
+            &self,
+            _like: crate::domain::page::PageLike,
+            _jobs: Vec<NewJob>,
+        ) -> Result<bool, PortError> {
+            Ok(false)
+        }
+        fn unlike_page(&self, _user_id: &str, _page_id: &str) -> Result<bool, PortError> {
+            Ok(false)
+        }
+        fn is_page_liked(&self, _user_id: &str, _page_id: &str) -> Result<bool, PortError> {
+            Ok(false)
+        }
+        fn featured_pages(&self) -> Result<Vec<crate::domain::page::Page>, PortError> {
+            Ok(Vec::new())
+        }
+    }
+
+
     impl StreamingSink for Mem {
         fn publish(&self, _event_type: &str, _payload: &[u8]) -> Result<(), PortError> {
             Ok(())
@@ -3175,6 +3480,8 @@ mod tests {
             signin: mem.clone(),
             password_resets: mem.clone(),
             registry: mem.clone(),
+            clips: mem.clone(),
+            pages: mem.clone(),
             federation_http: crate::federation::delivery::SafeHttpClient::new(
                 crate::federation::delivery::SafeHttpConfig {
                     allow_private_ips: true,

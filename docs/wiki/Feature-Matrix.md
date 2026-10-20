@@ -40,7 +40,7 @@ Legend: ✅ supported · 🟡 partial/subset · ❌ not supported (yet) · ⛔ d
 | Follow / unfollow | ✅ | ✅ | ✅ |
 | Follow requests (locked accounts) | ✅ (list/accept/reject/cancel) | ✅ | ✅ |
 | Mute / block / renote-mute | ❌ | ✅ | ✅ |
-| User lists, antennas, clips, pages, flash, gallery, channels | ✅ (user lists + antennas; clips/pages/flash/gallery/channels out) | ✅ | ✅ |
+| User lists, antennas, clips, pages, flash, gallery, channels | ✅ (user lists + antennas + local clips/pages; flash/gallery/channels out) | ✅ | ✅ |
 | Drive: upload | ✅ | ✅ | ✅ |
 | Drive: folders, listing, management | 🟡 (listing/show/update/delete; no folders) | ✅ | ✅ |
 | Search (notes/users) | 🟡 (notes + tag + user search, substring) | ✅ | ✅ |

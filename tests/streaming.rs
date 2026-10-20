@@ -91,6 +91,8 @@ impl LiveServer {
             signin: store.clone(),
             password_resets: store.clone(),
             registry: store.clone(),
+            clips: store.clone(),
+            pages: store.clone(),
             streaming: streaming.clone(),
             dedup: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {

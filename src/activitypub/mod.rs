@@ -3,6 +3,9 @@ pub mod objects;
 pub mod quotes;
 pub mod webfinger;
 pub mod signatures;
+/// Federated clips + pages wire surface (`OrderedCollection` clips,
+/// `Article` pages, fetch-gated serving, remote resolution).
+pub mod federated_collections;
 
 /// Misskey server version we claim compatibility with.
 ///

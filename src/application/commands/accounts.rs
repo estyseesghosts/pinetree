@@ -146,8 +146,7 @@ impl AppServices {
     ///   caller's role policy forces it on; the default policy is false so
     ///   the flag stays user-settable (no roles infra yet).
     /// - `pinnedPageId`: non-null ids resolve against the pages store →
-    ///   `NO_SUCH_PAGE`. TODO(§0B): no pages store exists yet, so any
-    ///   non-null value reports `NO_SUCH_PAGE`; `null` clears.
+    ///   `NO_SUCH_PAGE`; `null` clears.
     /// - `alsoKnownAs` remote resolution: blank lines → `NO_SUCH_USER`,
     ///   self → `FORBIDDEN_TO_SET_YOURSELF`, resolved accounts without a URI
     ///   → `URI_NULL`; unresolvable entries are skipped (the sync use-case
@@ -246,9 +245,14 @@ impl AppServices {
             }
         }
 
-        // Pinned page: no pages store yet.
-        if let Some(Some(_)) = &patch.pinned_page_id {
-            return Err(PortError::NotFound("NO_SUCH_PAGE".to_string()));
+        // Pinned page: must exist and belong to the caller (upstream
+        // `update.ts:433-438` parity: `findOneBy({ id })`, missing or
+        // foreign → `NO_SUCH_PAGE`; `null` clears, absent untouched).
+        if let Some(Some(page_id)) = &patch.pinned_page_id {
+            match self.pages.get_page(page_id)? {
+                Some(page) if page.owner_id == account_id => {}
+                _ => return Err(PortError::NotFound("NO_SUCH_PAGE".to_string())),
+            }
         }
 
         // Also-known-as resolution.

@@ -1,0 +1,153 @@
+# Federated collections: clips + pages (pinetree↔pinetree)
+
+Status: Draft (Phase 0 + Phase 1 local + Phase 3 local land with this
+handoff; Phase 2/3 remote serving + delivery land here as they are built).
+
+Clips and pages are server-local in Misskey (no AP representation), so
+everything below is a pinetree-first DIVERGENCE — pinetree↔pinetree only,
+gracefully ignored by everyone else. This doc is the contract a remote
+implementer (or the private-community track,
+`docs/community-planning.md`) codes against.
+
+## 1. Authenticated-fetch gate (shared infrastructure)
+
+Location: `src/federation/fetch_gate.rs`. The gate does two things and
+nothing else:
+
+1. **Authenticate the fetcher** (`authenticate_fetch_viewer`): verify the
+   HTTP Signature on an inbound GET (same key-lookup discipline as the
+   inbox: cached key, fetch-on-miss, one refresh on rotation; requires
+   signed `(request-target)`, `host`, `date`; 300 s skew). Any failure —
+   missing/unparsable header, unresolvable key, bad signature — collapses
+   to an **anonymous viewer**, never a 401/403. Rationale: existence-hiding
+   resources must 404 strangers without confirming the object exists.
+2. **Map (viewer, resource decision) to serve/403/404**
+   (`decide_fetch`):
+   - `Serve` → 200 with the object.
+   - `Forbidden` + identified viewer → 403.
+   - `Forbidden` + anonymous viewer → 404 (existence unconfirmed).
+   - `Hidden` → 404 always.
+
+Resource authorization lives in per-resource callbacks **above** the gate
+(e.g. `AppServices::authorize_clip_fetch`,
+`AppServices::authorize_page_fetch`: pure functions over the resource row
++ switches + `Option<actor_uri>`). **No object-type logic lives below the
+callback** — the gate never inspects what kind of object is fetched.
+
+### Reuse contract (community track)
+
+Private-community fetch (`docs/community-planning.md`: "private fetch
+requires follower-instance signature", "reader checks + signed
+`is_follower` probe") calls the same two functions:
+
+```rust
+let viewer = authenticate_fetch_viewer(&services, &original_target, &headers);
+let decision: FetchDecision = /* community membership check */;
+decide_fetch(&viewer, decision)?; // Ok(()) = serve, Err(status) = answer it
+```
+
+Rules for new callbacks: return `Serve` only for explicitly authorized
+fetchers; `Forbidden` for identified-but-unauthorized; `Hidden` for
+local-only/deleted/unknown. Never distinguish "forbidden" from "missing"
+yourself — the gate's anonymous→404 collapse does that generically.
+
+Signed-outbound fetching (`signed_get_json` in
+`src/federation/delivery.rs`, system-actor key) is the counterpart for
+server-to-server pulls.
+
+## 2. Privacy tiers (clips + pages, one model)
+
+`Private` (self-only, never leaves) → `LocalApproved` (remote 403) →
+`Unlisted` (capability URI, served to bearer, never advertised) →
+`Listed` (advertised, collection servable, items gated per-item) →
+`RemoteApproved` (signed fetch, listed approver actors only).
+
+Upstream `isPublic` maps onto the model (`true` ⇒ listed-global, `false`
+⇒ self-only); the per-object `federate` flag defaults OFF. Either the
+admin switch (`federateClips`/`federatePages`, default OFF,
+`admin/update-meta`) or the per-object flag off ⇒ local-only behavior,
+zero protocol footprint (routes 404, actor `clips` reference omitted).
+
+Remote-approved carries the standing trust caveat: we control who can
+fetch, not what the remote server does next (same as federated DMs).
+High-stakes content stays local-only.
+
+## 3. Clip wire shape
+
+- Collection: `OrderedCollection` at `{base}/clips/{id}` with
+  `attributedTo`, `name`, `summary`, `totalItems`, paged **note URIs only**
+  (never embedded notes; page size 200 = the member cap; single full-state
+  page + `first` link). No new activity types: collection state is the
+  protocol.
+- Membership sync: full-state paging with 10-minute TTL revalidation
+  (`resolve_remote_clip`) + inbound `Add`/`Remove` for promptness
+  (idempotent cache eviction, authority = collection owner verified by
+  fetching the collection and comparing `attributedTo`).
+- Item privacy composes: every served note URI resolves through the
+  existing note path on the fetching side; the serving side only includes
+  notes visible to the verified fetcher (per-item follow edges). A
+  non-visible note in a visible collection resolves to nothing — by
+  construction, never by special-casing.
+- Advertisement: listed clips in the actor's `clips` collection reference
+  (`{actor}/clips` → `OrderedCollection` of listed + federate-enabled
+  clip URIs); unlisted never advertised; nothing in NodeInfo, search, or
+  public timelines.
+- Outbound promptness: adding/removing a **remote-authored** note
+  delivers `Add`/`Remove` (`target` = collection URI) to the note
+  author's inbox. Local-authored members need no delivery (co-located).
+
+## 4. Page wire shape
+
+- Document: `Article` at `{base}/pages/{id}` with `name` = title,
+  `content` = server-rendered sanitized HTML, `summary`, `url` = page
+  URL, `attributedTo`, `published`/`updated`, `attachment` = eye-catch
+  image (+ origin attachments verbatim for remote pages), `tag` = [],
+  `source` = `{content` blocks, `variables}` for pinetree↔pinetree
+  fidelity. The object claims the public collection only for `Listed`
+  pages (capability-tier pages carry no public audience claim).
+- **Inbound `Article`s materialize as pages, not notes** (public
+  audience only — anything else keeps the note pipeline, which enforces
+  visibility). Identity is the Article `id` (stored as the row's
+  canonical `uri`; updates/deletes/likes correlate by URI, never slug).
+  Content prefers `source.content` blocks, else one synthesized text
+  block from sanitized HTML. **`script` is NEVER stored from remote
+  input** (remote rows keep `script: ""`) and NEVER serialized into any
+  federated field, structurally. Slugs derive from the title with
+  per-owner numeric disambiguation. Owner is the remote author's account
+  row; remote pages never re-federate (`Update`/`Delete` inbound apply to
+  the row; outbound `Create`/`Update` fan-out is local-author only).
+- **`script` is NEVER serialized into any federated field,
+  structurally**: the serializer has no code path that reads
+  `page.script`. Block rendering escapes all text and only emits a fixed
+  tag whitelist (`p/h2/section/figure/img/blockquote/a`); image URLs come
+  from local drive rows (server-constructed), quote links only for
+  `http(s)` URLs or resolvable local notes; unknown blocks are dropped.
+- Updates ride the existing `Update(Article)` delivery path (inbound
+  `Update(Article)` refreshes the materialized page when the signer owns
+  it; otherwise the note pipeline).
+- Deletes: inbound owner-signed `Delete(Article-URI)` retracts the
+  materialized page (likes cascade); local pages delete locally only.
+- Page likes: stored + counted; likes on materialized remote pages
+  federate back to the origin as `Like` with the page-URI object
+  (pinetree↔pinetree; co-located likes need no delivery; degrades to
+  nothing elsewhere). No notification is emitted for page likes
+  (DIVERGENCE — counts surface in `likedCount`/`featured`).
+
+## 5. Route table
+
+| Route | Gate | Serves |
+|---|---|---|
+| `GET /clips/{id}[?page=true]` | §1 + clip tier callback | `OrderedCollection` / page |
+| `GET /users/{id}/clips[?page=true]` | switch only (index reveals nothing unlisted) | advertised clips index |
+| `GET /pages/{id}` | §1 + page tier callback | `Article` |
+| Actor doc `clips` field | switch only | collection reference |
+
+Response codes: unknown/deleted/ungated ⇒ 404; known signer without
+authorization ⇒ 403; unknown/unsigned ⇒ 404 (existence unconfirmed).
+
+## 6. Non-goals (recorded)
+
+Channels (Lemmy covers that later). New activity types beyond
+`Add`/`Remove` handling. Executable content federation, ever.
+Public-directory/indexing of unlisted objects. `pages/featured` stays a
+pure query (upstream parity — no admin-curation surface exists upstream).

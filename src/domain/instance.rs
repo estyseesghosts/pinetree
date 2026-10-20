@@ -61,6 +61,16 @@ pub struct InstanceSettings {
     pub name: Option<String>,
     pub description: Option<String>,
     pub max_note_text_length: usize,
+    /// Federated clips + pages handoff (Phase 2/3): instance kill-switches
+    /// for clip/page federation. Both default OFF: either switch off (or
+    /// the per-object `federate` flag off) ⇒ local-only behavior, zero
+    /// protocol footprint. `#[serde(default)]` keeps rows written before
+    /// this field existed decoding as off.
+    #[serde(default)]
+    pub federate_clips: bool,
+    /// See [`InstanceSettings::federate_clips`].
+    #[serde(default)]
+    pub federate_pages: bool,
 }
 
 impl Default for InstanceSettings {
@@ -71,6 +81,8 @@ impl Default for InstanceSettings {
             name: None,
             description: None,
             max_note_text_length: 3000,
+            federate_clips: false,
+            federate_pages: false,
         }
     }
 }

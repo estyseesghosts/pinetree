@@ -281,4 +281,23 @@ Backend-agnostic, same cases both adapters (FDB inherits).
 
 Ports: `PasswordResetStore`, `RegistryStore` (required, no defaults). redb implemented (`password_resets*`, `registry` tables).
 
-Execution status (honest): W1–W2 green on redb only; FDB has not run them. Suite total: 110/110 green on redb.
+Execution status (honest): W1–W2 green on redb only; FDB has not run them.
+
+### Group X — clips + clip-notes + clip favorites (federated clips + pages handoff; added 2026-10-20; Draft)
+
+Backend-agnostic, same cases both adapters (FDB inherits).
+
+- **X1 clip CRUD + cap race**: owner-scoped create/update; foreign updates miss; concurrent creates at the owner cap → exactly `CLIP_LIMIT_PER_OWNER` succeed (`TOO_MANY_CLIPS` else); foreign-owner delete is a miss. Executed: `x1_clip_crud_and_cap_race` green (redb).
+- **X2 notes/favorites/cascade**: duplicate pairs converge on `ALREADY_CLIPPED`; per-clip cap holds (`TOO_MANY_CLIP_NOTES`); `last_clipped_at` touches on add only; member ids read newest-first; favorites are idempotent inserts with counts; delete cascades memberships + favorites in the same commit. Executed: `x2_clip_notes_favorites_and_cascade` green (redb).
+
+### Group Y — pages + page likes (federated clips + pages handoff; added 2026-10-20; Draft)
+
+Backend-agnostic, same cases both adapters (FDB inherits).
+
+- **Y1 page CRUD + slug race**: id/slug reads; `(owner, name)` uniqueness holds under a thread race (`NAME_ALREADY_EXISTS`); slug moves onto a sibling slug conflict; other owners may reuse a slug; delete cascades likes. Executed: `y1_page_crud_and_slug_race` green (redb).
+- **Y2 likes + featured**: like/unlike are idempotent and move `liked_count` in the same txn (`ALREADY_LIKED`/`NOT_LIKED` surface at the op layer); likes on remote pages enqueue a `Like` fan-out job in the same txn; `featured_pages` returns only liked pages, highest count first, at most 10. Executed: `y2_page_likes_and_featured` green (redb).
+- **Y3 page URI index**: `get_page_by_uri` round-trip, index follows renames, delete drops the index row. Executed: `y3_page_uri_index_round_trip` green (redb).
+
+Ports: `ClipStore`, `PageStore` (required, no defaults). redb implemented (`clips*`, `pages*` tables).
+
+Execution status (honest): X1–X2 + Y1–Y3 green on redb only; FDB has not run them. Suite total: 115/115 green on redb.

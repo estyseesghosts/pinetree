@@ -1482,6 +1482,135 @@ mod tests {
         }
     }
 
+    impl crate::application::ports::ClipStore for Mem {
+        fn create_clip(
+            &self,
+            _clip: crate::domain::clip::Clip,
+        ) -> Result<crate::domain::clip::Clip, PortError> {
+            unavailable("create_clip")
+        }
+        fn update_clip(
+            &self,
+            _clip: crate::domain::clip::Clip,
+        ) -> Result<Option<crate::domain::clip::Clip>, PortError> {
+            Ok(None)
+        }
+        fn delete_clip(&self, _owner_id: &str, _clip_id: &str) -> Result<bool, PortError> {
+            Ok(false)
+        }
+        fn get_clip(&self, _clip_id: &str) -> Result<Option<crate::domain::clip::Clip>, PortError> {
+            Ok(None)
+        }
+        fn clips_by_owner(
+            &self,
+            _owner_id: &str,
+        ) -> Result<Vec<crate::domain::clip::Clip>, PortError> {
+            Ok(Vec::new())
+        }
+        fn add_clip_note(
+            &self,
+            _row: crate::domain::clip::ClipNote,
+            _now_ms: i64,
+            _jobs: Vec<NewJob>,
+        ) -> Result<crate::domain::clip::ClipNote, PortError> {
+            unavailable("add_clip_note")
+        }
+        fn remove_clip_note(
+            &self,
+            _clip_id: &str,
+            _note_id: &str,
+            _jobs: Vec<NewJob>,
+        ) -> Result<bool, PortError> {
+            Ok(false)
+        }
+        fn clip_note_ids(&self, _clip_id: &str) -> Result<Vec<String>, PortError> {
+            Ok(Vec::new())
+        }
+        fn count_clip_notes(&self, _clip_id: &str) -> Result<u64, PortError> {
+            Ok(0)
+        }
+        fn favorite_clip(
+            &self,
+            _fav: crate::domain::clip::ClipFavorite,
+        ) -> Result<bool, PortError> {
+            Ok(false)
+        }
+        fn unfavorite_clip(&self, _user_id: &str, _clip_id: &str) -> Result<bool, PortError> {
+            Ok(false)
+        }
+        fn is_clip_favorited(&self, _user_id: &str, _clip_id: &str) -> Result<bool, PortError> {
+            Ok(false)
+        }
+        fn clip_favorite_count(&self, _clip_id: &str) -> Result<u64, PortError> {
+            Ok(0)
+        }
+        fn clip_favorites_by_user(
+            &self,
+            _user_id: &str,
+        ) -> Result<Vec<crate::domain::clip::ClipFavorite>, PortError> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl crate::application::ports::PageStore for Mem {
+        fn create_page(
+            &self,
+            _page: crate::domain::page::Page,
+            _jobs: Vec<NewJob>,
+        ) -> Result<crate::domain::page::Page, PortError> {
+            unavailable("create_page")
+        }
+        fn update_page(
+            &self,
+            _page: crate::domain::page::Page,
+            _jobs: Vec<NewJob>,
+        ) -> Result<Option<crate::domain::page::Page>, PortError> {
+            Ok(None)
+        }
+        fn delete_page(&self, _page_id: &str) -> Result<bool, PortError> {
+            Ok(false)
+        }
+        fn get_page(&self, _page_id: &str) -> Result<Option<crate::domain::page::Page>, PortError> {
+            Ok(None)
+        }
+        fn get_page_by_name(
+            &self,
+            _owner_id: &str,
+            _name: &str,
+        ) -> Result<Option<crate::domain::page::Page>, PortError> {
+            Ok(None)
+        }
+        fn get_page_by_uri(
+            &self,
+            _uri: &str,
+        ) -> Result<Option<crate::domain::page::Page>, PortError> {
+            Ok(None)
+        }
+        fn pages_by_owner(
+            &self,
+            _owner_id: &str,
+        ) -> Result<Vec<crate::domain::page::Page>, PortError> {
+            Ok(Vec::new())
+        }
+        fn like_page(
+            &self,
+            _like: crate::domain::page::PageLike,
+            _jobs: Vec<NewJob>,
+        ) -> Result<bool, PortError> {
+            Ok(false)
+        }
+        fn unlike_page(&self, _user_id: &str, _page_id: &str) -> Result<bool, PortError> {
+            Ok(false)
+        }
+        fn is_page_liked(&self, _user_id: &str, _page_id: &str) -> Result<bool, PortError> {
+            Ok(false)
+        }
+        fn featured_pages(&self) -> Result<Vec<crate::domain::page::Page>, PortError> {
+            Ok(Vec::new())
+        }
+    }
+
+
     impl StreamingSink for Mem {
         fn publish(&self, _event_type: &str, _payload: &[u8]) -> Result<(), PortError> {
             Ok(())
@@ -1522,6 +1651,8 @@ mod tests {
             signin: mem.clone(),
             password_resets: mem.clone(),
             registry: mem.clone(),
+            clips: mem.clone(),
+            pages: mem.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()
