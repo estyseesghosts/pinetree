@@ -1,24 +1,33 @@
 # pinetree
 
-A small, friendly **social network server** written in Rust that speaks the
-same language as [Misskey](https://misskey-hub.net/) — both its client API and
-its federation protocol (ActivityPub). Post notes, follow people, react, quote,
-reply in threads, stream updates live, and chat with other servers across the
-fediverse.
+pinetree is a lightweight, single-binary **Misskey-compatible social network
+server** written in Rust. Existing Misskey clients talk to it through a
+deliberately chosen, contract-tested subset of the Misskey API (plus
+streaming), and it federates over ActivityPub with Misskey, Sharkey, and other
+fediverse software.
 
-It is deliberately **lightweight**: no Postgres, no Redis, no message broker.
-One binary, one embedded database file, done.
+It is deliberately **small to run**: no Postgres, no Redis, no message broker.
+One binary, one embedded database file (`redb`), local file storage, done.
 
-> **Status:** Actively in development. Phases 0–3 are complete and
-> green-tested (single-node server, federation with real Misskey/Sharkey,
-> streaming, quote posts, branched replies). The next phase adds multi-node
-> clustering on FoundationDB. See [Where things stand](#where-things-stand).
+pinetree does not come with a frontend. Point any Misskey-compatible web
+client at it — for example [Keystone](https://github.com/estyseesghosts/keystone)
+(which targets pinetree as a backend) or [KissMe](https://github.com/estyseesghosts/kissme).
+
+> **Status (2026-10-20):** the single-node server is done through client
+> compatibility, federation, streaming, quote posts, branched replies, polls,
+> post editing, drafts/scheduling, blocking/muting, private lists, pins,
+> notification grouping/filtering, profile import/export, and a first batch of
+> moderation + registration tooling. Multi-node clustering (FoundationDB) is
+> still planned, not built. Details below — including what is *not* wired up
+> yet.
 
 ---
 
 ## Table of contents
 
-- [What it does](#what-it-does)
+- [What it does today](#what-it-does-today)
+- [What it does not do](#what-it-does-not-do)
+- [Known gaps and rough edges](#known-gaps-and-rough-edges)
 - [Where things stand](#where-things-stand)
 - [Run your own server](#run-your-own-server)
   - [Prerequisites](#prerequisites)
@@ -35,34 +44,202 @@ One binary, one embedded database file, done.
 
 ---
 
-## What it does
+## What it does today
 
-pinetree is a fediverse server that Misskey clients can talk to. Concretely,
-that means:
+Everything in this section runs on the single-node server and is covered by
+executed tests (see [Testing it yourself](#testing-it-yourself)). Roughly 95
+JSON API endpoints answer at `POST /api/{endpoint}`; anything not on the list
+returns `404 UNKNOWN_API_ENDPOINT`, and unknown fields on listed endpoints
+return `400 UNSUPPORTED_FIELD`. The exact contract is
+`docs/endpoint-manifest.md`.
 
-**For people using it (via a Misskey client, the API, or MiAuth web login):**
+**Accounts, auth, and registration:**
 
-- Sign up, sign in, get an API token.
-- Post notes — text, content warnings, visibility (`public` / `home` /
-  `followers` / `specified`), replies, renotes, **quote posts**, and file
-  attachments.
-- Branched reply threads that stay intact even when the original parent
-  arrives late from a remote server.
-- React with emoji, follow people, send follow requests to locked accounts.
-- Browse home / local / hybrid / global timelines.
-- Get notified about mentions, replies, reactions, and follows.
-- **Stream** live updates over a WebSocket (new notes, reactions, etc.).
-- Upload and manage drive files.
+- Signup / signin with per-token permissions, rate limits with Misskey-style
+  `429` + `retryAfter`.
+- MiAuth web flow (`miauth/gen-token`, `GET|POST /miauth/{session}[/check]`)
+  and legacy `auth/session/generate|show|userkey` + `auth/accept`.
+- Registration policy: open signup, invite-only (`invite/create|list|delete|limit`,
+  `admin/invite/create|list`), or admin-managed (`admin/accounts/create`,
+  `disableRegistration` via `admin/meta` / `admin/update-meta`).
+- Roles: admin and moderator (`set-role` CLI), `isAdmin` / `isModerator`
+  packed on users, a moderation log (`admin/show-moderation-logs`).
+- Suspension (`admin/suspend-user|unsuspend-user`): sign-in refused with
+  `USER_SUSPENDED`, open streams closed, follows torn down in bounded sweeps.
+- Full profile store: `i/update` accepts all 39 upstream profile params
+  (name, description, location, birthday, avatar/banner, followedMessage,
+  languages, muted words/instances, notification receive config, and more),
+  plus pinetree's own `rejectQuotes` and `defaultReaction` toggles.
+- Self-delete (`i/delete-account`) and admin delete (`admin/delete-account`),
+  admin user views (`admin/show-user(s)`, `admin/update-user-note`).
 
-**For other servers (federation / ActivityPub):**
+**Notes and timelines:**
 
-- WebFinger, NodeInfo, actor documents with RSA keys.
-- Shared and personal inboxes with HTTP Signatures.
-- Follow / Accept / Reject / Undo, Create / Update / Delete / Like / Announce.
-- Durable delivery with retry and backoff — a remote hiccup never loses a post.
-- Quote-post authorization (FEP-044f) between pinetree instances.
-- Verified against real Misskey, Sharkey, Pleroma, and Akkoma in local interop
-  tests.
+- Create (text, content warning, `public` / `home` / `followers` /
+  `specified` visibility, replies, renotes, file attachments, `localOnly`),
+  show, delete, unrenote.
+- **Polls** with voting (`notes/polls/vote`), expiry, and federation as
+  `Question` (+ `pollVoted` events).
+- **Post editing** in the Sharkey `notes/edit` shape (reply immutable,
+  visibility forced back, poll add/replace resets votes, version history),
+  plus `edited` notifications and federated `Update(Note)`.
+- **Quote posts** (FEP-044f canonical + legacy compat + request/approval
+  workflow; quoter-side `rejectQuotes` enforcement, remote strip-to-plain-note
+  fallback) and **branched reply threads** that stay intact when the parent
+  arrives late (pending parents fail closed until the resolver links them).
+- Home / local / hybrid / global timelines with cursor pagination,
+  `users/notes`, `notes/replies|renotes|children|conversation`,
+  `notes/search|search-by-tag` (substring scan over local notes),
+  `notes/featured`, `users/featured-notes`.
+- Read-time enforcement everywhere: blocked/muted/suspended authors,
+  instance blocks, and renote-mutes are filtered on every timeline and note
+  read.
+
+**Reactions, follows, and social graph:**
+
+- Reactions create/delete with Misskey normalization (bare-`❤` fallback,
+  `likeOnly`, legacy mapping); per-user `defaultReaction` so a bare heart-tap
+  resolves server-side; full reaction list via `notes/reactions`.
+- Follow / unfollow, follow requests to locked accounts
+  (`following/requests/list|accept|reject|cancel`).
+- Blocking, muting, renote-muting (`blocking/*`, `mute/*`, `renote-mute/*`,
+  `users/relation`), enforced on follow/react/vote/create and on every read.
+- Private followers/following lists (self / follower / public gating with
+  `FORBIDDEN` + count masking) and private reactions (`users/reactions`).
+- Pins (`i/pin|unpin`, limit 5, federated) and a documented “compatible,
+  simplified” featured-notes ranking (not upstream-identical).
+
+**Notifications, drafts, import/export:**
+
+- `i/notifications` (cursor, `markAsRead`, include/exclude type filters,
+  creation-time receive-config gates, muting/self drops),
+  `i/notifications-grouped` (reaction/renote grouping, pure pack-layer),
+  `notifications/mark-all-as-read`.
+- Drafts + scheduled posts (`notes/drafts/create|list|update|delete|count`;
+  scheduling = `scheduledAt` on a draft, published by a durable job with
+  `scheduledNotePosted/Failed` notifications).
+- Profile import/export: 8 exports (`following`, `blocking`, `mute`, `notes`,
+  `antennas`, `clips`, `favorites`, `user-lists`) + 5 imports with upstream
+  error codes and an `exportCompleted` notification. (Entities pinetree has no
+  model for — lists, antennas, clips, favorites — export empty valid files and
+  import zero rows; that is documented, not silent.)
+
+**Streaming:**
+
+- Authenticated WebSocket `/streaming` (`?i=` or Bearer): `main`,
+  `homeTimeline`, `localTimeline`, `hybridTimeline`, `globalTimeline`.
+- Note capture (`subNote`/`unsubNote` + aliases, `reacted`/`unreacted`/`deleted`
+  with the visibility gate), `readNotification`, `pollVoted`, `edited` note
+  updates, unknown channels answered with `UNSUPPORTED_CHANNEL`.
+- Suspended users' sockets are closed server-side.
+
+**Media:**
+
+- Multipart/JSON upload (`drive/files/create`), listing/show/update/delete,
+  public serving at `GET /files/{id}`, local filesystem blob store.
+- Remote attachments are validated and cached (scheme, SSRF, size limit,
+  MIME sniff). No folders: `folderId` must be null.
+
+**Federation (ActivityPub):**
+
+- WebFinger (JRD + XRD), host-meta, NodeInfo 2.0/2.1, stable actor documents
+  with RSA keys, outbox/followers/following/featured collections, note
+  documents (tombstone `410` for deleted).
+- Shared + personal inboxes. Digest + legacy HTTP Signatures (`rsa-sha256`)
+  verified inbound and emitted outbound; 64 KiB body cap, ±5 min `Date` skew,
+  actor/object authority checks, atomic activity-ID deduplication (in the same
+  transaction as the state change).
+- Activities: Follow / Accept / Reject / Undo, Create(Note), Update (edits and
+  poll votes), Delete, Like with `_misskey_reaction`, Announce, `Question`
+  (polls), FEP-044f quote authorization on the pinetree↔pinetree path.
+  Inbound `EmojiReact` (Akkoma/Pleroma-family) is accepted through the Like
+  path.
+- Durable outbound delivery with exponential backoff, per-destination limits,
+  shared-inbox dedup; terminally failed jobs are quarantined with a logged
+  reason instead of retrying forever.
+- Instance blocks (`blockedHosts`): subdomain-aware, enforced on inbound
+  (drop before state write) and at delivery time outbound.
+- Federation input is treated as untrusted: size/timeout/redirect limits,
+  SSRF protection (private IPs blocked by default), HTML/MFM sanitization.
+
+**Durability:**
+
+- Every local state change commits together with its outbox/job record in one
+  storage transaction; workers do notifications, streaming fan-out, and
+  delivery. Jobs are idempotent, deduplicated, retryable, and crash-safe
+  (crash-recovery tests).
+
+---
+
+## What it does not do
+
+Deliberate non-goals (proposal §1) and deferred work — asking for these
+returns `404 UNKNOWN_API_ENDPOINT` (API) or `UNSUPPORTED_CHANNEL` (streaming)
+rather than a broken half-implementation:
+
+- **No multi-node mode.** `--mode=cluster` refuses to start
+  (`cluster mode is not implemented (Phase 4)`). One process, one embedded
+  `redb` file, no FoundationDB adapter, no account directory, no cross-node
+  routing. That is Phase 4, not started.
+- **No bundled web client.** Use Keystone, KissMe, or any Misskey-compatible
+  client.
+- **No Mastodon client REST API.** ActivityPub federation *with*
+  Mastodon-family servers stays in scope; the Mastodon API itself is a
+  non-goal (Sharkey ships one; pinetree never will unless the proposal
+  changes).
+- **No custom-emoji subsystem.** No emoji listing/management endpoints, no
+  registry. Foreign `:shortcode:` reactions store verbatim but never render.
+  Outbound reactions to Akkoma/Pleroma-family hosts degrade to a plain `Like`
+  (❤ favorite) until an `EmojiReact` emit shape passes a live round-trip test.
+- **No antennas, clips, channels, pages, drive folders, user lists, chat,
+  Reversi, or search-by-hashtag.** No featured/mentions/user-list timelines,
+  no `drive` streaming channel, no `notes/user-list-timeline`,
+  no `notifications/flush`, no `signin-flow`, no 2FA/passkeys/webhooks.
+- **No OAuth.** MiAuth + API tokens only (OAuth lands only if a target client
+  requires it).
+- **No thread muting, no Move activity handling, no RFC 9421 or Linked-Data
+  signatures,** no `_misskey_content` (never emitted, by decision), no polls
+  over deleted/expired edge beyond documented errors.
+- **No favorites, url-preview, follower-removal, or `followRequestAccepted`
+  notification yet** (Batch M work packages WP7–WP14 are specified in
+  `docs/implementer-guide-batch-m.md` §§5 but not implemented).
+- **User-facing abuse reporting is not wired up.** The storage, application
+  ops, and outbound `Flag` rendering exist below the HTTP layer, but
+  `users/report-abuse` and the `admin/abuse-user-reports` family are *not*
+  routed, and inbound `Flag` activities are not handled. Admins currently
+  moderate via suspend/delete/notes/blocks instead.
+
+---
+
+## Known gaps and rough edges
+
+Things that work but with documented limits you may trip over:
+
+- **Loopback-tested only.** Interop is verified against real servers in local
+  labs (see below), never against the live public internet. SSRF protection
+  blocks private IPs by default; loopback federation needs
+  `PINETREE_ALLOW_PRIVATE_IPS=1`.
+- **Single-node storage.** One writer (`redb`), no read replicas, no live
+  migration path to multi-node yet (export/import covers accounts, follows,
+  blocks, mutes, and notes — not a transparent upgrade).
+- **Search is a bounded substring scan** over cached notes, not an index.
+  `notes/reactions` pages newest-first on `sinceId`-only cursors (documented
+  divergence from Misskey's ascending order).
+- **Featured notes use a simplified ranking** (recent non-sensitive public
+  notes scored by reactions + renotes) — compatible in shape, not identical to
+  upstream.
+- **Actor RSA keys generate lazily on first use** — slow in debug builds, so
+  the first remote fetch of a new account can time out for peers.
+- **Word mutes are client-side by design** (Misskey parity): the server stores
+  `mutedWords`/`hardMutedWords` and ships them on `MeDetailed` but never
+  hides notes itself.
+- **Private follow lists have no per-user visibility knobs yet** — the profile
+  stores the fields, lists gate on the documented rule (self/follower/public).
+- **No per-destination delivery tuning, no timeline indexes beyond the
+  reactions-by-note index, minimal observability** (stderr diagnostics only).
+  That is Phase 5 work and starts only with measurements.
+- **Benchmarks are debug-build, single-node numbers** (~870 notes-create/s,
+  ~430 timeline/s, ~1200 users-show/s) — a rough guide, not a promise.
 
 ---
 
@@ -75,10 +252,12 @@ that means:
 | 2 | Federation (WebFinger, actors, signatures, inboxes, delivery, dedup) | Done |
 | 3 | Client compatibility & streaming (live WebSocket, richer API, real-client contract tests) | Done |
 | — | Quote posts (FEP-044f) and branched replies on top | Done |
-| 4 | Multi-node on FoundationDB | Planned — next up |
+| — | Misskey parity batch: polls, editing, drafts/scheduling, blocks/mutes, private lists, pins, notification grouping/filtering, import/export | Done |
+| — | Moderation batch (Batch M, pre-Phase 4): roles, registration/invites, suspension, instance blocks, admin views; abuse-report plumbing below the API layer | Mostly done — WP1–WP6 landed, WP7+ pending |
+| 4 | Multi-node on FoundationDB | Planned — not started |
 | 5 | Scale & hardening | Planned |
 
-The single-node server is **ready to run today**. Multi-node mode will refuse
+The single-node server is **ready to run today**. Multi-node mode refuses
 to start until Phase 4 lands (that is intentional).
 
 ---
@@ -93,7 +272,7 @@ to start until Phase 4 lands (that is intentional).
 
 > If you want to run the full test suite or the interop labs later, you'll
 > also want `bun`, Docker (with the compose plugin), Node 24, and Node 22.
-> But to just *run a pinetree*, you only need Rust.
+> But to *run a pinetree*, you only need Rust.
 
 ### Build it
 
@@ -152,16 +331,20 @@ target/release/pinetree \
 ```
 
 (Yes, the `create-account` subcommand goes after the server flags — it exits
-after creating the account instead of starting the server.)
+after creating the account instead of starting the server. Registration policy
+— open, invite-only, or admin-only — is managed afterwards via
+`admin/update-meta` and the invite endpoints.)
 
-To make yourself an admin:
+To make yourself an admin (or moderator):
 
 ```bash
 target/release/pinetree \
   --public-url=https://social.example.com \
   --data-dir=./data \
-  set-role --username=alice --admin=true
+  set-role --username=alice --admin
 ```
+
+(`--moderator`, and `=false` to revoke, work the same way.)
 
 ### Log in and post
 
@@ -201,12 +384,21 @@ Once it's running, you interact with pinetree the same way you'd interact
 with any Misskey instance:
 
 - **Post:** `POST /api/notes/create` with `text`, optional `visibility`,
-  `cw` (content warning), `replyId`, `renoteId`, `fileIds`, `localOnly`.
+  `cw` (content warning), `replyId`, `renoteId`, `fileIds`, `localOnly`,
+  `poll`. Edit with `notes/edit`, vote with `notes/polls/vote`.
 - **Timelines:** `POST /api/notes/timeline`, `notes/local-timeline`,
-  `notes/hybrid-timeline`, `notes/global-timeline`.
+  `notes/hybrid-timeline`, `notes/global-timeline`; thread views via
+  `notes/replies|renotes|children|conversation`; `notes/search`,
+  `notes/search-by-tag`.
 - **Reactions:** `POST /api/notes/reactions/create` with `noteId` + `reaction`
-  (e.g. `"👍"`).
-- **Follows:** `POST /api/following/create` with `userId`.
+  (e.g. `"👍"`); omit `reaction` to use your `defaultReaction`.
+- **Follows:** `POST /api/following/create` with `userId`; locked accounts go
+  through `following/requests/*`. Block/mute via `blocking/*`, `mute/*`,
+  `renote-mute/*`.
+- **Drafts:** `notes/drafts/create|list|update|delete|count`; add `scheduledAt`
+  to publish later.
+- **Portability:** `i/export-*` / `i/import-*` for follows, blocks, mutes,
+  notes, and more.
 - **Streaming:** connect a WebSocket to `ws://<host>/streaming?i=<token>` (or
   with a Bearer header). Channels include `main`, `homeTimeline`,
   `localTimeline`, `hybridTimeline`, and `globalTimeline`.
@@ -214,22 +406,31 @@ with any Misskey instance:
   served at `GET /files/<id>`.
 
 The full API surface is documented in `docs/endpoint-manifest.md` (the frozen
-contract) and `docs/phase-3-profile.md` (the compatibility profile). Anything
-not in that list returns `404 UNKNOWN_API_ENDPOINT`.
+contract plus dated superseding notes) and `docs/phase-3-profile.md` (the
+compatibility profile). Anything not in that list returns
+`404 UNKNOWN_API_ENDPOINT`.
 
 ---
 
 ## What it talks to
 
-pinetree federates over ActivityPub and has been tested against real:
+pinetree federates over ActivityPub and has been tested against real software
+in local (loopback/docker) labs — never against the public internet so far:
 
-- **Misskey** (2026.10.1-alpha.0)
-- **Sharkey** (2025.4.7)
-- **Pleroma / Akkoma** (via the local-federation test rig)
+- **Misskey** (2026.10.1-alpha.0) and **Sharkey** (2025.4.7): follow, post,
+  react, reply, quote, and delivery flows in a live four-server interop lab
+  (two pinetrees + real Misskey + real Sharkey).
+- **Akkoma / Pleroma-family, Mastodon, Catodon, and a reference implementation:**
+  broader multi-family bench harness (`scripts/fediverse-bench/`) covering
+  follows, feature interop (notes, polls, reactions, quotes), and stress runs.
+  Known standing limits from those runs: outbound emoji reactions to
+  Akkoma-family hosts degrade to favorites; foreign custom emoji never
+  renders.
 
-It supports the core activity types (Follow, Accept, Reject, Undo, Create,
-Update, Delete, Like, Announce), WebFinger, NodeInfo, HTTP Signatures, and
-FEP-044f quote authorization between pinetree instances.
+It speaks the core activity types (Follow, Accept, Reject, Undo, Create,
+Update, Delete, Like, Announce, Question), WebFinger, NodeInfo, HTTP
+Signatures, and FEP-044f quote authorization (full workflow between
+pinetrees; legacy-compatible with Misskey/Sharkey).
 
 ---
 
@@ -240,23 +441,28 @@ FEP-044f quote authorization between pinetree instances.
 ├── sns-server-proposal.md    the product & architecture plan (source of truth)
 ├── AGENTS.md                 rules for anyone (human or AI) working in this repo
 ├── docs/                     frozen contracts, phase plans, exit criteria, wiki
-│   ├── endpoint-manifest.md  the Misskey API contract
+│   ├── endpoint-manifest.md  the Misskey API contract (+ superseding notes)
 │   ├── phase-3-profile.md    the compatibility profile (target clients, scope)
+│   ├── misskey-parity-plan.md  the parity batch (§§0–13 done; Batch M status)
+│   ├── implementer-guide-batch-m.md  moderation/daily-use batch (WP1–WP6 done)
 │   ├── testing.md            how to run every test suite
 │   └── wiki/                 living overview docs (About, Current State, Roadmap)
 ├── src/                      the Rust crate
 │   ├── domain/               pure types & rules (no HTTP, no DB)
 │   ├── application/          use cases (commands, queries, ports)
-│   ├── api/misskey/          HTTP API adapter
+│   ├── api/misskey/          HTTP API adapter (endpoints, packers, errors)
 │   ├── activitypub/          ActivityPub protocol adapter
-│   ├── federation/           delivery, retry, inbound processing
+│   ├── federation/           inbox, outbox, delivery, retry
 │   ├── persistence/redb/     the embedded database adapter
 │   ├── streaming/            WebSocket server & channel hub
 │   ├── jobs/                 durable job queue & worker
 │   ├── media/                file blob storage
 │   └── cluster/              Phase 4 multi-node (stub for now)
-├── tests/                    conformance, federation, streaming, crash-recovery
+├── tests/                    conformance (100 cases incl. polls, edits,
+│                             blocks, imports), federation, streaming,
+│                             crash-recovery, real-client smoke tests
 ├── scripts/                  smoke-all.sh and friends (one-command test gates)
+├── scripts/fediverse-bench/  multi-family federation bench harness
 ├── state/logs/               dated work logs with real command output
 └── misskey, sharkey          symlinks to reference checkouts (git-ignored;
                               only needed for tests, not for running a server)
@@ -279,17 +485,19 @@ bash scripts/smoke-all.sh
 
 That runs (in order):
 
-1. `cargo test --offline` — the full Rust test suite (unit tests, storage
-   conformance, federation, streaming, crash recovery, real-client smoke
-   tests). Currently **351 tests green**.
+1. `cargo test --offline` — the full Rust test suite. Currently **553 green**:
+   424 unit tests, 100 storage-conformance cases on redb, and 29 integration
+   tests (streaming over live WebSockets, federation between in-process nodes,
+   crash recovery, and real-`misskey-js` client smoke tests).
 2. `scripts/smoke-phase1.sh` — core flows driven by the real `misskey-js`
    client library.
 3. `scripts/smoke-phase3.sh` — the compatibility profile endpoints and
    streaming via `misskey-js`.
 4. `scripts/keystone-sweep.sh` — Keystone frontend's exact API calls (41
-   checks).
+   checks, all passing).
 5. `scripts/smoke-phase2.sh` — live four-server federation interop (real
-   Misskey + real Sharkey + two pinetree instances).
+   Misskey + real Sharkey + two pinetree instances). Needs Node 22 for the
+   Sharkey side; it skips cleanly without it.
 
 You can also run pieces individually:
 
@@ -299,7 +507,7 @@ PINETREE_BIN=target/release/pinetree bash scripts/smoke-phase1.sh
 ```
 
 See `docs/testing.md` for the full guide, including how to run the interop
-rig by hand.
+rig and the multi-family bench harness by hand.
 
 ---
 
@@ -313,8 +521,9 @@ rig by hand.
   get up to speed.
 
 If you want to help, the most useful things are: trying it out, running the
-test suite, and filing issues when something doesn't work. Phase 4
-(multi-node) is next if you want to dig into distributed systems work.
+test suite, and filing issues when something doesn't work. The Batch M
+remainder (WP7+: favorites, emoji, self-service, follower removal, URL
+preview, drive extras) and then Phase 4 (multi-node) are the open frontiers.
 
 ---
 
