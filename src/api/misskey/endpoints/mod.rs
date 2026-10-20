@@ -62,6 +62,7 @@ use super::auth::{
 use super::errors::ApiError;
 use super::packers::{
     pack_abuse_report, pack_antenna, pack_blocking, pack_clip, pack_drive_file, pack_emoji_detailed, pack_emoji_simple,
+    pack_remote_emoji_detailed,
     pack_following, pack_invite_code, pack_me_detailed,
     pack_meta, pack_moderation_log, pack_muting, pack_note, pack_note_draft,
     pack_note_reaction_with_note, pack_page, pack_scheduled_note,
@@ -5259,6 +5260,185 @@ fn api_dispatch_blocking(
             Ok(Json(Value::Array(packed)).into_response())
         }
 
+        // --- Emoji completion: bulk ops, copy, list-remote ---------------
+        "admin/emoji/add-aliases-bulk" => {
+            check_allowed_fields(&obj, &["ids", "aliases"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:emoji")?;
+            require_moderator(&caller)?;
+            state.rate_limiter.check(&rate_key, "admin/emoji/add-aliases-bulk")?;
+            let ids = required_str_array(&obj, "ids")?;
+            let aliases = required_str_array(&obj, "aliases")?;
+            if aliases.len() > 32 {
+                return Err(ApiError::invalid_param("aliases", "must have at most 32 entries"));
+            }
+            state
+                .services
+                .add_emoji_aliases_bulk(&caller.account.id, &ids, &aliases)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "admin/emoji/remove-aliases-bulk" => {
+            check_allowed_fields(&obj, &["ids", "aliases"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:emoji")?;
+            require_moderator(&caller)?;
+            state.rate_limiter.check(&rate_key, "admin/emoji/remove-aliases-bulk")?;
+            let ids = required_str_array(&obj, "ids")?;
+            let aliases = required_str_array(&obj, "aliases")?;
+            if aliases.len() > 32 {
+                return Err(ApiError::invalid_param("aliases", "must have at most 32 entries"));
+            }
+            state
+                .services
+                .remove_emoji_aliases_bulk(&caller.account.id, &ids, &aliases)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "admin/emoji/set-aliases-bulk" => {
+            check_allowed_fields(&obj, &["ids", "aliases"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:emoji")?;
+            require_moderator(&caller)?;
+            state.rate_limiter.check(&rate_key, "admin/emoji/set-aliases-bulk")?;
+            let ids = required_str_array(&obj, "ids")?;
+            let aliases = required_str_array(&obj, "aliases")?;
+            if aliases.len() > 32 {
+                return Err(ApiError::invalid_param("aliases", "must have at most 32 entries"));
+            }
+            state
+                .services
+                .set_emoji_aliases_bulk(&caller.account.id, &ids, &aliases)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "admin/emoji/set-category-bulk" => {
+            check_allowed_fields(&obj, &["ids", "category"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:emoji")?;
+            require_moderator(&caller)?;
+            state.rate_limiter.check(&rate_key, "admin/emoji/set-category-bulk")?;
+            let ids = required_str_array(&obj, "ids")?;
+            // Absent resets to null (upstream `ps.category ?? null` parity).
+            let category = match obj.get("category") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => Some(s.clone()),
+                Some(_) => return Err(ApiError::invalid_param("category", "must be a string or null")),
+            };
+            state
+                .services
+                .set_emoji_category_bulk(&caller.account.id, &ids, category)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "admin/emoji/set-license-bulk" => {
+            check_allowed_fields(&obj, &["ids", "license"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:emoji")?;
+            require_moderator(&caller)?;
+            state.rate_limiter.check(&rate_key, "admin/emoji/set-license-bulk")?;
+            let ids = required_str_array(&obj, "ids")?;
+            // Absent resets to null (upstream `ps.license ?? null` parity).
+            let license = match obj.get("license") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => Some(s.clone()),
+                Some(_) => return Err(ApiError::invalid_param("license", "must be a string or null")),
+            };
+            state
+                .services
+                .set_emoji_license_bulk(&caller.account.id, &ids, license)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "admin/emoji/delete-bulk" => {
+            check_allowed_fields(&obj, &["ids"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:emoji")?;
+            require_moderator(&caller)?;
+            state.rate_limiter.check(&rate_key, "admin/emoji/delete-bulk")?;
+            let ids = required_str_array(&obj, "ids")?;
+            state
+                .services
+                .delete_emojis_bulk(&caller.account.id, &ids)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "admin/emoji/copy" => {
+            // DIVERGENCE: upstream takes `{emojiId}` against the shared
+            // local+remote table; pinetree remote rows have no global ids, so this
+            // takes `{host, name}` (see `AppServices::copy_remote_emoji`).
+            check_allowed_fields(&obj, &["host", "name"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:emoji")?;
+            require_moderator(&caller)?;
+            state.rate_limiter.check(&rate_key, "admin/emoji/copy")?;
+            let host = required_str(&obj, "host")?;
+            let name = required_str(&obj, "name")?;
+            let emoji = state
+                .services
+                .copy_remote_emoji(&caller.account.id, &host, &name)
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(pack_emoji_detailed(&emoji, &state.services)).into_response())
+        }
+
+        "admin/emoji/list-remote" => {
+            check_allowed_fields(
+                &obj,
+                &["query", "host", "limit", "sinceId", "untilId", "sinceDate", "untilDate"],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:admin:emoji")?;
+            require_moderator(&caller)?;
+            state.rate_limiter.check(&rate_key, "admin/emoji/list-remote")?;
+            let cursor = TimelineCursor {
+                since_id: opt_string(&obj, "sinceId")?,
+                until_id: opt_string(&obj, "untilId")?,
+                since_date: opt_i64(&obj, "sinceDate")?,
+                until_date: opt_i64(&obj, "untilDate")?,
+                limit: get_limit_with_default(&obj, 10)?,
+            };
+            // `host` null/absent = all remote rows; otherwise that host
+            // (case-insensitive). `sinceId`/`untilId` accepted but ignored.
+            let host = opt_string(&obj, "host")?;
+            let rows = state
+                .services
+                .list_remote_emojis(opt_string(&obj, "query")?.as_deref(), host.as_deref(), &cursor)
+                .map_err(ApiError::from_port_error)?;
+            let packed: Vec<Value> = rows
+                .iter()
+                .map(|e| pack_remote_emoji_detailed(e, &state.services))
+                .collect();
+            Ok(Json(Value::Array(packed)).into_response())
+        }
+
+        "admin/emoji/import-zip" => {
+            check_allowed_fields(&obj, &["fileId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:emoji")?;
+            require_moderator(&caller)?;
+            state.rate_limiter.check(&rate_key, "admin/emoji/import-zip")?;
+            let file_id = required_str(&obj, "fileId")?;
+            // Zips legitimately exceed the §13 64 KiB endpoint cap, so the
+            // transfer guard (32 MiB) applies instead of `check_import_file`.
+            if let Err(err) = state
+                .services
+                .check_custom_emoji_import_file(&caller.account.id, &file_id)
+            {
+                return Err(map_import_file_error(err, "admin/emoji/import-zip"));
+            }
+            state
+                .services
+                .enqueue_custom_emoji_import(&caller.account.id, &file_id)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
         // --- Batch N WS4: antennas (guide WP15) ---------------------------
         // `antennas/list|show|create|update|delete|notes|remove-note` +
         // real `i/export-antennas` / `i/import-antennas` + the `antenna`
@@ -5821,6 +6001,22 @@ fn api_dispatch_blocking(
                 .map_err(ApiError::from_port_error)?;
             Ok(StatusCode::NO_CONTENT.into_response())
         }
+
+        "export-custom-emojis" => {
+            // Misskey `export-custom-emojis.ts` parity: any authenticated
+            // caller (self-service, like the `i/export-*` family — NOT
+            // moderator-gated), 1/hr bucket (see `response.rs`).
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state.rate_limiter.check(&rate_key, "export-custom-emojis")?;
+            state
+                .services
+                .enqueue_custom_emoji_export(&caller.account.id)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
 
         "i/import-following" => {
             check_allowed_fields(&obj, &["fileId", "withReplies"])?;

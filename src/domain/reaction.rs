@@ -27,12 +27,13 @@ pub const LEGACY_REACTIONS: &[(&str, &str)] = &[
 /// selector `FE0F` (unless the emoji contains a `ZWJ` joiner), and fall back
 /// to the bare heart for anything else (including `null`).
 ///
-/// Custom-emoji (`:name:` / `:name@host:`) shapes pass through unchanged:
-/// pinetree has no custom-emoji registry, so there is nothing to check
-/// permission/sensitivity against (Misskey checks `localOnly`, reaction
-/// roles, `isSensitive`, and media-silenced hosts in `ReactionService.ts`
-/// there). DIVERGENCE (documented): unknown custom names are stored
-/// verbatim instead of falling back.
+/// Custom-emoji (`:name:`) shapes pass through unchanged here: registry and
+/// permission checks live in the application `react` op
+/// (`resolve_custom_emoji_reaction` — unknown names, role-gated rows,
+/// `localOnly` on remote notes, and sensitive rows on `nonSensitive*`
+/// notes fall back to ❤, Misskey `ReactionService.create` parity).
+/// `:name@host:` shapes never originate locally and keep the verbatim
+/// divergence.
 pub fn normalize_reaction(reaction: Option<&str>) -> String {
     let Some(reaction) = reaction else {
         return FALLBACK_REACTION.to_string();

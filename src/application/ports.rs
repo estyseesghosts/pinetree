@@ -839,6 +839,25 @@ pub enum JobKind {
     /// quietly too — the packed URL keeps pointing at the remote host (the
     /// documented privacy trade-off). Only storage faults retry.
     RemoteEmojiFetch,
+    /// Custom-emoji export (`export-custom-emojis`; Misskey `db` queue
+    /// `exportCustomEmojis` parity): builds the instance zip (meta.json +
+    /// per-emoji files) off-request, stores it in the caller's drive, and
+    /// reports completion with an `exportCompleted` notification
+    /// (`exportedEntity: "customEmoji"` verbatim). The payload is
+    /// [`CustomEmojiTransferPayload`] (ids only — never file content).
+    /// Idempotent: the drive upload dedups on content and the completion
+    /// `Notify` job carries a deterministic key. A gone user converges
+    /// quietly. Reuses the worker's standard lease/backoff.
+    ExportCustomEmojis,
+    /// Custom-emoji zip import (`admin/emoji/import-zip`; Misskey `db` queue
+    /// `importCustomEmojis` parity): reads the caller's drive file
+    /// off-request, validates the archive (zip-bomb, entry-count, size,
+    /// traversal, and name-pattern guards), and applies its rows through the
+    /// same `create_emoji` op as the interactive endpoint (name collisions
+    /// replace, upstream delete-then-add parity). The payload is
+    /// [`CustomEmojiTransferPayload`]. A gone user or file converges
+    /// quietly; only storage faults retry the job.
+    ImportCustomEmojis,
     /// Antenna fan-in (Batch N WS4; guide WP15): one bounded job per created
     /// note carrying the note id. The worker loads the active antennas,
     /// matches, and appends `antenna_notes` rows (trimmed to the newest 200
@@ -1318,6 +1337,20 @@ pub trait EmojiStore: Send + Sync {
     ) -> Result<Option<crate::domain::emoji::RemoteEmoji>, PortError>;
     /// Every known remote-emoji metadata row (lazy-fetch fan-out source).
     fn all_remote_emojis(&self) -> Result<Vec<crate::domain::emoji::RemoteEmoji>, PortError>;
+    /// Remote emoji, newest-first by `first_seen_ms`. `host`: `None` lists
+    /// every remote row (upstream `list-remote` with `host: null`); `Some(h)`
+    /// restricts to that host (case-insensitive exact). `query` is the same
+    /// name-or-`:name:` filter as [`EmojiStore::list_emojis`] (remote rows
+    /// carry no aliases/category, so it matches the shortcode). `limit`
+    /// (default 10, 1..=100) and `since_date`/`until_date` apply;
+    /// `since_id`/`until_id` are accepted and ignored (remote rows have no
+    /// time-ordered ids — documented DIVERGENCE from upstream pagination).
+    fn list_remote_emojis(
+        &self,
+        query: Option<&str>,
+        host: Option<&str>,
+        cursor: &TimelineCursor,
+    ) -> Result<Vec<crate::domain::emoji::RemoteEmoji>, PortError>;
     /// Record the lazily fetched local copy (`media_id`) for one remote row.
     fn set_remote_emoji_media(
         &self,
@@ -1709,6 +1742,17 @@ pub struct UnfollowAllPayload {
 pub struct RemoteEmojiFetchPayload {
     pub host: String,
     pub shortcode: String,
+}
+
+/// Payload of a `JobKind::ExportCustomEmojis` / `JobKind::ImportCustomEmojis`
+/// job: the requesting user, plus (import only) the drive file holding the
+/// zip. `#[serde(default)]` keeps payloads written before `file_id` existed
+/// decodable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomEmojiTransferPayload {
+    pub user_id: String,
+    #[serde(default)]
+    pub file_id: Option<String>,
 }
 
 /// Payload of a `JobKind::AntennaMatch` job (Batch N WS4): the committed
@@ -2426,6 +2470,12 @@ pub trait StreamingSink: Send + Sync {
     /// Fan out one `main`-channel event. The default is a no-op so
     /// test doubles keep working; the broadcast hub overrides it.
     fn push_main(&self, _msg: crate::application::events::MainMessage) -> Result<(), PortError> {
+        Ok(())
+    }
+    /// Fan out one broadcast-stream event (`{type, body}` to every
+    /// connection — Misskey `onBroadcastMessage` parity). The default is a
+    /// no-op so test doubles keep working; the broadcast hub overrides it.
+    fn push_broadcast(&self, _event: &str, _body: serde_json::Value) -> Result<(), PortError> {
         Ok(())
     }
 }

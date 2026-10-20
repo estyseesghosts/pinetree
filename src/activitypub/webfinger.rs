@@ -1067,6 +1067,14 @@ mod tests {
         fn all_remote_emojis(&self) -> Result<Vec<crate::domain::emoji::RemoteEmoji>, PortError> {
             Ok(Vec::new())
         }
+        fn list_remote_emojis(
+            &self,
+            _query: Option<&str>,
+            _host: Option<&str>,
+            _cursor: &crate::application::ports::TimelineCursor,
+        ) -> Result<Vec<crate::domain::emoji::RemoteEmoji>, PortError> {
+            Ok(Vec::new())
+        }
         fn set_remote_emoji_media(
             &self,
             _host: &str,

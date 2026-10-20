@@ -618,6 +618,52 @@ pub fn pack_emoji_detailed(
     Value::Object(obj)
 }
 
+/// Remote custom-emoji pack (emoji completion; `admin/emoji/list-remote` +
+/// upstream `EmojiDetailed` parity): mirrors `pack_emoji_detailed`
+/// field-for-field, with `host` set (never null) and `url` preferring the
+/// lazily cached drive copy when `media_id` resolves, else the remote URL
+/// (the same rule as `emoji_maps_for_viewer`).
+///
+/// DIVERGENCE: remote rows have no global ids, so `id` is the composite
+/// `{host}:{shortcode}`. Remote rows carry no category/aliases/license/
+/// flags, so `category` stays absent and those slots pack as
+/// empty/null/false.
+pub fn pack_remote_emoji_detailed(
+    remote: &crate::domain::emoji::RemoteEmoji,
+    services: &AppServices,
+) -> Value {
+    let url = match remote.media_id.as_deref() {
+        Some(media_id) => match services.media.get(media_id) {
+            Ok(Some(meta)) => Value::String(meta.url.clone()),
+            _ => Value::String(remote.remote_url.clone()),
+        },
+        None => Value::String(remote.remote_url.clone()),
+    };
+    let mut obj = Map::new();
+    obj.insert(
+        "name".to_string(),
+        Value::String(remote.shortcode.clone()),
+    );
+    obj.insert("aliases".to_string(), Value::Array(Vec::new()));
+    obj.insert("url".to_string(), url);
+    obj.insert(
+        "id".to_string(),
+        Value::String(format!("{}:{}", remote.host, remote.shortcode)),
+    );
+    obj.insert(
+        "host".to_string(),
+        Value::String(remote.host.clone()),
+    );
+    obj.insert("license".to_string(), Value::Null);
+    obj.insert("localOnly".to_string(), Value::Bool(false));
+    obj.insert("isSensitive".to_string(), Value::Bool(false));
+    obj.insert(
+        "roleIdsThatCanBeUsedThisEmojiAsReaction".to_string(),
+        Value::Array(Vec::new()),
+    );
+    Value::Object(obj)
+}
+
 /// Served URL for one local emoji: the drive file's URL, falling back to
 /// the canonical `/emojis/:name` path when the file row is gone (upstream
 /// renders `publicUrl || originalUrl`; pinetree has one served URL).
@@ -2878,6 +2924,14 @@ mod tests {
             Ok(None)
         }
         fn all_remote_emojis(&self) -> Result<Vec<crate::domain::emoji::RemoteEmoji>, PortError> {
+            Ok(Vec::new())
+        }
+        fn list_remote_emojis(
+            &self,
+            _query: Option<&str>,
+            _host: Option<&str>,
+            _cursor: &crate::application::ports::TimelineCursor,
+        ) -> Result<Vec<crate::domain::emoji::RemoteEmoji>, PortError> {
             Ok(Vec::new())
         }
         fn set_remote_emoji_media(

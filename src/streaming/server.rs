@@ -795,6 +795,17 @@ async fn dispatch_hub_message(
         // when the suspended account is this connection's viewer. The arm
         // exists for exhaustiveness only.
         HubMessage::UserSuspended { .. } => {}
+        // Custom-emoji broadcasts go to every connection with no channel
+        // filter (Misskey `onBroadcastMessage` parity: `{type, body}` at
+        // the top level, not wrapped in a channel frame).
+        HubMessage::EmojiBroadcast { event, body } => {
+            let frame = Message::Text(
+                serde_json::json!({ "type": event, "body": body })
+                    .to_string()
+                    .into(),
+            );
+            let _ = sender.send(frame).await;
+        }
         HubMessage::AntennaNote { antenna_id, note_id } => {
             // Batch N WS4: fan one matched note out to this connection's
             // `antenna` channels subscribed to that antenna. Read-time

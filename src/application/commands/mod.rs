@@ -13,6 +13,8 @@ pub mod antennas;
 pub mod blocks;
 pub mod drafts;
 pub mod emoji;
+
+pub mod emoji_transfer;
 pub mod exports;
 pub mod favorites;
 pub mod follows;

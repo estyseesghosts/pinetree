@@ -13,7 +13,8 @@
 
 use super::AppServices;
 
-use crate::application::ports::{NewJob, PortError, TimelineCursor};
+use crate::application::events::{EmojiBroadcastOp, StreamingEvent};
+use crate::application::ports::{InsertMediaInput, NewJob, PortError, TimelineCursor};
 use crate::domain::emoji::{validate_shortcode, CustomEmoji, RemoteEmoji};
 use crate::domain::moderation::{ModerationAction, ModerationLogEntry};
 
@@ -29,6 +30,11 @@ pub const REMOTE_EMOJI_FETCH_PER_TOGGLE: usize = 200;
 /// Largest remote-emoji image the fetch job accepts (WP8b §2 rule 6
 /// size cap; stated in the session log).
 pub const REMOTE_EMOJI_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+/// Cap on row ids per bulk admin emoji call (Gap 1; stated in the session
+/// log). Each touched row commits its own state + log + broadcast-job
+/// transaction, so the cap bounds request work, not transaction size.
+pub const BULK_EMOJI_IDS_CAP: usize = 100;
 
 impl AppServices {
     fn emoji_log(
@@ -95,7 +101,14 @@ impl AppServices {
             None,
             serde_json::json!({ "emojiId": emoji.id, "emojiName": emoji.shortcode }),
         )?;
-        self.emojis.create_emoji(emoji, log, Vec::new())
+        let broadcast = self.streaming_job(
+            &StreamingEvent::EmojiBroadcast {
+                op: EmojiBroadcastOp::Added,
+                emojis: vec![emoji.clone()],
+            },
+            format!("emoji-added:{}:{}", emoji.id, self.ids.generate()),
+        )?;
+        self.emojis.create_emoji(emoji, log, vec![broadcast])
     }
 
     /// `admin/emoji/update`: address by `id` xor `name` (the endpoint resolves
@@ -169,7 +182,14 @@ impl AppServices {
             None,
             serde_json::json!({ "emojiId": emoji.id, "emojiName": emoji.shortcode }),
         )?;
-        match self.emojis.update_emoji(emoji, log, Vec::new()) {
+        let broadcast = self.streaming_job(
+            &StreamingEvent::EmojiBroadcast {
+                op: EmojiBroadcastOp::Updated,
+                emojis: vec![emoji.clone()],
+            },
+            format!("emoji-updated:{}:{}", emoji.id, self.ids.generate()),
+        )?;
+        match self.emojis.update_emoji(emoji, log, vec![broadcast]) {
             // The store names the residual race; surface it verbatim.
             Err(PortError::Conflict(code)) => Err(PortError::Conflict(code)),
             other => other,
@@ -177,18 +197,26 @@ impl AppServices {
     }
 
     /// `admin/emoji/delete` by `id`. Unknown ids are `NO_SUCH_EMOJI`
-    /// (upstream parity).
+    /// (upstream parity). Snapshots the row before the delete so the
+    /// `emojiDeleted` broadcast carries it (upstream packs the deleted row).
     pub fn delete_emoji(&self, moderator_id: &str, id: &str) -> Result<(), PortError> {
-        if self.emojis.get_emoji(id)?.is_none() {
+        let Some(emoji) = self.emojis.get_emoji(id)? else {
             return Err(PortError::NotFound("NO_SUCH_EMOJI".to_string()));
-        }
+        };
         let log = self.emoji_log(
             moderator_id,
             ModerationAction::DeleteCustomEmoji,
             None,
             serde_json::json!({ "emojiId": id }),
         )?;
-        self.emojis.delete_emoji(id, log, Vec::new())?;
+        let broadcast = self.streaming_job(
+            &StreamingEvent::EmojiBroadcast {
+                op: EmojiBroadcastOp::Deleted,
+                emojis: vec![emoji],
+            },
+            format!("emoji-deleted:{id}:{}", self.ids.generate()),
+        )?;
+        self.emojis.delete_emoji(id, log, vec![broadcast])?;
         Ok(())
     }
 
@@ -315,5 +343,294 @@ impl AppServices {
             self.jobs.enqueue_jobs(jobs)?;
         }
         Ok(n)
+    }
+
+    /// Reject bulk calls touching more than [`BULK_EMOJI_IDS_CAP`] rows.
+    fn check_bulk_ids(ids: &[String]) -> Result<(), PortError> {
+        if ids.len() > BULK_EMOJI_IDS_CAP {
+            return Err(PortError::Validation(format!(
+                "INVALID_PARAM ids must have at most {BULK_EMOJI_IDS_CAP} entries"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Reject blank alias entries (the row validator caps the count at 32
+    /// but does not inspect entries).
+    fn check_alias_entries(aliases: &[String]) -> Result<(), PortError> {
+        for alias in aliases {
+            if alias.trim().is_empty() {
+                return Err(PortError::Validation(
+                    "INVALID_PARAM aliases must be non-empty strings".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Commit one touched local-emoji row with its per-row
+    /// `UpdateCustomEmoji` log row and one `emojiUpdated` broadcast job in
+    /// the same storage transaction. DIVERGENCE: upstream logs nothing for
+    /// the alias/category/license bulk ops; the port requires a log row per
+    /// `update_emoji` call, so pinetree logs (same shape as `update_emoji`).
+    fn commit_bulk_update(
+        &self,
+        moderator_id: &str,
+        emoji: CustomEmoji,
+    ) -> Result<CustomEmoji, PortError> {
+        emoji
+            .validate()
+            .map_err(|e| PortError::Validation(format!("{e:?}")))?;
+        let log = self.emoji_log(
+            moderator_id,
+            ModerationAction::UpdateCustomEmoji,
+            None,
+            serde_json::json!({ "emojiId": emoji.id, "emojiName": emoji.shortcode }),
+        )?;
+        let broadcast = self.streaming_job(
+            &StreamingEvent::EmojiBroadcast {
+                op: EmojiBroadcastOp::Updated,
+                emojis: vec![emoji.clone()],
+            },
+            format!("emoji-updated:{}:{}", emoji.id, self.ids.generate()),
+        )?;
+        self.emojis.update_emoji(emoji, log, vec![broadcast])
+    }
+
+    /// `admin/emoji/add-aliases-bulk`: per-row alias union, skipping unknown
+    /// ids (upstream `findBy(In(ids))` parity).
+    pub fn add_emoji_aliases_bulk(
+        &self,
+        moderator_id: &str,
+        ids: &[String],
+        aliases: &[String],
+    ) -> Result<Vec<CustomEmoji>, PortError> {
+        Self::check_bulk_ids(ids)?;
+        Self::check_alias_entries(aliases)?;
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            let Some(mut emoji) = self.emojis.get_emoji(id)? else {
+                continue;
+            };
+            for alias in aliases {
+                if !emoji.aliases.iter().any(|a| a == alias) {
+                    emoji.aliases.push(alias.clone());
+                }
+            }
+            out.push(self.commit_bulk_update(moderator_id, emoji)?);
+        }
+        Ok(out)
+    }
+
+    /// `admin/emoji/remove-aliases-bulk`: per-row alias subtraction,
+    /// skipping unknown ids (upstream parity).
+    pub fn remove_emoji_aliases_bulk(
+        &self,
+        moderator_id: &str,
+        ids: &[String],
+        aliases: &[String],
+    ) -> Result<Vec<CustomEmoji>, PortError> {
+        Self::check_bulk_ids(ids)?;
+        Self::check_alias_entries(aliases)?;
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            let Some(mut emoji) = self.emojis.get_emoji(id)? else {
+                continue;
+            };
+            emoji.aliases.retain(|a| !aliases.contains(a));
+            out.push(self.commit_bulk_update(moderator_id, emoji)?);
+        }
+        Ok(out)
+    }
+
+    /// `admin/emoji/set-aliases-bulk`: per-row alias replace, skipping
+    /// unknown ids (upstream `update(In(ids))` parity — missing rows are a
+    /// no-op there too).
+    pub fn set_emoji_aliases_bulk(
+        &self,
+        moderator_id: &str,
+        ids: &[String],
+        aliases: &[String],
+    ) -> Result<Vec<CustomEmoji>, PortError> {
+        Self::check_bulk_ids(ids)?;
+        Self::check_alias_entries(aliases)?;
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            let Some(mut emoji) = self.emojis.get_emoji(id)? else {
+                continue;
+            };
+            emoji.aliases = aliases.to_vec();
+            out.push(self.commit_bulk_update(moderator_id, emoji)?);
+        }
+        Ok(out)
+    }
+
+    /// `admin/emoji/set-category-bulk`: per-row category set; `None` resets
+    /// to null (upstream `ps.category ?? null` parity). Empty strings reset
+    /// too (same rule as `update_emoji`).
+    pub fn set_emoji_category_bulk(
+        &self,
+        moderator_id: &str,
+        ids: &[String],
+        category: Option<String>,
+    ) -> Result<Vec<CustomEmoji>, PortError> {
+        Self::check_bulk_ids(ids)?;
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            let Some(mut emoji) = self.emojis.get_emoji(id)? else {
+                continue;
+            };
+            emoji.category = category.clone().filter(|c| !c.is_empty());
+            out.push(self.commit_bulk_update(moderator_id, emoji)?);
+        }
+        Ok(out)
+    }
+
+    /// `admin/emoji/set-license-bulk`: per-row license set; `None` resets to
+    /// null (upstream `ps.license ?? null` parity). Empty strings reset too
+    /// (same rule as `update_emoji`).
+    pub fn set_emoji_license_bulk(
+        &self,
+        moderator_id: &str,
+        ids: &[String],
+        license: Option<String>,
+    ) -> Result<Vec<CustomEmoji>, PortError> {
+        Self::check_bulk_ids(ids)?;
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            let Some(mut emoji) = self.emojis.get_emoji(id)? else {
+                continue;
+            };
+            emoji.license = license.clone().filter(|l| !l.is_empty());
+            out.push(self.commit_bulk_update(moderator_id, emoji)?);
+        }
+        Ok(out)
+    }
+
+    /// `admin/emoji/delete-bulk`: per-row delete of the rows that exist
+    /// (upstream `findBy(In(ids))` parity — unknown ids are skipped), each
+    /// with its own `DeleteCustomEmoji` log row, plus one `emojiDeleted`
+    /// broadcast job per deleted row carrying the pre-delete snapshot.
+    /// Returns the snapshots of the rows actually deleted.
+    pub fn delete_emojis_bulk(
+        &self,
+        moderator_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<CustomEmoji>, PortError> {
+        Self::check_bulk_ids(ids)?;
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            let Some(emoji) = self.emojis.get_emoji(id)? else {
+                continue;
+            };
+            let log = self.emoji_log(
+                moderator_id,
+                ModerationAction::DeleteCustomEmoji,
+                None,
+                serde_json::json!({ "emojiId": emoji.id }),
+            )?;
+            let broadcast = self.streaming_job(
+                &StreamingEvent::EmojiBroadcast {
+                    op: EmojiBroadcastOp::Deleted,
+                    emojis: vec![emoji.clone()],
+                },
+                format!("emoji-deleted:{}:{}", emoji.id, self.ids.generate()),
+            )?;
+            if self.emojis.delete_emoji(id, log, vec![broadcast])? {
+                out.push(emoji);
+            }
+        }
+        Ok(out)
+    }
+
+    /// `admin/emoji/copy` (DIVERGENCE — upstream looks the emoji up in the
+    /// shared local+remote table by `emojiId`; pinetree remote rows have no
+    /// global ids, so this takes `host` + `name`): look up the remote row
+    /// (missing → `NO_SUCH_EMOJI`), re-download `remote_url` through the
+    /// SSRF-guarded fetcher with the same 2 MiB / `image/*` content-type +
+    /// sniff gates as `fetch_remote_emoji` (unusable remote → a
+    /// `CANNOT_COPY_EMOJI` validation error), store the bytes + a drive
+    /// metadata row, then run the interactive `create_emoji` op (duplicate
+    /// local name → `DUPLICATE_NAME` verbatim; emits `emojiAdded` + an
+    /// `AddCustomEmoji` mod log). Remote rows carry no category/aliases/
+    /// license/flags, so the copy is created with defaults.
+    pub fn copy_remote_emoji(
+        &self,
+        moderator_id: &str,
+        host: &str,
+        name: &str,
+    ) -> Result<CustomEmoji, PortError> {
+        let row = self
+            .emojis
+            .get_remote_emoji(host, name)?
+            .ok_or_else(|| PortError::NotFound("NO_SUCH_EMOJI".to_string()))?;
+        let fail = |detail: String| PortError::Validation(format!("CANNOT_COPY_EMOJI {detail}"));
+        let resp = self
+            .federation_http
+            .send("GET", &row.remote_url, &[], None, REMOTE_EMOJI_MAX_BYTES)
+            .map_err(|e| fail(format!("download failed: {e:?}")))?;
+        if resp.status != 200 {
+            return Err(fail(format!("unexpected status {}", resp.status)));
+        }
+        if resp.body.len() > REMOTE_EMOJI_MAX_BYTES {
+            return Err(fail(format!(
+                "body {} bytes exceeds {} byte cap",
+                resp.body.len(),
+                REMOTE_EMOJI_MAX_BYTES
+            )));
+        }
+        let content_type = resp.header("content-type").unwrap_or("").to_ascii_lowercase();
+        if !content_type.starts_with("image/") {
+            return Err(fail(format!("unsupported content type {content_type:?}")));
+        }
+        let sniffed = crate::domain::media::sniff_mime(&resp.body);
+        if !sniffed.starts_with("image/") {
+            return Err(fail(format!("sniffed mime {sniffed:?} is not an image")));
+        }
+        let media_id = self.ids.generate();
+        let url = format!("{}/files/{media_id}", self.public_url.trim_end_matches('/'));
+        self.blobs
+            .put(&crate::media::ingest::sha256_hex(&resp.body), &resp.body)?;
+        self.media.insert_metadata(InsertMediaInput {
+            id: Some(media_id.clone()),
+            owner_id: None,
+            name: row.shortcode.clone(),
+            mime: sniffed,
+            size_bytes: resp.body.len() as u64,
+            hash: crate::media::ingest::md5_hex(&resp.body),
+            blob_key: crate::media::ingest::sha256_hex(&resp.body),
+            blurhash: None,
+            properties: crate::domain::media::MediaProperties::default(),
+            is_sensitive: false,
+            is_link: false,
+            url,
+            thumbnail_url: None,
+            comment: None,
+            source_url: Some(row.remote_url.clone()),
+            max_file_size: self.max_file_size,
+        })?;
+        self.create_emoji(
+            moderator_id,
+            &row.shortcode,
+            &media_id,
+            None,
+            Vec::new(),
+            None,
+            false,
+            false,
+            Vec::new(),
+        )
+    }
+
+    /// `admin/emoji/list-remote` read path: delegates to the store (same
+    /// `host`/`query`/date semantics; `since_id`/`until_id` accepted and
+    /// ignored — remote rows have no time-ordered ids).
+    pub fn list_remote_emojis(
+        &self,
+        query: Option<&str>,
+        host: Option<&str>,
+        cursor: &TimelineCursor,
+    ) -> Result<Vec<RemoteEmoji>, PortError> {
+        self.emojis.list_remote_emojis(query, host, cursor)
     }
 }

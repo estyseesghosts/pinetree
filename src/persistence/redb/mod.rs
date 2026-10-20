@@ -5443,6 +5443,68 @@ impl EmojiStore for RedbStore {
         Ok(out)
     }
 
+    fn list_remote_emojis(
+        &self,
+        query: Option<&str>,
+        host: Option<&str>,
+        cursor: &TimelineCursor,
+    ) -> Result<Vec<RemoteEmoji>, PortError> {
+        let limit = if cursor.limit == 0 { 10 } else { cursor.limit.min(100) };
+        let wanted_host = host
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty());
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(REMOTE_EMOJIS).map_err(map_redb_err)?;
+        let mut out: Vec<RemoteEmoji> = Vec::new();
+        for entry in table.iter().map_err(map_redb_err)? {
+            let (_, v) = entry.map_err(map_redb_err)?;
+            let emoji: RemoteEmoji = decode_json(v.value())?;
+            if let Some(want) = wanted_host.as_deref() {
+                if emoji.host.to_ascii_lowercase() != want {
+                    continue;
+                }
+            }
+            if let Some(since) = cursor.since_date {
+                if emoji.first_seen_ms < since {
+                    continue;
+                }
+            }
+            if let Some(until) = cursor.until_date {
+                if emoji.first_seen_ms > until {
+                    continue;
+                }
+            }
+            if let Some(q) = query {
+                let q = q.trim();
+                if !q.is_empty() {
+                    // Same token rule as `list_emojis`; remote rows carry no
+                    // aliases/category, so plain queries match the shortcode.
+                    if q.starts_with(':') && q.ends_with(':') && q.len() >= 2 {
+                        let want = q.trim_matches(':').to_ascii_lowercase();
+                        if emoji.shortcode.to_ascii_lowercase() != want {
+                            continue;
+                        }
+                    } else {
+                        let needle = q.to_ascii_lowercase();
+                        if !emoji.shortcode.to_ascii_lowercase().contains(&needle) {
+                            continue;
+                        }
+                    }
+                }
+            }
+            out.push(emoji);
+        }
+        // Newest-first by first-seen time (remote rows have no aidx ids).
+        out.sort_by(|a, b| {
+            b.first_seen_ms
+                .cmp(&a.first_seen_ms)
+                .then_with(|| a.host.cmp(&b.host))
+                .then_with(|| a.shortcode.cmp(&b.shortcode))
+        });
+        out.truncate(limit);
+        Ok(out)
+    }
+
     fn set_remote_emoji_media(
         &self,
         host: &str,

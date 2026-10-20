@@ -38,14 +38,14 @@ Conventions: `- [ ]` = open, `- [x]` = done (move to log, don't delete the line)
 - [ ] `[declared-out]` `notes/thread-muting/create|delete` (manifest §11).
 - [ ] `i/2fa/*` (8) + `my/apps` + `app/create|show`.
 - [ ] `users/update-memo`, `notes/show-partial-bulk` (N×`show` fallback), `notifications/create`, `notes/polls/recommendation`, `notes/clips` (renamed `clips/notes` exists — alias or document).
-- [ ] Admin families: bulk/remote/copy/import-zip emoji, `admin/roles|queue|relays|webhook|ad|announcements|federation|stats|user-ips|send-email|server-info|proxy-account|mfa|reset-password`, abuse-report notification recipients.
-- [ ] Misc: `users/achievements|flashs|gallery/posts|pages|get-following-*-by-birthday|get-frequently-replied-users`, `users/lists/create-from-public`, `ping`, `page-push`, `retention`, `reset-db`, `export-custom-emojis`, `sw/*`, `v2/admin/emoji/list`, `endpoint(s)`.
+- [ ] Admin families: [x] bulk/remote/copy/import-zip emoji — LANDED 2026-10-20 (manifest §40.1; `tests/emoji_admin_bulk.rs` 14 green). Still open: `admin/roles|queue|relays|webhook|ad|announcements|federation|stats|user-ips|send-email|server-info|proxy-account|mfa|reset-password`, abuse-report notification recipients.
+- [ ] Misc: `users/achievements|flashs|gallery/posts|pages|get-following-*-by-birthday|get-frequently-replied-users`, `users/lists/create-from-public`, `ping`, `page-push`, `retention`, `reset-db`, `export-custom-emojis` ([x] LANDED 2026-10-20, manifest §40.1), `sw/*`, `v2/admin/emoji/list`, `endpoint(s)`.
 
 ## P1 — streaming holes
 
 - [ ] Missing channels (→ `UNSUPPORTED_CHANNEL`): `hashtag`, `roleTimeline`, `channel`, `drive`, `serverStats`/`queueStats`, `admin`, `clip`, `chatUser`/`chatRoom`, `reversi`/`reversiGame` (`streaming/server.rs:410-425`). All `[declared-out]` except decide `clip`/`drive`/`hashtag` fate for upload-progress/badge clients.
 - [ ] Missing `main` events: `unreadNotification`, `unreadAntenna`/`readAntenna`, `readAllAnnouncements`/`announcementCreated`, `myTokenRegenerated`, `signin`, `registryUpdated`, `driveFileCreated`, `urlUploadFinished`, `pageEvent`, `newChatMessage` (`events.rs:65-83` ends at `NotificationFlushed`).
-- [ ] Missing broadcast `emojiAdded/Updated/Deleted` (no broadcast arm; `server.rs:211-231` only `UserSuspended` + `HubMessage`).
+- [x] Missing broadcast `emojiAdded/Updated/Deleted` — LANDED 2026-10-20: `StreamingEvent::EmojiBroadcast` + `push_broadcast` + `{type,body}`-to-all dispatch; contract tests in `tests/emoji_streaming_transfer.rs` (manifest §40.2).
 - [ ] `reacted` lacks optional `emoji` detail (`server.rs:641-646` vs upstream `NoteEventTypes:117-123`).
 - [ ] `userList` ignores `withFiles/withRenotes` (`server.rs:399`).
 - [ ] `pollEnded`-as-`noteUpdated` is a pinetree extension stock clients ignore — also emit the `pollEnded` *notification* or document handling.

@@ -137,6 +137,11 @@ impl RateLimiter {
             .with_limit("i/import-muting", 1, HOUR_MS, None)
             .with_limit("i/import-user-lists", 1, HOUR_MS, None)
             .with_limit("i/import-antennas", 1, HOUR_MS, None)
+            // Custom-emoji export (upstream `export-custom-emojis.ts`
+            // `1hour/1` parity). `admin/emoji/import-zip` has no upstream
+            // bucket; it rides the default open bucket like the other
+            // `admin/emoji/*` arms.
+            .with_limit("export-custom-emojis", 1, HOUR_MS, None)
             // Every signup attempt from one IP counts (see `check`).
             .with_limit("auth/signup", 20, HOUR_MS, None)
             // MiAuth check polls: every request counts per IP.

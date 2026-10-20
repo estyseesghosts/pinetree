@@ -9,6 +9,26 @@ use crate::domain::notification::NotificationKind;
 use crate::domain::policy::{ViewerContext, is_visible};
 use crate::domain::reaction::{FALLBACK_REACTION, Reaction, coerce_reaction, normalize_reaction};
 
+/// Local custom-emoji reaction shape (`:name:` or `:name@.:`, Misskey
+/// `isCustomEmojiRegexp` parity): returns the lowercased shortcode the
+/// local registry is keyed by. `:name@other-host:` shapes never originate
+/// from local users and are left alone (pre-existing divergence).
+fn parse_local_custom_emoji(reaction: &str) -> Option<String> {
+    let inner = reaction.strip_prefix(':')?.strip_suffix(':')?;
+    if inner.is_empty() {
+        return None;
+    }
+    let name = inner.strip_suffix("@.").unwrap_or(inner);
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '+' || c == '-')
+    {
+        return None;
+    }
+    Some(name.to_ascii_lowercase())
+}
+
 impl AppServices {
     #[allow(clippy::too_many_lines)]
     pub fn create_note(&self, mut input: CreateNoteInput) -> Result<Note, PortError> {
@@ -574,6 +594,14 @@ impl AppServices {
         } else {
             coerced
         };
+        // Custom-emoji permission gate (Misskey `ReactionService.create`
+        // parity for the local `:name:` / `:name@.:` shapes): unknown names,
+        // role-gated emoji (no role subsystem — permission unprovable),
+        // `localOnly` on remote notes, and sensitive emoji on
+        // `nonSensitive*` notes all fall back to ❤ (never an error).
+        // `:name@other-host:` shapes never originate locally; they keep the
+        // pre-existing verbatim divergence.
+        let coerced = self.resolve_custom_emoji_reaction(&coerced, &note)?;
         // One id for the reaction row and the federated Like, so `unreact`'s
         // Undo(Like) names the activity the remote server received.
         let reaction_id = self.ids.generate();
@@ -623,6 +651,51 @@ impl AppServices {
         }
         self.reactions
             .react(user_id, note_id, &coerced, &reaction_id, upsert, jobs)
+    }
+
+    /// Misskey `ReactionService.create` custom-emoji branch parity (local
+    /// `:name:` / `:name@.:` shapes only): resolve against the local emoji
+    /// registry, falling back to [`FALLBACK_REACTION`] on unknown names,
+    /// role-gated rows (pinetree has no role subsystem, so the permission
+    /// is unprovable), `localOnly` rows on remote notes, and sensitive rows
+    /// on `nonSensitive*` notes. Never errors.
+    fn resolve_custom_emoji_reaction(
+        &self,
+        reaction: &str,
+        note: &Note,
+    ) -> Result<String, PortError> {
+        let name = match parse_local_custom_emoji(reaction) {
+            Some(name) => name,
+            None => return Ok(reaction.to_string()),
+        };
+        let Some(emoji) = self.emojis.get_emoji_by_name(&name)? else {
+            return Ok(FALLBACK_REACTION.to_string());
+        };
+        if !emoji.role_ids.is_empty() {
+            return Ok(FALLBACK_REACTION.to_string());
+        }
+        if emoji.local_only {
+            let author_local = self
+                .accounts
+                .find_by_id(&note.author_id)?
+                .is_some_and(|a| a.is_local());
+            if !author_local {
+                return Ok(FALLBACK_REACTION.to_string());
+            }
+        }
+        if emoji.is_sensitive
+            && matches!(
+                note.reaction_acceptance,
+                Some(
+                    crate::domain::note::ReactionAcceptance::NonSensitiveOnly
+                        | crate::domain::note::ReactionAcceptance::NonSensitiveOnlyForLocalLikeOnlyForRemote
+                )
+            )
+        {
+            return Ok(FALLBACK_REACTION.to_string());
+        }
+        // Canonicalize `:name@.:` to `:name:` (upstream parity).
+        Ok(format!(":{name}:"))
     }
 
     pub fn unreact(&self, user_id: &str, note_id: &str) -> Result<(), PortError> {

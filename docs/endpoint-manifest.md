@@ -807,3 +807,83 @@ Status: ADDENDUM only. Frozen text above is not rewritten; the superseding notes
 
 - Drive `sort` variants, `users/show` `userIds` batch, and `users/search` defaults (not re-traced).
 - Exact `NO_SUCH_USER` UUID unification (`fcd2eef9-…`) across endpoints (sampled via §§31, 34, 35 notes; not re-grepped).
+
+## §40 — Custom-emoji completion (handoff `docs/handoff-emoji-completion.md`, 2026-10-20)
+
+Status: ADDENDUM only. Closes the §28 out-of-scope row and the TODOS
+streaming `emojiAdded/Updated/Deleted` hole. Every item below is implemented
+and executed-green (lib + conformance + the two new contract files), except
+the two recorded DIVERGENCEs. Evidence is `file:line` against the 2026-10-20
+tree.
+
+### 40.1 New endpoint arms (`src/api/misskey/endpoints/mod.rs`)
+
+| Endpoint | Auth | Params → result |
+|---|---|---|
+| `admin/emoji/add-aliases-bulk` (`:5264`) | credential + `write:admin:emoji` + moderator | `ids*` (≤100), `aliases*` (≤32) → 204; union per row, unknown ids skipped |
+| `admin/emoji/remove-aliases-bulk` (`:5282`) | same | `ids*`, `aliases*` → 204; subtraction per row, unknown ids skipped |
+| `admin/emoji/set-aliases-bulk` (`:5300`) | same | `ids*`, `aliases*` → 204; replace per row |
+| `admin/emoji/set-category-bulk` (`:5318`) | same | `ids*`, `category?` → 204; absent AND explicit null both reset to null (upstream `ps.category ?? null` parity) |
+| `admin/emoji/set-license-bulk` (`:5338`) | same | `ids*`, `license?` → 204; same null-reset rule |
+| `admin/emoji/delete-bulk` (`:5358`) | same | `ids*` → 204; per-row `deleteCustomEmoji` log row |
+| `admin/emoji/copy` (`:5372`) | same | `{host*, name*}` → `EmojiDetailed`; missing remote row `NO_SUCH_EMOJI`, duplicate local name `DUPLICATE_NAME` |
+| `admin/emoji/list-remote` (`:5390`) | credential + `read:admin:emoji` + moderator | `query?`, `host?` (null/absent = all remote), `limit` 1–100 default 10, `sinceId`/`untilId` accepted-but-ignored, `sinceDate`/`untilDate` → `EmojiDetailed[]`, newest-first by `first_seen_ms` |
+| `admin/emoji/import-zip` (`:5420`) | same as copy | `fileId*` (must exist + belong to caller, non-empty, ≤32 MiB) → 204; queues `ImportCustomEmojis` |
+| `export-custom-emojis` (`:6005`) | any authenticated caller + `write:account` (self-service, `i/export-*` parity — NOT moderator-gated) | `{}` → 204; queues `ExportCustomEmojis`; 1/hr bucket (`response.rs`, upstream `1hour/1` parity) |
+
+### 40.2 Streaming broadcasts (closes the §28 "no broadcast bus" DIVERGENCE)
+
+`create/update/delete` + all six bulk ops enqueue `StreamingEvent::EmojiBroadcast`
+(`src/application/events.rs`, op `Added/Updated/Deleted`) in the same store
+transaction as the state change; the worker packs snapshots to `EmojiDetailed`
+(`src/jobs/worker.rs:handle_emoji_broadcast`, via `push_broadcast`) and the
+server sends `{type: emojiAdded|Updated|Deleted, body: {emoji}|{emojis}}` to
+EVERY connection with no channel filter (`src/streaming/server.rs`,
+Misskey `Connection.onBroadcastMessage` parity). Delete snapshots the row
+before the delete; update/add pack post-commit rows, skipping rows deleted
+between commit and run.
+
+### 40.3 Reaction gate (closes handoff Gap 4 as implemented, not documented-out)
+
+`AppServices::react` resolves local `:name:` / `:name@.:` shapes through
+`resolve_custom_emoji_reaction` (`src/application/commands/notes.rs`):
+unknown names, role-gated rows (no role subsystem — permission unprovable),
+`localOnly` rows on remote notes, and sensitive rows on `nonSensitive*`
+notes all fall back to ❤, never an error (Misskey `ReactionService.create`
+parity). `:name@other-host:` shapes never originate locally and stay
+verbatim.
+
+### 40.4 Import/export jobs (new `JobKind::ExportCustomEmojis|ImportCustomEmojis`)
+
+Worker entry `handle_custom_emoji_transfer`
+(`src/application/commands/emoji_transfer.rs`): export zips ALL local
+emojis in memory (`meta.json` `{metaVersion:2, host, exportedAt, emojis[]}`
++ per-emoji files, stored compression), stores the zip in the caller's
+drive, fans out `exportCompleted` with `exportedEntity: "customEmoji"`
+verbatim. Import validates the archive (32 MiB total, 500 entries, 32 MiB
+per-entry checked BEFORE extraction, 64 MiB cumulative, `enclosed_name()`
+traversal guard, 16 MiB `meta.json` cap, upstream fileName/emoji-name
+regexes, `downloaded`-only, `image/*` sniff) and applies rows
+delete-then-add through `create_emoji`.
+
+### 40.5 DIVERGENCEs (decided, supersede §28)
+
+- §28 "bulk ops, import-zip, copy, list-remote stay out (guide §8)" and
+  "`export-custom-emojis` has no dedicated endpoint in this pin and stays
+  out" are SUPERSEDED: all ten are implemented above. (The parity-plan §13
+  "no dedicated endpoint" note was factually wrong against the pin —
+  `export-custom-emojis.ts` exists in Misskey `2026.10.1-alpha.0`.)
+- `admin/emoji/copy` takes `{host, name}`, not upstream `{emojiId}`
+  (pinetree remote rows have no global ids); the copy carries no
+  category/aliases/license/flags (remote rows don't store them) and a new
+  `CANNOT_COPY_EMOJI` 400 covers unusable remotes.
+- Bulk alias/category/license touches write per-row `UpdateCustomEmoji`
+  moderation-log rows though upstream logs nothing (the port requires one
+  log per `update_emoji` call to keep the atomic state+log+job commit).
+- Remote `EmojiDetailed.id` is the composite `{host}:{shortcode}` (remote
+  rows have no global ids); no `category` key; `sinceId`/`untilId` on
+  `list-remote` are accepted but ignored (sort is by `first_seen_ms`).
+- Export zip is built in memory and content-deduped (`force=false`, unlike
+  upstream `force:true`); import rows attribute the importing user as
+  moderator (upstream adds with none); `meta.json` capped at 16 MiB
+  (upstream 64 MiB).

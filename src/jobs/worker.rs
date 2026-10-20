@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use crate::api::misskey::packers::{
-    pack_note, pack_notification, pack_user_detailed_not_me,
+    pack_emoji_detailed, pack_note, pack_notification, pack_user_detailed_not_me,
 };
 use crate::application::commands::AppServices;
-use crate::application::events::{MainEventKind, MainMessage, NotifyJobPayload, StreamingEvent};
+use crate::application::events::{EmojiBroadcastOp, MainEventKind, MainMessage, NotifyJobPayload, StreamingEvent};
 use crate::application::ports::{
     Clock, IdGenerator, Job, JobKind, JobQueue, NewJob, NotificationStore, PortError,
     RemoteMediaFetchPayload, StreamingSink, MAX_JOBS_PER_TXN, MAX_JOB_ATTEMPTS,
@@ -278,6 +278,24 @@ impl JobWorker {
                     Err(_) => Ok(Disposition::Retry { retry_after_ms: None }),
                 }
             }
+            // Custom-emoji export/import (emoji completion workstream; real
+            // handlers in `application::commands::emoji_transfer`, owned by
+            // the transfer subagent — these arms only keep the dispatcher
+            // exhaustive until they land).
+            JobKind::ExportCustomEmojis | JobKind::ImportCustomEmojis => {
+                match crate::application::commands::emoji_transfer::handle_custom_emoji_transfer(
+                    &self.services,
+                    &job.kind,
+                    &job.payload,
+                ) {
+                    Ok(None) => Ok(Disposition::Done),
+                    Ok(Some(notify)) => Ok(Disposition::Fanout(vec![notify])),
+                    Err(PortError::Validation(reason)) => {
+                        Ok(Disposition::Quarantine(format!("bad-payload: {reason}")))
+                    }
+                    Err(_) => Ok(Disposition::Retry { retry_after_ms: None }),
+                }
+            }
         }
     }
 
@@ -493,7 +511,50 @@ impl JobWorker {
             }
             return Ok(());
         }
+        // Custom-emoji broadcasts carry domain snapshots (a delete snapshots
+        // before its row is gone): pack them here — the sink has no
+        // `AppServices` — and push the wire-shaped bodies to every
+        // connection (Misskey `onBroadcastMessage` parity).
+        if let Ok(StreamingEvent::EmojiBroadcast { op, emojis }) =
+            serde_json::from_slice::<StreamingEvent>(payload)
+        {
+            return self.handle_emoji_broadcast(&op, &emojis);
+        }
         self.streaming.publish("streaming", payload)
+    }
+
+    /// Expand one `EmojiBroadcast` streaming event (custom-emoji
+    /// `emojiAdded`/`emojiUpdated`/`emojiDeleted` parity): pack each
+    /// snapshot to `EmojiDetailed` and push the wire-shaped body to every
+    /// connection. `Added`/`Updated` re-read the row and skip snapshots
+    /// deleted between commit and run; `Deleted` snapshots were taken
+    /// before the row was removed, so they always pack.
+    fn handle_emoji_broadcast(
+        &self,
+        op: &EmojiBroadcastOp,
+        emojis: &[crate::domain::emoji::CustomEmoji],
+    ) -> Result<(), PortError> {
+        let mut packed = Vec::with_capacity(emojis.len());
+        for snap in emojis {
+            match op {
+                EmojiBroadcastOp::Added | EmojiBroadcastOp::Updated => {
+                    if self.services.emojis.get_emoji(&snap.id)?.is_none() {
+                        continue;
+                    }
+                }
+                EmojiBroadcastOp::Deleted => {}
+            }
+            packed.push(pack_emoji_detailed(snap, &self.services));
+        }
+        let body = match op {
+            EmojiBroadcastOp::Added => serde_json::json!({
+                "emoji": packed.into_iter().next().unwrap_or(serde_json::Value::Null),
+            }),
+            EmojiBroadcastOp::Updated | EmojiBroadcastOp::Deleted => {
+                serde_json::json!({ "emojis": packed })
+            }
+        };
+        self.services.streaming.push_broadcast(op.wire_name(), body)
     }
 
     /// Slice 7: run one `RemoteMediaFetch` job. A note deleted between

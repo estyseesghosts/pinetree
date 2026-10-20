@@ -35,6 +35,7 @@ foundationdb-sys = { version = "0.11.0", features = ["fdb-7_3"], optional = true
 argon2 = "0.5"
 ring = "0.17"
 futures-util = "0.3"
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 futures-core = "0.3"

@@ -6187,6 +6187,85 @@ fn j2_emoji_uniqueness() {
     case_j2_emoji_uniqueness(&*store);
 }
 
+/// J3 (emoji completion; Group J — custom emoji): `list_remote_emojis`
+/// pages remote rows newest-first by `first_seen_ms`, filters by host
+/// (case-insensitive) and shortcode query (plain or `:name:` tokens), and
+/// honors `since_date`/`until_date` + `limit`. `since_id`/`until_id` are
+/// accepted and ignored (remote rows have no time-ordered ids).
+fn case_j3_remote_emoji_list<S: ConformanceStore>(store: &S) {
+    use pinetree::domain::emoji::RemoteEmoji;
+    let cursor = |limit: usize| TimelineCursor {
+        limit,
+        ..Default::default()
+    };
+    for (host, name, seen) in [
+        ("r.example", "party", 10),
+        ("r.example", "blobcat", 20),
+        ("other.example", "party", 30),
+    ] {
+        store
+            .upsert_remote_emoji(
+                RemoteEmoji::new(host, name, &format!("https://{host}/{name}.png"), seen).unwrap(),
+            )
+            .expect("remote lands");
+    }
+    // No filters: newest-first by first_seen_ms.
+    let all = store
+        .list_remote_emojis(None, None, &cursor(10))
+        .expect("list");
+    assert_eq!(all.len(), 3);
+    assert_eq!(all[0].shortcode, "party");
+    assert_eq!(all[0].host, "other.example");
+    assert_eq!(all[2].host, "r.example");
+    assert_eq!(all[2].shortcode, "party");
+    // Host filter is case-insensitive.
+    let mine = store
+        .list_remote_emojis(None, Some("R.EXAMPLE"), &cursor(10))
+        .expect("host filter");
+    assert_eq!(mine.len(), 2);
+    assert!(mine.iter().all(|e| e.host == "r.example"));
+    // Query matches the shortcode (plain or `:name:` token).
+    let q = store
+        .list_remote_emojis(Some("blob"), None, &cursor(10))
+        .expect("query");
+    assert_eq!(q.len(), 1);
+    assert_eq!(q[0].shortcode, "blobcat");
+    let tok = store
+        .list_remote_emojis(Some(":party:"), None, &cursor(10))
+        .expect("token");
+    assert_eq!(tok.len(), 2);
+    // Dates bound first_seen_ms; limit truncates.
+    let dated = store
+        .list_remote_emojis(
+            None,
+            None,
+            &TimelineCursor {
+                since_date: Some(15),
+                until_date: Some(25),
+                ..cursor(10)
+            },
+        )
+        .expect("dates");
+    assert_eq!(dated.len(), 1);
+    assert_eq!(dated[0].shortcode, "blobcat");
+    let capped = store
+        .list_remote_emojis(None, None, &cursor(2))
+        .expect("limit");
+    assert_eq!(capped.len(), 2);
+    // Unknown host matches nothing.
+    let none = store
+        .list_remote_emojis(None, Some("nope.example"), &cursor(10))
+        .expect("unknown host");
+    assert!(none.is_empty());
+}
+
+#[test]
+fn j3_remote_emoji_list() {
+    let factory = RedbFactory::fresh("j3");
+    let store = factory.open(test_clock());
+    case_j3_remote_emoji_list(&*store);
+}
+
 /// O1 (Batch N WS4; Group O — antennas): per-antenna feeds append
 /// newest-first, trim to the newest 200 in the same transaction, drop
 /// single rows idempotently, and cascade on antenna delete.

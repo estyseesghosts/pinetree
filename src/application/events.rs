@@ -50,6 +50,36 @@ pub enum StreamingEvent {
     /// pinned upstream only invalidates caches with it, so the socket drop
     /// is a pinetree hardening — see `docs/endpoint-manifest.md` §23).
     UserSuspended { account_id: String },
+    /// Custom-emoji broadcast (Misskey `emojiAdded`/`emojiUpdated`/
+    /// `emojiDeleted` parity): emitted by the admin emoji ops. Carries
+    /// domain snapshots (deletes snapshot before the row is gone); the
+    /// worker packs them to `EmojiDetailed` and pushes them to the hub —
+    /// the application layer never touches wire shapes.
+    EmojiBroadcast {
+        op: EmojiBroadcastOp,
+        emojis: Vec<crate::domain::emoji::CustomEmoji>,
+    },
+}
+
+/// Which broadcast-stream emoji event an [`StreamingEvent::EmojiBroadcast`]
+/// carries (Misskey `GlobalEventService` parity: `emojiAdded` carries
+/// `{emoji}`, `emojiUpdated`/`emojiDeleted` carry `{emojis}`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum EmojiBroadcastOp {
+    Added,
+    Updated,
+    Deleted,
+}
+
+impl EmojiBroadcastOp {
+    pub fn wire_name(&self) -> &'static str {
+        match self {
+            EmojiBroadcastOp::Added => "emojiAdded",
+            EmojiBroadcastOp::Updated => "emojiUpdated",
+            EmojiBroadcastOp::Deleted => "emojiDeleted",
+        }
+    }
 }
 
 /// A `main`-channel event for one user (Phase 3 streaming). Built by the

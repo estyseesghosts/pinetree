@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 
+use serde_json::Value;
 use tokio::sync::broadcast;
 
 use crate::application::events::{MainMessage, StreamingEvent};
@@ -53,6 +54,10 @@ pub enum HubMessage {
     NoteDeleted { note_id: String },
     /// A `main`-channel event for one user.
     Main(MainMessage),
+    /// A custom-emoji broadcast for every connection (Misskey
+    /// `publishBroadcastStream('emojiAdded|Updated|Deleted')` parity):
+    /// `event` is the wire name, `body` the `{emoji}`/`{emojis}` object.
+    EmojiBroadcast { event: String, body: Value },
     /// The account was suspended: connections authenticated as it close
     /// (Batch M WP3). Anonymous sockets and other users' sockets ignore it.
     UserSuspended { account_id: String },
@@ -223,6 +228,19 @@ impl StreamingSink for BroadcastStreamingSink {
             StreamingEvent::UserSuspended { account_id } => {
                 self.hub.send(HubMessage::UserSuspended { account_id });
             }
+            // Custom-emoji broadcasts never reach the hub through the
+            // worker: the worker intercepts them first to pack the
+            // `EmojiDetailed` bodies (it has `AppServices`, the sink does
+            // not). This arm exists only so a direct `publish` cannot
+            // vanish silently — it is diagnosed instead of delivered.
+            StreamingEvent::EmojiBroadcast { op, emojis } => {
+                eprintln!(
+                    "streaming: EmojiBroadcast({:?}) reached the hub without worker expansion \
+                     ({} snapshots); dropping",
+                    op,
+                    emojis.len()
+                );
+            }
             // `Unfollowed` never reaches the hub through the worker: the
             // worker intercepts it first to pack the followee (it needs
             // `AppServices`, which the sink does not have). This arm exists
@@ -243,6 +261,14 @@ impl StreamingSink for BroadcastStreamingSink {
 
     fn push_main(&self, msg: MainMessage) -> Result<(), PortError> {
         self.hub.send(HubMessage::Main(msg));
+        Ok(())
+    }
+
+    fn push_broadcast(&self, event: &str, body: serde_json::Value) -> Result<(), PortError> {
+        self.hub.send(HubMessage::EmojiBroadcast {
+            event: event.to_string(),
+            body,
+        });
         Ok(())
     }
 }
