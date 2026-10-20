@@ -1,8 +1,14 @@
+> **Status (2026-10-20 freshness pass):** PLAN HISTORY (dated 2026-10-14). Most slices are landed, verified by code grep. The stale 'hide followers' item in `TODOS.md` is wrong: AP followers and following collections return 403 for non-public settings (`activitypub/actor.rs:922,981`). Still open: slice 13 gate evidence, D-c (upload concurrency), D-e (blob rekey wipe), and the slice 7 CSP/Disposition details (partially verified).
+> Tags: `[LANDED — evidence]` verified in code at HEAD; `[OPEN]` not in code; `[SUPERSEDED by …]`; `[DECISION — still binding]`; `[PLAN HISTORY]`. Original text is unchanged; tag blocks are additions. Short paths are under `src/`; `mod.rs` = `src/api/misskey/endpoints/mod.rs`.
+
 Status: Draft (2026-10-14). Pre-Phase-3 security/correctness cleanup, driven by the external audit of `6b58dcb` (`pine2.md`).
 
 # Phase 2.6 — Security and federation-correctness cleanup
 
 ## Audit verification summary
+
+> **[PLAN HISTORY]** Verdicts as of `6b58dcb`. Each row's current status is in the slice headings below.
+
 
 Every claim in the audit was checked against the tree at `6b58dcb` (read-only, file:line evidence). Nothing was executed; "confirmed" means traced in code. Each slice below must add a failing regression test **first**, then the fix.
 
@@ -28,12 +34,21 @@ Further gaps found during verification, folded into slices: the TCP path has no 
 
 ## Slices
 
+> **[PLAN HISTORY]**
+
+
 Same rules as Phase 2.5: one commit per slice, a dated log per slice, test-first, and both backends' conformance suite stays green. The order is by severity × blast radius, with tiny crash fixes first.
 
 ### Slice 0: Baseline
+
+> **[PLAN HISTORY]** Clean-clone 150/150 claim not re-recorded here.
+
 - Record clean-clone `cargo test` (expect 150/150) and `scripts/smoke-phase2.sh` (`SMOKE_OK`) on `6b58dcb`. No code changes.
 
 ### Slice 1: HTTP response framing (R4 + D7)
+
+> **[LANDED — federation/delivery.rs:463 (`--raw` passed to curl), :1024 (decode_chunked), :1080,1090 (checked_add); persistence/redb/mod.rs:7078 (lease reclaim counts an attempt); jobs/worker.rs:71,709 (catch_unwind)]**
+
 - Pass `--raw` to curl, so `read_http_response` sees real framing on both paths. The alternative is to skip dechunking on the curl path; pick one and document it.
 - `decode_chunked`: `checked_add`, reject any chunk larger than the remaining budget, and use `get()` slicing. Also reject chunk-extension garbage.
 - Handle (or explicitly reject) extra header blocks: `100 Continue`, proxy CONNECT. Add `-q` so `.curlrc` and proxy env are ignored, unless proxies are a supported config.
@@ -41,17 +56,26 @@ Same rules as Phase 2.5: one commit per slice, a dated log per slice, test-first
 - **Tests:** a chunked response over a local HTTPS fixture (or a curl-args test plus a parser test on raw framing); a fuzz-style `decode_chunked` test with `ffffffffffffffff`; a conformance cell showing lease expiry counts as an attempt.
 
 ### Slice 2: Key ownership (C1) — highest severity
+
+> **[LANDED — activitypub/actor.rs:226-260 (publicKey.id under actor; owner must equal actor)]** Cache-overwrite refusal and inbox `authenticate` owner-return not re-verified here.
+
 - At parse: `publicKey.id` must equal the actor id or be a fragment or path under it. In all cases it must be on the same origin as the actor. `owner`, when present, must equal the actor id. Reject otherwise.
 - At cache write: refuse to overwrite a key id whose stored `actor_uri` differs. Drop the speculative `{uri}/publickey` alias, or store it only when it is the real key id.
 - At inbox auth: `authenticate` returns the key's owner (from cache or the fresh fetch). `activity.actor` must equal that owner, not a string derived from the keyId. Keep `force_refresh`, but re-apply the same checks after the refetch.
 - **Tests:** a malicious actor doc advertising a victim's key id (with and without `owner`), then a forged victim activity, must be rejected. The pre-cached real key must not be overwritten. Honest Misskey/Sharkey key shapes (`#main-key`, `/publickey`) must still pass.
 
 ### Slice 3: Inbox URL validation (H5)
+
+> **[LANDED — activitypub/actor.rs:199-202 (sharedInbox parsed)]** Same-host and https→http downgrade rules not re-verified; treat as partially verified.
+
 - Parse `endpoints.sharedInbox` with the same URL parser. It must be same-host as the actor, and if the actor is https it must not be http. Apply the same scheme rule to `inbox`. On failure, drop the shared inbox and fall back to the personal inbox; don't reject the actor.
 - Run `Account::validate()` on the remote-actor upsert path.
 - **Tests:** a third-party `sharedInbox`, an https→http downgrade, and an overlong URL.
 
 ### Slice 4: Follow request state (C2)
+
+> **[LANDED — commands/follows.rs (Requested path); inbound/follow.rs; domain/follow.rs FollowRequest; api/…/mod.rs:6074-6111 (following/requests list|accept|reject|cancel); packers.rs:415-419 (hasPendingFollowRequest*)]**
+
 - Domain: `Follow` gains `state: Pending | Accepted`, or a separate `FollowRequest` record (**decision D-a**). Only accepted edges feed `follows_author`, `followers_of` fan-out, counters, and AP collections.
 - Inbound Follow to a locked local account becomes pending: no auto-Accept, and a `receiveFollowRequest` notification instead of `follow`. Local `following/create` to a locked account becomes pending too.
 - Accept/Reject path for local owners: add the minimal Misskey endpoints `following/requests/list`, `/accept`, `/reject`, `/cancel`. Accept emits an AP `Accept` job atomically with the state flip. Without these endpoints a locked account could never gain followers. They are pulled forward from Phase 3 deliberately (**decision D-b**).
@@ -61,17 +85,26 @@ Same rules as Phase 2.5: one commit per slice, a dated log per slice, test-first
 - **Tests:** a pending follower receives no followers-only delivery and can't read via the API. Accept grants both. Reject and cancel clean up. Live: a Misskey user follows a locked pinetree user and is accepted (extend the smoke script).
 
 ### Slice 5: Reply visibility (D8)
+
+> **[LANDED — commands/notes.rs:22-27 (missing and invisible reply targets are indistinguishable)]**
+
 - `create_note`: if `reply_id` is set, require `is_visible(target, author_viewer)`. Otherwise return Misskey's `NO_SUCH_NOTE`, so existence is not leaked. Apply the same check to the inbound remote-reply path only where it would grant audience. Remote replies to unseen notes are still stored, but must not widen the audience.
 - Re-check renote/quote against `is_visible` for completeness. The policy already covers it, so this is a test only.
 - **Tests:** replies to followers-only (non-follower) and specified (non-recipient) notes are rejected. The allowed cases still work.
 
 ### Slice 6: Request bodies (H1)
+
+> **[LANDED — api/misskey/endpoints/mod.rs:167 (DefaultBodyLimit::disable removed)]** Per-route 1 MiB cap and the streaming `drive/files/create` cap not re-verified.
+
 - Remove the router-wide `DefaultBodyLimit::disable()`. Set a sane default (Misskey's API JSON limit, or 1 MiB) on the Misskey routes.
 - Give `drive/files/create` its own layer, capped at `max_file_size` + multipart overhead. Read the body as a stream with a running cap (`http_body_util::Limited`) and abort with 413 as soon as the cap is crossed.
 - Auth ordering: when the token is in the `Authorization` header, authenticate and rate-limit **before** reading the body. When the token is the multipart `i` field (as misskey-js sends it), the bounded streaming read is the guard. Also add a per-IP concurrent-upload limit (**decision D-c**: how strict).
 - **Tests:** an oversized upload is rejected without buffering (assert via a capped body source). An oversized JSON body to `/api/notes/create` returns 413. The misskey-js client smoke test still uploads.
 
 ### Slice 7: Media safety (H2 + C3)
+
+> **[LANDED — mod.rs:174-181 (global nosniff); mod.rs:1276-1290 (Content-Disposition for non-inline MIME; CSP `default-src 'none'; sandbox`); media/remote_cache.rs:227,572-600 (HTML/SVG → octet-stream); inbox.rs:2151-2164 (fetch moved to job)]** Attachment-count cap of 16 at `remote_cache.rs:28`. Upload-side `Limited` stream not re-verified.
+
 - MIME allowlist: images (png/jpeg/gif/webp/avif), video (mp4/webm), audio (mpeg/ogg/wav), and `application/octet-stream`. The stored MIME comes from sniffing **only**. Declared or remote types may refine within the allowlist but never introduce a type. Explicitly never `text/html`, `image/svg+xml`, `application/xhtml+xml` or `text/xml`. `text/plain` only if a sniff confirms UTF-8. Apply to local and remote ingest via one shared `sniff_mime`; delete the duplicate in `commands/media.rs`.
 - `serve_file`: `X-Content-Type-Options: nosniff`, `Content-Security-Policy: default-src 'none'; sandbox`, and `Content-Disposition: attachment` for anything not in the inline-safe set. Add a global `nosniff` layer too. A separate cookieless media origin goes on the Phase 4 shared-media list, not here.
 - Inbound Create: check activity dedup (read-only `is_recorded`) **before** any fetch. The final `record_note_activity` stays the atomic authority, so the race is benign. Cap attachments per note (Misskey uses 16) and total bytes per activity. Make attachment `MediaMeta` insert idempotent per (remote URL, note), or fold it into the dedup transaction, so replays don't orphan rows.
@@ -79,11 +112,17 @@ Same rules as Phase 2.5: one commit per slice, a dated log per slice, test-first
 - **Tests:** remote `text/html` and SVG attachments are stored as octet-stream or rejected. A local non-UTF-8 upload with `text/html` is not served as HTML. Response headers are present. Replaying the same Create triggers zero fetches. Too many attachments are truncated or rejected.
 
 ### Slice 8: Content addressing (D6)
+
+> **[LANDED — media/remote_cache.rs:293 and application/commands/media.rs:55 (blob key = SHA-256); media/storage.rs:55 (length sidecar, `get` verifies)]** MD5 remains the dedup key and packer field (`commands/media.rs:43`), as intended. Decision D-e (wipe vs rekey) not re-verified.
+
 - Blob key is SHA-256. `MediaMeta` keeps `md5` as a separate field for the packer. `FsBlobStore::put` may skip on an existing key (SHA-256 is safe), but `get` verifies length.
 - Existing data migration (**decision D-e**): there are no production instances, so the recommendation is a one-shot rekey on startup or simply documenting a data wipe.
 - **Tests:** two distinct blobs never share storage. Upload dedup per owner still works. The packer's `md5` is unchanged for the same bytes.
 
 ### Slice 9: Passwords and auth throttling (H3 + H4)
+
+> **[LANDED — api/misskey/auth.rs:9,30 (argon2, `$argon2id$` prefix); mod.rs:86,201 (trusted_proxies, ConnectInfo)]** Rate-limiter coverage on every signin and MiAuth path not re-verified.
+
 - Argon2id (`argon2` crate, PHC string `$argon2id$...`). Verify the legacy `salt:hex` format and rehash on successful login. New hashes are always Argon2id. Pick parameters and log them (target ~50–100 ms).
 - Run hashing in `spawn_blocking`, never on the async executor.
 - Rate limit signin, MiAuth submit and check, and MiAuth signup per account **and** per IP: fixed window plus a progressive delay, with no hard lockout so a victim can't be locked out by an attacker. Return Misskey-shaped `RATE_LIMIT_EXCEEDED`.
@@ -91,6 +130,9 @@ Same rules as Phase 2.5: one commit per slice, a dated log per slice, test-first
 - **Tests:** a legacy hash verifies and is upgraded. Brute force trips the limiter. A spoofed XFF from an untrusted peer is ignored.
 
 ### Slice 10: Delivery reliability (R5 + M7 fan-out cap)
+
+> **[LANDED — federation/outbox.rs:403 (followers paged); MAX_DELIVERY_ATTEMPTS removed (no hits); production drain removed from handlers (remaining `drain(` calls are in `mod tests`, from mod.rs:10206)]** Per-inbox failure-only retry and DestinationTracker cooldown not re-verified here.
+
 - On partial fan-out failure, mark the activity job done and enqueue one `Federate` job per **failed** inbox, using the existing `inbox_override` field (this implements the doc comment at `outbox.rs:165`). Each job is enqueued in one transaction.
 - Classify errors: SSRF block, invalid URL and DNS NXDOMAIN are permanent; timeouts, 5xx and 429 are transient. Honor `Retry-After`.
 - Consult `DestinationTracker` before sending. A host in cooldown is deferred, not counted as an attempt. Delete dead `MAX_DELIVERY_ATTEMPTS`.
@@ -100,12 +142,18 @@ Same rules as Phase 2.5: one commit per slice, a dated log per slice, test-first
 - **Tests:** one of three inboxes failing means only that inbox is retried. A cooldown host is skipped. API latency is independent of peer latency (a slow-peer fixture).
 
 ### Slice 11: AP collections (M7)
+
+> **[LANDED — activitypub/actor.rs:721 (COLLECTION_PAGE_SIZE 40); actor.rs:922,981 (403 for non-public followers/following); api/…/mod.rs:13756 (250-follower sweep test)]** This closes the TODOS 'hide followers' item (stale). Outbox `totalItems` contract not re-verified.
+
 - Write a short contract section (`docs/identity-rules.md` or a new `docs/activitypub-collections.md`) covering `OrderedCollection` plus `OrderedCollectionPage`, `first`/`next`/`prev`, page size 20–50, opaque cursor, and `totalItems` from counters. Match what Misskey and Sharkey emit and accept.
 - Followers, following and outbox use cursor paging with `next` links. Storage errors return 500. `find_by_id` misses are logged, not silently dropped. Outbox `totalItems` is the visible-to-public count, or omitted.
 - Respect the Misskey "hide followers/following" settings if `Account` carries them; otherwise note it as a Phase 3 gap.
 - **Tests:** 250 followers page through completely. A storage error returns 500. Live: Misskey can fetch the collections.
 
 ### Slice 12: RSA advisory decision (M6)
+
+> **[LANDED — activitypub/signatures.rs:138-142 (signing via ring); Cargo.toml:25 (rsa 0.9 kept for verify)]** `cargo audit` output not recorded here.
+
 - Check the current RUSTSEC-2023-0071 status and whether `rsa 0.10` (still RC in the local registry) fixes it.
 - **Decision D-f:**
   - (a) Sign with `aws-lc-rs` or `ring`, which are constant-time, and keep `rsa` for verify and SPKI parsing.
@@ -114,6 +162,9 @@ Same rules as Phase 2.5: one commit per slice, a dated log per slice, test-first
 - **Verification:** a fixture sign/verify round-trip, existing keys still load, and `smoke-phase2.sh` against live Misskey and Sharkey.
 
 ### Slice 13: Docs and exit gate
+
+> **[OPEN]** Gate evidence (clean-clone cargo test, smoke-phase2, cargo audit) not re-run in this pass.
+
 - A log per slice. Frozen-contract superseding notes for slices 1, 4 and 11. Mark this file's checklist with evidence. Update the `AGENTS.md` phase header.
 - **Phase 3 entry gate:**
   - clean-clone `cargo test` is green, with all new regression tests listed;
@@ -123,6 +174,9 @@ Same rules as Phase 2.5: one commit per slice, a dated log per slice, test-first
 
 ## Ordering
 
+> **[PLAN HISTORY]**
+
+
 - Slices 1, 2 and 3 are small and independent; land them first. Slice 2 is the most urgent.
 - Slice 4 is the largest and touches frozen contracts; land it before 5 and 10, which read follow state.
 - Slices 6 and 7 both touch `endpoints/mod.rs` upload and serve code; do them sequentially.
@@ -130,6 +184,9 @@ Same rules as Phase 2.5: one commit per slice, a dated log per slice, test-first
 - Slices 9, 11 and 12 are independent and can land any time after 0.
 
 ## Open decisions
+
+> **[OPEN]** D-a: separate FollowRequest type landed. D-b: following/requests endpoints landed. D-d: remote-media job landed. D-f: ring signing landed. D-c (upload concurrency per IP/account) and D-e (wipe vs rekey) not verified.
+
 
 - **D-a** — Pending follows: a state field on `Follow`, or a separate `FollowRequest` store. Recommendation: a separate store, which mirrors Misskey's `FollowRequest` and keeps `followers_of` and counters untouched.
 - **D-b** — Pull the `following/requests/*` endpoints into 2.6? Recommendation: yes. Fixing C2 without them makes locked accounts unusable.
@@ -139,6 +196,9 @@ Same rules as Phase 2.5: one commit per slice, a dated log per slice, test-first
 - **D-f** — RSA signing backend. Recommendation: `aws-lc-rs` or `ring`, after a spike.
 
 ## Out of scope (kept for Phase 3+)
+
+> **[DECISION — still binding]**
+
 
 - Interop beyond Misskey and Sharkey (Mastodon, Pixelfed).
 - Quotes, polls, and distributed deployment.

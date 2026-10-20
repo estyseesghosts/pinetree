@@ -1,5 +1,10 @@
 # Phase 7 report: federation bench run3 (2026-10-19, fresh run only)
 
+> **Status (2026-10-20 freshness pass)** — historical bench record; figures are not re-run.
+> - **LANDED (pinetree, verified at HEAD):** poll options carry `type: "Note"` (`src/activitypub/objects.rs:1070`); inbound `EmojiReact` routed to the Like handler (`src/federation/inbox.rs:346`); `NOTES_BY_URI` unique with `DUPLICATE_NOTE_URI` (`src/persistence/redb/mod.rs:1129-1139`); Delete-beats-Create tombstone (`src/federation/inbox.rs:1740-1748`).
+> - **OPEN (`docs/TODOS.md` "Bench forensics"):** outbound `EmojiReact` degrades to Like; quote stamp/reply debt; poll-vote drop counters.
+> - **HARNESS-ONLY:** the birchtree poll-federation and reblog fixes (birchtree repo, `/root/birchtree`), and harness tooling under `scripts/fediverse-bench/` and `/root/bench`.
+
 Run: `/root/bench/run3`, suite dir `runs/20261019T021448Z`.
 Builds (from `/proc/<pid>/exe` at `bench-up`): pinetree `f58be005c558f650`,
 birchtree `cc4421edd6130686` (poll federation). Post-run, bt-a/b/c were

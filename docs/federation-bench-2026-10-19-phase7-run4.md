@@ -1,5 +1,10 @@
 # Phase 7 report: federation bench run4 (2026-10-19, fresh run only)
 
+> **Status (2026-10-20 freshness pass)** — historical bench record; figures are not re-run.
+> - **LANDED (pinetree, verified at HEAD):** `ap/show` ingests via the shared inbox pipeline with reply-parent pending/resolve and a queued `RemoteMediaFetch` (`src/api/misskey/endpoints/mod.rs:8213`, `src/federation/inbox.rs:2081`, `:2113-2170`); `notes/reactions` list present (`endpoints/mod.rs:6278`); poll `type: "Note"` (`src/activitypub/objects.rs:1070`).
+> - **OPEN (`docs/TODOS.md` "Bench forensics"):** quote-path bounded media fetch and stamp debt; reply debt (N-waiter jobs, late-link Reply notification); outbound `EmojiReact` degrade.
+> - **HARNESS-ONLY:** S7 500-char cap and exemption, media settle-until-deadline, `fetch_bytes` lab CA, birchtree status-limit change (birchtree repo).
+
 Run: `/root/bench/run4`, suite dir `runs/20261019T144547Z`.
 Builds (from `/proc/<pid>/exe` at `bench-up`): pinetree `f58be005c558f650`
 (unchanged), birchtree `ee6bfe94122a12c7` (configurable status text limit;

@@ -1,3 +1,6 @@
+> **Status (2026-10-20 freshness pass):** WP1–WP16 are largely landed in the dispatcher. Open: WP8 admin emoji (partially), WP16 `create-from-public` and remote-member system actor, §6 doc updates, §7 smoke-gate fix (still `tail -30` at `scripts/smoke-all.sh:53`), and §9 owner decisions. Line refs in §1.2 are stale; use `docs/inventory-pinetree-vs-misskey-2026-10-20.md` §1.
+> Tags: `[LANDED — evidence]` verified in code at HEAD; `[OPEN]` not in code; `[SUPERSEDED by …]`; `[DECISION — still binding]`; `[PLAN HISTORY]`. Original text is unchanged; tag blocks are additions. Short paths are under `src/`; `mod.rs` = `src/api/misskey/endpoints/mod.rs`.
+
 # Implementer guide — Batch M: moderation, registration policy, and daily-use parity (pre-Phase 4)
 
 **Status:** Draft (2026-10-17). Owner decisions in §9 are open; the defaults stated there apply until changed.
@@ -6,6 +9,9 @@
 ---
 
 ## 0. Why this batch exists and what "done" means
+
+> **[PLAN HISTORY]** Pre-Phase-4 batch; scope executed per work package below.
+
 
 Pinetree is a headless backend. Keystone is the primary UI and the target for every item here. The Misskey web UI is an optional frontend path. Pinetree does **not** serve any UI bundle, and that is not a gap.
 
@@ -30,6 +36,9 @@ Done means all of the following hold:
 
 ## 1. Read before writing code
 
+> **[PLAN HISTORY]** Line refs in §1.2 point at pre-batch code (e.g. `queries.rs:124–130`, now `queries.rs:135`).
+
+
 1. `AGENTS.md` — layout, state-maintenance rules, architecture rules, verification rules.
 2. `docs/README.md` — contract status. Frozen contracts change only through a logged superseding decision.
 3. `docs/application-ports.md` and `src/application/ports.rs` — the port pattern. This batch adds ports; read the existing ones first.
@@ -40,12 +49,18 @@ Done means all of the following hold:
 
 ### 1.1 Corrections to the earlier gap analysis
 
+> **[PLAN HISTORY]**
+
+
 - **Serving the UI is not a gap.** Pinetree is paired with a UI, not serving one.
 - **Keystone's Pinetree column is stale in places.** Its table says `drive/files` returns 404 (`api-surface.md:128`). Pinetree implements `drive/files` (`src/api/misskey/endpoints/mod.rs:3757`). Its table also says streaming is "not implemented" (`:134`), but Phase 3 shipped streaming. Report both to the Keystone side (§10); do not edit the Keystone repo from here.
 - **Keystone still calls `url-preview`, `emojis`, `antennas/*`.** It records `url-preview` as a pinetree workstream (`api-surface.md:99`). `emojis` is a gap (`:73`, `:133`). `antennas/*` is an honest 404 today and becomes real under WP15.
 - **`signin-flow` is only needed for the optional Misskey web UI path.** Keystone uses `signin` on pinetree (`api-surface.md:37`). It is not in this batch (§8).
 
 ### 1.2 Verified current state (cite these when you start)
+
+> **[PLAN HISTORY]** Superseded by `inventory-pinetree-vs-misskey-2026-10-20.md` §1.
+
 
 | Fact | Where |
 |---|---|
@@ -64,6 +79,9 @@ Done means all of the following hold:
 | Phase 2 SKIP still ends with `SMOKE_ALL_OK` | `scripts/smoke-all.sh:77–79`, `:92` |
 
 ### 1.3 Upstream references
+
+> **[PLAN HISTORY]**
+
 
 Read each upstream file before implementing its feature. Paths are under `misskey/packages/backend/src/`.
 
@@ -101,6 +119,9 @@ For any other error code, take the id from the upstream file. Do not invent one.
 
 ## 2. Cross-cutting rules for every work package
 
+> **[DECISION — still binding]**
+
+
 These come from `AGENTS.md`. They are restated here because the rules are easy to break in a feature this size.
 
 1. **Domain stays pure.** Domain types have no HTTP, Misskey, ActivityPub, or DB imports.
@@ -118,7 +139,13 @@ These come from `AGENTS.md`. They are restated here because the rules are easy t
 
 ## 3. Shared foundations (do these first; WP1–WP3 depend on them)
 
+> **[LANDED — domain/instance.rs:99 (blocked_hosts); domain/moderation.rs:74,100 (moderation log actions); api/misskey/auth.rs:243 (require_moderator)]** §3.4 conformance groups H–Z are present in `tests/conformance.rs`; see `persistence-conformance.md` §17.
+
+
 ### 3.1 Roles
+
+> **[LANDED — api/misskey/auth.rs:243 require_moderator; require_admin in the same module]** `role_ids` stored but not enforced (`TODOS.md` domain gaps).
+
 
 - Add two booleans on `Account` in `src/domain/account.rs`: `is_admin`, `is_moderator`. Use fixed built-in roles only. Custom roles and policies are out (§8).
 - Persist in redb. Check how the existing schema is versioned in `src/persistence/redb/mod.rs` and follow that pattern. Do not invent a second migration mechanism.
@@ -129,6 +156,9 @@ These come from `AGENTS.md`. They are restated here because the rules are easy t
 
 ### 3.2 Moderation log
 
+> **[LANDED — domain/moderation.rs:74,100; admin/show-moderation-logs mod.rs:4868]**
+
+
 - Domain type `ModerationLogEntry { id, actor_account, action, target, details, created_at }`. `action` is an enum: `suspend`, `unsuspend`, `resolveAbuseReport`, `forwardAbuseReport`, `updateAbuseReportNote`, `updateUserRejectQuotes`, `setRole`, `updateMeta`, `createInvite`, `deleteInvite`, and so on. Match upstream action names where they exist (see `ModerationLogService.ts`).
 - Port `ModerationLogStore`: `append(entry)` (called inside the same transaction as the action, §2.3) and `list(filter, cursor, limit)`.
 - Endpoint: `admin/show-moderation-logs` (upstream file of the same name), cursor paging `sinceId`/`untilId`/`limit`, moderator only.
@@ -136,12 +166,18 @@ These come from `AGENTS.md`. They are restated here because the rules are easy t
 
 ### 3.3 Instance settings
 
+> **[LANDED — domain/instance.rs:99 blocked_hosts; admin/update-meta mod.rs:5642]**
+
+
 - Domain type `InstanceSettings { registration: RegistrationPolicy, blocked_hosts: Vec<String>, name, description, max_note_text_length, … }`. Keep only what this batch uses; do not build a generic settings bag.
 - Port `InstanceSettingsStore`: `get()` and `update(patch)`. `update` runs in a transaction with the moderation-log append.
 - Defaults reproduce today's behavior: registration open, no blocked hosts, `maxNoteTextLength` 3000.
 - `packers.rs:1537` and `:1560` read from this store (not hardcoded).
 
 ### 3.4 Conformance groups to add (`docs/persistence-conformance.md`)
+
+> **[LANDED — tests/conformance.rs (118 #[test] fns by grep)]** Redb only; FDB not implemented.
+
 
 Add these to the suite; both adapters must pass them. Give each case an id following the existing style.
 
@@ -153,9 +189,15 @@ Add these to the suite; both adapters must pass them. Give each case an id follo
 
 ## 4. Admin and moderation (WP1–WP6)
 
+> **[LANDED — per-WP below]**
+
+
 Do WP1–WP3 before anything else in this section. WP4–WP6 depend on them.
 
 ### WP1 — Roles, guards, moderation log, and the reject-quotes fix
+
+> **[LANDED — mod.rs:4535-4539 (reject-quotes calls require_moderator); mod.rs:4868 (show-moderation-logs)]** The `:2824–2832` TODO removal was not re-verified.
+
 
 **Deliverables**
 
@@ -173,6 +215,9 @@ Do WP1–WP3 before anything else in this section. WP4–WP6 depend on them.
 - Test: the existing case in `mod.rs` (the reject-quotes test near `:10895`) is updated to assert the moderator requirement.
 
 ### WP2 — Registration policy and invite-only signup
+
+> **[LANDED — mod.rs:2784-2788 (admin/accounts/create requires admin); mod.rs:5441-5512 (invite/create|list|delete|limit); accounts.rs:27 (registration gate bypass); mod.rs:2074 (signup enforces policy)]** `admin/invite/create|list` not individually located.
+
 
 **Model (recommended).** Use Misskey's model, which is one switch. `registration` open or closed. When closed, `signup` requires a valid invite code. Closed with no codes issued is a fully closed instance. Read the invite check in `SignupApiService.ts` around line 136 before implementing, so the error shape matches upstream.
 
@@ -197,6 +242,9 @@ Do WP1–WP3 before anything else in this section. WP4–WP6 depend on them.
 
 ### WP3 — Suspension
 
+> **[LANDED — mod.rs:4935-4938 (admin/suspend-user, unsuspend-user); streaming/hub.rs:221-224 (UserSuspended closes sockets); commands/moderation.rs:164,176 (sweep jobs)]**
+
+
 **Deliverables**
 
 - `admin/suspend-user` `{userId}` and `admin/unsuspend-user` `{userId}`, moderator only. Refuse to suspend an admin or moderator (upstream: `cannot suspend moderator account`, `suspend-user.ts:45–47`).
@@ -219,6 +267,9 @@ Do WP1–WP3 before anything else in this section. WP4–WP6 depend on them.
 
 ### WP4 — Abuse reports
 
+> **[LANDED — mod.rs:4983 (abuse-user-reports), :5023 (resolve), :5059 (forward); abuse_reports.rs:213 (Flag job); activitypub/objects.rs:860 (Flag renderer)]** Admin abuse-report note-update endpoint not individually located.
+
+
 **Deliverables**
 
 - `users/report-abuse` `{userId, comment}` (`comment` 1–2048 chars). Errors: `NO_SUCH_USER`, `CANNOT_REPORT_YOURSELF`, `CANNOT_REPORT_THE_ADMIN` (upstream: admins are not reportable, `report-abuse.ts:69–71`). Reporter host is always null (local reports only).
@@ -236,6 +287,9 @@ Do WP1–WP3 before anything else in this section. WP4–WP6 depend on them.
 - Forward on a local target is rejected; forward on a remote target sends exactly one Flag.
 
 ### WP5 — Instance blocks
+
+> **[LANDED — application/queries.rs:135-137 (blocked_hosts reads the store, not an empty vec); inbound_host_blocked (queries.rs:137+); admin/update-meta mod.rs:5642]** Delivery-time outbound skip not re-verified. The TODOS line that says `blocked_hosts()` is empty is stale.
+
 
 **Semantics (copy upstream exactly).** Blocking a host also blocks its subdomains. Upstream `isBlockedHost` (`UtilityService.ts:52–54`) matches a host that ends with `.` + the blocked host. Entries are stored lowercased (`admin/update-meta.ts:260`).
 
@@ -256,6 +310,9 @@ Do WP1–WP3 before anything else in this section. WP4–WP6 depend on them.
 
 ### WP6 — Admin read and user views
 
+> **[LANDED — mod.rs:4562 (admin/show-user), :4657 (update-user-note), :4672 (admin/delete-account)]** `admin/show-users` not located.
+
+
 - `admin/show-user` `{userId}` and `admin/show-users` (upstream params; read the file). Moderator only. Include `isSuspended`, `isAdmin`, `isModerator`, and report counts.
 - `admin/update-user-note` `{userId, text}`: moderator note on an account (upstream `update-user-note.ts`). Logged.
 - `admin/delete-account` `{userId}`: admin only. Shares the machinery of `i/delete-account` (§5.9). Build it once; do not write two deletes.
@@ -265,9 +322,15 @@ Do WP1–WP3 before anything else in this section. WP4–WP6 depend on them.
 
 ## 5. Daily-use parity (WP7–WP16)
 
+> **[OPEN]** Per-WP status below; WP8 and WP16 have open items.
+
+
 Items are in priority order for Keystone. Each item is independent unless a dependency is noted.
 
 ### WP7 — Favorites and note state
+
+> **[LANDED — mod.rs:6350 (notes/favorites/create); mod.rs:5813-5822 (i/export-favorites enqueues a real export, not an empty file)]** `i/favorites` and `notes/state` not individually re-verified.
+
 
 - `notes/favorites/create` `{noteId}` and `notes/favorites/delete` `{noteId}`. Unique per (account, note) (conformance J1). Upstream errors: check `create.ts` for `ALREADY_FAVORITED` and `NO_SUCH_NOTE` and copy the ids.
 - `i/favorites` (list, `sinceId`/`untilId`/`limit`).
@@ -276,6 +339,9 @@ Items are in priority order for Keystone. Each item is independent unless a depe
 - **Also fix `i/export-favorites`**, which currently writes an empty file (parity plan §13). Keystone's import/export UI uses it (`/root/keystone/frontend/src/api/importExport.ts:47, 65`).
 
 ### WP8 — Custom emoji (listing and admin management)
+
+> **[OPEN — emojis list mod.rs:5080; admin/emoji/add mod.rs:5109, update :5155 landed]** `admin/emoji/delete|list` and the packing into `reactionEmojis`/`emojis` not re-verified. Check before closing.
+
 
 Keystone calls `emojis` and the picker drops its Custom section when the call 404s (`api-surface.md:73`). Keystone's verified shape is `{emojis: [{name, category, url, aliases}]}` from `{}` (public, no auth).
 
@@ -286,6 +352,9 @@ Keystone calls `emojis` and the picker drops its Custom section when the call 40
 - **Remote custom emoji is opt-in per user, default off** (§9.4). Details in WP8b below. With the setting off, remote custom emoji render as their `:name@host:` text, and no remote emoji URLs are packed.
 
 ### WP8b — Remote custom emoji (per-user opt-in, default off)
+
+> **[LANDED — account.rs:212,477 (show_remote_emojis, default false); domain/emoji.rs:75 (RemoteEmoji)]** Toggle-enqueues-fetch and default-off packing not re-verified.
+
 
 Decided in §9.4. The user chooses; there is no instance-wide override in this batch.
 
@@ -301,6 +370,9 @@ Decided in §9.4. The user chooses; there is no instance-wide override in this b
 
 ### WP9 — Account self-service
 
+> **[LANDED — mod.rs:6527 (i/change-password), :6580 (i/regenerate-token), :6622 (i/apps), :6677 (i/authorized-apps)]** `i/update-email` correctly deferred.
+
+
 - `i/change-password` `{password, newPassword}`. Read upstream for the wrong-password error and whether it revokes other sessions. Mirror upstream.
 - `i/regenerate-token` `{password}`. Rotates the **native** token. Read upstream for the response. Scoped app tokens are separate (§9.7).
 - `i/apps` and `i/authorized-apps`. List app grants for the caller, cursor-paged.
@@ -309,16 +381,25 @@ Decided in §9.4. The user chooses; there is no instance-wide override in this b
 
 ### WP10 — Follower removal and remote lookup
 
+> **[LANDED — mod.rs:6036 (following/invalidate), :3062 (users/search-by-username-and-host), :8213 (ap/get|ap/show)]**
+
+
 - `following/invalidate` `{userId}`: remove a follower (upstream `following/invalidate.ts`). Emit a Reject/Undo to the remote follower if the follower is remote (match the existing unfollow federation path).
 - `users/search-by-username-and-host` `{username, host?}`: a thin alias over `users/show`.
 - `ap/get` `{uri}`: returns the AP object for a URI. Lower priority; implement if time allows, and list it as deferred otherwise.
 
 ### WP11 — Notifications: follow-request accepted
 
+> **[LANDED — commands/follows.rs:98-125 (accept emits FollowRequestAccepted); inbound/follow.rs:177]**
+
+
 - Emit `followRequestAccepted` when a locked account accepts a request (`mod.rs:952` lists it as not emitted). Test the packing and the `includeTypes`/`excludeTypes` filter.
 - Do not implement the other unemitted types (`app`, `achievementEarned`, `login`, `roleAssigned`). They are out (§8).
 
 ### WP12 — Link preview: `url-preview` (Keystone-requested, first-party)
+
+> **[LANDED — mod.rs:8371 (url-preview, rate-limited)]** SSRF guard, auth-required, and cache caps not re-verified here.
+
 
 Keystone asks for this explicitly (`api-surface.md:99`). It is not a Misskey endpoint.
 
@@ -332,11 +413,17 @@ Keystone asks for this explicitly (`api-surface.md:99`). It is not a Misskey end
 
 ### WP13 — Drive extras
 
+> **[LANDED — mod.rs:8017 (upload-from-url), :8064 (find-by-hash)]** `folderId` still accepted and ignored (`[OPEN]` per §9.8).
+
+
 - `drive/files/upload-from-url` `{url, folderId?, force?, isSensitive?, comment?, name?}`. Reuse `src/media/ingest.rs` and the §2 rule 6 fetcher. Enforce the existing media size limit. Do not add a second ingest path.
 - `drive/files/find-by-hash` (upstream param name; read the file). Uses the existing SHA-256 keys in `src/media/storage.rs`.
 - Drive folders are pending the owner decision in §9.8 (recommended in scope, §13.4). Until then, `folderId` is accepted and ignored, as today.
 
 ### WP14 — Self-delete
+
+> **[LANDED — mod.rs:4685 (i/delete-account)]**
+
 
 - `i/delete-account` (upstream: read `i/delete-account.ts` for the password requirement and error ids). Shares the machinery with `admin/delete-account` (§4 WP6).
 - One transaction: tombstone the account (the handle stays reserved, per conformance C3), remove follows and requests, append the log (for admin actions), and enqueue a Delete(Person) to remote inboxes. Do not delete note bodies in-line; hand that to a job so the transaction stays bounded.
@@ -345,6 +432,9 @@ Keystone asks for this explicitly (`api-surface.md:99`). It is not a Misskey end
 ---
 
 ### WP15 — Antennas
+
+> **[LANDED — mod.rs:5268-5293 (antennas/list|show|create…); commands/antennas.rs:337 (AntennaMatch job); persistence/redb/mod.rs:114 (antenna_notes); mod.rs:5789-5796 (i/export-antennas enqueues a real export)]** `home` label and the no-auto-deactivation divergence not re-verified.
+
 
 Antennas are rules that collect matching notes into a personal feed. Keystone already has the UI, and it gets an honest 404 today (`/root/keystone/docs/api-surface.md:96, 129`).
 
@@ -385,6 +475,9 @@ Antennas are rules that collect matching notes into a personal feed. Keystone al
 
 ### WP16 — User lists
 
+> **[LANDED — mod.rs:3152-3488 (users/lists/*), notes/user-list-timeline; userList streaming]** `create-from-public` `[OPEN]`. Remote-member system-actor Follow `[OPEN]` (§9.12). The notification `list` config is not re-verified.
+
+
 Lists are named sets of accounts with their own timeline. Keystone's antenna list source depends on them (`api-surface.md:95–96, 115–117`).
 
 **Scope.** `users/lists/create`, `update`, `delete`, `list`, `show`, `push`, `pull`, `get-memberships`, `update-membership`, `favorite`, `unfavorite`; `notes/user-list-timeline`; `i/export-user-lists` and `i/import-user-lists` (CSV); the `userList` streaming channel; list-based notification receive config. `create-from-public` is deferred (§8).
@@ -411,6 +504,9 @@ Lists are named sets of accounts with their own timeline. Keystone's antenna lis
 
 ## 6. Documentation updates (required, same change set)
 
+> **[OPEN]** Not audited in this pass. `phase-3-profile.md` §5 is still stale per `TODOS.md`.
+
+
 1. **`docs/endpoint-manifest.md`** — a row or superseding note for every endpoint added or changed in §4–§5. Mark each status.
 2. **`docs/phase-3-profile.md` §5** — the non-goal list is stale. It still lists `notes/reactions` (list), `notes/featured`, `users/featured-notes`, and `i/notifications-grouped`, all shipped. Add a superseding note, and move every item this batch implements out of the non-goal list. Keep items §8 keeps.
 3. **`docs/application-ports.md`** — the new ports (`ModerationLogStore`, `InstanceSettingsStore`, `AbuseReportStore`, `InviteStore`, `EmojiStore`, favorites, and any others). Note that no defaults exist.
@@ -425,6 +521,9 @@ Lists are named sets of accounts with their own timeline. Keystone's antenna lis
 
 ## 7. Smoke gate fix (do this after implementation, before the final test run)
 
+> **[OPEN]** `scripts/smoke-all.sh:53` still reads `… cargo test --offline 2>&1 | tail -30`. The masking issue is open.
+
+
 The smoke gate currently reports green when tests fail, so it cannot be trusted until this is fixed. Do this **after** the work above and **before** the final run.
 
 1. **Step 1 exit code (`scripts/smoke-all.sh:53`).** The step runs `bash -c "cd … && cargo test --offline 2>&1 | tail -30"`. The step's status is the status of `tail`, which is 0 even when `cargo test` fails. Fix: remove the `| tail -30` from inside `bash -c`. The outer `step()` already tees the output and reads `PIPESTATUS[0]`, so it keeps the full log and the right exit code. Keep a `tail` for display if you want one, but let the exit status come from `cargo test`.
@@ -438,6 +537,9 @@ The smoke gate currently reports green when tests fail, so it cannot be trusted 
 ---
 
 ## 8. Explicitly out of this batch
+
+> **[DECISION — still binding]**
+
 
 Each item stays a 404 or a documented non-goal. Record it in the manifest and profile §5 (§6).
 
@@ -458,6 +560,9 @@ Each item stays a 404 or a documented non-goal. Record it in the manifest and pr
 
 ## 9. Owner decisions (defaults apply until changed)
 
+> **[OPEN]** Owner decisions pending. The defaults in each WP apply.
+
+
 1. **Who may create invites?** Default: admins and moderators only, through `admin/invite/create`. Option: allow all signed-in users within a cap (upstream `invite/create` with `canInvite`). The cap option needs a per-user limit store.
 2. **Email.** Default: none in this batch. `enableEmail` stays `false`; password reset and email change are out. Option: implement an outbound email port with a no-op transport, so password reset can be added later without changing the API surface.
 3. **`url-preview` authentication.** Default: credential required. Keystone calls it from a signed-in UI, so this costs nothing and avoids an open proxy.
@@ -475,6 +580,9 @@ Each item stays a 404 or a documented non-goal. Record it in the manifest and pr
 
 ## 10. Cross-repo follow-ups (not pinetree's to make)
 
+> **[OPEN]** Owned by Keystone and other repos, not audited here.
+
+
 Report these to the Keystone side. Do not edit the Keystone repo from here.
 
 1. `api-surface.md:128` says pinetree `drive/files` is 404. It is implemented (`mod.rs:3757`). Update the Pinetree column.
@@ -490,6 +598,9 @@ Report these to the Keystone side. Do not edit the Keystone repo from here.
 
 ## 11. Known risks the implementer should watch
 
+> **[PLAN HISTORY]**
+
+
 - **Two places can enforce the same rule.** Suspension and blocked-host checks are already in several read and inbound paths. Add the setter and the new check in the existing place. Do not add a third copy.
 - **`admin/accounts/create` is a live hole** until WP2 lands. Treat it as the first thing to fix in WP2, even though it appears later in the batch.
 - **Dedup rows for dropped activities.** A blocked-host or suspended-author activity must not leave a dedup record. Otherwise unblocking does not let the activity through, and the record is the thing that forever suppresses it.
@@ -503,6 +614,9 @@ Report these to the Keystone side. Do not edit the Keystone repo from here.
 ---
 
 ## 12. Suggested order of work
+
+> **[PLAN HISTORY]**
+
 
 1. §3 foundations (roles, log, settings, conformance skeletons for H/I/J).
 2. WP1 — roles, guards, log, and the reject-quotes fix. It is a live bug, so it goes first.
@@ -523,9 +637,15 @@ Report these to the Keystone side. Do not edit the Keystone repo from here.
 
 ## 13. Remaining Misskey features: what they do, and the scope question
 
+> **[OPEN]** Scope question still owner-pending.
+
+
 Source: upstream Misskey `2026.10.1-alpha.0` (`misskey/packages/backend/src/`, read-only). Complexity is the rough backend cost for a Rust re-implementation. None of these four is federated: no ActivityPub object or activity exists for any of them, so none can break federation compatibility if left out.
 
 ### 13.1 Clips — "bookmark collections for notes"
+
+> **[LANDED — application/commands/clips.rs; mod.rs:3877-3920]**
+
 
 **What a user does.** Creates named collections of notes ("clips"). Adds a note to a clip from the note menu. Clips are private by default. A public clip appears on the owner's profile (Clips tab) and at `/clips/:id`. A note's page lists the public clips that contain it.
 
@@ -540,6 +660,9 @@ Source: upstream Misskey `2026.10.1-alpha.0` (`misskey/packages/backend/src/`, r
 **Recommendation.** In scope, after Batch M, as a small self-contained batch. It is cheap, and a curation feature many users expect. It is not daily use, so it does not block the current batch.
 
 ### 13.2 Channels — "community timelines"
+
+> **[DECISION — still binding]** Declared out (`endpoint-manifest.md` §5/§9). `channels/*` still 404 (`mod.rs:9122`).
+
 
 **What a user does.** Creates a channel with a name, description, banner, color, and sensitive flag. Posts to it. Followers see channel posts in their home timeline. Channels have their own timeline page, can be favorited and muted (with optional expiry), and can pin notes.
 
@@ -559,6 +682,9 @@ Source: upstream Misskey `2026.10.1-alpha.0` (`misskey/packages/backend/src/`, r
 
 ### 13.3 Pages — "long-form documents with embedded scripts"
 
+> **[LANDED — application/commands/pages.rs; mod.rs:3944-4010]** Scripts are not a pinetree feature.
+
+
 **What a user does.** Writes a long-form document from blocks (text, section, image, note embed, inputs) and can attach a small client-side script that makes the page interactive. Pages are viewed at `/@user/pages/<name>`. There is a Featured tab, a My tab, and a Liked tab. Pages can be liked and appear on the profile.
 
 **Rules.** Title up to 256 characters; name unique per user. The visibility enum exists, but the code hardcodes `public` and no endpoint sets anything else. The script field is up to 16 KB. Creation is limited to 10 per hour. There is no per-user page count cap that I found.
@@ -572,6 +698,9 @@ Source: upstream Misskey `2026.10.1-alpha.0` (`misskey/packages/backend/src/`, r
 **Recommendation.** Out. Storing pages without the editor and renderer produces data that no UI can show. Revisit only with a Keystone page editor in scope.
 
 ### 13.4 Drive folders — "folders inside Drive"
+
+> **[OPEN]** `folderId` rejected or ignored; folders not implemented.
+
 
 **What a user does.** Creates folders inside their Drive, renames, moves, and deletes them. Deleting a folder is refused unless it is empty. Folders nest without a depth limit, with a cycle check on move. Files have an optional folder. There is a default upload folder setting. Folders are private to their owner.
 
@@ -590,6 +719,9 @@ Source: upstream Misskey `2026.10.1-alpha.0` (`misskey/packages/backend/src/`, r
 **Recommendation.** In scope as a low-cost addition, in the same batch as the drive extras (WP13). It is the basic way to organize files, and Keystone already accepts the parameter. Decide the name limit before implementing (§9.10).
 
 ### 13.5 Summary for the owner
+
+> **[OPEN]** Owner summary; still pending.
+
 
 | Feature | Federated | Cost | Keystone needs it | Recommendation |
 |---|---|---|---|---|

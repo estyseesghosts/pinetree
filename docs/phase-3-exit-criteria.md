@@ -1,5 +1,11 @@
 # Phase 3 exit criteria — Client compatibility and streaming
 
+> **Status at HEAD (2026-10-20 freshness pass)** — boxes left as recorded (Phase 3 exit); **no boxes changed**, tests not re-run.
+> - Cited files exist at HEAD: `tests/streaming.rs`, `tests/client_profile.rs`, `scripts/smoke-phase3.sh`, `src/streaming/hub.rs`, `src/streaming/server.rs`.
+> - **Still true:** `i/revoke-token` is fully implemented (`src/api/misskey/endpoints/mod.rs:6770`), so the older "no-op" note in `docs/phase-3-profile.md` §7 is stale.
+> - **Stale claims elsewhere (not edited here):** streaming `updated` is emitted (`src/streaming/server.rs`, Sharkey parity) while `docs/endpoint-manifest.md` §9 still says it is not; `users/followers|following` moderator bypass is wired but always false until roles land. See `docs/TODOS.md` "Manifest/profile stale lines".
+> - **Out of Phase 3 scope, still open:** `hashtag`, `channel`, `drive`, `clip`, `admin`, and the other missing streaming channels (`docs/TODOS.md` "streaming holes").
+
 **Status:** Tracking checklist (proposal §9 Phase 3).
 
 **Exit:** All endpoints in the declared compatibility profile

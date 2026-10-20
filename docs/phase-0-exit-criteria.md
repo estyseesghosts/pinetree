@@ -1,5 +1,10 @@
 # Phase 0 — exit criteria checklist
 
+> **Status at HEAD (2026-10-20 freshness pass)** — boxes left as recorded at exit (2026-10-14); **no new boxes checked** and nothing re-executed here.
+> - Contract docs still exist and are the frozen set in `docs/README.md` (identity, endpoint manifest, domain types, visibility, ports) — **still true**.
+> - The in-memory 15/15 harness and the FDB probe lived in `/tmp/opencode/phase0-harness` and `/tmp/opencode/fdb-probe`; **neither exists** at the 2026-10-20 check. Their evidence is the 2026-10-14 log, not a re-run.
+> - The 15/15 harness proof was superseded by redb conformance (118/118 per `docs/README.md`) — see `docs/TODOS.md` P0 for the open Phase 4 FDB adapter.
+
 Source: `sns-server-proposal.md` §9, Phase 0. Freeze review: 2026-10-14.
 
 **Exit:**

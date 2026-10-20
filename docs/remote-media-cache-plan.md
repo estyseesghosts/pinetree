@@ -1,3 +1,6 @@
+> **Status (2026-10-20 freshness pass):** Build-step status below. Landed: per-note 64 MiB budget, 16-attachment cap, SHA-256 blob keys, durable RemoteMediaFetch job. Open: reference-safe delete, eviction, global/class budgets, on-demand default, stream-to-disk, reconciler, observability, warming, FDB parity. No GC/reconciler exists (grep `evict|quota|warm|reconcil` over `src/media` and `src/config.rs` is empty).
+> Tags: `[LANDED — evidence]` verified in code at HEAD; `[OPEN]` not in code; `[SUPERSEDED by …]`; `[DECISION — still binding]`; `[PLAN HISTORY]`. Original text is unchanged; tag blocks are additions. Short paths are under `src/`; `mod.rs` = `src/api/misskey/endpoints/mod.rs`.
+
 Status: Draft
 
 # Pinetree — remote-media cache plan (from `storage-cache.md` review)
@@ -11,6 +14,10 @@ content addressing) and schema (Pinetree: Misskey-compatible media
 semantics; Birchtree: Mastodon-compatible attachments).
 
 ## 1. Where Pinetree stands
+
+> **[LANDED — remote_cache.rs:28,35,134,293]** Building blocks: 16-cap `remote_cache.rs:28`; 64 MiB per-job-run budget `:35,:133-136`; SHA-256 blob key `:293`; SSRF/URL validation `:38`.
+> The 'Missing' paragraph (plan `:35-39`) still holds: `[OPEN]` for global budget, class accounting, and eviction.
+
 
 Existing building blocks (`src/media/remote_cache.rs`,
 `src/media/storage.rs`, `src/media/ingest.rs`):
@@ -39,6 +46,10 @@ lifecycle. The per-note cap cannot stop thousands of individually
 acceptable notes from filling the disk.
 
 ## 2. Fix-first: shared-blob deletion bug (before any eviction work)
+
+> **[OPEN — commands/media.rs:211-216]** `delete_media` still calls `delete_metadata` (`:213`) then `blobs.delete` (`:214`) with no reference check, in two separate writes. Plan line refs `:147-151` are stale; the function is now at `:211`.
+> Same-owner dedup holds: `upload_media` early-returns on `find_by_owner_and_hash` (`commands/media.rs:45`).
+
 
 `delete_media` (`src/application/commands/media.rs:147-151`) deletes the
 metadata row then the SHA-256 blob with no reference check, and the two
@@ -71,6 +82,10 @@ Fix requirements:
 
 ## 3. Corrections adopted from the review
 
+> **[OPEN]** Item 1 (eager vs lazy): `[OPEN]`. Still eager on arrival: `inbox.rs:2157-2164` builds the job per note. The job runs off-request (`worker.rs:147`), but there is no fetch-on-first-request.
+> Item 5 (stream enforcement): `[OPEN]`. `fetch_and_attach_remote_media` still holds the full body (`remote_cache.rs:245-256`) and calls `blobs.put` on the Vec (`:174`, `:323`). Plain-HTTP and curl cap claims (`delivery.rs:469-470,928-995`) were not re-verified here.
+
+
 1. **Current fetch is async-eager, not lazy.** Queueing downloads when notes
    arrive moves work off ingest but still fetches everything. Default must
    become fetch-on-first-media-request; keep the job system for optional
@@ -101,6 +116,9 @@ Fix requirements:
 
 ## 4. Recommended changes (ordered)
 
+> **[OPEN]** 1 reference-safe deletion: `[OPEN]`. 2 (source-URL, variant) index: `[OPEN]`, `find_by_source_url` exists (`remote_cache.rs:128`) but there is no variant key and no refcount. 3 eviction keeps metadata: `[OPEN]`. 4 on-demand default: `[OPEN]`. 5 separate local vs remote stores: `[OPEN]`. 6 global + class budgets: `[OPEN]`.
+
+
 1. **Reference-safe deletion** (§2) — prerequisite, land first.
 2. **Remote-cache index keyed by (source URL, media variant)** (new schema —
    no such index exists today), separate from the SHA-256 physical blob
@@ -119,6 +137,9 @@ Fix requirements:
    attempted, §1).
 
 ## 5. Shared policy (same concepts as Birchtree)
+
+> **[OPEN]** No `disabled | on_demand | warm` mode, no class caps, and no global cap exist in `src/`. Grep for `on_demand|warm|evict` in `src/media` and `src/config.rs` is empty.
+
 
 Modes: `disabled` / `on_demand` / `warm`. **Default: `on_demand`, warming
 off.**
@@ -169,6 +190,9 @@ parity plan if it affects `docs/misskey-parity-plan.md`.
 
 ## 6. Suggested build order
 
+> **[OPEN]** Step status: 1 shared-blob fix `[OPEN]`; 2 index + refcount `[OPEN]`; 3 eviction + accounting `[OPEN]`; 4 on-demand default `[OPEN]` (`inbox.rs:2157`); 5 reconciler + observability `[OPEN]`; 6 stream-to-disk `[OPEN]`; 7 scoped warming `[OPEN]`; 8 FDB parity `[OPEN]` (`src/persistence/foundationdb/mod.rs` is 0 lines).
+
+
 1. Shared-blob deletion fix + regression tests (§2).
 2. (source-URL, variant) index + reference accounting alongside SHA-256
    blob keys (new schema).
@@ -189,6 +213,9 @@ parity plan if it affects `docs/misskey-parity-plan.md`.
 
 ## 7. Acceptance tests (must prove)
 
+> **[OPEN]** Existing tests (`remote_cache.rs:423-606`) cover SSRF round-trip, oversize rejection, HTML/SVG-as-octet-stream, and truncation to 16. Not found: in-flight reservation, cap-never-exceeded, local-survives-eviction, eviction re-fetch, cross-owner delete regression.
+
+
 - Cache never exceeds configured cap under concurrent downloads — with an
   explicit in-flight reservation test (simultaneous downloads cannot
   overshoot), not just post-hoc totals.
@@ -203,6 +230,9 @@ parity plan if it affects `docs/misskey-parity-plan.md`.
 - Evicted media re-fetches while source remains available.
 
 ## 8. Sequencing vs Birchtree
+
+> **[OPEN]** Cross-repo sequencing; `birchtree/` not audited in this pass.
+
 
 Per the review: implement lifecycle + eviction here first (fetching +
 SHA-256 addressing already exist), including the §2 fix, then carry the

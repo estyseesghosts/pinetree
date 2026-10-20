@@ -1,5 +1,10 @@
 # Phase 2 — exit criteria checklist
 
+> **Status at HEAD (2026-10-20 freshness pass)** — boxes left as recorded (2026-10-14); **no boxes changed**, the four-server interop was **not** re-run.
+> - `scripts/smoke-phase2.sh` exists and supports `KEEP=1` and `stop`; `misskey` and `sharkey` checkouts resolve (symlinks outside the repo). See `docs/phase-2-interop-howto.md` (status block).
+> - The header pins Sharkey `2025.4.4`; `docs/README.md` pins `2025.4.7`. Unreconciled — the Phase 2 record is the 2025.4.4 run.
+> - `smoke-all.sh` step 5 prints SKIP when Node 22 / docker / built checkouts are absent, and then still prints `SMOKE_ALL_OK` (`docs/testing.md` "Known gaps"). A green `SMOKE_ALL_OK` on a machine without the federation rig does **not** re-prove these boxes.
+
 Source: `sns-server-proposal.md` §7 and §9, Phase 2. Plan: `docs/phase-2-plan.md`
 (Frozen 2026-10-14; pinned against Misskey `2026.10.1-alpha.0` at `./misskey/`
 and Sharkey `2025.4.4` at `./sharkey/`).

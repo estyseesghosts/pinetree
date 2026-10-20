@@ -1,0 +1,7 @@
+# 2026-10-20 — TODOS from full docs sweep
+
+All 6 docs sweeps returned (API contracts, exit-criteria/plans, domain/federation, ops/media/decisions, handoffs/implementer-guide, audit/bench/wiki). Merged into `docs/TODOS.md`: source line now cites inventory + sweep; added "Docs sweep additions" sections — remote-media ordered build (§2 steps, budgets, reconciler, acceptance tests), communities/extension phases A–G + decisions (like/fav split, messages hiding, cat split, RFC 9421, events, imports, translate/rec open), quote/reply follow-ups (replies_count, pending-URI, repair path, manual-approval gate, fixtures), hide-followers fields, handoff N–Q verify-then-close vs still-open (webhooks, analytics/retention, rateLimitFactor), bench pinetree-owned subset (poll `type:Note`, EmojiReact decision, ap/show reply/media paths, stamp/quote debt), wiki roadmap/non-goals, manifest/profile stale lines.
+
+Notes: handoff N/O/P items are mostly landed per the code inventory — recorded as verify-then-close, not re-work. Bench forensics split pinetree-owned vs harness/birchtree/upstream (harness items stay in bench docs). User flagged remote-media-cache-plan + community-planning + pinetree-decisions as important upcoming work — all three are captured as the ordered build + extension phases in TODOS.
+
+Verification: `docs/TODOS.md` edited in place; `git status` clean except pre-existing `scripts/fediverse-bench/__pycache__/`. No code touched, no tests run (docs-only).

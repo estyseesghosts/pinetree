@@ -1,5 +1,10 @@
 # Federation bench 2026-10-18: postmortem
 
+> **Status (2026-10-20 freshness pass)** — the "Phase 7 deliverables were not produced" status below is **superseded**: Phase 7 reports exist (`docs/federation-bench-2026-10-19-phase7-run{3,4,5}.md`).
+> - **LANDED (pinetree):** `NOTES_BY_URI` uniqueness (`src/persistence/redb/mod.rs:1129-1139`); `notes/reactions` (`src/api/misskey/endpoints/mod.rs:6278`); poll `type: "Note"` (`src/activitypub/objects.rs:1070`); Delete tombstone (`src/federation/inbox.rs:1740-1748`).
+> - **OPEN:** quote/reply debt and outbound `EmojiReact` (`docs/TODOS.md` "Bench forensics").
+> - **HARNESS-ONLY:** birchtree defects and harness defects listed in the body.
+
 **Status:** The rebench in `/root/PLAN_LOCAL_FEDERATION_FIX_AND_REBENCH.md` is not complete. Phases 1–5 were
 worked, with several failures still open. Phase 6 produced partial results from a harness with known defects.
 Phase 7 deliverables were not produced. `/root/FEDERATION_BENCHMARK_REPORT.md` is still the first-run report

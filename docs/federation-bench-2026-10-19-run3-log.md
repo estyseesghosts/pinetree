@@ -1,5 +1,10 @@
 # Federation bench run3 log (2026-10-19): poll federation + full matrix
 
+> **Status (2026-10-20 freshness pass)** — historical log; not rewritten.
+> - **LANDED (pinetree):** poll `type: "Note"` options (`src/activitypub/objects.rs:1070`); inbound `EmojiReact` → Like handler (`src/federation/inbox.rs:346`); poll-vote drops labelled per reason (`src/application/commands/polls.rs:181-193`).
+> - **OPEN:** poll-vote drop counters/fixtures; outbound `EmojiReact` degrade (`docs/TODOS.md` "Bench forensics").
+> - **HARNESS-ONLY:** the two birchtree poll-federation bugs (fixed in birchtree). File paths cited here as `src/activitypub/{outgoing,wire,activities}.rs`, `src/federation/events.rs`, `src/application/federation_inbound.rs`, `src/persistence/redb/polls.rs` are **not** in pinetree at HEAD (checked 2026-10-20); they refer to birchtree-side code.
+
 **Status: all suites finished.** `follows` 0 (785 s); `features` 1 (3215 s,
 1069/101); `stress` 1 (3084 s); `concurrent` 0 (37 s); `crossfamily` 1
 (379 s; 162 checks, 18 FAIL); `interop` 1 (403 s; 22/23 PASS).

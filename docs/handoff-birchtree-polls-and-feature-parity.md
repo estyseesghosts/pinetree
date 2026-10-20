@@ -1,5 +1,10 @@
 # Handoff: make birchtree federate polls, then get the feature matrix to zero failures
 
+> **Status (2026-10-20 freshness pass)** — a birchtree (separate repo, `/root/birchtree`) workstream; pinetree-side items are classified below.
+> - **LANDED (pinetree):** poll `type: "Note"` options (`src/activitypub/objects.rs:1070`); `notes/reactions` (`src/api/misskey/endpoints/mod.rs:6278`); poll-vote per-reason drop labels (`src/application/commands/polls.rs:181-193`).
+> - **OPEN (pinetree):** poll-vote counters/fixtures; outbound `EmojiReact` degrade (`docs/TODOS.md` "Bench forensics").
+> - **HARNESS-ONLY:** birchtree poll federation, feature-matrix failures, and harness bugs (items 24–28). Paths `tests/phase6_federation.rs`, `docs/phase-6-exit-criteria.md`, `docs/compatibility-profile.md` cited here do **not** exist in pinetree (checked 2026-10-20).
+
 You are continuing the 2026-10-18 federation benchmark work. Read these first, in this order:
 
 1. `/root/pinetree/docs/federation-bench-2026-10-18-session2-problems.md`: every problem hit so far (38

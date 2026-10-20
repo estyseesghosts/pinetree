@@ -1,5 +1,9 @@
 # Handoff: Batch O — self-service, follower removal & lookup, drive extras, url-preview, user lists
 
+> **Status (2026-10-20 freshness pass)** — spot-checked (endpoint strings + dispatch arms present); behaviour not re-tested.
+> - **LANDED:** `following/invalidate` (`src/application/commands/follows.rs`, `endpoints/mod.rs`); `users/search-by-username-and-host` (`endpoints/mod.rs`); `drive/files/upload-from-url` (`endpoints/mod.rs:~8017`, `src/application/commands/media.rs`); `drive/files/find-by-hash` (`endpoints/mod.rs:~8064`); `url-preview` (`endpoints/mod.rs:~8371`); `i/revoke-token` (`endpoints/mod.rs:~6770`); user lists (`src/application/commands/user_lists.rs`).
+> - **OPEN:** `users/lists/create-from-public` (absent, 0 hits; TODOS "Manifest"); remote list members via system actor (owner decision pending); `drive/files/find|move-bulk|check-existence` (TODOS P1).
+
 ## Why
 
 The remaining client-visible gaps, in dependency order: self-service auth (WP9), follower removal + remote lookup (WP10), drive extras (WP13) + `url-preview` (WP12), and user lists (WP16 — the biggest item; it also unblocks antennas `src=list`, currently refused). Guide spec: `docs/implementer-guide-batch-m.md` §§5 (WP9–WP13, WP16), 8, 9. Upstream pins: Misskey `2026.10.1-alpha.0`, Sharkey `2025.4.7` (read-only).

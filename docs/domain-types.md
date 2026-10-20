@@ -156,3 +156,22 @@ New pure-domain type (`src/domain/pinning.rs`; no HTTP/DB imports):
 - `UserNotePining { id, user_id, note_id }`: unique pair `(user_id, note_id)` (Misskey `UserNotePining.ts` parity). Pin limit default `DEFAULT_PIN_LIMIT = 5` (upstream `RoleService.pinLimit`), instance-configurable through `Config.pin_limit`.
 
 `NotificationKind` gains `ScheduledNotePosted` / `ScheduledNotePostFailed` (wire `scheduledNotePosted` / `scheduledNotePostFailed`); `Notification` gains nullable `draft_id` (`#[serde(default)]`, legacy rows decode draft-less) carrying the failed draft for `ScheduledNotePostFailed`.
+
+## Addendum 2026-10-20 (freshness pass)
+
+The contract text above is unchanged. The Status line above stays `Frozen`. Verified by reading `src/domain/**` and `src/application/**` on 2026-10-20.
+
+### Status (2026-10-20 freshness pass)
+
+**LANDED (in code, beyond the §1–§7 tables):**
+- `Note` gains `updated_at_ms` (`src/domain/note.rs:98`, `notes/edit` §8) and `process_errors` (`src/domain/note.rs:105`). Both are `#[serde(default)]`. The §2 table does not list them.
+- `Note.quote: Option<QuoteReference>` (`note.rs:93`, serde default), `is_quote()` (`note.rs:112`), `reply_parent_uri` (`note.rs:87`, 2048-char cap at `note.rs:237`), `is_reply()` / `has_pending_reply_parent()` (`note.rs:124,130`). The superseding notes above already cover these.
+- `Account` gains `also_known_as` (`src/domain/account.rs:110`), `fields: Vec<ProfileField>` (`account.rs:132`, type at `:311`), `verified_links` (`:136`), `pinned_page_id` (`:179`), `moved_to_uri` (`:229`), and `followers_visibility` / `following_visibility` (`:142`, `:145`). The §1 "deferred" items (`alsoKnownAs` / `movedTo`, `fields[]`) and the §6 #3 note are superseded.
+- Domain modules present in `src/domain/`: `antenna`, `page`, `clip`, `poll`, `draft`, `pinning`, `favorite`, `user_list`, `emoji`, `moderation`, `instance`, `collection`, `notification`, `blocking`, `muting`, `reaction`, `quote`, `word_mute`. Antennas, pages, clips, and polls have landed. The TODOS "domain-types deferred list" item is superseded for these.
+- §6 #2 (custom-emoji model): `src/domain/emoji.rs` and the `EmojiStore` port exist (see the Batch N note in `application-ports.md`). The reaction `:name:` passthrough, with no registry or role check, is still the documented divergence (§4 of this file).
+
+**STILL OUT (verified absent in `src/domain`):**
+- Channels: no `channel` domain module.
+- Drive folders: no folder type and no `folder_id`.
+- Access keys: none. `src/application/commands/keys.rs:14` (`ensure_actor_keypair`) is the ActivityPub RSA signing keypair, not Misskey access keys. Do not conflate the two.
+- Request forensics (`request_ip`, `request_headers`): no fields.

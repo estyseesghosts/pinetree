@@ -1,5 +1,10 @@
 # Phase 1 — exit criteria checklist
 
+> **Status at HEAD (2026-10-20 freshness pass)** — boxes left as recorded (2026-10-14); **no boxes changed** and no tests re-run in this pass.
+> - Paths cited in the boxes exist at HEAD: `tests/conformance.rs`, `tests/crash_recovery.rs`, `tests/client_smoke.rs`, `scripts/smoke-phase1.sh`, and the `misskey` symlink used by the json-schema parity test.
+> - **Superseded counts:** the "78 lib + 26 redb conformance + 2 crash + 1 client = 107/107" figure is the 2026-10-14 run. `docs/README.md` now reports the conformance suite at **118/118** on redb. Do not quote 107 as current.
+> - The `src/persistence/foundationdb/` adapter (Phase 4) is still empty at HEAD (`docs/TODOS.md` P0); this is expected, not a Phase 1 regression.
+
 Source: `sns-server-proposal.md` §9, Phase 1. Plan: `docs/phase-1-plan.md`
 (Frozen 2026-10-14; pinned against Misskey `2026.10.1-alpha.0`).
 Target clients/versions: Misskey 2026.10 (`2026.10.1-alpha.0` checkout at

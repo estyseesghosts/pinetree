@@ -1,5 +1,9 @@
 # Implementation plan: federated clips + pages (pinetree↔pinetree, closed-by-default)
 
+> **Status (2026-10-20 freshness pass)** — built. Phase 1 landed in commit `5f5d416` (fetch gate, local parity, AP wire, remote pages); the phase-2 commit `7fa40e0` is the follow-up.
+> - **LANDED (file evidence):** fetch gate (`src/federation/fetch_gate.rs`); federated collections (`src/activitypub/federated_collections.rs`); clip sync (`src/application/commands/clips.rs:122,193,247`; inbound `handle_clip_sync_update/delete` at `src/federation/inbox.rs:521,573`); gated page reads (`src/application/commands/pages.rs:467,881`).
+> - **OPEN:** none recorded in TODOS for this plan; remote pages/clips remain pinetree↔pinetree only (closed by default, by design).
+
 ## Why
 
 Clips and pages are server-local in Misskey (no AP representation), so federating them is a pinetree-first DIVERGENCE — pinetree↔pinetree only for now, gracefully ignored by everyone else. This plan ships local parity first (Keystone's clip UI exists and gets 404s today; `i/export-clips` currently writes empty files), then federation. Channels are OUT (Lemmy communities cover that need later).

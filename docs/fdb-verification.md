@@ -1,5 +1,10 @@
 # FoundationDB client verification
 
+> **Status (2026-10-20 freshness pass)** — the 2026-10-14 executed evidence stands as recorded; the probe is not reproducible at HEAD.
+> - **LANDED (at HEAD):** the `fdb` cargo feature is declared (`Cargo.toml:11`, `dep:foundationdb`, `dep:foundationdb-sys`); the `foundationdb/` upstream checkout is present (read-only).
+> - **HARNESS-ONLY / not reproducible:** the throwaway probe `/tmp/opencode/fdb-probe/` cited in §§0, 6 **does not exist** at the 2026-10-20 check, so the §6 numbers cannot be re-run from this repo. The cited `state/logs/2026-10-14-fdb-verified.md` is the record.
+> - **OPEN:** the FDB adapter itself. `src/persistence/foundationdb/mod.rs` is **0 bytes**; no `foundationdb` import exists in `src/` outside `src/persistence/mod.rs`; the `cluster/*` stubs are empty (`docs/TODOS.md` P0, Phase 4).
+
 **Status:** Executed 2026-10-14 — all four questions answered (see §6); mid-run failure posture deferred to Phase 4 adapter tests
 **Sources:** `sns-server-proposal.md` §§2, 9; FDB checkout (`foundationdb/`, read-only); live cluster + throwaway probe (below).
 

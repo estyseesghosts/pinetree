@@ -1,28 +1,58 @@
 # Roadmap
 
-From `sns-server-proposal.md` §9 (the proposal wins on any disagreement).
+Status: living page, as of 2026-10-20. Source of the phase plan: the [product proposal](../../sns-server-proposal.md) §9. The proposal wins on any disagreement. Items here are summaries; the full list is in [TODOS](../TODOS.md).
 
-| Phase | Scope | Exit criterion | Status |
-|---|---|---|---|
-| 0 | Freeze contracts: endpoint/streaming manifest, domain types, identity rules, visibility policy, ports, persistence conformance tests; FDB client prototype | IDs/URI rules fixed; a note + durable job commit atomically through the storage interface | ✅ done |
-| 1 | Single-node server: redb adapter, accounts, tokens, notes, follows, reactions, local timelines, MiAuth, durable jobs, local media | Core flows survive restart/crash; real Misskey client can register, post, read timelines, follow, react | ✅ done |
-| 2 | Minimal federation: WebFinger, actors, signatures, inboxes, core activities, dedup, durable delivery | Local and remote follow/post/react work end-to-end with real Misskey and Sharkey; transient failures retry without duplicating state | ✅ done |
-| 2.5 | Cleanup: repo reproducibility, `commands` split, Reject atomicity, TLS/SSRF split, job quarantine, maintained RSA, AP/Misskey decoupling, visibility decision, docs + gate | One commit per slice with executed evidence; clean-clone suite and live interop green | ✅ done 2026-10-15 |
-| 3 | Client compatibility and streaming: streaming channels, note capture, notifications, attachments, richer note fields, endpoint coverage driven by real client tests | Every endpoint in the declared compatibility profile passes contract tests against the target client versions | ✅ done 2026-10-16 |
-| Quote posts | FEP-044f canonical outbound + legacy inbound compat + Misskey projection + request/accept/reject/revoke workflow | 4-server + elixir interop green, conformance Group Q | ✅ done 2026-10-16 |
-| Branched replies | Indexed direct-child lookup + migration, visibility-aware `notes/replies`, pending parents with fail-closed reads, durable resolver + opt-in repair | Full suite + reply-burst stress `STRESS_OK items=28` green | ✅ done 2026-10-16 |
-| — | Daily-use batch (Batch N): favorites + note state, custom emoji (+ remote opt-in), `followRequestAccepted`, antennas + `antenna` stream channel, abuse-report routes, admin remainder (`unset-user-avatar|banner`, `delete-all-files-of-a-user`, `admin/drive/files|show-file`), server-side word mutes, MiAuth hardening, Sharkey `notes/schedule/*` shim | ✅ done 2026-10-20 (manifest §§27–33; `SMOKE_ALL_OK`, keystone 41/0) |
-| 4 | FoundationDB multi-node: full FDB adapter, durable multi-worker jobs, global directory, owner routing, secure cross-node ops, shared media | `@a@xyz` on node `foo` and `@b@xyz` on `bar` keep canonical identities, interact locally and federate externally as one instance; restarts, duplicate jobs, routing, account moves tested | planned |
-| 5 | Scale and hardening: benchmark contention, timeline strategies, queue growth, big follower lists, federation backlogs, node failure; add caches/hybrid fan-out only when measured | Documented performance targets and budgets met for small redb and representative multi-node deployments | planned |
+## Where we are
 
-## Phase 3 in more detail (what "complete" means)
+| Phase or batch | What it was for | Status |
+|---|---|---|
+| 0 Contracts | Agree the rules: API, data shapes, identities, visibility | Done |
+| 1 Single-machine server | Sign up, post, timelines, follow, react, on one machine | Done |
+| 2 Talking to other servers | Follow and post across servers; retry failed deliveries | Done (tested with real Misskey and Sharkey) |
+| 2.5 and 2.6 Cleanup and hardening | Tidy the code; stronger checks on incoming messages | Done |
+| 3 App compatibility and live updates | Apps and live channels work for the agreed feature list | Done 2026-10-16 |
+| Quote posts | Quote another post, with approval | Done 2026-10-16 |
+| Reply threads | Correct replies, including replies whose parent is not known yet | Done 2026-10-16 |
+| Batch N | Favorites, custom emoji, antennas, abuse reports, more | Done 2026-10-20 |
+| Batches O and P | User lists, pull timelines, email identity, account move, and more | Shipped per the 2026-10-20 inventory; re-check pending |
+| Federated clips and pages | Share clips and pages with other servers | Phase 2 shipped; federation switches need a check |
+| **4 Many machines as one server** | Run one server across several machines, with the database on FoundationDB | **Planned. Not started in code** |
+| **5 Scale and hardening** | Measure, speed up, and make it survive machine failures | **Planned** |
 
-1. **Declare the compatibility profile** — name the target client versions (at minimum the Misskey web client of the pinned checkout, `misskey-js`, plus any mobile/third-party clients the owner chooses) and list every endpoint/channel/field in scope; extend `docs/endpoint-manifest.md` accordingly.
-2. **Streaming:** authenticated WebSocket `/streaming`, channel connect/disconnect, `main`, `homeTimeline`, `localTimeline`, `hybridTimeline`, `globalTimeline`, note capture (`subNote`/`unsubNote`, `noteUpdated`), notification events — fed from the existing `StreamingSink` jobs.
-3. **Common interactions:** replies/mentions, notifications, attachments (drive listing/folders as clients need), richer note fields, remaining client-visible profile fields.
-4. **Optional, only if in the profile:** quotes, polls, custom emoji, mute/block, lists, search.
-5. **Contract tests against the real clients** (not mocks) for every endpoint and channel in the profile.
+## What is missing, and when
 
-## Later / explicitly deferred
+"When" is the planned phase. No dates are set beyond the ones above.
 
-Newer HTTP message signatures (RFC 9421), OAuth, public-internet federation soak, Mastodon client API (non-goal), Reversi/chat and other legacy Misskey features (non-goals unless a target client requires them; local clips/pages already shipped, federation pinetree-first). Antennas, custom emoji, favorites, polls, user lists, url-preview, self-service auth, follower removal, and drive extras shipped (Batch N + Batch O); email identity, account move, registry, mentions, notification utilities, discovery, versions, and translate shipped (Batch P); word mutes are server-enforced by owner decision; federated clips + pages Phase 2 (gated pages, clip sync + follows, Article fidelity) shipped.
+| What | Plain meaning | When |
+|---|---|---|
+| Many machines as one server | Several machines share one online identity, so a person's account lives on one of them and the rest cope | Phase 4 |
+| FoundationDB database | A database built to run across many machines, instead of the single-file database used now | Phase 4 |
+| Moving data between the two databases | A safe way to move an existing server's data to the new database | Phase 4 |
+| Shared file storage | Pictures and files kept in shared storage, not only on one disk | Phase 4 |
+| Safe multi-machine job handling | Background jobs run by several machines without doing the same work twice | Phase 4 (designed, not tested) |
+| Cleanup of old remote pictures | Pictures and files from other servers are kept only as long as needed, with a size cap | Planned, not dated. The order is in the [remote media cache plan](../remote-media-cache-plan.md): first safe deletion, then size caps and removal, then fetch-on-demand, then streaming large files to disk, then optional pre-loading |
+| Backups | Copy the data safely and restore it | Not dated |
+| Health and metrics | A real health check, and counters that show how the server is doing | Not dated |
+| Live channels for hashtags, drive, clips, admin | Live updates for these areas | Not dated; see [Feature matrix](Feature-Matrix.md) |
+| Folders, per-follow settings, bulk file tools | Features apps expect that are not built yet | Not dated |
+| Federation follow-ups | Apply edits that arrive in a short form, read unusual poll shapes, outgoing emoji reactions | Ongoing; listed in TODOS |
+| Performance targets | Measured speed limits for one machine and for many machines | Phase 5 |
+
+## Won't do for now
+
+These are left out on purpose. Each could change only by a deliberate decision. See [Intentional differences](Intentional-Differences.md) for the reasons.
+
+- **Chat** (direct messages between people in groups).
+- **Channels** (community spaces with their own timelines).
+- **Drive folders.**
+- **Hashtag trends** (lists of what is trending).
+- **Announcements** (server-wide notices). Note that the unread-badge problem they cause is still open in TODOS.
+- **Games** (for example, Reversi).
+- **Mastodon's own app interface.**
+- **Relays** (shared forwarding servers).
+
+## Read more
+
+- [Full TODO list](../TODOS.md): every open item, with evidence.
+- [Current state](Current-State.md) and [Feature matrix](Feature-Matrix.md).
+- [Phase 3 exit criteria](../phase-3-exit-criteria.md) and [phase 2 exit criteria](../phase-2-exit-criteria.md): the checklists that closed those phases.

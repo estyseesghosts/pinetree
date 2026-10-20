@@ -1,5 +1,39 @@
 # Pinetree forward plan — use Catodon as reference, not as template
 
+**Status (2026-10-20 freshness pass):** plan text below is unchanged. Each numbered item is marked against pinetree code. `file:line` is cited for every LANDED or OPEN claim. `n/v` = not re-verified this pass.
+
+| # | Item | Status | Evidence |
+|---|---|---|---|
+| A1 | SSRF re-validated per hop | **LANDED** | `src/federation/delivery.rs:527` (`resolve_and_validate_url` runs every loop iteration) |
+| A1 | DNS pinned via `--resolve` | **LANDED** | `delivery.rs:446-471` |
+| A1 | `https→http` redirect refused; ≤3 hops | **LANDED** | `delivery.rs:48`, `:541-549`, `:560-567` |
+| A1 | Re-sign GET per hop with system key | n/v | — |
+| A1 | Re-run federation-allowed + blocked-host check after each `Location` | **OPEN** | instance-block check is inbound + `deliver_single` only (manifest §25); not per hop |
+| A1 | `Link: rel=alternate` before HTML fallback | **OPEN** | no `rel="alternate"` handling in `src/` (grep) |
+| A1 | PSL registrable-domain host compare; `sanitizeInlineObject` | **OPEN** | no `haveSameAuthority`/registrable/inline-sanitize in `src/` (grep) |
+| A2 | Atomic `FederateDeliver`, transient/permanent split | **LANDED** | `delivery.rs:51-82` (`SendErrorKind::is_transient`); `retry.rs:58` (`300..=499` → permanent) |
+| A2 | Planner: direct `to/cc` first, followers coalesced by `sharedInbox` | **partial** | preferred-inbox fan-out, followers paged 1000 (inventory §1.9, `src/federation/outbox.rs:307-1929`) |
+| A2 | `410 + shared → goneSuspended`; `not-responding 7d → autoSuspended` | **OPEN** | no `suspension_state`/`auto_suspend`/`not_responding` in `src/` (grep) |
+| A2 | Dead-host 1 h cache | **OPEN** | not found |
+| A3 | Instance blocks (blockedHosts), subdomain match, inbound + outbound | **LANDED** | manifest §25; `queries.rs` `suspended_or_host_blocked`; `deliver_single` |
+| A3 | `federation: all\|specified\|none` mode switch; `silencedHosts`/`mediaSilencedHosts`; per-user domain blocks | **OPEN** | no hits in `src/` (grep) |
+| B4 | Authorized fetch (signed GET verify) | **partial** | `src/federation/fetch_gate.rs` `authenticate_fetch_viewer` covers collections/pages only (manifest §36) |
+| B4 | `allowUnsignedFetch` per user | **OPEN** | no hits in `src/` (grep) |
+| B5 | `actor == signer` | **LANDED** | inventory §1.9 (`inbox.rs:183-355`) |
+| B5 | Replay gate before fetch; atomic dedup | **LANDED** | `src/federation/inbox.rs:1592` (replay gate before store lookups); inventory §1.9 |
+| B5 | `signerHost == activity.id` host; LD `RsaSignature2017` | n/v / **OPEN** | not found by grep |
+| B6 | Quote abuse guard (`QuoteRequest` 30/actor, 5/pair per 300 s) | **OPEN** | no per-actor/pair limiter found in `src/federation/` or quote command paths (grep) |
+| C7 | `Like` VS16 strip | **LANDED** | `src/domain/reaction.rs:52`, `:77`, `:157`, `:193` (normalized at write, so outbound `_misskey_reaction` is bare) |
+| C7 | Suppress `_misskey_reaction` for mastodon/akkoma/pleroma/iceshrimp | **LANDED** (for plain-`Like` hosts) | `src/federation/host_caps.rs:44-54`; `src/activitypub/objects.rs:991-1003` (plain `Like` carries neither field) |
+| C7 | `Flag.object` must be array | n/v | — |
+| C7 | `Group Announce` ignore; `quote`/`_misskey_quote` + `RE:` fallback kept | Group: **n/a** (no groups); quote carriers **LANDED** | inventory §1.9 (`quotes.rs:123-486`) |
+| C8 | Outbox page size 20 | **divergent (kept at 40)** | inventory §1.9 (`actor.rs:719-1048`, 40/page) |
+| C8 | `null` for removed/hidden/orphan outbox items | n/v | — |
+| C8 | WebFinger `422/404/max-age=180`; NodeInfo `10m cache` | n/v | inventory §1.9 (JRD+XRD, NodeInfo 2.0/2.1 present) |
+| C8 | `ApLogService` inbox/fetch logs with expiry | **OPEN** | `src/observability.rs:21` no-op init (inventory §3.3) |
+
+Summary: the resolver/delivery hardening core (A1 SSRF-per-hop, pinning, downgrade refusal, hop cap; A2 transient/permanent classes) and most of A3's block list are in. Open: per-hop block re-check, `rel=alternate`, PSL host compare, `allowUnsignedFetch`, the `federation` mode switch and silenced hosts, the dead-host suspension state machine, the quote-abuse guard, and the AP log table. The "Where you are" bullets below were spot-checked through the items in this table. Anything not in the table was not re-verified.
+
 Catodon is the right reference because it already survived what Pinetree is about to hit: `Misskey + Sharkey + Mastodon + Lemmy/Pleroma` simultaneously. Don't port it. Steal its federation rules, keep your architecture.
 
 Your constraints stay: `domain <- application <- adapters`, state+job atomically, FDB `5s / 10MB`, no blobs in tx, verify by execution (`cargo test`, `smoke-all.sh`, `smoke-phase2.sh` 4-server, elixir triangle).

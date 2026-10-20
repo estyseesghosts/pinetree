@@ -1,5 +1,9 @@
 # Federated clips + pages, phase 2: sync, follow-push, gated pages, Article fidelity
 
+> **Status (2026-10-20 freshness pass)** — the header line "plan (build after Batch Q lands)" is **superseded**: commit `7fa40e0` ("Federated clips + pages phase 2: sync, follow-push, gated pages, Article fidelity") built it.
+> - **LANDED (file evidence):** clip sync + follow-push (`src/application/commands/clips.rs:122,193,247,591`; `src/federation/inbox.rs:521,573`); gated pages (`src/application/commands/pages.rs:467,881`); Article ingest/render (`src/activitypub/objects.rs`, `src/federation/inbox.rs`).
+> - **OPEN:** nothing new recorded; see `docs/federated-collections.md` for the frozen wire contract.
+
 Status: plan (build after Batch Q lands).
 
 ## Why

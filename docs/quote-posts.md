@@ -4,6 +4,28 @@
 **Status:** implementation guide; update the relevant contracts and work log as changes are made  
 **Reviewed:** 16 October 2026
 
+## Status (2026-10-20 freshness pass)
+
+Verified against `src/domain/{quote,note}.rs`, `src/activitypub/{quotes,objects}.rs`, `src/federation/inbox.rs`, `src/application/commands/{notes,inbound/quotes}.rs`, `src/persistence/redb/mod.rs`, `src/api/misskey/packers.rs`, and `tests/quote_fixtures.rs`.
+
+**LANDED**
+- Domain record: `QuoteReference` (`src/domain/quote.rs:107-111`) and `QuoteAuthorizationState` (`quote.rs:27-45`), with the transition table (`allows_transition`) and the API projection `approvedByException → approved` (`quote.rs:228`). The note field is `Note.quote` (`src/domain/note.rs:93`).
+- Migration default: `#[serde(default)]` on `Note.quote` (`note.rs:92`), so legacy rows decode as non-quotes. Pure renotes stay `quote: None`. `is_quote()` is at `note.rs:112`. No backfill marker is needed. CLOSED.
+- Inbound normalization of all five carriers: `src/activitypub/quotes.rs:10-16` (list) and constants at `:40-50` (both the no-slash and slash `_misskey_quote` IRIs). Unresolved targets keep their URI as unapproved (`src/federation/inbox.rs:2204-2208`).
+- Outbound wire: `quote`, `_misskey_quote`, `quoteUrl`, `quoteUri` (`quotes.rs:281-298`; JSON-LD context at `objects.rs:81`). `interactionPolicy.canQuote.automaticApproval` only, under the GoToSocial namespace (`quotes.rs:285-289,318-334`).
+- Local quote creation: `Pending` plus a `QuoteRequest` delivery job in one transaction (`src/application/commands/notes.rs:194-245`). Self-quote and mention exceptions yield `ApprovedByException` (`notes.rs:194,218`).
+- Inbound `Accept` / `Reject` / stamp `Delete` for quotes we authored: `src/federation/inbox.rs:1029-1110`. Stamp re-verification is a `QuoteStampReverify` job (`src/jobs/worker.rs:164,584-600`). State changes are atomic through the `record_quote_*` methods (`src/persistence/redb/mod.rs:8690-8790`).
+- Inbound `QuoteRequest` for a local post: `src/federation/inbox.rs:955-1020`. Policy at `src/application/commands/inbound/quotes.rs:111-126`: self, mention, or Public/Home auto-approve; tighter targets get `Reject` only when the requester is entitled, and a silent `Ignore` otherwise.
+- API projection: `quoteAuthorizationStatus`, `quoteTargetUri`, `quoteTargetUnavailable` (`src/api/misskey/packers.rs:1667-1700`; tests `:4238-4298`).
+- Hermetic normalization tests in `tests/quote_fixtures.rs` (Misskey, Fedibird, Mastodon FEP-044f, FEP-e232, Pleroma/Akkoma legacy). Conformance Group Q at `tests/conformance.rs:2744`.
+
+**OPEN / CORRECTED**
+- Manual approval: NOT advertised. That is correct (`src/activitypub/quotes.rs:323`, test `:750-758`; `objects.rs:652,2216-2222`). There is no review queue for inbound requests; decisions are automatic (`src/application/commands/inbound/quotes.rs:109-115`). The "do not advertise" item is satisfied. The durable review workflow stays OPEN and should not be built without product input.
+- Auto-approve scope: the guide recommends automatic approval for `Public`. Code approves `Public` **and** `Home`, and also requires `!local_only` (`inbound/quotes.rs:113-114`). Record this as a deliberate choice, or change it, per the product owner.
+- Fixtures from actual target revisions: PARTIAL. `tests/quote_fixtures.rs:3-16` cites Pleroma/Akkoma fixture files. The real-file pin (`:214-260`) runs only when the external checkout `/root/fedifedifedi` exists and skips otherwise. The Mastodon shape is hand-built (`:98-110`). No Mastodon or Glitch-Soc revision is pinned. OPEN.
+- Live Misskey/Sharkey quote interop: NOT re-verified in this pass.
+- FDB: the quote transitions exist only on redb. The `NoteStore` and `ActivityDedup` quote methods have defaults that either return `StorageUnavailable` or call `unimplemented!()` (see the `application-ports.md` addendum).
+
 ## Goal
 
 Implement quote posts as a first-class relationship across ActivityPub federation and Pinetree's Misskey-compatible API. Use **FEP-044f as Pinetree's canonical outbound federation format**, accept legacy quote formats, and project every recognized structured quote through one internal representation and the existing Misskey-style `renote` / `renoteId` API shape so Keystone can display it consistently. FEP-044f authorization is an optional interoperability layer: its absence must never prevent quote detection, storage, or API projection.

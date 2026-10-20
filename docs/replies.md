@@ -1,8 +1,37 @@
 # Implementation Plan: Branched Replies in Pinetree
 
-**Status:** Draft implementation plan  
+**Status:** Draft implementation plan (Slices A+B landed on redb 2026-10-20; C partial; FDB open — see status block)  
 **Codebase basis:** Pinetree `master`, reviewed 2026-10-16  
 **Scope:** Domain, persistence, Misskey-compatible API, ActivityPub ingestion, tests, and contracts
+
+## Status (2026-10-20 freshness pass)
+
+Verified against `src/persistence/redb/mod.rs`, `src/application/{ports,queries}.rs`, `src/application/commands/inbound/{notes,replies}.rs`, `src/federation/inbox.rs`, `src/domain/{note,visibility}.rs`, `src/activitypub/objects.rs`, `src/jobs/worker.rs`, `src/main.rs`, and `tests/conformance.rs` (Group R). Slices A and B are landed on redb. Slice C is partial. FDB is open.
+
+**Slice A (storage index and query): LANDED on redb**
+- Index `NOTES_BY_REPLY` (`src/persistence/redb/mod.rs:211-212`), opened at `:448`. The `(parent, child)` row is removed on delete (`:1856-1858`).
+- Backfill: done marker `REPLY_INDEX_DONE_KEY` (`:265`), resume cursor `REPLY_INDEX_PROGRESS_KEY` (`:268`), bounded batches in `run_reply_index_backfill` (`:500-560`). Test R7 at `tests/conformance.rs:3874`.
+- Query: `NoteStore::notes_by_reply` (`ports.rs:458`; redb read at `redb/mod.rs:4334-4370`). `AppServices::note_replies` is a visibility-aware bounded scan (`queries.rs:1216-1270`; batch `REPLY_SCAN_BATCH` at `:15`). Tests R2 and R4 (`conformance.rs:3381,3505`).
+- Create: the parent's `replies_count` increments with `saturating_add` (`redb/mod.rs:1216-1227`). Test R1 (`conformance.rs:3294`).
+- Delete counter (TODOS "replies_count never decremented"): LANDED on redb. `delete_note_in_txn` (`redb/mod.rs:1775-1876`) decrements the parent with `saturating_sub` (`:1865`) under the already-deleted guard (`:1797-1801`). It is the single implementation for every delete path (`:4212-4217`; callers `:8420`, `:8457`; inbound Delete at `src/application/commands/inbound/notes.rs:121-143`). Test R3 (`conformance.rs:3494`).
+
+**Slice B (unresolved parent preservation): LANDED on redb**
+- Inbound: a present but unresolved `inReplyTo` is stored as `reply_parent_uri`, never as a root (`src/federation/inbox.rs:2113-2126`). The `ReplyParentResolve` job commits in the same transaction as the note (`inbox.rs:2170-2177`). A parent's arrival enqueues a resolver for its waiting children (`inbox.rs:2184-2197`). TODOS "inbound drops unresolved inReplyTo": LANDED.
+- Fail-closed: `src/domain/visibility.rs:71-73`. `notes/show` pending withhold at `queries.rs:456-460`. Tests R8 (`conformance.rs:3998`) and `src/domain/policy.rs:272`.
+- Atomic link: `link_pending_reply` (`redb/mod.rs:4415-4560`) clears the pending URI, increments the parent counter (`:4551`), and swaps the index row. Replays return `Ok(None)`. Test R6 (`conformance.rs:3863`).
+- Resolver: the `ReplyParentResolve` worker arm (`src/jobs/worker.rs:178-192`) and a bounded resolve with continuation (`src/application/commands/inbound/replies.rs:57-185`). Test R10 (`conformance.rs:4243`).
+- Outbound: `inReplyTo` is the resolved parent's canonical URI. Pending parents are withheld (`src/activitypub/objects.rs:569-581`).
+- Repair: `repair_unresolved_reply_parents` (`replies.rs:211-256`) re-fetches the origin document and marks only a declared `inReplyTo`. Test R9 (`conformance.rs:4123`). **The opt-in gate is env-only**: `PINETREE_REPLY_REPAIR_LIMIT` at `src/main.rs:307-322`. There is no JSON key (`src/config.rs`). This breaks the AGENTS.md configuration rule. OPEN.
+
+**Slice C (federation and regression hardening): PARTIAL**
+- LANDED: R11 (`notes/children` semantics, `conformance.rs:4366`), R12 (`notes/conversation` oldest-first, `:4401`), and outbound direct-parent `inReplyTo` (`objects.rs:569-581`).
+- NOT VERIFIED in this pass: the Keystone sweep, live Misskey/Sharkey reply interop, and the Slice C federation tests for private or deleted parents (only the domain test `policy.rs:272` was located).
+- OPEN: the §5 counter edge cases (deleting a child whose parent is deleted; a reply that is also a quote or renote). No test was located for them.
+
+**Open items**
+1. FDB parity for `notes_by_reply`, the pending link, and the index. `src/persistence/foundationdb/mod.rs` is empty.
+2. The repair gate is env-only and startup-only (`main.rs:307`). Move it to `--config`, or record the exception.
+3. Index removal on delete (§3.2): redb removes the row. FDB must use the same policy.
 
 ## 1. Goal and invariants
 

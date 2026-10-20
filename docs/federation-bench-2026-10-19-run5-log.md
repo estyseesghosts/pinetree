@@ -1,5 +1,10 @@
 # Federation bench run5 log (2026-10-19): item-52 fix verification
 
+> **Status (2026-10-20 freshness pass)** — historical log; not rewritten.
+> - **LANDED (pinetree):** S6 Delete-beats-Create tombstone (`src/federation/inbox.rs:1740-1748`); `NOTES_BY_URI` uniqueness (`src/persistence/redb/mod.rs:1129-1139`); poll `type: "Note"` (`src/activitypub/objects.rs:1070`).
+> - **OPEN:** outbound `EmojiReact` degrade; poll-vote drop counters.
+> - **HARNESS-ONLY:** item-52 reblog-delete Undo (birchtree commit); the `src/persistence/redb/statuses.rs` path cited in this log is not a pinetree file (checked 2026-10-20).
+
 **Status: all suites finished.** `follows` 1 (1335 s, 3 missing);
 `features` 1 (3510 s, 1108/62); `stress` 1 (3152 s); `concurrent` 0
 (37 s); `crossfamily` 0 (50 s, 162/162); `interop` 1 (398 s, 22/23).

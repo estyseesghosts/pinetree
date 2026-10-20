@@ -1,5 +1,7 @@
 # Sharkey vs. Misskey: A Feature and Compatibility Comparison
 
+**Status (2026-10-20 freshness pass):** this is a descriptive comparison of Sharkey and Misskey, not a pinetree contract. Its claims about Sharkey and Misskey were **not** re-verified against the `./sharkey` and `./misskey` checkouts in this pass. The pinetree cross-reference table at the end was verified against `src/` (`file:line` cited). Items the table marks as "not verified" are not checked.
+
 Sharkey is more than a themed version of Misskey. It is a fork that follows upstream changes where possible while adding its own features, user-interface improvements, federation fixes, and administrative controls.
 
 The differences span several areas: ActivityPub interoperability, third-party client support, post management, timelines, accessibility, moderation, and deployment. Some are significant architectural or interoperability improvements; others are relatively small quality-of-life changes.
@@ -135,3 +137,32 @@ The Mastodon API enables additional clients to connect. Separately, correct Acti
 The comparison changes as both projects evolve. Sharkey's upstream-tracking approach does not guarantee that it contains every feature or fix from the newest Misskey release. The official comparison maintained in a separate maintainer repository explicitly describes itself as “probably comprehensive,” not guaranteed current.
 
 For a decision-critical feature, verify the implementation in the exact Sharkey and Misskey versions being evaluated, including whether the feature is enabled by default and whether it interoperates with the remote software you care about.
+
+## 6. Pinetree cross-reference (2026-10-20, code-verified)
+
+Where pinetree stands on the Sharkey-listed items. `✓` = shipped, `partial` = a subset, `✗` = absent, `n/v` = not re-verified this pass. Evidence cites `src/api/misskey/endpoints/mod.rs` unless noted.
+
+| Item (section above) | Pinetree | Evidence |
+|---|---|---|
+| Federated post editing + history (§1) | ✓ `notes/edit`, `notes/versions`, inbound `Update(Note)` | `mod.rs:4302`, `:7920`; `src/federation/inbox.rs:1796-1797`, `:1953` |
+| Mastodon API + OAuth2 (§1) | ✗ non-goal | `docs/phase-3-profile.md` §5; no Mastodon arm |
+| Post import from other platforms (§1) | partial: Misskey-shaped CSV/JSON only | `i/import-following`, `i/import-blocking`, `i/import-muting`, `i/import-user-lists`, `i/import-antennas` at `mod.rs:5825-5919`; `i/import-clips` `:5903` |
+| Scheduled posts (§1) | ✓ drafts + `notes/schedule/*` shim | `mod.rs:8645-8939` |
+| Following feed (§1) | ✗ no arm | — |
+| Bubble timeline (§1) | ✗ no arm | — |
+| Independent boost visibility (§2) | n/v | — |
+| Quote posts / FEP-044f (§1) | ✓ | `src/activitypub/quotes.rs`; `src/federation/inbox.rs:359` (`QuoteRequest`) |
+| Reaction interop: plain `Like` vs emoji reaction (§1) | partial: per-host split; inbound `EmojiReact` lands; outbound Akkoma favourite-only | `src/federation/host_caps.rs:44-54`; `src/federation/inbox.rs:346` (dispatch), `:1207` (Undo arm) |
+| Data export (§1) | ✓ `i/export-*` (8) | `mod.rs:5722-5919` |
+| Antennas (§3) | ✓ `src` `home\|all\|users\|list\|users_blacklist`; no instance-targeted `src` | `mod.rs:5268-5446`; manifest §29 |
+| Drive folders + folder search (§2) | ✗ `folderId` non-null → 400 | `mod.rs:7109-7113`, `:8028-8032` |
+| Follow-request accept/reject (§2) | ✓ `following/requests/list|accept|reject|cancel` | `mod.rs:6074-6112` |
+| Outgoing follow-request list (§2) | ✗ `following/requests/sent` no arm | — |
+| Signup approval with reasons (§4) | ✗ registration policy + invite codes only | manifest §22 |
+| Delete a user's files (§4) | ✓ `admin/delete-all-files-of-a-user` | `mod.rs:4728` |
+| Remote custom emoji (§4) | ✓ opt-in cache | manifest §28 |
+| Server-side URL preview cache (§4) | ✓ `url-preview` (in-process, ~1 h) | `mod.rs:8371`; manifest §34 |
+| Argon2 hashing (§4) | ✓ (Argon2id) | inventory `docs/inventory-pinetree-vs-misskey-2026-10-20.md` §1.2 (`src/api/misskey/auth.rs:60-118`) |
+| Password-check rate limiting (§4) | ✓ auth-failure throttle | manifest §34 (WP9) |
+| Translation backends (§4) | dormant (`UNAVAILABLE` until configured) | manifest §35 |
+| Federated profile backgrounds / ListenBrainz (§1) | n/v (no arm for music status) | — |

@@ -77,3 +77,21 @@ Fail-closed pending rule: while a note's `reply_parent_uri` is set, `is_visible(
 ## Superseding note — §0A blocking / muting (2026-10-16, `docs/misskey-parity-plan.md`)
 
 Read-time feed filter (`AppServices::feed_filter` / `feed_filter_hides` in `src/application/queries.rs`; Misskey `QueryService generate*FilteringQuery` parity, in-memory form) applies on every timeline and note read (`notes/show`, `users/notes`, `notes/replies|renotes|children|conversation|search|search-by-tag`, home/local/hybrid/global timelines). A note is hidden when the viewer muted, blocks, or is blocked by its author, reply author, or renote author (unresolvable renote target hides nothing); pure renotes (`renoteId` set, `text` null) by renote-muted authors are hidden while their quotes stay visible; notes by suspended or host-blocked authors are hidden even anonymously. `blocked_hosts()` is the single extension point and is empty until an instance block list lands (muted instances arrive with §0B). Creation-time enforcement is unchanged except that `renote_target_blocks_author` is now a real store lookup (pure renotes rejected with `YOU_HAVE_BEEN_BLOCKED`) and replies to blockers are rejected the same way.
+
+## Addendum 2026-10-20 (freshness pass)
+
+The contract text above is unchanged. The Status line above stays `Frozen`. Verified against `src/domain/{visibility,instance}.rs`, `src/application/queries.rs`, and `src/federation/outbox.rs`.
+
+### Status (2026-10-20 freshness pass)
+
+**Superseded / closed:**
+- Instance blocklist: LANDED. The §0A paragraph that says `blocked_hosts()` "is empty until an instance block list lands" is stale. `AppServices::blocked_hosts()` reads the `InstanceSettings` store (`src/application/queries.rs:135-137`). The domain rule `host_is_blocked` is a suffix match (`src/domain/instance.rs:195`, tests `:332-337`). It is enforced on the inbound path (`queries.rs:142-152`), in the feed-filter builder (`queries.rs:347-364`), and on outbound delivery (`src/federation/outbox.rs:1844`).
+- application-ports open decision #3 (this file's "should drop that row at freeze"): resolved. The row is already struck through in `application-ports.md` §11 (line 109).
+- Fail-closed pending rule: LANDED. `src/domain/visibility.rs:71-73` withholds any note with `reply_parent_uri` set, before the `local_only` and visibility arms. Storage reads are unaffected. `notes/show` also has an explicit pending check (`queries.rs:456-460`).
+
+**Verified call sites (not every listed surface re-read):**
+- `apply_feed_filter` callers: `queries.rs:714,759,801,1056,1422,1489,1615`. Direct `feed_filter` callers: `queries.rs:516,902,1027,1228,1339,1870`.
+
+**OPEN:**
+- Instance mute (§0B, "muted instances arrive with §0B"): not located in this pass. Treat as OPEN until found.
+- FDB parity: visibility runs in application code, so FDB will inherit it once it exists. `src/persistence/foundationdb/mod.rs` is empty.

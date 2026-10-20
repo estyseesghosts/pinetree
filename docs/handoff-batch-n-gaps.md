@@ -1,5 +1,9 @@
 # Handoff: Batch N — emoji, favorites, notifications, antennas, abuse reports, admin remainder, MiAuth, server-side word mutes
 
+> **Status (2026-10-20 freshness pass)** — spot-checked (endpoint strings + dispatch arms present); behaviour not re-tested.
+> - **LANDED:** `notes/favorites/create` + `notes/state` (`src/api/misskey/endpoints/mod.rs`, `src/application/commands/favorites.rs`); `antennas/create` (`endpoints/mod.rs:~5293`); `admin/emoji/add` (`endpoints/mod.rs:~5109`); `followRequestAccepted` notification (`src/application/commands/follows.rs:117`); server-side word mute domain (`src/domain/word_mute.rs`); abuse/Flag (`src/application/commands/abuse_reports.rs`); MiAuth hardening (manifest §23).
+> - **OPEN:** emoji bulk/remote/copy/import-zip admin families (TODOS "Admin families"); `notes/thread-muting/*` is declared-out (manifest §11).
+
 ## Context (read first)
 
 - Product/architecture source of truth: `sns-server-proposal.md` (§§1, 6–7, 9).

@@ -1,5 +1,10 @@
 # Federation bench, session 2 (2026-10-18): every problem hit
 
+> **Status (2026-10-20 freshness pass)** — problem log, not rewritten. Items below are classified against HEAD.
+> - **LANDED (pinetree):** `notes/reactions` list (item on "missing reactions list"; `src/api/misskey/endpoints/mod.rs:6278`); poll `type: "Note"` (`src/activitypub/objects.rs:1070`); `NOTES_BY_URI` uniqueness (`src/persistence/redb/mod.rs:1129-1139`); Delete tombstone (`src/federation/inbox.rs:1740-1748`); inbound `EmojiReact` (`src/federation/inbox.rs:346`).
+> - **OPEN:** quote/reply debt; outbound `EmojiReact` degrade; poll-vote drop counters (`docs/TODOS.md` "Bench forensics").
+> - **HARNESS-ONLY:** birchtree product bugs and harness bugs (items 24–28 are harness bugs; items 31–37 were open in birchtree). `src/persistence/redb/statuses.rs` and `tests/phase6_*.rs` cited here are not pinetree paths; `docs/compatibility-profile.md` and `docs/phase-6-exit-criteria.md` cited here do not exist in `docs/`.
+
 This is the log of what went wrong while building a clean, fresh Phase 6 run from
 `/root/handoff-federation-bench-fresh-run.md`. It records problems, not results. No number in
 this file is a benchmark result. Run directory: `/root/bench/run1` (suites aborted before

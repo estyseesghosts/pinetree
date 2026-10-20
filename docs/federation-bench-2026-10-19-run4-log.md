@@ -1,5 +1,10 @@
 # Federation bench run4 log (2026-10-19): S7 + media harness tweaks, configurable status limit
 
+> **Status (2026-10-20 freshness pass)** — historical log; not rewritten.
+> - **LANDED (pinetree):** `ap/show` media + reply ingest through the shared pipeline (`src/api/misskey/endpoints/mod.rs:8213`, `src/federation/inbox.rs:2081-2170`); `notes/reactions` list present (`endpoints/mod.rs:6278`).
+> - **OPEN:** quote-path media fetch (bounded, `docs/TODOS.md` "Bench forensics"); reply debt.
+> - **HARNESS-ONLY:** S7 500-char cap and exemption; media settle-until-deadline; birchtree configurable status limit. The cited `src/api/mastodon/mod.rs`, `src/application/statuses.rs`, `src/application/scheduled_statuses.rs`, and `tests/phase3_status_limit.rs` are **not** pinetree paths (no `src/api/mastodon` at HEAD); they are birchtree code.
+
 **Status: all suites finished.** `follows` 0 (797 s); `features` 1 (3709 s,
 1101/69); `stress` 1 (3045 s); `concurrent` 0 (37 s); `crossfamily` 1 (211 s,
 162 checks, 9 FAIL fresh); `interop` 1 (399 s, 22/23).

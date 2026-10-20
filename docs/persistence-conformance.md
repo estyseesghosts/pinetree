@@ -1,3 +1,6 @@
+> **Status (2026-10-20 freshness pass):** Redb suite count checks out: `tests/conformance.rs` has 118 `#[test]` fns by grep (not run in this pass). FDB backend is NOT implemented: `src/persistence/foundationdb/mod.rs` is 0 lines and no `use foundationdb` exists in `src/`. Every group below is `[LANDED — redb]` and `[OPEN — FDB]`. The inventory's '119 tests' figure is not reproduced by grep.
+> Tags: `[LANDED — evidence]` verified in code at HEAD; `[OPEN]` not in code; `[SUPERSEDED by …]`; `[DECISION — still binding]`; `[PLAN HISTORY]`. Original text is unchanged; tag blocks are additions. Short paths are under `src/`; `mod.rs` = `src/api/misskey/endpoints/mod.rs`.
+
 # Persistence conformance tests
 
 **Status:** Frozen (Phase 0 freeze review 2026-10-14; harness green, see §9)
@@ -7,12 +10,18 @@ Both storage backends (redb Phase 1, FoundationDB Phase 4) must pass this exact 
 
 ## 1. Harness requirements
 
+> **[DECISION — still binding]**
+
+
 - Each case runs against a fresh, isolated store instance.
 - Time is injected (`Clock`); IDs generated inside the store under test.
 - Crash cases kill/restart the backend process (or drop the handle) mid-operation, then assert post-recovery state. Fault-injection hooks, if any, live in the harness, not the ports.
 - Concurrency cases run N parallel clients; assertions allow any linearizable outcome but forbid lost updates and duplicates.
 
 ## 2. Group A — atomic state + job commit (exit box 2 core)
+
+> **[DECISION — still binding]** Per-case redb mapping not re-verified in this pass. FDB `[OPEN]`.
+
 
 - **A1 create-then-crash**: `create_note` with one `StreamingPublish` job; crash immediately after commit returns. After recovery: note readable AND job claimable. Neither may exist without the other.
 - **A2 crash-before-commit**: crash injected before commit (harness-driven). After recovery: no note, no job. Partial state is failure.
@@ -21,6 +30,9 @@ Both storage backends (redb Phase 1, FoundationDB Phase 4) must pass this exact 
 - **A5 follow atomicity**: `follow` + `FederateDeliver` job appear together.
 
 ## 3. Group B — job queue semantics
+
+> **[DECISION — still binding]** FDB `[OPEN]`.
+
 
 - **B1 lease redelivery**: claim with short lease, never complete, advance clock past expiry → job claimable again with same idempotency key.
 - **B2 no double-claim**: job claimed under valid lease is invisible to concurrent `claim_next`.
@@ -31,6 +43,9 @@ Both storage backends (redb Phase 1, FoundationDB Phase 4) must pass this exact 
 
 ## 4. Group C — accounts and handles
 
+> **[DECISION — still binding]** FDB `[OPEN]`.
+
+
 - **C1 uniqueness race**: N concurrent `create_account` with same handle (mixed case) → exactly one succeeds, rest `Conflict`.
 - **C2 case-insensitivity**: `find_by_handle` resolves any case; `create_account` with differing case collides.
 - **C3 rename tombstone**: rename A→B; new account cannot take A (`Conflict`); actor URL unchanged; old handle unresolvable.
@@ -38,11 +53,17 @@ Both storage backends (redb Phase 1, FoundationDB Phase 4) must pass this exact 
 
 ## 5. Group D — activity dedup
 
+> **[DECISION — still binding]** FDB `[OPEN]`.
+
+
 - **D1 first-seen**: `check_and_record(new_id)` → false, then → true.
 - **D2 dedup + state atomicity**: inbox-style op (record + state + jobs) crashed mid-way; retry observes already-seen and produces no duplicate state or jobs.
 - **D3 concurrent duplicates**: N parallel `check_and_record(same_id)` with state write → exactly one winner writes state.
 
 ## 6. Group E — visibility agreement
+
+> **[DECISION — still binding]** FDB `[OPEN]`.
+
 
 One predicate, three call sites (`application-ports.md` §10, `visibility-policy.md` intro). Fixture matrix over {public, home, followers, specified} × {author, follower, mentioned, replied-to-author, stranger, anonymous} × {local_only on/off}:
 
@@ -53,21 +74,33 @@ One predicate, three call sites (`application-ports.md` §10, `visibility-policy
 
 ## 7. Group F — bounds and isolation
 
+> **[DECISION — still binding]** FDB `[OPEN]`.
+
+
 - **F1 media bytes rejected**: storing blob bytes through any metadata path fails; hashes only.
 - **F2 transaction scope**: a single use case touches bounded keys (harness asserts operation completes within backend TX limits; FDB 5 s / 10 MB — the adapter must split, never the application).
 - **F3 read-your-commit**: committed state visible to subsequent reads on all nodes/handles (single-node: immediate; multi-node: after commit, no stale routing).
 
 ## 8. Exit-box-2 acceptance test
 
+> **[DECISION — still binding]**
+
+
 `conformance_exit_box_2`: drive `create_note` (author, text, visibility public) requesting one durable job through the storage interface; crash; recover; assert note + job both present and linked (job payload references the note ID). This single test is the Phase 0 exit evidence for box 2; it must run green against at least one backend or faithful harness before Phase 1.
 
 ## 9. Execution status
+
+> **[PLAN HISTORY]** 2026-10-14 in-memory harness result. Superseded for redb by the 118-test count in `tests/conformance.rs`. FDB has no adapter, so no FDB run exists.
+
 
 First green run achieved 2026-10-14: throwaway in-memory harness (`/tmp/opencode/phase0-harness`, std-only Rust, explicitly not product code) implements the ports over maps with commit-point fault injection and passes 15/15 suite cases plus the §8 acceptance test (`cargo test`: groups A1–A4, B1/B3/B4/B6, C1/C3, D1/D3, E1/E3, exit-box-2). Real thread-race cases (C1, D3) included. Evidence in `state/logs/2026-10-14-phase-0-freeze.md`.
 
 Honest scope: this proves suite coherence and interface viability, not a backend. First real-backend green run = redb adapter, Phase 1; both backends must still pass this exact suite before they ship.
 
 ## 10. Group Q — quote posts (`docs/quote-posts.md`)
+
+> **[LANDED — redb: tests/conformance.rs]** FDB `[OPEN]`.
+
 
 Backend-agnostic, same cases both adapters (FDB inherits):
 
@@ -79,6 +112,9 @@ Backend-agnostic, same cases both adapters (FDB inherits):
 - **Q6 crash consistency**: quote create-then-crash — note + quote state + outbox job survive SIGKILL after commit (redb crash harness; mirrored per backend).
 
 ## 11. Group R — branched replies (`docs/replies.md`)
+
+> **[LANDED — redb: tests/conformance.rs]** FDB `[OPEN]`.
+
 
 Backend-agnostic, same cases both adapters (FDB inherits once implemented):
 
@@ -99,6 +135,9 @@ Execution status (honest): R1–R12 are green on redb only (`tests/conformance.r
 
 ## 12. Group G — blocking / muting (`docs/misskey-parity-plan.md` §0A)
 
+> **[LANDED — redb: tests/conformance.rs]** FDB `[OPEN]`.
+
+
 Backend-agnostic, same cases both adapters (FDB inherits once implemented):
 
 - **G1 block CRUD**: unique pair, `Conflict(ALREADY_BLOCKING)` on dup, `Validation(BLOCKEE_IS_YOURSELF)` on self, `NotFound(NO_SUCH_USER)` on unknown, directional id lists (`blocking_ids_for` / `blocked_by_ids_for`), newest-first cursor paging (`sinceId`/`untilId`/`sinceDate`/`untilDate`, `limit`), `NotFound(NOT_BLOCKING)` on missing unblock.
@@ -110,6 +149,9 @@ Execution status (honest): G1–G4 are green on redb only (`tests/conformance.rs
 
 ## 13. Group S — drafts + scheduled arming (`docs/misskey-parity-plan.md` §5)
 
+> **[LANDED — redb: tests/conformance.rs]** FDB `[OPEN]`.
+
+
 Backend-agnostic, same cases both adapters (FDB inherits once implemented):
 
 - **S1 draft CRUD**: create/get/update/delete through the ports; `get_draft` on unknown ids is `None`; `update_draft` on unknown rows is `NotFound(NO_SUCH_NOTE_DRAFT)`; `delete_draft` on unknown rows is a no-op success; `count_drafts` / `count_scheduled_drafts` track the rows; `drafts_by_user` reads newest-first with the `scheduled` tri-state filter; delete commits the row/index removal and the jobs atomically.
@@ -119,6 +161,9 @@ Execution status (honest): S1–S2 are green on redb only (`tests/conformance.rs
 
 ## 14. Group P — pinnings (`docs/misskey-parity-plan.md` §7)
 
+> **[LANDED — redb: tests/conformance.rs]** FDB `[OPEN]`.
+
+
 Backend-agnostic, same cases both adapters (FDB inherits once implemented):
 
 - **P1 pinning CRUD**: `add_pinning` inserts the pair; duplicates are `Conflict(ALREADY_PINNED)`; `pinnings_for_user` lists oldest-first (pinning-id order); `remove_pinning` drops the pair and repeats/missing pairs are no-op successes.
@@ -127,6 +172,9 @@ Backend-agnostic, same cases both adapters (FDB inherits once implemented):
 Execution status (honest): P1–P2 are green on redb only (`tests/conformance.rs`); the FDB adapter is still a stub and has not run them.
 
 ## 15. Group E — note edits (§8) + quote-disable storage (§3)
+
+> **[LANDED — redb: note_edit_lifecycle, quote_disable_storage present in tests/conformance.rs]** FDB `[OPEN]`.
+
 
 Backend-agnostic, same cases both adapters (FDB inherits once implemented).
 
@@ -142,6 +190,9 @@ Naming note: this storage group reuses the `E1`–`E6` case labels from `docs/mi
 Execution status (honest): E1–E6 are green on redb only (`tests/conformance.rs`: `note_edit_lifecycle`, `note_edit_noop_writes_nothing`, `note_edit_poll_replace_resets_votes`, `note_edit_history_chaining`, `note_edit_inbound_dedup`, `quote_disable_storage`); the FDB adapter is still a stub and has not run them.
 
 ## Note URI uniqueness (Group U, added 2026-10-17; Draft)
+
+> **[LANDED — redb: u1 present in tests/conformance.rs]** FDB `[OPEN]`.
+
 
 Every backend MUST keep **at most one live note per non-empty `uri`**, enforced
 inside the storage transaction (not by caller-side find-then-insert):
@@ -161,6 +212,9 @@ inside the storage transaction (not by caller-side find-then-insert):
   `u3_deleted_note_releases_uri` in `tests/conformance.rs`.
 
 ## Remembered deletions (Group T, added 2026-10-17; Draft)
+
+> **[LANDED — redb: t1 present in tests/conformance.rs]** FDB `[OPEN]`.
+
 
 **Why:** bench S6 (2026-10-17). Misskey and Catodon send `Delete` before the `Create`
 it races with. Before this, a `Delete` that found no note returned 202 and kept nothing,
@@ -199,6 +253,9 @@ so the late `Create` stored the note and it stayed live.
 
 ## 16. Notification order (Group N, added 2026-10-17; Draft)
 
+> **[LANDED — redb: n1 present in tests/conformance.rs]** FDB `[OPEN]`.
+
+
 - **Contract:** `list_notifications` and `list_notifications_filtered` return a
   notifiee's notifications newest-first **across all kinds**. `sinceId`/`untilId`
   compare on the time-ordered suffix of the id, and `sinceDate`/`untilDate` use that
@@ -216,9 +273,15 @@ so the late `Create` stored the note and it stayed live.
 
 ## 17. Groups H/I/J — moderation, registration/invites, favorites/emoji (Batch M §3.4; added 2026-10-17; Draft)
 
+> **[LANDED — redb: h1…, i*, j2_emoji_uniqueness, o1, l*, v*, w*, x*, y*, z* per tests/conformance.rs]** FDB `[OPEN]`.
+
+
 Backend-agnostic, same cases both adapters (FDB inherits). Atomicity rule (§2.3 of the guide): a moderation action's state change, its moderation-log row, and its outbound jobs commit in ONE transaction. The cases prove it through the pure port interface by forcing the log append to fail inside the action (invalid row) and asserting nothing else committed.
 
 ### Group H — moderation (executed: `tests/conformance.rs` `h1_suspend_atomicity`, `h2_unsuspend_atomicity`, `h3_suspend_unsuspend_race`, `h4_log_never_lost`, 4/4 green 2026-10-17)
+
+> **[LANDED — redb: h1_suspend_atomicity present]** FDB `[OPEN]`.
+
 
 - **H1 suspend atomicity**: `set_suspended(true)` commits `is_suspended`, the follow-request teardown in both directions (upstream `postSuspend`), the `suspend` log row, and the outbox job together. With an invalid log row the whole action fails: flag unchanged, no row, no job.
 - **H2 unsuspend atomicity**: `set_suspended(false)` commits flag + `unsuspend` row + job together (same fail-closed rule); the removed follow requests stay removed.
@@ -228,6 +291,9 @@ Backend-agnostic, same cases both adapters (FDB inherits). Atomicity rule (§2.3
 
 ### Group I — registration and invites (executed: `tests/conformance.rs` `i1_invite_single_use`, `i2_consume_create_atomic`, `i3_registration_policy`, `i4_consume_happy_path`, 4/4 green 2026-10-17; ports: `InviteStore`)
 
+> **[LANDED — redb (per doc; not individually grepped)]** FDB `[OPEN]`.
+
+
 - **I1 single-use invite under N retries**: one code claimed by 5 `consume_and_create_account` calls → exactly one succeeds and creates exactly one account; the others fail `NotFound` and create nothing (the unique-index row goes with the claim).
 - **I2 consume + create atomicity**: a failing account insert inside the claim (duplicate handle) aborts the whole transaction — the code stays unused and claimable and no account row appears; a later valid claim then succeeds. No account without a consumed invite, no consumed invite without an account.
 - **I3 registration policy persists**: `InstanceSettings.registration` (upstream `disableRegistration`) round-trips through `InstanceSettingsStore` and each write commits with its `updateServerSettings` row. The gate itself is application logic (`AppServices::signup`); its enforcement is asserted by the endpoint test `wp2_signup_policy_gate_and_invite_claim` (closed + no code → plain 400, nothing created).
@@ -235,11 +301,17 @@ Backend-agnostic, same cases both adapters (FDB inherits). Atomicity rule (§2.3
 
 ### Group J — favorites and emoji (Batch N WS1 lands the emoji half; favorites landed WS2)
 
+> **[LANDED — redb: j2_emoji_uniqueness present]** FDB `[OPEN]`.
+
+
 - **J1 favorite uniqueness** per (account, note) under concurrency. Executed: `tests/conformance.rs` `j1_favorite_uniqueness` green (this session; redb).
 - **J2 emoji shortcode unique case-insensitively** (account-handle rule, C2) + rename conflict + delete-frees-name + remote (host, shortcode) uniqueness with cache-preserving upserts. Executed: `tests/conformance.rs` `j2_emoji_uniqueness` green (this session; redb).
 - **J3 favorite delete leaves the note**. Executed: `tests/conformance.rs` `j3_favorite_delete_leaves_note` green (this session; redb).
 
 ### Group K — abuse reports (Batch M WP4)
+
+> **[LANDED — redb (per doc)]** FDB `[OPEN]`.
+
 
 - **K1 report create atomicity** (state row committed; no log on create per upstream).
 - **K2 resolve atomicity** (resolved flag + assignee + resolved_as + moderation-log row in one txn).
@@ -250,10 +322,16 @@ Ports: `AbuseReportStore`. redb implemented; K1–K4 storage paths present (K2/K
 
 ### Group O — antennas (Batch N WS4; executed: `tests/conformance.rs` `o1_antenna_feed_trim_and_cascade` green this session; redb)
 
+> **[LANDED — redb: o1_antenna_feed_trim_and_cascade present]** FDB `[OPEN]`.
+
+
 - **O1 feed trim + cascade**: `antenna_notes` appends newest-first and trims to the newest 200 in the same append transaction; single-row removal is idempotent; `delete_antenna` cascades the feed rows.
 - Match order, visibility/src/keyword gates, and the DIVERGENCEs are covered by domain unit tests (`src/domain/antenna.rs`) and the endpoint test `batch_n_antennas_crud_notes_and_errors` (create/update/delete/list/notes/remove-note, error ids, cap, export/import application).
 
 ### Group L — instance blocks (Batch M WP5)
+
+> **[LANDED — redb (domain test per doc)]** FDB `[OPEN]`.
+
 
 - **L1 blocked_hosts normalization** (lowercase, dedup, empty-drop) — domain `blocked_host_normalization` test (executed green).
 - **L2 update atomicity** (settings + `updateServerSettings` moderation-log row in one txn) — exercised by `update_instance_settings` command path and redb store; L2 executed green.
@@ -262,6 +340,9 @@ Ports: `AbuseReportStore`. redb implemented; K1–K4 storage paths present (K2/K
 Ports: `InstanceSettingsStore` (required, no defaults). redb implemented.
 
 ### Group V — user lists + signin history (Batch O; added 2026-10-20; Draft)
+
+> **[LANDED — redb (per doc)]** FDB `[OPEN]`.
+
 
 Backend-agnostic, same cases both adapters (FDB inherits).
 
@@ -274,6 +355,9 @@ Execution status (honest): V1–V4 are green on redb only (`tests/conformance.rs
 
 ### Group W — password-reset + registry stores (Batch P; added 2026-10-20; Draft)
 
+> **[LANDED — redb: w2_registry_store_isolation present]** FDB `[OPEN]`.
+
+
 Backend-agnostic, same cases both adapters (FDB inherits).
 
 - **W1 reset lifecycle**: create → find-by-token → delete-by-id → both lookups miss; re-delete and missing-id deletes are silent successes (consume-on-expiry parity). Executed: `w1_reset_request_lifecycle` green (redb).
@@ -285,12 +369,18 @@ Execution status (honest): W1–W2 green on redb only; FDB has not run them.
 
 ### Group X — clips + clip-notes + clip favorites (federated clips + pages handoff; added 2026-10-20; Draft)
 
+> **[LANDED — redb: x1_clip_crud_and_cap_race present]** FDB `[OPEN]`.
+
+
 Backend-agnostic, same cases both adapters (FDB inherits).
 
 - **X1 clip CRUD + cap race**: owner-scoped create/update; foreign updates miss; concurrent creates at the owner cap → exactly `CLIP_LIMIT_PER_OWNER` succeed (`TOO_MANY_CLIPS` else); foreign-owner delete is a miss. Executed: `x1_clip_crud_and_cap_race` green (redb).
 - **X2 notes/favorites/cascade**: duplicate pairs converge on `ALREADY_CLIPPED`; per-clip cap holds (`TOO_MANY_CLIP_NOTES`); `last_clipped_at` touches on add only; member ids read newest-first; favorites are idempotent inserts with counts; delete cascades memberships + favorites in the same commit. Executed: `x2_clip_notes_favorites_and_cascade` green (redb).
 
 ### Group Y — pages + page likes (federated clips + pages handoff; added 2026-10-20; Draft)
+
+> **[LANDED — redb: y1_page_crud_and_slug_race present]** FDB `[OPEN]`.
+
 
 Backend-agnostic, same cases both adapters (FDB inherits).
 
@@ -304,12 +394,18 @@ Execution status (honest): X1–X2 + Y1–Y3 green on redb only; FDB has not run
 
 ### Group Z — clip follows + clip tombstones (federated clips + pages phase 2; added 2026-10-20; Draft)
 
+> **[LANDED — redb: z1_clip_follow_converges_and_cascades present]** FDB `[OPEN]`.
+
+
 Backend-agnostic, same cases both adapters (FDB inherits).
 
 - **Z1 follow converges + cascades**: duplicate follows converge (idempotent bool); unfollow idempotent; followers newest-first bounded; delete cascades follows in the same commit. Executed: `z1_clip_follow_converges_and_cascades` green (redb).
 - **Z2 tombstone round-trip**: record + read; re-record overwrites (replay converge). Executed: `z2_clip_tombstone_round_trip` green (redb).
 
 ### Group Y4 — page visibility + origin timestamps (federated clips + pages phase 2; added 2026-10-20; Draft)
+
+> **[LANDED — redb (per doc)]** FDB `[OPEN]`.
+
 
 - **Y4 columns round-trip**: Followers + Specified (with listed ids) persist; origin timestamps persist; old rows decode as Public via `#[serde(default)]` (covered implicitly by every older fixture). Executed: `y4_page_visibility_columns_round_trip` green (redb).
 

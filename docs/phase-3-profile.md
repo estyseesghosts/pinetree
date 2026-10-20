@@ -1,6 +1,13 @@
 # Phase 3 — Declared compatibility profile
 
 **Status:** Frozen (declared 2026-10-16; changes require a logged superseding decision)
+
+**Status (2026-10-20 freshness pass):** no contract change. The four stale
+claims called out in TODOS (the `tokenId` no-op note, `notes/search` params,
+out-list items, and the search/notifications auth columns) are superseded in
+place by the notes below and by §8 at the end. Verified against the dispatcher
+in `src/api/misskey/endpoints/mod.rs` and `src/streaming/server.rs`. Evidence
+is in `docs/endpoint-manifest.md` §39.
 **Phase exit (proposal §9):** every endpoint/channel in this profile passes
 contract tests against the target client versions below.
 
@@ -81,6 +88,14 @@ public (documented deviation; Misskey `FORBIDDEN` cases do not apply).
 
 ## 5. Explicitly OUT of the profile (non-goals)
 
+> **Superseded 2026-10-20 (§8):** `i/notifications-grouped`, `notes/featured`,
+> `users/featured-notes`, and `notes/reactions` (list) are shipped
+> (`src/api/misskey/endpoints/mod.rs:9067`, `:8998`, `:9029`, `:6278`), so they
+> are no longer out. `i/update-email` is shipped (`mod.rs:7193`). The last bullet
+> ("`notes/search` offset/channelId/range rejected") is stale for
+> `offset`/`rangeStartAt`/`rangeEndAt` (`mod.rs:8146-8178`); `channelId` is still
+> rejected. `users/lists/create-from-public` is still out (no arm).
+
 - `drive/folders/*` + non-null `folderId` (no folder model;
   `drive/files*` requires null, documented), `channels/*`,
   `chat*`, Reversi, `hashtag`, `roleTimeline`, `serverStats`,
@@ -125,6 +140,12 @@ will render follow-record rows. Logged, not fixed here.
 
 ## 7. Superseding audit fixes (2026-10-17)
 
+> **Superseded 2026-10-20 (§8):** the "`tokenId` revoke no-op" deviation below is
+> wrong. `i/revoke-token {tokenId}` is implemented (`src/api/misskey/endpoints/mod.rs:6776-6799`).
+> The `notes/search` `offset`/range params listed below are shipped
+> (`mod.rs:8146-8178`). The `notes/search` and `notes/search-by-tag` public
+> auth in this section is confirmed (`mod.rs:8162`, `:8202`).
+
 Five-finder audit (`state/logs/2026-10-16-audit-fixes.md`) verified the
 profile against Misskey `2026.10.1-alpha.0` and tightened these rows
 (behavior changes vs §§2–4 above; rationale in each case is Misskey
@@ -156,3 +177,27 @@ non-public); `tokenId` revoke no-op; empty search `query` rejected;
 form); read rate-limit buckets and timeline/scan indexes (Phase 5
 scale work); `notes/renotes` + conversation `NO_SUCH_NOTE`/empty
 semantics are Misskey-exact and unchanged.
+
+## 8. Freshness addendum (2026-10-20, code-verified)
+
+Dated addendum. Frozen text above is not rewritten; each row supersedes the cited line. Evidence and the full verified table are in `docs/endpoint-manifest.md` §39.
+
+| Profile line | Superseded by code truth | Evidence |
+|---|---|---|
+| §2 streaming channel list (`main`, five timeline/session channels only) | `antenna` and `userList` channels are also live (owner-checked; list membership re-read per event) | `src/streaming/server.rs:341-345`, `:358` |
+| §2 `main` event list | Subset is correct. Also emitted: `edited`, `unfollow`, `receiveFollowRequest`, `notificationFlushed` | `src/application/events.rs:67-99` |
+| §3 table: `notes/search`, `notes/search-by-tag` "credential `read:account`" | **Public** (no credential; §7 is correct) | `mod.rs:8162`, `:8202-8203` |
+| §3 table: `i/notifications` "`read:account` (extended)" | **`read:notifications`** (§7 is correct) | `mod.rs:6475-6476` |
+| §3 table: `drive/files` `folderId` must be null | Confirmed: non-null → `folders are unsupported; folderId must be null` | `mod.rs:7109-7113` |
+| §3 table: `users/notes` `withChannelNotes`/`allowPartial` accepted | Confirmed: accepted and ignored | `mod.rs:6863-6878` |
+| §4 handshake: token without `read:account` → 401 | Confirmed | `src/streaming/server.rs:119-121` |
+| §5 out: `i/notifications-grouped`, `notes/featured`, `users/featured-notes`, `notes/reactions` (list) | **Shipped** | `mod.rs:9067`, `:8998`, `:9029`, `:6278` |
+| §5 out: `i/update-email` | **Shipped** (dormant SMTP; §35 of the manifest) | `mod.rs:7193` |
+| §5 out: `users/lists/create-from-public` | Still out: no arm, 404 | `grep` of `src/` → 0 hits |
+| §5 out: `signin-flow` | Still out: no arm | `mod.rs` dispatcher |
+| §5 out: `drive/folders/*`, `channels/*`, `chat*`, Reversi, `hashtag`, `roleTimeline`, `serverStats`, `queueStats` | Still out (no arm / `UNSUPPORTED_CHANNEL` fall-through) | `server.rs:405-420` |
+| §5 last bullet: `notes/search` `offset`/`rangeStartAt`/`rangeEndAt` rejected | **Accepted.** `channelId` still rejected | `mod.rs:8146-8178` |
+| §7 `i/revoke-token` `tokenId` "no-op" | **Implemented**: grant must belong to caller; foreign or unknown ids are silent 204 | `mod.rs:6776-6799` |
+| §7 `notes/search` offset/range "shipped" | Confirmed | `mod.rs:8175-8193` |
+
+Still open (not profile-level decisions): `queue/*` (out), `users/lists/create-from-public` (deferred), `notes/reactions` `sinceId`-only cursor order (divergent — always newest-first, `src/application/queries.rs:1944`). Not individually re-verified this pass: the six `drive/files` `sort` variants and the `users/notes` `NO_SUCH_USER`-vs-`[]` change in §7.

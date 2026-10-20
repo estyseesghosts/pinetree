@@ -1,5 +1,9 @@
 # Pinetree Audit — Phase 0 to Now (2026-10-16)
 
+> **Status (2026-10-20 freshness pass)** — point-in-time snapshot from 2026-10-16; body not rewritten and individual findings were **not** re-verified here. For current HEAD status use `docs/inventory-pinetree-vs-misskey-2026-10-20.md` (§1 works, §3 gaps) and `docs/TODOS.md`.
+> - **Superseded by later work:** notes/reactions list, NOTES_BY_URI, poll `type: "Note"`, S6 tombstone, Batch N–P endpoints, and federated clips/pages (see the archive status blocks).
+> - **Still open per TODOS:** multi-node/FDB (P0), remote-media lifecycle (P1), client API holes (P1), ops (P3).
+
 Status: Complete 2026-10-16 — all 8 parallel explore workers filed with file:line evidence.
 
 ## 1. Internals / Architecture

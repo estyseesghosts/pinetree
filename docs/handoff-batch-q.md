@@ -1,5 +1,10 @@
 # Batch Q plan: fix the nine audit findings + implement the remainder
 
+> **Status (2026-10-20 freshness pass)** — the nine audit findings were **not** re-audited in this pass; no finding is marked fixed.
+> - **LANDED-unverified:** the audit's `following/requests/list` surface exists (`endpoints/mod.rs`, 3 hits for `following/requests/list`).
+> - **OPEN (confirmed absent, 0 endpoint hits):** `i/webhooks/*`, `i/2fa/*`, `my/apps`, `app/*`, `drive/folders/*`, `announcements`, `i/read-announcement`, `following/update`, `following/requests/sent`, `hashtags/*`; `rateLimitFactor` is a fixed `1` in the packer (`src/api/misskey/packers.rs:1212`), not a limiter knob.
+> - **OPEN (see `docs/TODOS.md` "Handoff batches N–Q"):** the nine findings (re-audit before closing each), webhooks in scope, media pipeline (thumbnails/blurhash/Range), analytics/retention/charts, rate-limit remainder.
+
 ## Why
 
 The 2026-10-20 code audit (four read-only subagents + head-verification) left nine concrete broken/divergent items and a list of openly unbuilt features. Since then Batch P, federated clips/pages, and a JSON config file have committed — so some items may already be fixed. This batch: verify each finding at HEAD, fix what's still broken, then implement the remaining missing features except `notes/translate` (no backend), achievements (out), and passkeys (out).

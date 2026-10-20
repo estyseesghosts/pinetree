@@ -15,16 +15,20 @@ dirs, ephemeral ports, fresh containers) — never the play/browser rig:
 
 | Step | What | Time |
 |---|---|---|
-| `cargo test --offline` | unit + contract + integration (351 tests) | ~15 s |
+| `cargo test --offline` | unit + contract + integration (live count is in the `cargo test` output; older text said 349/351, not re-counted 2026-10-20) | ~15 s |
 | `scripts/smoke-phase1.sh` | core flows via real `misskey-js` (+ restart durability) | ~10 s |
 | `scripts/smoke-phase3.sh` | profile REST + streaming via real `misskey-js` `Stream` | ~10 s |
-| `scripts/keystone-sweep.sh` | Keystone's exact calls, 41 checks | ~10 s |
+| `scripts/keystone-sweep.sh` | Keystone's exact calls (the script's own PASS/FAIL summary is authoritative; `scripts/smoke-all.sh` header says 38, not reconciled 2026-10-20) | ~10 s |
 | `scripts/smoke-phase2.sh` | four-server federation, fresh pg/redis (hermetic: tears down after) | ~15–25 min |
 
 Each step streams its own progress live (`[smoke1]` / `[smoke3]` / `[PASS]`
-/ `[interop]` lines); the wrapper adds per-step timing and ends with
+/ `[interop]` lines); the wrapper adds per-step timing and is meant to end with
 `SMOKE_ALL_OK` or `SMOKE_ALL_FAIL` plus a results table (full log of the
-last step at `/tmp/smoke-all-step.log`).
+last step at `/tmp/smoke-all-step.log`). **Open:** on a failing step the
+wrapper exits 1 right after its `FAIL:` line and prints neither the table nor
+`SMOKE_ALL_FAIL`; and a SKIP still ends with `SMOKE_ALL_OK`. See "Known gaps"
+below. Do not treat `SMOKE_ALL_OK` as proof that step 1 or the federation
+step ran.
 
 Environment:
 
@@ -80,7 +84,7 @@ node node_modules/.bin/vite --mode misskey --host 0.0.0.0 --port 5176 --strictPo
 node node_modules/.bin/vite --mode sharkey --host 0.0.0.0 --port 5177 --strictPort &
 # pinetree+misskey UI rig (stop Keystone :5173 first — same port):
 PROXY_LISTEN=127.0.0.1:8182 PINETREE_UPSTREAM=127.0.0.1:3103 \
-  bun /tmp/opencode/mk-proxy.mjs &
+  bun /tmp/opencode/mk-proxy.mjs &   # NOT in repo; /tmp/opencode/mk-proxy.mjs was absent at the 2026-10-20 check — recreate or find it before use
 # Misskey-native UI: frontend vite :5181 (Node 24, needs packages/i18n build),
 # then restart the :3101 backend with VITE_PORT=5181 EMBED_VITE_PORT=5182 (same DB).
 # Sharkey-native UI: one-time pnpm --filter frontend-shared build +
@@ -113,3 +117,28 @@ in dev builds and peers may time out).
   vites, pt5, and the `:8182` rig are managed separately (plain PIDs).
 - Bench only against a throwaway pinetree (`scripts/bench-local.py`
   on `:3210`), never the play stack.
+
+## Known gaps (open, verified 2026-10-20 by reading the script text)
+
+Tracked in `docs/TODOS.md` "Smoke gate". The script is **not** fixed here.
+
+1. **Step 1 masks cargo failure.** `scripts/smoke-all.sh:53` runs
+   `bash -c "cd … && cargo test --offline 2>&1 | tail -30"`. The inner shell
+   does not inherit `pipefail`, so the step's exit status is `tail`'s (0).
+   Checked: `bash -c 'exit 7 | tail -30'` exits 0.
+2. **SKIP prints `SMOKE_ALL_OK`.** `scripts/smoke-all.sh:77-83` records a
+   `SKIP` row for the federation step, and the final check (`:88`) only greps
+   for `^FAIL`, so a skipped federation step still prints `SMOKE_ALL_OK`.
+3. **Failure exit is silent.** `step()` returns 1 under `set -e`, so the script
+   exits 1 right after `[smoke-all] FAIL: …` and never prints the results table
+   or `SMOKE_ALL_FAIL` (header comment `:16` and this doc say it does). Checked
+   with a faithful copy of `step()`.
+4. **Keystone count** differs between `smoke-all.sh:12` (38) and this doc (41);
+   a static count of `scripts/keystone-sweep.sh` does not settle it. Use the
+   script's own summary line.
+5. **Env-only knobs** `PINETREE_ELIXIR_INTEROP`, `PINETREE_ELIXIR_STRESS`, and
+   `PINETREE_REPLY_REPAIR_LIMIT` (above) are not in the JSON config, which
+   `AGENTS.md` forbids for new settings (TODOS P3).
+6. **Out-of-repo paths.** `/root/keystone`, `/tmp/opencode/mk-proxy.mjs`, and the
+   bench rigs under `/root/bench` are not in the repo; `/tmp/opencode/*` did not
+   exist at the 2026-10-20 check.

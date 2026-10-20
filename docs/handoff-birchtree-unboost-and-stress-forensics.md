@@ -1,5 +1,10 @@
 # Handoff: fix birchtree reblog-delete Undo + classify S2/S3/S6/interop residue
 
+> **Status (2026-10-20 freshness pass)** — birchtree workstream; the reblog-delete Undo fix is birchtree-side (HARNESS-ONLY for pinetree).
+> - **LANDED (pinetree):** S6 Delete-beats-Create tombstone (`src/federation/inbox.rs:1740-1748`, "bench S6, 2026-10-17" comment); `NOTES_BY_URI` uniqueness (`src/persistence/redb/mod.rs:1129-1139`).
+> - **OPEN (pinetree):** none beyond the quote/reply debt in `docs/TODOS.md` "Bench forensics".
+> - **HARNESS-ONLY:** the reblog-delete Undo (birchtree); S2/S3 residue classified in the harness. `src/persistence/redb/statuses.rs` is not a pinetree file.
+
 You are continuing the 2026-10-19 federation benchmark. Read these first, in this order:
 
 1. `/root/pinetree/docs/federation-bench-2026-10-19-phase7-run4.md` — the run4 report (all numbers, all classifications).

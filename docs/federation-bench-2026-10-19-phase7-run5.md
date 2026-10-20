@@ -1,5 +1,10 @@
 # Phase 7 report: federation bench run5 (2026-10-19, fresh run only)
 
+> **Status (2026-10-20 freshness pass)** — historical bench record; figures are not re-run.
+> - **LANDED (pinetree, verified at HEAD):** `NOTES_BY_URI` uniqueness + tombstones (`src/persistence/redb/mod.rs:1129-1148`); Delete-beats-Create tombstone (`src/federation/inbox.rs:1740-1748`) — the S6 race class is covered for pinetree; poll `type: "Note"` (`src/activitypub/objects.rs:1070`).
+> - **OPEN:** outbound `EmojiReact` degrade (`docs/TODOS.md` "Bench forensics"); quote/reply debt.
+> - **HARNESS-ONLY:** the reblog-delete Undo fix (birchtree commit, `/root/birchtree`); S2/S3 residue classified in the harness; interop oracle rewrite.
+
 Run: `/root/bench/run5`, suite dir `runs/20261019T181810Z`.
 Builds (from `/proc/<pid>/exe` at `bench-up`): pinetree `f58be005c558f650`
 (unchanged), birchtree `e24d75aea1085a06` (item-52 reblog-delete Undo fix;

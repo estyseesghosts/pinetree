@@ -118,3 +118,18 @@ Skips never fail the request. Each one is logged with `eprintln!` naming the col
 
 - Unit/handler tests in `src/activitypub/actor.rs` under the `slice11_` prefix cover: 250-follower full traversal (no duplicates, none missing, no `next` on the last page, index `totalItems` equal to the counter); a failing `FollowStore` returning 500; outbox paging over more than `PAGE_SIZE` public notes with non-public notes interleaved; an invalid cursor returning 400; following paging.
 - Live interop with Misskey (fetching these collections from a real Misskey instance) is part of the slice 11 live check and is recorded in the Phase 2.6 log, not here.
+
+## Addendum 2026-10-20 (freshness pass)
+
+The contract text above is unchanged. The Status line above stays `Frozen (Phase 2.6 slice 11)`. Verified against `src/activitypub/actor.rs`, `src/domain/account.rs`, `src/application/ports.rs`, and `src/persistence/redb/mod.rs`.
+
+### Status (2026-10-20 freshness pass)
+
+**SUPERSEDED: §9 "Hide followers / hide following" is stale.**
+- `Account` now has `followers_visibility` and `following_visibility: FollowVisibility` (`src/domain/account.rs:142,145`; default `Public`, `:456-457`). They are patchable (`src/application/ports.rs:99-100`; redb applies them at `src/persistence/redb/mod.rs:2586-2590`). They are packed as `followersVisibility` / `followingVisibility` (`src/api/misskey/packers.rs:398-403`) and set through `i/update` (`src/api/misskey/endpoints/mod.rs:9827-9828`).
+- The AP handlers gate on them. Followers: `src/activitypub/actor.rs:922-924` returns `forbidden_collection()` unless the value is `Public`. Following: `actor.rs:981`. The check applies to every AP fetcher, and this handler has no follower-only exemption. Whether that matches Misskey's followers-only semantics is NOT verified here.
+- So "collections are public to any AP fetcher" is no longer true. The remaining gap is the missing followers-only exemption, which needs a test against a real Misskey fetcher.
+
+**OPEN: §9 outbox `totalItems`.** Still omitted by design (`src/activitypub/actor.rs:823`; the test asserts absence at `actor.rs:1728,1733`). There is no store-side count index, so a visible count would still need a scan. Keep the omission unless a count is required.
+
+**LANDED: §2–§7 and the §10 tests.** The `slice11_` tests are in `src/activitypub/actor.rs` (for example `:1533-1575` for paging and counter parity, `:1800` for the index `totalItems`).

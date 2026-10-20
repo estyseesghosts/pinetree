@@ -1,5 +1,8 @@
 # Handoff — continue the fediverse stress bench (pinetree vs Misskey / Catodon / Akkoma)
 
+> **Status (2026-10-20 freshness pass)** — superseded in practice by the federation-bench run3–5 reports (`docs/federation-bench-2026-10-19-phase7-run{3,4,5}.md`). The pinetree-side findings it asks for are classified in `docs/fediverse-bench-2026-10-16.md` (status block) and `docs/handoff-fediverse-bench-fixes.md`.
+> - **LANDED / OPEN / HARNESS-ONLY:** as in those docs. Stress-run numbers were not re-run.
+
 Status: Draft. Written 2026-10-17 after `state/logs/2026-10-17-fed-debug-logging.md`.
 Goal: finish the 5-node stress and feature bench against the current pinetree build,
 decide which open findings are real pinetree bugs, fix only those (with a failing test

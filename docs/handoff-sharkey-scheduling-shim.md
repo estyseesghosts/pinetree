@@ -1,5 +1,8 @@
 # Handoff: Sharkey `notes/schedule/*` shim (slip in before Batch N closes)
 
+> **Status (2026-10-20 freshness pass)** — LANDED: `notes/schedule/create|list|delete` are dispatched (`src/api/misskey/endpoints/mod.rs:8804, 8916, 8939`), over the drafts/scheduled-post model (`src/application/commands/drafts.rs`, `JobKind::PostScheduledDraft`).
+> - **OPEN:** none recorded; scheduling remains a Misskey-model shim (inventory §1.5).
+
 ## Why
 
 Pinetree's scheduling copies Misskey's model (draft + `scheduledAt`/`isActuallyScheduled` → delayed publish job). Sharkey instead has a dedicated `notes/schedule/create|delete|list` family over a `note_schedule` row. Same capability, different shape — so Sharkey clients calling `notes/schedule/*` get a 404 today. This handoff adds the Sharkey family as a **thin alias over the existing draft machinery**: no new storage, no new tables, no new job kinds, no new ports. Do this after your current workstream, before the final smoke — it must not disturb in-flight work.

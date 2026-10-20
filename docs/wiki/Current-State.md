@@ -1,70 +1,143 @@
-# Current state (2026-10-16 — Phase 3 complete, quote posts + branched replies green)
+# Current state
 
-## Phase status
+Status: living page, as of 2026-10-20. Built from the code inventory [`inventory-pinetree-vs-misskey-2026-10-20.md`](../inventory-pinetree-vs-misskey-2026-10-20.md), which reads the source code directly. Where an older document disagrees, the inventory wins. Disagreements are listed under [Known doubts](#known-doubts).
 
-| Phase | Status | Evidence |
-|---|---|---|
-| 0 Contracts | Done | `docs/phase-0-exit-criteria.md`; FDB client verified live (`docs/fdb-verification.md`) |
-| 1 Single-node server | Done | `docs/phase-1-exit-criteria.md`; `state/logs/2026-10-14-phase-1-complete.md` |
-| 2 Minimal federation | **Done** | `docs/phase-2-exit-criteria.md`; `state/logs/2026-10-14-phase-2-complete.md` |
-| 2.5 Cleanup | **Done** | Slices 0–9, one commit each: `state/logs/2026-10-15-phase2-5-*`; `cargo test` 251 green; `scripts/smoke-phase2.sh` → `SMOKE_OK` |
-| 2.6 Federation hardening | **Done** | Slices 1–12 (`state/logs/2026-10-15-phase2-6-*`): key ownership, inbox URLs, follow requests, reply visibility, request bodies, media safety, content addressing, passwords/throttling, delivery reliability, AP collections, RSA→`ring` signer |
-| 3 Client compatibility + streaming | **Done** | `docs/phase-3-exit-criteria.md` (all boxes checked); `state/logs/2026-10-16-phase-3-*.md`; `cargo test` 283 green; `scripts/smoke-phase3.sh` → `SMOKE3_OK`; `scripts/keystone-sweep.sh` → `KEYSWEEP_OK` 41/41; `scripts/smoke-phase2.sh` → `SMOKE_OK` on Phase 3 binaries |
-| Quote posts (FEP-044f) | **Done** | `docs/quote-posts.md`; `state/logs/2026-10-16-quote-posts.md`; conformance Group Q; 4-server + elixir interop green |
-| Branched replies | **Done** | `docs/replies.md` Slices A–C; `state/logs/2026-10-16-replies.md`; conformance Group R; reply-burst stress `STRESS_OK items=28` |
-| 4 FoundationDB multi-node | Planned | — |
-| 5 Scale and hardening | Planned | — |
+Meaning of the words used: **works** means the feature runs and has been checked. **partly** means some of it works, with limits noted. **not yet** means planned or missing. **won't do (for now)** means left out on purpose. A short plain table is in [Feature matrix](Feature-Matrix.md).
 
-## Repository layout
+## Phases in one line each
 
-```
-sns-server-proposal.md   product/architecture proposal (source of truth)
-AGENTS.md                rules for agents; current phase
-docs/                    frozen/draft contracts, phase plans, exit criteria, specs, this wiki
-state/logs/              dated append-only work logs (real command output)
-src/                     the crate (see About → How it is built)
-tests/                   conformance (+ Groups Q/R), crash_recovery, client_smoke,
-                         client_profile, federation, federation_interop,
-                         federation_elixir, quote_fixtures, streaming, minrepro
-scripts/                 smoke-all.sh, smoke-phase1/2/3.sh, keystone-sweep.sh,
-                         bench-local.py, interop/ (compose + loopback proxy)
-foundationdb/, redb/     upstream reference checkouts (git-ignored, read-only)
-misskey, sharkey         symlinks to reference checkouts (git-ignored, read-only;
-                          keep the targets on the native Linux fs under WSL)
-.cargo/config.toml       git-ignored machine-local settings (cargo target-dir on ext4)
-```
+- Phase 0 (contracts) and Phase 1 (single-machine server): done.
+- Phase 2 (talking to other servers): done, tested live with Misskey and Sharkey in a local lab.
+- Phase 3 (app compatibility and live updates): done on 2026-10-16.
+- Quote posts and reply threads: done on 2026-10-16.
+- A batch of everyday features (favorites, custom emoji, antennas, abuse reports, and more): done on 2026-10-20.
+- Phase 4 (many machines as one server, on FoundationDB): not started in code. Empty placeholders only.
 
-## Implemented Misskey API surface
+[Phase](Glossary.md) and other terms are explained in the [Glossary](Glossary.md).
 
-JSON POST at `/api/{endpoint}`, credentials via `i` body field or `Authorization: Bearer`.
+## Accounts and signing in
 
-`meta`, `signup`, `signin`, `admin/accounts/create`, `miauth/gen-token`, `auth/session/generate|show|userkey`, `auth/accept`, `GET|POST /miauth/{session}[/check]`, `i`, `i/update` (full profile store + `rejectQuotes`/`defaultReaction`/`showRemoteEmojis`), `i/notifications` (cursor, markAsRead, type filters) + `i/notifications-grouped`, `notifications/mark-all-as-read`, `i/revoke-token`, `i/pin|unpin`, `users/show`, `users/search`, `users/notes`, `users/reactions`, `users/followers|following` (`Following[]`), `username/available`, `users/report-abuse`, `notes/create`, `notes/show`, `notes/delete`, `notes/unrenote`, `notes/replies|renotes|children|conversation`, `notes/search|search-by-tag`, `notes/timeline`, `notes/local-timeline`, `notes/hybrid-timeline`, `notes/global-timeline`, `notes/reactions` (list), `notes/reactions/create|delete`, `notes/polls/vote`, `notes/drafts/create|list|update|delete|count`, `notes/schedule/create|list|delete` (Sharkey shim over drafts), `notes/edit`, `notes/favorites/create|delete`, `i/favorites`, `notes/state`, `following/create|delete`, `following/requests/list|accept|reject|cancel`, `blocking/*`, `mute/*`, `renote-mute/*`, `users/relation`, `emojis`, `emoji`, `admin/emoji/add|update|delete|list`, `antennas/list|show|create|update|delete|notes|remove-note`, `notifications/mark-all-as-read`, `drive/files` (+`|show|update|delete`, `drive/files/create` multipart/JSON, `GET /files/{id}`), `ap/show`, admin: `show-user|show-users`, `update-user-note`, `delete-account` + `i/delete-account`, `suspend-user|unsuspend-user`, `meta` + `update-meta`, `invite/*` + `admin/invite/*`, `abuse-user-reports` + `resolve|update|forward-abuse-user-report`, `unset-user-avatar|banner`, `delete-all-files-of-a-user`, `drive/files|show-file`.
+- **Sign up and sign in: works.** Passwords are stored in a scrambled form that is hard to reverse.
+- **Sign in from a Misskey app (MiAuth): works.** Requests have stricter checks than a basic flow: a time limit on the login handshake and an explicit list of permissions the app asks for.
+- **Access tokens with permissions, and revoking them: works.**
+- **Editing your profile: partly.** Name, bio, location, birthday, avatar, banner and flags work. Some profile fields, decorations and mute settings are not included yet.
+- **Suspending and deleting accounts: works.**
+- **Moving an account to a new address: works** between pinetree servers. The account keeps its ID.
+- **Two-factor sign-in, passkeys, and listing apps: not yet.**
 
-Streaming: authenticated WebSocket `/streaming` (`?i=` or Bearer) with `main`, `homeTimeline`, `localTimeline`, `hybridTimeline`, `globalTimeline`, `antenna` channels, note capture (`subNote`/`unsubNote` + aliases, `reacted`/`unreacted`/`deleted` with the visibility gate), `readNotification`, `UNSUPPORTED_CHANNEL` frame for unknown channels. Word mutes are server-enforced (hard drops, soft `isSoftMuted` flag; `docs/word-mutes.md`).
+## Posting
 
-Quotes pack onto notes as Pinetree extensions (`quoteAuthorizationStatus`, `quoteTargetUri`, `quoteTargetUnavailable`; `docs/quote-posts.md`): present on quotes only, never on pure renotes, always subject to visibility. Replies are served from an indexed direct-child lookup (`docs/replies.md`); unresolved remote parents stay pending and fail-closed until the resolver links them.
+- **Writing posts: works.** Text, content warnings, visibility (public, home only, followers only, specific people), replies, boosts, attached files, and "local only" posts.
+- **Showing and deleting posts: works.** A deleted post leaves a marker so other servers know it is gone.
+- **Editing posts: works,** keeping an edit history. This is a Sharkey-style feature; the Misskey row in the [Feature matrix](Feature-Matrix.md) is not confirmed.
+- **Drafts and scheduled posts: works.**
+- **Emoji reactions: works,** including custom emoji. Custom emoji from other servers are opt-in.
+- **Boosts (renotes), and undoing them: works.**
+- **Quote posts: works.** A quoted post needs approval. Public quotes are approved automatically; a manual-approval option is not offered yet. See [Quote posts](../quote-posts.md).
+- **Reply threads: works.** A reply whose parent post is not known yet is kept hidden until the parent is found. This is on purpose, so nothing is shown that might be unsafe. See [Replies](../replies.md).
+- **Polls: works** for creating, voting and closing. Polls that arrive from other servers in unusual shapes may show up without the poll. See [Federation](#talking-to-other-servers).
+- **Favorites and pinned posts: works.**
+- **Word mutes: works,** enforced by the server, not just by the app. See [word mutes](../word-mutes.md).
 
-Anything else answers 404 `UNKNOWN_API_ENDPOINT`; unknown fields on listed endpoints answer 400 `UNSUPPORTED_FIELD`. The exact contract is `docs/endpoint-manifest.md` as extended by the frozen profile `docs/phase-3-profile.md`.
+## Following and blocking
 
-## Federation surface
+- **Following and unfollowing: works.** Follower and following lists work.
+- **Locked accounts: works.** Follow requests can be listed, accepted, rejected, or cancelled.
+- **Blocking, muting, and muting boosts: works.**
+- **Per-follow settings and a list of requests you sent: not yet.**
 
-- Discovery: `/.well-known/webfinger`, `/.well-known/host-meta[.json]`, `/.well-known/nodeinfo`, `/nodeinfo/2.0|2.1`.
-- Objects: `/users/{id}` (+ `/publickey`, `/outbox`, `/followers`, `/following`, `/featured`), `/@{acct}`, `/notes/{id}` (tombstone `410` for deleted).
-- Inbound: `POST /inbox`, `POST /users/{id}/inbox` — Digest + HTTP signature required, 64 KiB body cap, ±5 min `Date` skew, actor/object authority checks, atomic dedup.
-- Outbound: signed delivery from durable `FederateDeliver` jobs, retries with exponential backoff (`MAX_DELIVERY_ATTEMPTS`), shared-inbox dedup. Quote authorization travels as FEP-044f `QuoteRequest`/`Accept`(`Reject`)/stamp-`Delete` on the pinetree↔pinetree path; legacy-only peers stay `unapproved` by design.
-- Interop-learned behaviours: Misskey reuses Follow/Undo ids per follower/followee pair, so dedup forgets them after `Undo(Follow)`; legacy HTTP Signatures only; Pleroma silently absorbs remote Announces of local posts (inbox 200, never displayed) while Akkoma renders them — Announce visibility is peer-defined and never gates our suites.
+## Timelines and search
 
-## Tests (all executed 2026-10-16, quotes + replies)
+- **Home, local, hybrid and global timelines: works,** read a page at a time.
+- **A timeline of one of your user lists: works.**
+- **Hashtag timelines: won't do (for now).** Looking up one exact hashtag works. Trending hashtags do not.
+- **Mentions: works.**
+- **Search for posts and people: partly.** It matches part of a word, and only looks at a recent window of posts kept in memory.
+- **Recommendations: partly.** A simple scoring method, not a learned one.
 
-`cargo test --offline`: 351 green — lib 254, conformance 69 (redb, incl. Groups Q/R), crash_recovery 2, client_smoke 1 (real `misskey-js`), client_profile 1 (real `misskey-js` `APIClient` + `Stream`), federation 2 (two in-process nodes), minrepro 1, quote_fixtures 5, streaming 13 (live WS); federation_elixir 2 + federation_interop 1 skip-gated (need rigs). Clean-clone `cargo test` needs `./misskey`/`./sharkey` re-linked first (packer snapshot + client_profile tests skip without them). Full gate `scripts/smoke-all.sh` → `SMOKE_ALL_OK`; live four-server interop: `scripts/smoke-phase2.sh` → `SMOKE_OK` + `INTEROP_OK` (Misskey 2026.10.1-alpha.0, Sharkey 2025.4.7, 2× pinetree). Profile suites: `scripts/smoke-phase3.sh` → `SMOKE3_OK`, `scripts/keystone-sweep.sh` → `KEYSWEEP_OK` 41/41. Elixir triangle (`local-federation` rig + `pinetree.test`): `ELIXIR_QUOTE_FEDERATION_OK`, extended stress `STRESS_OK items=28 nodes=3 duplicates=0` (15 posts + 8 quotes + 5 replies with follow churn). Single-node bench: `scripts/bench-local.py` (~870 notes-create/s, ~430 timeline/s, ~1200 users-show/s on a debug build).
+## Notifications
 
-## Known gaps / limits
+- **Notification list, grouped list, and marking as read: works.**
+- **Live notifications: partly.** The main live channel sends the most common events, but not all of them (see [Streaming](#live-updates-streaming)).
 
-- Streaming channels: `userList`, `hashtag`, `roleTimeline`, `channel`, `drive`, `chat*`, `reversi*`, `clip`, `admin`, `serverStats`, `queueStats` answer `UNSUPPORTED_CHANNEL` (`antenna` shipped Batch N); connection caps (32/1536) and the 2 min idle reap are implemented but not live-tested.
-- API profile subset only (see above): no channels, drive folders, featured timelines, 2FA, webhooks, OAuth, Mastodon API. Local clips + pages shipped (11 `clips/*` + 7 `pages/*` endpoints + `clips/follow|unfollow|followers`, real export + pinetree-only `i/import-clips`); federation is pinetree-first (`OrderedCollection` clips, `Article` pages) behind default-OFF switches — Phase 2 adds page read gates, clip sync (`Update`/`Delete` + tombstones), clip follows, and `clipUpdated`/`pageLiked` notifications. User lists + pull timelines + `userList` stream, url-preview, self-service auth, follower removal, drive extras (Batch O), and email identity + move + registry + mentions + notification utilities + discovery + versions + translate (Batch P; email/translate transports dormant, `pinned-users` empty, hashtag timeline out — upstream has none). `users/followers|following` return Misskey `Following[]` — Keystone's `FollowList` needs a one-line map in its own repo (logged follow-up).
-- `i/update` supports a subset of profile fields (no profile `fields[]`, decorations, mutes, …).
-- Federation MVP scope: no `_misskey_content` (never emitted), no Move activity handling, no RFC 9421 message signatures or LD signatures, no public-internet validation (interop was loopback-only).
-- Storage is single-node `redb`; FoundationDB adapter and `src/cluster/*` are Phase 4. `--mode=cluster` is refused.
-- Actor RSA keys are generated lazily on first use (slow in debug builds; peers may time out on the first fetch). Generating at signup is a known follow-up.
-- Remote-user and note lookups, and inbox processing, perform blocking I/O on the tokio blocking pool; there is no per-destination concurrency tuning yet (Phase 5).
-- Observability is minimal (stderr diagnostics only).
+## Lists, antennas, clips, and pages
+
+- **User lists: works.** Add and remove members and read a timeline of the list. Remote accounts as list members are still an open decision.
+- **Antennas: works.** An antenna is a filter you set up; posts that match it collect into its own feed. There is a cap on how many you can have.
+- **Clips (your saved collections of posts): works** on the local server. Sharing them with other servers is partly done.
+- **Pages: works** on the local server. Sharing pages with other servers is partly done; see [federated collections](../federated-collections.md).
+- **Channels, galleries, and flash-style posts: won't do (for now).**
+
+## Drive (files and pictures)
+
+- **Uploading files, from your device or from a web address: works.** Duplicate files are recognised.
+- **Listing, viewing, editing and deleting files: works.**
+- **Folders: won't do (for now).** Files sit in one flat list. Apps that expect folders will show them as missing.
+- **Finding or moving many files at once, and thumbnails: not yet.**
+- **Pictures and files sent from other servers: partly.** They are checked for size and type, and fetched safely. They are never cleaned up yet, so disk use only grows. The planned fix is in the [remote media cache plan](../remote-media-cache-plan.md).
+- **Serving files: works.** Safe picture and video types show in the browser; anything else is offered as a download.
+
+## Live updates (streaming)
+
+Streaming means the server pushes new posts and events to an app as they happen, instead of the app asking again and again.
+
+- **Live home, local, hybrid and global timelines: works.**
+- **Live user list and antenna feeds: works.**
+- **Live note updates (new reactions, deletions, poll votes, edits): works.**
+- **Live main channel (notifications, follows, and similar events): partly.** Many event types are not sent yet.
+- **Live channels for hashtags, drive, clips, admin and stats: not yet.**
+- **Live channels for chat, community channels, and games: won't do (for now).**
+- **Connection limits and idle cut-off: partly.** Built, but not yet tested under live load.
+
+## Talking to other servers
+
+- **Being found by other servers (WebFinger, NodeInfo): works.**
+- **Checking the identity of remote accounts and their signatures: works.** Messages with a bad signature are refused.
+- **Following, accepting, rejecting and undoing follows: works,** tested live with real Misskey and Sharkey.
+- **Posts, edits and deletions: works.** Edits that arrive without the full post are not applied yet. See [Known doubts](#known-doubts).
+- **Reactions (likes): works.** Servers in the Mastodon family receive a plain "like" instead of an emoji reaction.
+- **Boosts and quote posts: works.**
+- **Polls from other servers: partly.** See Posting above.
+- **Blocks, reports and account moves: works.**
+- **Real strangers' servers on the open internet: partly.** Tests ran on a local lab only.
+- **Mastodon and Pleroma/Akkoma: partly.** Exchanges have been seen in test runs. The full test set runs against Misskey and Sharkey.
+- **Newer message signature standard (RFC 9421): not yet.**
+- **Built-in sign-in through other apps (OAuth): not yet,** only if an app needs it.
+- **Mastodon's own app interface: won't do.** See [Intentional differences](Intentional-Differences.md).
+- **Relays (shared forwarding servers): won't do (for now).**
+
+Safety for incoming messages from other servers: they are size-limited, time-limited, redirect-limited, checked for unsafe internal addresses, and checked for valid signatures. This is done for every incoming message. Details: [Glossary](Glossary.md).
+
+## Running it
+
+- **Running on a single machine: works.** Uses one data file.
+- **Settings file: works** for most settings. A few settings are still only set by environment variables or command-line flags.
+- **Limits on how often each app can call (rate limits): works,** answering "slow down, try again later" in the same way Misskey does.
+- **Error answers: works.** Unknown addresses get "not found"; unknown fields get a clear error.
+- **Health check: partly.** It answers "ok" without checking the database.
+- **Logs and metrics: partly.** Basic logs only; no metrics.
+- **Backups: not yet.**
+- **Many machines as one server, on FoundationDB: not yet.** See [Roadmap](Roadmap.md).
+
+## What is missing, in one list
+
+For the full list with evidence, see [TODOS](../TODOS.md). The big items are: many-machine operation, shared file storage, cleanup of old remote pictures, health and metrics, and the client features listed as not yet above.
+
+## Known doubts
+
+Where sources disagree, this page follows the 2026-10-20 inventory. These are the points that are still not settled:
+
+1. **The older feature matrix (dated 2026-10-16) said polls, mutes and blocks, note editing, and admin roles were missing.** The inventory shows them working, at least in part. The [Feature matrix](Feature-Matrix.md) here follows the inventory.
+2. **The [Roadmap](Roadmap.md) table only lists Batch N as shipped.** The inventory and TODOS also show Batches O and P as shipped. A spot check on 2026-10-20 found their endpoints in the code, but each feature has not been individually re-tested. This page treats them as shipped, not yet re-verified.
+3. **Federating clips and pages:** resolved in the code. Both federation switches default to OFF (`src/domain/instance.rs:128-130`), so nothing federates until an admin turns them on. One recent commit message says pages federate by default; the code does not match that message, and the code wins.
+4. **Announcements:** the inventory lists them as out of scope, but TODOS lists the missing "badge never clears" problem as open. Both are true; the feature is a won't-do-for-now with a visible gap.
+5. **Profile editing:** the inventory says the full set of profile fields is there; this page earlier listed a subset. Marked partly.
+6. **Public-internet federation:** not tested. All federation tests are on a local lab.
+7. **Mastodon-family servers:** the test set is Misskey and Sharkey. Mastodon fixtures are still pending.
+8. **Quote approvals:** approval is automatic for public and home-visible quotes. There is no manual review queue yet, so the setting is not offered to users.
+
+## Read more
+
+- [Feature matrix](Feature-Matrix.md) and [Roadmap](Roadmap.md) in this wiki.
+- Contract detail: [endpoint manifest](../endpoint-manifest.md), [Phase 3 profile](../phase-3-profile.md), [quote posts](../quote-posts.md), [replies](../replies.md), [word mutes](../word-mutes.md), [federated collections](../federated-collections.md).
+- Inventory: [inventory 2026-10-20](../inventory-pinetree-vs-misskey-2026-10-20.md).

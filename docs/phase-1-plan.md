@@ -1,9 +1,15 @@
+> **Status (2026-10-20 freshness pass):** PLAN HISTORY. Phase 1 is complete: `docs/phase-1-exit-criteria.md` has 24 boxes checked and 0 open (grep). Pointer: `state/logs/2026-10-14-phase-1-complete.md`.
+> Tags: `[LANDED — evidence]` verified in code at HEAD; `[OPEN]` not in code; `[SUPERSEDED by …]`; `[DECISION — still binding]`; `[PLAN HISTORY]`. Original text is unchanged; tag blocks are additions. Short paths are under `src/`; `mod.rs` = `src/api/misskey/endpoints/mod.rs`.
+
 # Phase 1 plan — single-node server
 
 **Status:** Frozen (2026-10-14; pinned against Misskey 2026.10.1-alpha.0)
 **Scope:** proposal §9 Phase 1. Builds on the frozen contracts in `docs/`.
 
 ## Ground rules
+
+> **[DECISION — still binding]** Mode `single` → redb; cluster is rejected at startup (inventory §3.1; `config.rs:85-87`). The no-env/CLI-settings rule still applies.
+
 
 - **Storage depends on deployment mode, with no exceptions.** `mode = single` → redb. `mode = cluster` → FoundationDB. Phase 1 builds only the redb path. At startup, `cluster` mode exits with "not implemented (Phase 4)". redb is never used across nodes, and FDB is never used for single-node.
 - The `foundationdb` crate sits behind a cargo feature (`fdb`), off by default. Single-node builds don't need `libfdb_c`.
@@ -12,6 +18,9 @@
 - A slice is done when `cargo test` is green and its state log entry is written.
 
 ## A — Skeleton
+
+> **[PLAN HISTORY]** Landed. See `phase-1-exit-criteria.md`.
+
 
 | Slice | Deliverable |
 |---|---|
@@ -22,6 +31,9 @@
 
 ## B — Ports + redb
 
+> **[PLAN HISTORY]** Landed. Conformance suite now 118 `#[test]` fns (redb only).
+
+
 | Slice | Deliverable |
 |---|---|
 | B1 Ports | `application/ports.rs` traits, exactly as in `application-ports.md` |
@@ -30,6 +42,9 @@
 | B4 BlobStore (fs) | Content-addressed paths keyed by hash. Writes go to a temp file, then rename. Tests: put/get/delete, and a partial write is never visible |
 
 ## C — Application + jobs
+
+> **[PLAN HISTORY]** Landed.
+
 
 | Slice | Deliverable |
 |---|---|
@@ -40,6 +55,9 @@
 
 ## D — Misskey API
 
+> **[PLAN HISTORY]** Landed; the dispatcher has grown well past this slice.
+
+
 | Slice | Deliverable |
 |---|---|
 | D1 API core | `POST /api/{endpoint}` router; `i` or Bearer extraction; permission check; `{id,code,message}` errors; unknown param → `UNSUPPORTED_FIELD`; unknown endpoint → 404; fixed-window rate limits |
@@ -49,12 +67,18 @@
 
 ## E — Exit
 
+> **[PLAN HISTORY]** Landed. `phase-1-exit-criteria.md` all checked.
+
+
 | Slice | Deliverable |
 |---|---|
 | E1 Client smoke | Script + checklist against the target client(s): register → auth → post → timeline → follow → react |
 | E2 Checklist | `docs/phase-1-exit-criteria.md`, every box backed by evidence logged in `state/logs/` |
 
 ## Gaps settled before D (recorded in `docs/endpoint-manifest.md` and `state/logs/2026-10-14-phase-1-gaps-settled.md`)
+
+> **[PLAN HISTORY]** Settled; historical.
+
 
 1. **Reaction endpoints (`notes/reactions/create|delete`)**: Added to `docs/endpoint-manifest.md` §4 (`write:reactions`, `204 No Content`, `NO_SUCH_NOTE`/`ALREADY_REACTED`/`NOT_REACTED`/`CANNOT_REACT_TO_RENOTE`, `notes/reactions/delete` 60/h + 3s min interval, `reactionAcceptance` fallback coercion per Misskey `ReactionService.ts:127,149`).
 2. **Account creation**: Both `POST /signup` (`/api/signup` + `/api/admin/accounts/create`, returning `MeDetailed & { token }`) and CLI (`pinetree create-account`) are supported, plus `POST /signin` (`/api/signin`) and web MiAuth login/approval at `GET/POST /miauth/:session`.

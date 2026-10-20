@@ -1,3 +1,6 @@
+> **Status (2026-10-20 freshness pass):** Phase-2 clip and page surface is landed: `clips/follow|unfollow|followers`, `isFollowing`, `pageVisibility`/`visibleUserIds`, gated pages (`NO_SUCH_PAGE`), and the `clipUpdated`/`pageLiked` notification types. Client-side rendering guidance is not verifiable from the backend.
+> Tags: `[LANDED — evidence]` verified in code at HEAD; `[OPEN]` not in code; `[SUPERSEDED by …]`; `[DECISION — still binding]`; `[PLAN HISTORY]`. Original text is unchanged; tag blocks are additions. Short paths are under `src/`; `mod.rs` = `src/api/misskey/endpoints/mod.rs`.
+
 # Keystone surface: federated clips + pages phase 2
 
 Status: Draft (2026-10-20; tracks `docs/endpoint-manifest.md` §38).
@@ -10,6 +13,9 @@ decision in `docs/federated-collections.md` §3).
 
 ## New endpoints (all 200/204; pinetree-first, DIVERGENCE)
 
+> **[LANDED — mod.rs:3877 (clips/follow), :3890 (clips/unfollow), :3906-3916 (clips/followers, owner-only, ACCESS_DENIED via errors.rs:954-957)]**
+
+
 - `clips/follow {clipId!}` → 204 (idempotent; needs `write:clip-favorite`).
 - `clips/unfollow {clipId!}` → 204 (idempotent; unknown clip →
   `NO_SUCH_CLIP`).
@@ -18,6 +24,9 @@ decision in `docs/federated-collections.md` §3).
   via `clips/show.isFollowing`.
 
 ## Changed packs / params
+
+> **[LANDED — packers.rs:753 (isFollowing in the clip pack path); mod.rs:3959-3997 (pageVisibility/visibleUserIds on pages/create|update); pages.rs:130-156 (NO_SUCH_PAGE for gated pages)]**
+
 
 - `clips/show` gains `isFollowing` (boolean, only when authed).
 - `pages/create|update` gain `pageVisibility`
@@ -29,6 +38,9 @@ decision in `docs/federated-collections.md` §3).
 
 ## Notification wire types (new, pinetree-only)
 
+> **[LANDED — mod.rs:1130-1131 (clipUpdated, pageLiked accepted in notificationRecieveConfig); domain/notification.rs:41,44; emitted at commands/clips.rs:124 and commands/pages.rs:304]**
+
+
 - `clipUpdated`: `clipId` + packed `clip` (metadata edited, clip deleted
   or restricted; membership edits notify the note's author instead and
   never spam followers).
@@ -38,6 +50,9 @@ decision in `docs/federated-collections.md` §3).
   `excludeTypes`.
 
 ## Rendering notes
+
+> **[DECISION — still binding]** Client-side guidance. The Tombstone-drop behavior is not verifiable from the backend.
+
 
 - Followers lists never advertise to non-owners; gate clip-member UI on
   `isFollowing`, not on `followers`.

@@ -1,15 +1,27 @@
+> **Status (2026-10-20 freshness pass):** PLAN HISTORY. This file opens with chat residue ('Understood…') and has no H1; the plan body is below it. Slices 1–6 are landed (evidence per slice). Slice 7 is `[OPEN]`. Slices 0, 8, and 9 are historical.
+> Tags: `[LANDED — evidence]` verified in code at HEAD; `[OPEN]` not in code; `[SUPERSEDED by …]`; `[DECISION — still binding]`; `[PLAN HISTORY]`. Original text is unchanged; tag blocks are additions. Short paths are under `src/`; `mod.rs` = `src/api/misskey/endpoints/mod.rs`.
+
 Understood. The visibility policy stays as it is, and `commands.rs` gets split now. I haven't touched any code. The `redb` dependency is the one decision still open (slice 1).
 
 ## Revised cleanup plan
 
+> **[PLAN HISTORY]** Superseded in detail by `phase2-6.md` for later work.
+
+
 Two changes from last time. The visibility slice is now docs-only. The `commands.rs` split moves to slice 2, because later slices edit that file, and they're easier to review once it's split.
 
 ### Slice 0: Baseline
+
+> **[PLAN HISTORY]** 107-test baseline is historical. Current conformance file is 118 `#[test]` fns.
+
 - **Deliverable:** a recorded `cargo test` result on the current tree. This slice contains no code changes.
 - **Expected result:** 107 tests green (78 lib, 26 conformance, 2 crash-recovery, 1 live `misskey-js`). Anything else means stop and investigate.
 - **Done when:** the result is pasted into the work log.
 
 ### Slice 1: Repo reproducibility
+
+> **[LANDED — .gitignore:1-2 (/foundationdb/, /redb/); redb in Cargo.toml]** Clean-clone build not re-run in this pass.
+
 - **Deliverables:**
   - `.gitignore` anchored to `/foundationdb/`, `/redb/`, `/misskey`, `/sharkey`, `/target/`, `/data/`, plus the existing unrelated entries.
   - The nine files tracked: seven under `src/api/misskey/`, plus `src/persistence/redb/mod.rs` and `src/persistence/foundationdb/mod.rs`.
@@ -18,6 +30,9 @@ Two changes from last time. The visibility slice is now docs-only. The `commands
 - **Verification:** clone into a fresh directory, run `cargo test`, and get the same 107 green. `git status --ignored` shows no source files.
 
 ### Slice 2: Split `commands.rs` (pure move, no behavior change)
+
+> **[LANDED — application/commands/ split: accounts, notes, follows, media, keys, helpers, inbound/]**
+
 - **Deliverables:** `application/commands.rs` becomes a `commands/` module. `AppServices` and its constructor stay in `mod.rs`, with `impl AppServices` blocks spread across these files:
 
 | File | Contents |
@@ -39,6 +54,9 @@ Two changes from last time. The visibility slice is now docs-only. The `commands
 - **Risk:** private-helper visibility (`pub(super)` or `pub(crate)`).
 
 ### Slice 3: Reject-follow atomicity
+
+> **[LANDED — persistence/redb/mod.rs:8560 record_reject_follow_activity; inbound/follow.rs:214]**
+
 - **Deliverables:**
   - A new `ActivityDedup` method for Reject.
   - A redb implementation that dedups and unfollows in one transaction.
@@ -48,6 +66,9 @@ Two changes from last time. The visibility slice is now docs-only. The `commands
 - **Tests:** an injected-failure test (dedup recorded, unfollow fails, redelivery still removes the follow), plus a normal-path test. Add both to the conformance suite so FDB inherits them.
 
 ### Slice 4: Split TLS from SSRF
+
+> **[LANDED — federation/delivery.rs:1602,1621 (tests: no `-k` in curl argv)]**
+
 - **Deliverables:**
   - `-k` removed from `send_https_via_curl`.
   - `allow_private_ips` documented as an SSRF exemption only.
@@ -57,6 +78,9 @@ Two changes from last time. The visibility slice is now docs-only. The `commands
 - **Deferred:** replacing the curl shell-out with a library client, the missing overall request deadline, and DNS pinning. These get a note in the log, not code.
 
 ### Slice 5: Job failure handling
+
+> **[LANDED — jobs/worker.rs:71,709 (catch_unwind); persistence/redb/mod.rs:7078 (attempts incremented on reclaim)]**
+
 - **Deliverables:**
   - A terminal failed/quarantined state on the `JobQueue` port.
   - redb implementation.
@@ -68,6 +92,9 @@ Two changes from last time. The visibility slice is now docs-only. The `commands
 - **Contract:** update `docs/application-ports.md`, which is frozen. This needs a logged superseding note.
 
 ### Slice 6: Replace the custom RSA
+
+> **[LANDED — activitypub/signatures.rs:138-142 (ring RsaKeyPair, RSA_PKCS1_SHA256); no custom modpow]**
+
 - **Deliverables:**
   - A maintained crate behind the existing `signatures.rs` surface, with bigint, primality, RSA and DER code deleted.
   - The HTTP-signature canonicalization kept.
@@ -80,6 +107,9 @@ Two changes from last time. The visibility slice is now docs-only. The `commands
 - This is the largest slice, and it only touches `keys.rs` and the signature callers after the split.
 
 ### Slice 7: Decouple ActivityPub from the Misskey adapter
+
+> **[OPEN]** `activitypub/webfinger.rs:4` still says route wiring lives in `api::misskey`. Not fully re-audited.
+
 - **Deliverables:**
   - `activitypub/{objects,actor,webfinger}.rs` and `federation/inbox.rs` take `Arc<AppServices>` (or a small shared state type) instead of `ApiState`.
   - `format_millis` and `PACKER_VERSION` moved to a neutral module.
@@ -87,12 +117,18 @@ Two changes from last time. The visibility slice is now docs-only. The `commands
 - **Verification:** grep confirms that, and the tests stay green.
 
 ### Slice 8: Visibility (docs only)
+
+> **[PLAN HISTORY]**
+
 - **Deliverable:** one log entry recording the decision to keep Misskey's remote-remote followers fallback (`docs/visibility-policy.md:45`).
   - It should note that the fallback is unreachable in production today, because only tests build remote viewers.
   - It should flag that Phase 3 streaming or any remote-viewer path must revisit it.
 - No code or policy change.
 
 ### Slice 9: Docs and exit gate
+
+> **[PLAN HISTORY]**
+
 - **Deliverables:**
   - The `users/followers` gap in AGENTS.md corrected: only the Misskey API endpoint is missing.
   - `docs/README.md:20` corrected to Sharkey 2025.4.7.

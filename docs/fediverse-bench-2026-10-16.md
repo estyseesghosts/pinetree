@@ -1,5 +1,11 @@
 # Fediverse compatibility bench — 2026-10-16
 
+> **Status (2026-10-20 freshness pass)** — bench findings P1–P6 mapped to HEAD (see `docs/handoff-fediverse-bench-fixes.md` status block for per-finding evidence).
+> - **LANDED:** P1 duplicate note rows (`NOTES_BY_URI` unique, `src/persistence/redb/mod.rs:1129-1139`); P2 `notes/reactions` list (`src/api/misskey/endpoints/mod.rs:6278`); P4 reply id via pending parent (`src/federation/inbox.rs:2113-2170`); P5 `ap/show` media queued as a job (`src/federation/inbox.rs:2081-2153`).
+> - **OPEN:** P5 quote-path bounded fetch; P6 poll-vote drop counters (per-reason labels exist, `src/application/commands/polls.rs:181-193`); P3 Undo(Like) convergence not re-verified in this pass.
+> - **HARNESS-ONLY:** the Catodon/Akkoma/Misskey lab rig and `scripts/fediverse-bench/` tooling (in-repo harness, not server code).
+> - **Unverifiable here:** the run logs `state/logs/2026-10-16-fediverse-bench.md` and the `/root/...` run directories cited in the body.
+
 **Scope**: pinetree vs Misskey, Catodon, and Akkoma in a five-node local matrix,
 stress-tested with 30 accounts and ~4 500 federated objects. Run by the bench
 session described in `state/logs/2026-10-16-fediverse-bench.md`. Harness:

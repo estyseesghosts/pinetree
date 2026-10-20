@@ -231,3 +231,39 @@ Status: LANDED (redb adapter green, conformance S1-signin → Group V below). Al
 - `UserListStore` (WP16; Misskey `MiUserList`/`MiUserListMembership`/`MiUserListFavorite` parity): `create_user_list(list)` (owner-count check + insert, one txn; `Conflict(TOO_MANY_USERLISTS)`), `update_user_list(list)` (owner-scoped; `None` on miss), `delete_user_list(owner, id) -> bool` (membership + favorite cascade, one txn), `get_user_list(id)`, `lists_by_owner(owner)` / `public_lists_by_owner(owner)` (newest-first), `add_list_member(member, jobs)` (dup → `Conflict(ALREADY_ADDED)`, cap → `Conflict(TOO_MANY_USERS)`, one txn with jobs), `remove_list_member(list, member, jobs) -> bool`, `update_list_membership` / `get_list_membership`, `members_of_list(list)` (bounded by the member cap), `favorite_list` / `unfavorite_list` (idempotent bool) / `is_list_favorited` / `list_favorite_count`. redb `user_lists` + `user_lists_by_owner` + `user_list_memberships` + `user_list_favorites`. Conformance Group V (V2–V4).
 - `ClipStore` (federated clips + pages handoff Phase 1; Misskey `MiClip`/`MiClipNote`/`MiClipFavorite` parity + pinetree federation columns): `create_clip(clip)` (owner-count check + insert, one txn; `Conflict(TOO_MANY_CLIPS)`), `update_clip(clip)` (owner-scoped; `None` on miss), `delete_clip(owner, id) -> bool` (membership + favorite cascade, one txn), `get_clip(id)`, `clips_by_owner(owner)` (newest-first, bounded by the cap), `add_clip_note(row, now, jobs)` (dup → `Conflict(ALREADY_CLIPPED)`, cap → `Conflict(TOO_MANY_CLIP_NOTES)`, cap check + insert + `last_clipped_at` touch + jobs, one txn), `remove_clip_note(clip, note, jobs) -> bool`, `clip_note_ids(clip)` (newest-first) / `count_clip_notes(clip)`, `favorite_clip` / `unfavorite_clip` (idempotent bool) / `is_clip_favorited` / `clip_favorite_count` / `clip_favorites_by_user`. redb `clips` + `clips_by_owner` + `clip_notes` + `clip_favorites`. Conformance Group X (X1–X2).
 - `PageStore` (federated clips + pages handoff Phase 3 local; Misskey `MiPage`/`MiPageLike` parity + federation columns): `create_page(page, jobs)` (`Conflict(NAME_ALREADY_EXISTS)` on `(owner, name)`, one txn with jobs), `update_page(page, jobs)` (`None` on miss, slug-move conflict, one txn), `delete_page(id) -> bool` (like cascade, one txn), `get_page(id)` / `get_page_by_name(owner, name)` / `pages_by_owner(owner)`, `like_page` / `unlike_page` (idempotent bool + `liked_count` bump in the same txn) / `is_page_liked`, `featured_pages` (liked > 0 desc, max 10). redb `pages` + `pages_by_owner` + `pages_by_owner_name` + `page_likes`. Conformance Group Y (Y1–Y2).
+
+## Addendum 2026-10-20 (freshness pass)
+
+The contract text above is unchanged. The Status line above stays `Frozen`. Verified against `src/application/ports.rs`, `src/persistence/redb/mod.rs`, and `src/jobs/worker.rs`.
+
+### Status (2026-10-20 freshness pass)
+
+**Resolved / superseded:**
+- §11 open decision #3 (`specified` `visible_users`): already struck through at §11 row 3 (line 109) and resolved by `visibility-policy.md` §6. The row stays struck; nothing to change.
+- §11 open decision #1 (per-kind payload schemas): largely landed in code. Typed payload structs: `ReplyParentResolvePayload` (`ports.rs:1683`), `RemoteMediaFetchPayload` (`:1659`), `QuoteStampReverifyPayload` (`:1670`), `PollExpiryPayload` (`:1690`), `UnfollowAllPayload` (`:1700`), scheduled-draft payload (`:1721`). Bad payloads quarantine (`src/jobs/worker.rs:187-189` for `ReplyParentResolve`). Still OPEN as a doc: there is no standalone jobs contract, so the schemas exist only in code.
+- §11 open decision #2 (lease and retry numbers): now concrete in code. `MAX_JOB_ATTEMPTS = 8` (`ports.rs:854`). Retry delay is `base << min(attempts, 10)` (`src/jobs/worker.rs:92-93`). Retry exhaustion quarantines with `retry-exhausted` (`worker.rs:87-90`). Production lease is 30 s and base backoff is 1 s, both hard-coded in `src/main.rs:334-335` with no JSON key. Per-destination delivery backoff base is 1 s (`src/federation/retry.rs:14`). OPEN: promote these into a delivery/jobs contract and make them config keys (TODOS P3).
+
+**LANDED (port surface added since the freeze):**
+- `NoteStore::notes_by_reply` (`ports.rs:458`), `pending_reply_children` (`:473`), `link_pending_reply` (`:501`), `set_pending_reply_parent` (`:520`). Their defaults return `StorageUnavailable`, not `unimplemented!`. redb implements them (`src/persistence/redb/mod.rs`, around `:4334–4620`).
+- `JobKind` variants `ReplyParentResolve` (`ports.rs:775`), `RemoteMediaFetch` (`:758`), `QuoteStampReverify` (`:765`), `PollExpiry` (`:782`), `PostScheduledDraft` (`:792`), `UnfollowAll` (`:833`). The worker has an arm for each.
+
+**OPEN / discrepancies:**
+- `ActivityDedup::record_quote_request_accept` and `record_quote_request_reject` have default bodies that call `unimplemented!()` (`ports.rs:1553`, `:1563`). That breaks the "no unimplemented defaults" rule from the Batch M guide, and an FDB adapter that forgets them would panic. redb implements both (`redb/mod.rs:8690`, `:8706`). Recommend changing the defaults to `StorageUnavailable` or making them required.
+- `JobKind::TimelineMaterialize` (`ports.rs:751`) stays reserved. Its only worker arm is `Disposition::Done` (`worker.rs:141`), and no producer exists. Still Phase 5.
+- `FederateDeliverPayload::FeaturedChanged` (`src/federation/outbox.rs:202`, produced by `src/application/commands/pins.rs:166`) fans out to followers only. `outbox.rs:200-201` says there is no relay infrastructure. Relays stay deferred.
+- FDB: `src/persistence/foundationdb/mod.rs` is empty. Every port is redb-only.
+
+---
+
+## Addendum 2026-10-20 (freshness pass): `unimplemented!()` defaults still present
+
+Status: ADDENDUM only. Frozen text above is not rewritten. Verified by reading `src/application/ports.rs` (grep `unimplemented!` returns 20 hits, all inside trait default bodies; no test mocks).
+
+The "no `Err`/`unimplemented!()` defaults" rule (section status at line 181, guide §2 rule 4) is **not yet true in code**. Twenty trait methods still ship a default body that panics:
+
+- `FollowStore` (`ports.rs:1037`, `:1067`, `:1078`): `request_follow`, `accept_follow_request`, `remove_follow_request`.
+- `ActivityDedup` (`ports.rs:1392` to `:1612`, 17 methods): `forget_activity`, `record_delete_note_activity`, `record_delete_uri_activity`, `record_follow_activity`, `record_follow_request_activity`, `record_unfollow_activity`, `record_block_activity`, `record_unblock_activity`, `record_react_activity`, `record_unreact_activity`, `record_update_account_activity`, `record_quote_request_accept`, `record_quote_request_reject`, `record_quote_decision_accept`, `record_quote_decision_reject`, `record_quote_stamp_delete`, `record_note_edit_activity`.
+
+Redb implements every one of them (no `unimplemented!` in `src/persistence/redb/mod.rs`), so the current tests cannot see the gap. An FDB adapter that forgets any method would compile and then panic at runtime. This is the same risk as the FDB adapter gap in `docs/TODOS.md` P0.
+
+Decision needed (tracked as a TODOS P2 item): either make these methods required (remove the default bodies) or change each default body to return `PortError::StorageUnavailable`. Either change is a superseding decision and needs a state log entry. Until then, the Status line at `:181` should be read as "redb-only; defaults still panic".

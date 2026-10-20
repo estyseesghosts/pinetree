@@ -1,6 +1,6 @@
 # Server-side word mutes (Batch N WS8)
 
-**Status:** Draft (2026-10-20; owner-approved DIVERGENCE from upstream)
+**Status:** Implemented (Batch N WS8; spec re-verified 2026-10-20; owner-approved DIVERGENCE from upstream)
 
 Upstream Misskey/Sharkey never enforce word mutes server-side
 (`hardMutedWords` is only packed, `UserEntityService.ts:616`); enforcement
@@ -8,6 +8,26 @@ lives in the frontend (`check-word-mute.ts` + `use-note.ts`). Pinetree
 enforces them server-side so every client (including Keystone, which
 implements the same matcher in `frontend/src/misskey/softMute.ts`) gets
 identical behavior without re-implementing the matcher.
+
+## Status (2026-10-20 freshness pass)
+
+Verified against `src/domain/word_mute.rs`, `src/application/queries.rs`, `src/api/misskey/packers.rs`, `src/application/commands/{accounts,antennas,notifications}.rs`, `src/streaming/server.rs`, and the upstream checkout `misskey/packages/backend/src`.
+
+**LANDED (verified)**
+- Matcher: compile (`src/domain/word_mute.rs:42-64`; empty keywords and empty groups dropped, invalid shapes dropped). Match (`:72-94`; self-exempt; CW-then-text haystack, trimmed). Flags (`:103-131`; `v` and other unknown flags never match; `y` anchors). Unit tests from `:133`.
+- Hard drop: the `feed_filter_hides` arm (`src/application/queries.rs:232-233`) and the `note_hard_muted` self, then reply, then renote chain (`:258-300`). The filter is compiled per read (`:125-126`).
+- Surfaces that call the filter. `apply_feed_filter` callers: `queries.rs:714,759,801,1056,1422,1489,1615`. Direct `feed_filter` callers: `:516` (notes/show), `:902` (channel eligibility), `:1027` (capture), `:1228` (replies), `:1339` (conversation), `:1870` (user reactions). Also `src/application/commands/antennas.rs:248`, streaming `src/streaming/server.rs:589,832`, and `capture_gate` (`queries.rs:999-1030`).
+- Soft flag: `isSoftMuted` (`src/api/misskey/packers.rs:1738-1750`; the no-own-CW rule is at `:1744`; the matcher call at `:1478-1495`). The hard list is packed as `hardMutedWords` (`packers.rs:1322-1323`).
+- Write validation: the word-mute validation loop in `src/application/commands/accounts.rs:231`. Endpoint tests at `src/api/misskey/endpoints/mod.rs:10936-10951` exercise invalid and over-length shapes.
+- Tests: `word_mutes_server_enforced_hard_drops_soft_keeps` (`queries.rs:2471`) and `batch_n_word_mutes_soft_flag_packed_hard_dropped` (`endpoints/mod.rs:19715`).
+- Upstream: Misskey packs `hardMutedWords` at `misskey/packages/backend/src/core/entities/UserEntityService.ts:616`. Its `i/update` validates them (`server/api/endpoints/i/update.ts:344-348`) and does not enforce them on reads. Server-side enforcement is the stated divergence.
+
+**CORRECTED**
+- The old text said pending (unresolved-parent) replies "carry no body and are skipped". That is wrong. The stored pending reply keeps its text (`src/federation/inbox.rs:2227`, `text: parsed.text.clone()`). It is skipped because `is_visible` withholds it (`src/domain/visibility.rs:71-73`) before the word-mute filter runs. The paragraph below is corrected to match. Whether `note_hard_muted` can match a pending parent's body inside a reply chain was NOT verified.
+
+**NOT VERIFIED**
+- "Notifications are not gated" is consistent with the code: `src/application/commands/notifications.rs` has no word-mute reference. The notification write path was not re-read.
+- The per-read note cache matches the `note_cache` parameter (`queries.rs:176-177`). Its behavior was not tested.
 
 ## Semantics (Misskey-exact)
 
@@ -23,7 +43,7 @@ identical behavior without re-implementing the matcher.
 - A user's own notes never match. Empty text never matches.
 - A note matches when itself, its reply, or its renote matches
   (`checkNoteWordMute`: self → reply → renote, first match wins).
-- Pending (unresolved-parent) replies carry no body and are skipped.
+- Pending (unresolved-parent) replies keep their stored body but are withheld by `is_visible` (`src/domain/visibility.rs:71-73`) before the word-mute filter runs. See the 2026-10-20 status block.
 
 ## Enforcement
 

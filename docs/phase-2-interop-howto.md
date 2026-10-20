@@ -1,5 +1,10 @@
 # Phase 2 interop — how to run each server yourself
 
+> **Status (2026-10-20 freshness pass)** — paths and commands spot-checked; not re-run.
+> - **Verified present:** `misskey` and `sharkey` symlinks resolve (to `/root/fedifedifedi/…`, outside the repo); `misskey/packages/backend/scripts/compile_config.js` exists (the `node scripts/compile_config.js` command at line ~93 runs from the Misskey backend dir, so it is Misskey's file, not pinetree's); `scripts/smoke-phase2.sh` supports `KEEP=1` (line 62) and `stop` (line 56); `scripts/interop/compose.yml` and `proxy.mjs` exist.
+> - **Not re-verified:** the Node 24 / Node 22 versions, the Sharkey pin (the phase-2 exit header says 2025.4.4; `docs/README.md` says 2025.4.7), and the `/tmp/pinetree-interop` work dir.
+> - **Browser-rig steps** (lines ~60–90) point at `/tmp/opencode/mk-proxy.mjs` and `/root/keystone`, which are outside the repo; see `docs/testing.md` "Known gaps".
+
 > For the single entry point covering all suites and browser topologies
 > (pinetree+keystone, pinetree+misskey, misskey+keystone, sharkey-native),
 > see `docs/testing.md`. This file remains the deep reference for the

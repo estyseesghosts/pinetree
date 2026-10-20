@@ -2,6 +2,11 @@
 
 **Status:** Frozen (Phase 0 freeze review 2026-10-14), extended by
 superseding Phase 3 decision below (2026-10-16)
+
+**Status (2026-10-20 freshness pass):** contract unchanged; superseding notes
+are inserted at the top of each affected section, and the code-verified
+corrections with `file:line` evidence are in §39 at the end. Where a section
+body and a later note disagree, the note wins. Frozen text is not rewritten.
 **Sources:** `sns-server-proposal.md` §6; Misskey checkout (read-only), verified this session: `endpoints/notes/create.ts:19-214`, `const.ts:6,20`, `ApiServerService.ts:157`, endpoint survey (meta, auth, accounts, follows, timelines) and streaming survey (`StreamingApiServerService.ts:42-159`, `stream/Connection.ts`, `stream/channel.ts`, timeline channels).
 
 Phase 0 scope = proposal §6 step 1 (core account/note flows) + step 2 basics (auth'd sockets, timeline channels, note capture). Richer fields, remaining channels, and polls/quotes arrive in Phase 3 driven by real client tests. Anything not listed here is **unsupported**: the server answers it per §8, never with an accidental shape.
@@ -100,6 +105,11 @@ Timelines (all → `Note[]`, cursor pagination via `sinceId`/`untilId` + `sinceD
 
 ## 6. Streaming (Phase 0 subset)
 
+> **Superseded 2026-10-20 (§39):** the `antenna` and `userList` channels are
+> shipped (`src/streaming/server.rs:341-345`); `updated` is emitted
+> (`server.rs:700-728`). The "explicitly unsupported in Phase 0" bullet below is
+> historical.
+
 - Connectorbidity: WebSocket `/streaming?i={token}` (or `Authorization: Bearer`); suspended → 403, bad token → 401 (M `StreamingApiServerService.ts:42-100`). Envelope client→server: `{ type, body }` with `connect/disconnect/readNotification/subNote(s,sr)/unsubNote(un)`; server→client channel envelope `{ type: 'channel', body: { id, type, body } }`, note updates as top-level `noteUpdated`. Limits: 32 channels/connection, 1536 captured notes (M `Connection.ts:47-48,62`); idle reap 2 min with 60 s pings.
 - Supported channels (params → emits `note`, filtered by visibility policy + mute/block rules):
 
@@ -123,6 +133,14 @@ Timelines (all → `Note[]`, cursor pagination via `sinceId`/`untilId` + `sinceD
 - Unlisted endpoint → 404. Unlisted channel → `UNSUPPORTED_CHANNEL`. Unlisted param on a listed endpoint → 400 `UNSUPPORTED_FIELD` naming it. Quotes (Phase 3+), channels, OAuth, Mastodon REST API → the corresponding documented error, never partial behavior. (Polls shipped in §15.)
 
 ## 9. Superseding note — Phase 3 compatibility profile (2026-10-16)
+
+> **Superseded 2026-10-20 (§39):** the "`updated` is not emitted" sentence below
+> is wrong (`src/streaming/server.rs:700-728`). The "explicitly out" list is
+> stale for antennas (`mod.rs:5268`), clips (`:3489`), pages (`:3944`), lists
+> (`:3152`), featured (`:8998`, `:9029`), mentions (`:7784`), and user-list
+> timelines (`:4121`), which are all shipped. Still out: drive folders,
+> channels, chat, Reversi, the hashtag timeline, and the `roleTimeline`,
+> `serverStats`, and `queueStats` channels.
 
 The declared profile lives in `docs/phase-3-profile.md` (frozen); it
 extends this manifest without contradicting it:
@@ -204,6 +222,12 @@ Every update resets `verifiedLinks` to `[]` (re-verification loop deferred: need
 
 ## 13. Superseding note — §1 private followers / following + §9 full list (2026-10-16, `docs/misskey-parity-plan.md`)
 
+> **Superseded 2026-10-20 (§39):** the moderator bypass is live, not "always
+> false". `viewer_is_moderator` reads `Account::has_moderator_powers()`
+> (`src/application/queries.rs:1704-1713`), and the §1 gate calls it
+> (`queries.rs:1737`). The `users/followers` UUID-sharing note below still
+> applies.
+
 `users/followers` + `users/following` keep their Misskey params (`userId` or `username`+`host`, cursor `sinceId`/`untilId`/`sinceDate`/`untilDate`, `limit` 1–100 default 10) and `Following[]` shape, and gain the upstream visibility gate (`users/followers.ts:115-135`, `users/following.ts:123-143`):
 
 | Target visibility | Who reads | Else |
@@ -222,6 +246,10 @@ ActivityPub `GET /users/{id}/followers` + `/following` (`ActivityPubServerServic
 
 ## 14. Superseding note — §2 private reactions (2026-10-16, `docs/misskey-parity-plan.md`)
 
+> **Superseded 2026-10-20 (§39):** the moderator bypass on this endpoint is live
+> via `viewer_is_moderator` (`src/application/queries.rs:1853`). The "always
+> false" DIVERGENCE line below is stale.
+
 New endpoint `users/reactions` (Misskey `users/reactions.ts` params, errors, and pack shape):
 
 | Aspect | Rule |
@@ -238,6 +266,13 @@ Read filters mirror the endpoint's SQL + post-filter split: note visibility plus
 Pack rule (`UserEntityService.ts:558` parity, verified no change needed): `publicReactions` packs `isLocal ? profile : false` — remote accounts always pack `false` regardless of the stored flag.
 
 ## 15. Superseding note — §4 polls + §6 wire compat (2026-10-16, `docs/misskey-parity-plan.md`)
+
+> **Superseded 2026-10-20 (§39):** the `TODO(§8)` accept-and-ignore stub below
+> is gone. Inbound `Update` routes `Note`/`Article`/`Page` to
+> `handle_update_note` (`src/federation/inbox.rs:1796-1797`; body at `:1953`).
+> The `notes/edit` arm is at `src/api/misskey/endpoints/mod.rs:4302`. Still
+> divergent: string-URI `Update` objects are not fetched
+> (`inbox.rs:1781-1786`).
 
 Polls ship backend-only (no frontend work). Reference pins: Misskey `2026.10.1-alpha.0` (`./misskey`), verified this session against `notes/create.ts:168-184,230`, `NoteCreateService.ts:405-470,659-722,819-820`, `notes/polls/vote.ts` (full file), `Poll.ts`, `PollVote.ts`, `models/json-schema/note.ts:118-`, `ApRendererService.ts:459-470,594-680` (`renderQuestion`/`renderVote`), `ApQuestionService.ts` (full file), `PollService.ts` (full file), `ReactionService.ts:34-48,125-162,383-401`.
 
@@ -316,6 +351,12 @@ Featured (`notes/featured`, `users/featured-notes {userId}`; no auth; both retur
 New endpoint `i/notifications-grouped` with the SAME params as `i/notifications` (the profile §5 OUT entry for `notifications-grouped` is superseded). Pure pack-layer change; no storage change. Consecutive `reaction` notifications on the same note merge into `reaction:grouped` (`{id, createdAt, type, note, reactions: [{user: UserLite, reaction}]}` — `createdAt` stays the newest member's, `id` rolls to the oldest, upstream `prev.createdAt` + rolling-`id` parity); consecutive `renote` notifications on the same *target* merge into `renote:grouped` (`{id, createdAt, type, note, users: [UserLite]}` — the target resolves through the renote note's `renote_id` since our rows carry no `targetNoteId`; unresolvable sides pass through unmerged). Groups drop the top-level `user`/`userId`; lone rows pack exactly like `i/notifications`. The `reaction:grouped` / `renote:grouped` pseudo-types are valid `includeTypes`/`excludeTypes` entries that match nothing alone and exclude nothing (same observable outcome as upstream, whose DB query only matches stored rows); `markAsRead` defaults true and flips before grouping, like upstream.
 
 ## 19. Superseding note — §11 notification filtering + §12 timelines (2026-10-16, `docs/misskey-parity-plan.md`)
+
+> **Verified 2026-10-20 (§39):** the home-timeline "no `withReplies`" decision
+> is kept. `notes/timeline` rejects `withReplies` through `check_allowed_fields`
+> (`src/api/misskey/endpoints/mod.rs:6132-6147`). Closed. The `list(userListId)`
+> receive-config TODO below is stale: list configs deliver to members
+> (`src/application/commands/notifications.rs:113-120`).
 
 Backend only. Reference pins: Misskey `2026.10.1-alpha.0` (`./misskey`). Verified this session against `NotificationService.ts:97-148`, `UserProfile.ts:252-272`, `types.ts:28-57`, `notes/{timeline,local-timeline,hybrid-timeline,global-timeline}.ts` (full files), `QueryService.ts:92-390` (`generateBaseNoteFilteringQuery`, muted-user/host/instance/renote queries, visibility query), `NoteEntityService.ts:131-328` (`shouldHideNote`/`hideNote`).
 
@@ -567,6 +608,11 @@ DIVERGENCES (recorded; do not "fix" back): `home` = owner's own notes + notes fr
 
 ## §30 — Moderation/admin remainder audit (Batch N WS6)
 
+> **Superseded 2026-10-20 (§39):** `reset-password` is shipped
+> (`src/api/misskey/endpoints/mod.rs:7311`, §35), so the needs-decision row for
+> it is stale. `server-info` (`mod.rs:7759`) and `stats` (`mod.rs:7764`) are
+> shipped too. `queue/*` remains out: no dispatcher arm exists.
+
 Upstream `admin/*` (~90 files) vs pinetree's routed set. Verdicts:
 implement / out (with reason) / needs-owner-decision. Reference pins:
 Misskey `2026.10.1-alpha.0` (`./misskey`).
@@ -721,3 +767,43 @@ Status: LANDED 2026-10-20 (pages visibility + gated ingest, clip sync + follow +
 - Article fidelity (inside `Article`, no new type): origin timestamps (`remote_published_ms`/`remote_updated_ms`, served in place of row times); outbound `Delete(Article)` on local page delete; `source` schema documented + honored (`content` + `variables` + `presentation {font, alignCenter, hideTitleWhenPinned}` + `slug`; no new top-level fields); audience audit (emitted `to`/`cc` matches visibility per the §4 table).
 - Stores: `ClipStore` gains follows + tombstones, `update_clip`/`delete_clip` take jobs (atomic fan-out), `remove_clip_note` takes `now_ms` (same-txn `updated` bump; adds bump too), `PageStore.delete_page` takes jobs (atomic `Delete(Article)`). Conformance Group Z (follows converge/cascade + tombstone round-trip) + Group Y4 (visibility + origin timestamps); suite now 118 green on redb.
 - Keystone contract (no new stream channel): new endpoints `clips/follow|unfollow|followers`, new params `pageVisibility`/`visibleUserIds`, new pack fields `isFollowing`/`clipId`+`clip`/`pageId`+`page` on notifications, new wire types `clipUpdated`/`pageLiked` for `notificationRecieveConfig` + include/exclude filters.
+
+## §39 — Freshness pass addendum (2026-10-20, code-verified)
+
+Status: ADDENDUM only. Frozen text above is not rewritten; the superseding notes at the top of §§6, 9, 13, 14, 15, 19, and 30 point here. Verified against the dispatcher arms in `src/api/misskey/endpoints/mod.rs`, `src/streaming/server.rs`, `src/federation/inbox.rs`, `src/federation/delivery.rs`, `src/application/queries.rs`, and `src/application/commands/notifications.rs`. Each row cites the code that proves it.
+
+### 39.1 Corrections (supersede the cited body text)
+
+| Claim (section) | Code truth 2026-10-20 | Evidence |
+|---|---|---|
+| Streaming `updated` "not emitted" (§9) | **Emitted.** `HubMessage::NoteUpdated` pushes `updated {cw, text}` via `push_note_updated` | `src/streaming/server.rs:700-728` |
+| `antenna` / `userList` channels "unsupported in Phase 0" (§6) | **Shipped.** Owner-checked antenna; list channel with membership re-read | `server.rs:341-345`, `:358`; manifest §29, §34 |
+| `pollEnded` on note stream (§6, §15) | Emitted as a note-capture `pollEnded` frame; the notification path is separate | `server.rs:694` |
+| Main stream events (profile §2 list) | Subset is correct. Also emitted: `edited`, `unfollow`, `receiveFollowRequest`, `notificationFlushed` | `src/application/events.rs:67-99` |
+| Out-list: antennas, clips, pages, lists, featured, mentions, user-list timeline (§9) | **Shipped** | antennas `mod.rs:5268`; clips `:3489-3906`; pages `:3944-4085`; lists `:3152-3463`; featured `:8998`, `:9029`; mentions `:7784`; user-list timeline `:4121` |
+| `notes/featured`, `users/featured-notes`, `i/notifications-grouped`, `notes/reactions` (list) listed "out" (profile §5) | **Shipped** | `mod.rs:8998`, `:9029`, `:9067`, `:6278` |
+| `reset-password` under needs-decision (§30) | **Shipped** (uniform 500 on unknown/expired = upstream parity) | `mod.rs:7311`; §35 |
+| `server-info` out (§30) / `stats` | `server-info` and `stats` **shipped** | `mod.rs:7759`, `:7764` |
+| Moderator bypass "wired but always false" (§13, §14) | **Live.** `viewer_is_moderator` → `Account::has_moderator_powers()`; used by the §1 gate and the reactions gate | `src/application/queries.rs:1704-1713`, `:1737`, `:1853` |
+| `notes/timeline` `withReplies` "kept, decided" (§19) | **Confirmed absent** → `UNSUPPORTED_FIELD` via `check_allowed_fields`. Closed | `mod.rs:6132-6147` |
+| `notes/search` `offset`/`rangeStartAt`/`rangeEndAt` rejected (profile §5 last bullet) | **Accepted.** `channelId` still rejected | `mod.rs:8146-8178` |
+| `Update(Note)` `TODO(§8)` accept-and-ignore (§15, ~line 272) | **Edit branch landed.** `Note`/`Article`/`Page` → `handle_update_note` | `src/federation/inbox.rs:1796-1797`, `:1953`; `notes/edit` `mod.rs:4302` |
+| `list(userListId)` notification receive-config "drops, no lists" (§19; parity plan §11) | **Live.** Members deliver; dangling/foreign lists drop silently | `src/application/commands/notifications.rs:113-120` |
+| `i/revoke-token` `tokenId` "no-op" (profile §7) | **Implemented.** Grant must belong to caller; unknown/foreign ids are silent 204 | `mod.rs:6770-6799` |
+| `notes/search` anonymous status (profile §3 table says `read:account`) | **Public** (profile §7 is right). `search-by-tag` also public | `mod.rs:8162` ("public endpoint"), `:8202-8203` |
+| `i/notifications` scope (profile §3 table says `read:account`) | **`read:notifications`** (profile §7 is right) | `mod.rs:6475-6476` |
+| `i/update-email` "needs §9.2 decision" (profile §5) | **Shipped** (§35), dormant SMTP | `mod.rs:7193` |
+
+### 39.2 Still open or out (verified absent or divergent)
+
+- `users/lists/create-from-public`: **no dispatcher arm** (grep of `src/` → 0 hits) → 404. Deferred, unchanged.
+- No dispatcher arm, so 404 `UNKNOWN_API_ENDPOINT`: `queue/*` (and `admin/queue*`), `channels/*`, `chat/*`, `hashtags/*`, `drive/folders/*`, `i/2fa/*`, `my/apps`, `app/*`, `notes/clips`, `users/update-memo`, `notes/thread-muting/*`, `notes/polls/recommendation`, `following/update|update-all|list`, `following/requests/sent`, `announcements*`, `i/read-announcement`, `drive/files/{find,move-bulk,check-existence,attached-notes}`. Dispatcher arm list checked against `grep ^\s+"…" =>` on `mod.rs`.
+- `notes/reactions` cursor: `sinceId`-only still reads **newest-first** (`queries.rs:1944` always sorts descending). The DIVERGENCE in the §4 row stands; the TODOS verify item "confirm still diverges" is confirmed.
+- Streaming: `reacted` body is `{reaction, userId}` only (no `emoji` detail; `server.rs:642-643`). Channels `hashtag`, `drive`, `clip`, `admin`, `roleTimeline`, `serverStats`, `queueStats`, `chat*`, `reversi*` fall through to `UNSUPPORTED_CHANNEL` (`server.rs:405-420`).
+- Streaming `userList` ignores `withFiles`/`withRenotes`: per the inventory (`server.rs:399`), not re-read in this pass.
+- Authentication for streaming: a token without `read:account` gets 401 (`server.rs:119-121`), matching §4 of the profile.
+
+### 39.3 Not individually verified this pass
+
+- Drive `sort` variants, `users/show` `userIds` batch, and `users/search` defaults (not re-traced).
+- Exact `NO_SUCH_USER` UUID unification (`fcd2eef9-…`) across endpoints (sampled via §§31, 34, 35 notes; not re-grepped).

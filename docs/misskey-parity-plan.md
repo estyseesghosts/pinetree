@@ -2,6 +2,10 @@
 
 Status: Draft rev.3 (2026-10-16; backend only, no frontend work; all sections LANDED + VERIFIED — see per-section status lines and `state/logs/2026-10-16-misskey-parity-complete.md`)
 
+**Status (2026-10-20 freshness pass):** every section's LANDED claim was re-traced against the dispatcher and the federation/notification code. Evidence is inline as `file:line`. Corrections made in place: §11 (list receive-config is live, the "no user-list subsystem" DIVERGENCE is gone) and §6 (inbound `EmojiReact` is live; outbound is still favourite-only). Open items are listed at the end of this block. Non-verified items are marked `(not re-verified)`.
+- Verified LANDED (dispatcher arm + code): §0A blocking/mute (`mod.rs:8383-8603`), §0B `i/update` (`mod.rs:2844`), §1/§2 private lists + `users/reactions` (`mod.rs:6985`, `:7054`; gate `queries.rs:1704-1737`), §3 `rejectQuotes` (`mod.rs:4535` admin route; create-path enforcement not re-traced), §4 polls (`mod.rs:6441`), §5 drafts (`mod.rs:8645-8783`) + schedule shim (`:8804-8939`), §7 pins (`mod.rs:8968-8983`) + featured (`:8998`, `:9029`), §8 `notes/edit` (`mod.rs:4302`) + inbound `Update(Note)` (`src/federation/inbox.rs:1796-1797`, `:1953`), §10 grouping (`mod.rs:9067`), §12 timelines (`mod.rs:6131-6277`; `withReplies` absent on home, `:6132-6147`), §13 `i/export-*` (`mod.rs:5722-5919`) + `i/import-*` (`:5825-5919`).
+- Open (verified): outbound `EmojiReact` to Akkoma-family (§6; favourite-only, `host_caps.rs:44-54`), `users/lists/create-from-public` (no arm), `queue/*` (no arm), and string-URI `Update(Note)` objects not fetched (`inbox.rs:1781-1786`).
+
 Rule: match upstream Misskey params, errors, and pack shapes by default.
 Copy Sharkey only where Misskey has no equivalent (`rejectQuotes`, `notes/edit`).
 Divergences are marked `DIVERGENCE` with a reason.
@@ -93,8 +97,8 @@ OUT OF SCOPE (initial release; nice-to-have later): Akkoma/Pleroma-family
 (`content` = unicode emoji or `:shortcode:`, plus `Emoji` tag objects for
 custom emoji; `builder.ex:74-84`) and only sends bare `Like` for plain
 favorites. UPDATE (2026-10-20): inbound `EmojiReact` now lands — inbox
-`dispatch` routes it through the `Like` path (`src/federation/inbox.rs`)
-and `Undo(EmojiReact)` unreacts, so akkoma→pinetree emoji reacts store on
+`dispatch` routes it through the `Like` path (`src/federation/inbox.rs:346`)
+and the Undo arm (`inbox.rs:1207`, `"Like" | "EmojiReact"`) unreacts (re-traced 2026-10-20), so akkoma→pinetree emoji reacts store on
 the normal per-(user,note) row; the normalizer already passes
 `:name:`/`:name@host:` through verbatim, but foreign shortcodes store
 without rendering (no registry). Outbound stays favourite-only: akkoma
@@ -124,7 +128,7 @@ Real editing copies Sharkey `notes/edit.ts` (484 lines) + `NoteEditService.ts` (
 - Service rules: author-only; `replyId` immutable (original parent kept); `visibility`/`localOnly` forced back to the original note's values (visibility change on edit is ill-defined); poll add/remove/replace resets votes; text/cw trimmed + truncated to limits; no-change edit returns the original note.
 - Version history: `note_edits{noteId,oldText,newText,cw,oldDate,updatedAt}` row per effective edit (same-note no-op writes nothing).
 - Side effects reuse the create path: note-stream `updated` event, `edited` notifications to reply author + interacters, AP `Update(Note)` deliver to followers + mentioned/replied/renoted/reacted remote users (+ relays when public). Owns the `Update(Note)` edit branch behind the shared inbox dispatcher (§4 owns only the poll-vote branch).
-- Status (2026-10-16): LANDED + VERIFIED — implementation commit 764ec7a (`notes/edit` arm, `note_edits`/`note_edits_by_note` tables, `apply_note_edit`/`note_edits`, `handle_update_note`, `Update(Note)` deliver); verification tests commit 07d834e (conformance Group E: lifecycle/no-op/poll-reset/history-chaining/inbound-dedup; endpoint gates + reply-immutable + visibility-forced + `edited` notifications; inbox render→apply→replay-converge round-trip + authority gates). Delete-and-redraft stays client-only as decided.
+- Status (2026-10-16): LANDED + VERIFIED — implementation commit 764ec7a (`notes/edit` arm, `note_edits`/`note_edits_by_note` tables, `apply_note_edit`/`note_edits`, `handle_update_note`, `Update(Note)` deliver); re-traced 2026-10-20: `notes/edit` `mod.rs:4302`, inbound `handle_update_note` `src/federation/inbox.rs:1953` routed from `:1796-1797`; verification tests commit 07d834e (conformance Group E: lifecycle/no-op/poll-reset/history-chaining/inbound-dedup; endpoint gates + reply-immutable + visibility-forced + `edited` notifications; inbox render→apply→replay-converge round-trip + authority gates). Delete-and-redraft stays client-only as decided.
 
 ## 9. Full follower list
 
@@ -144,7 +148,7 @@ Follows Misskey three layers (`NotificationService.ts:97-148`, `UserProfile.ts:2
 1. Creation-time receive config + read-time type filter. Creation: `notificationRecieveConfig[type] = never|following|follower|mutualFollow|followingOrFollower|list(userListId)` enforced at `Notify` creation. Read: `includeTypes/excludeTypes` over the 20 `notificationTypes`; drop obsolete `pollVote/groupInvited`. Pinetree has 6 + 13 `is_unemitted` — shrink the list as polls/scheduling/exports land.
 2. `mutings.has(notifier)` drops; self-notify drops.
 - Requested presets map to existing machinery, no second list: blacklist = `mutings`, whitelist-only = `list(userListId)` pointing at a user-owned list, mutuals-only = `mutualFollow`, followed-only = `following`, followers-only = `follower`, either-direction = `followingOrFollower`.
-- Status (2026-10-16): LANDED + VERIFIED — commit 764ec7a (creation-time receive-config + read-time include/exclude + muting/self drops); the `exportCompleted` type gap closed by commit 888f522 (§13). DIVERGENCE (documented): pinetree has no user-list subsystem, so `list(userListId)` configs are accepted on write but drop notifications at creation time (upstream missing-list parity — `notifications.rs` gate, never errors).
+- Status (2026-10-16): LANDED + VERIFIED — commit 764ec7a (creation-time receive-config + read-time include/exclude + muting/self drops); the `exportCompleted` type gap closed by commit 888f522 (§13). DIVERGENCE (documented, updated 2026-10-20): user lists landed in Batch O WP16 (manifest §34). `list(userListId)` configs now deliver to members of the referenced list and drop silently for dangling or foreign lists (upstream missing-list parity, never errors) — `src/application/commands/notifications.rs:113-120`. The older "no user-list subsystem" wording is stale.
 
 ## 12. Timelines: replies, blocks, mutes
 

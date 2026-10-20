@@ -9,6 +9,30 @@ gracefully ignored by everyone else. This doc is the contract a remote
 implementer (or the private-community track,
 `docs/community-planning.md`) codes against.
 
+## Status (2026-10-20 freshness pass)
+
+Verified against `src/federation/fetch_gate.rs`, `src/activitypub/federated_collections.rs`, `src/application/commands/{clips,pages}.rs`, `src/domain/{instance,clip,notification}.rs`, `src/persistence/redb/mod.rs`, and `src/api/misskey/endpoints/mod.rs`. The Status line above stays `Draft`.
+
+**LANDED**
+- Fetch gate: `authenticate_fetch_viewer` (`src/federation/fetch_gate.rs:81`) and `decide_fetch` (`:140`). The 404/403 mapping is as §1 describes; the body was not re-read line by line.
+- Per-resource callbacks sit above the gate: `authorize_clip_fetch` (`src/application/commands/clips.rs:691`), `authorize_page_fetch` (`src/application/commands/pages.rs:877`).
+- Admin switches `federate_clips` / `federate_pages`, default OFF (`src/domain/instance.rs:128-129`). Settable via `admin/update-meta` (`src/api/misskey/endpoints/mod.rs:5625-5630,5687-5688`). Checked in the actor document (`src/activitypub/actor.rs:554-559`) and in the object routes (`src/activitypub/federated_collections.rs:655-656`).
+- §5 routes: `/clips/{id}`, `/users/{id}/clips`, `/pages/{id}` (`endpoints/mod.rs:141-143`).
+- Clip tombstones: `CLIP_TOMBSTONES` table (`redb/mod.rs:145`; writes at `:6636-6648`).
+- Remote clip resolution: `resolve_remote_clip` (`federated_collections.rs:889`).
+- Clip follows: `ClipFollow` (`src/domain/clip.rs:135`).
+- Page-like notification: `NotificationKind::PageLiked` (`src/domain/notification.rs:42,67`; wire mapping `endpoints/mod.rs:1131`).
+
+**NOT VERIFIED in this pass**
+- The "10-minute TTL revalidation" constant. `federated_collections.rs` has no `600_000`-style constant in the grep. Locate it or correct the doc.
+- `Update(OrderedCollection)` and `Delete(OrderedCollection)` fan-out (§3, Phase 2a).
+- The structural "`script` is never serialized" claim (§4). It is a claim about the serializer, which was not read.
+- Remote `Article`-to-page materialization details (§4 ingest table).
+
+**OPEN (per the doc's own §4 and §6 notes)**
+- Article-derived notes are not converted to pages (recorded divergence).
+- Relays and channels stay out (§6).
+
 ## 1. Authenticated-fetch gate (shared infrastructure)
 
 Location: `src/federation/fetch_gate.rs`. The gate does two things and

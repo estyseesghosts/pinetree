@@ -94,3 +94,17 @@ Changing deployment modes (redb ↔ FoundationDB) uses explicit export/import wi
 ## Superseding note — Phase 2.6 slice 11 (2026-10-15)
 
 The collection endpoints in §4 (`/outbox`, `/followers`, `/following`) are now paged with opaque cursors and `next` links, and their `totalItems` rules changed (outbox `totalItems` omitted; followers/following from counters). The full contract is `docs/activitypub-collections.md`. The URL shapes in §4 are unchanged.
+
+## Addendum 2026-10-20 (freshness pass)
+
+The contract text above is unchanged. The Status line above stays `Frozen`. Verified against `src/cluster/*`, `src/persistence/redb/mod.rs`, and `src/api/misskey/endpoints/mod.rs`.
+
+### Status (2026-10-20 freshness pass)
+
+**OPEN (Phase 4, no code):**
+- §5 directory and routing: `src/cluster/routing.rs` is 0 lines. `src/cluster/account_directory.rs` and `src/cluster/internal_protocol.rs` are also empty (the `src/cluster` grep matched only `mod.rs`). In redb, `get_owner` (`src/persistence/redb/mod.rs:3970-3981`) returns the local node id for any existing account and `NotFound` otherwise. `set_owner` (`:3983`) has no cluster validation. The internal routing protocol and internal auth still need their own contract (deferred at §5, line 82).
+- Exact media URL paths: still deferred to a media contract (§4, line 73). The code has grown beyond that: `/files/{id}`, `/files/{id}/{name}`, `/identicon/{id}`, `/proxy`, and `/proxy/{*rest}` (`src/api/misskey/endpoints/mod.rs:149-164`). The contract has not caught up.
+
+**Routes in code, not in §4 (additive, no shape changes):**
+- `/users/{id}/stamps/{stamp}` (quote authorization stamp, `endpoints/mod.rs:137`).
+- `/clips/{id}`, `/users/{id}/clips`, `/pages/{id}` (`endpoints/mod.rs:141-143`; contract in `federated-collections.md`).

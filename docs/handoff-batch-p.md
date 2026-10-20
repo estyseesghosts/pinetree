@@ -1,5 +1,9 @@
 # Handoff: Batch P — email identity, account move, registry, small reads, timelines, notifications, discovery, versions, translate
 
+> **Status (2026-10-20 freshness pass)** — spot-checked (endpoint strings + dispatch arms present); behaviour not re-tested.
+> - **LANDED:** `i/update-email` (`endpoints/mod.rs:~7193`); `i/move` (`endpoints/mod.rs:~7385`, inbound Move in `src/federation/inbox.rs`); `i/registry/*` (`endpoints/mod.rs:~7521-7662`); `notifications/test-notification` (`endpoints/mod.rs:~7831`); `users/recommendation` + `notes/recommendations` (`endpoints/mod.rs:~7877-7897`); `notes/versions` (`endpoints/mod.rs:~7920`); `notes/translate` (`endpoints/mod.rs:~7974`); `notifications/mark-all-as-read` present.
+> - **OPEN:** `i/move` root = oldest admin is documented divergence (inventory §2), not a gap; account migration preserving keys/content is a Phase 4 item (TODOS P0).
+
 ## Why
 
 Close the remaining small-but-real Misskey gaps in dependency order: the email identity loop, account move/migration (the only item here with federation consequences), `i/registry`, small read endpoints, mentions timeline, notification utilities, discovery, edit-history viewing, and translation. Upstream pins: Misskey `2026.10.1-alpha.0`, Sharkey `2025.4.7` (read-only).

@@ -1,5 +1,13 @@
 # Handoff — fixing the fediverse-bench findings (P1–P6)
 
+> **Status (2026-10-20 freshness pass)** — per-finding status at HEAD (line numbers below are the 2026-10-20 locations; the "re-grep" warning still applies).
+> - **P1 duplicate note rows — LANDED:** `NOTES_BY_URI` unique, `DUPLICATE_NOTE_URI`, migration backfill (`src/persistence/redb/mod.rs:580, 1129-1139`); `find_by_uri` O(1) (`:4321`).
+> - **P2 `notes/reactions` — LANDED:** `src/api/misskey/endpoints/mod.rs:6278`.
+> - **P3 Undo(Like) non-convergence — NOT VERIFIED:** no `docs/TODOS.md` entry; needs a control run (the handoff says so). Propose adding a TODOS line.
+> - **P4 `replyId` lost — LANDED:** reply parent pending/resolve in the shared ingest (`src/federation/inbox.rs:2113-2170`); `ap/show` uses that ingest (`src/api/misskey/endpoints/mod.rs:8213`).
+> - **P5 remote media on `ap/show` — LANDED for `ap/show`:** `RemoteMediaFetch` queued in-txn (`src/federation/inbox.rs:2081-2153`). **OPEN for the quote path** (bounded fetch, TODOS "Bench forensics").
+> - **P6 poll-vote drops — PARTIAL:** per-reason labels (`src/application/commands/polls.rs:181-193`); counters and fixtures OPEN.
+
 Status: Draft. Written 2026-10-17 after a source investigation (no code changed).
 Inputs: `docs/fediverse-bench-2026-10-16.md`, `state/logs/2026-10-16-fediverse-bench.md`.
 Line numbers are as of master @ f4e1f30; re-grep before trusting them.
