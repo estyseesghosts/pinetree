@@ -226,8 +226,8 @@ fn authenticate(
                 match resolve_remote_public_key(services, client, &key_id, true) {
                     Ok((fresh_owner, fresh_pem)) => match verify(&fresh_pem) {
                         Ok(_) => Ok(fresh_owner),
-                        Err(_) => {
-                            crate::fed_debug!("in  reject reason=signature-invalid keyId={key_id:?}");
+                        Err(detail) => {
+                            crate::fed_debug!("in  reject reason=signature-invalid keyId={key_id:?} detail={detail:?}");
                             Err(unauthorized())
                         }
                     },
@@ -332,6 +332,10 @@ fn dispatch(
         "Create" => handle_create(services, activity, activity_id, actor_uri),
         "Announce" => handle_announce(services, activity, activity_id, actor_uri),
         "Like" => handle_like(services, activity, activity_id, actor_uri),
+        // Akkoma/Pleroma-family emoji reacts (`EmojiReact{content}`; see
+        // `docs/misskey-parity-plan.md` §6): same per-(user,note) row as a
+        // `Like`, extracted from `content` by the shared helper.
+        "EmojiReact" => handle_like(services, activity, activity_id, actor_uri),
         "Delete" => handle_delete(services, activity, activity_id, actor_uri),
         "Update" => handle_update(services, activity, activity_id, actor_uri),
         "QuoteRequest" => handle_quote_request(services, activity, activity_id, actor_uri),
@@ -734,7 +738,7 @@ fn handle_undo(
                     services.dedup.forget_activity(activity_id)?;
                     Ok(accepted())
                 }
-                "Like" => {
+                "Like" | "EmojiReact" => {
                     let liker = resolve_remote_account(services, actor_uri)?;
                     if services.inbound_host_blocked(&liker.id) {
                         return Ok(accepted());
@@ -970,6 +974,7 @@ fn handle_announce(
         prohibited_words: Vec::new(),
         sensitive_words: Vec::new(),
         uri: Some(activity_id.to_string()),
+        uri_base: String::new(),
         url: Some(activity_id.to_string()),
         extra_mentions: Vec::new(),
         extra_tags: Vec::new(),
@@ -1531,6 +1536,7 @@ fn ingest_remote_note_inner(
         prohibited_words: Vec::new(),
         sensitive_words: Vec::new(),
         uri: Some(parsed.uri.clone()),
+        uri_base: String::new(),
         url: parsed.url.clone(),
         extra_mentions: mention_ids,
         extra_tags: parsed.hashtags.clone(),
@@ -3358,6 +3364,84 @@ mod like_reaction_tests {
         let resp = handle_like(&services, &activity, "like-act-2", CAROL_URI).expect("handle");
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
         assert_eq!(stored_reaction(&services, &carol.id, &note.id), "🎉");
+    }
+
+    #[test]
+    fn emoji_react_with_unicode_content_stores_emoji() {
+        let services = services();
+        let alice = services.create_account("alice", None).expect("local author");
+        let carol = remote_carol(&services);
+        let (note, note_uri) = local_note(&services, &alice.id);
+
+        // Akkoma unicode-emoji shape: `EmojiReact{content}` with no tag.
+        let activity = json!({
+            "id": "https://akkoma.example/reactions/1",
+            "type": "EmojiReact",
+            "actor": CAROL_URI,
+            "object": note_uri,
+            "content": "🎉",
+        });
+        let resp = dispatch(&services, &activity, "emoji-act-1", "EmojiReact", CAROL_URI);
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(stored_reaction(&services, &carol.id, &note.id), "🎉");
+    }
+
+    #[test]
+    fn emoji_react_with_tag_falls_back_to_emoji_name() {
+        let services = services();
+        let alice = services.create_account("alice", None).expect("local author");
+        let carol = remote_carol(&services);
+        let (note, note_uri) = local_note(&services, &alice.id);
+
+        // Custom-emoji shape with no `content`: fall back to the `Emoji`
+        // tag `name`.
+        let activity = json!({
+            "id": "https://akkoma.example/reactions/2",
+            "type": "EmojiReact",
+            "actor": CAROL_URI,
+            "object": note_uri,
+            "tag": [{"type": "Emoji", "name": ":party:", "icon": {"type": "Image", "url": "https://akkoma.example/emoji/party.png"}}],
+        });
+        let resp = handle_like(&services, &activity, "emoji-act-2", CAROL_URI).expect("handle");
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(stored_reaction(&services, &carol.id, &note.id), ":party:");
+    }
+
+    #[test]
+    fn undo_emoji_react_removes_the_reaction() {
+        let services = services();
+        let alice = services.create_account("alice", None).expect("local author");
+        let carol = remote_carol(&services);
+        let (note, note_uri) = local_note(&services, &alice.id);
+
+        let react = json!({
+            "id": "https://akkoma.example/reactions/3",
+            "type": "EmojiReact",
+            "actor": CAROL_URI,
+            "object": note_uri,
+            "content": "🎉",
+        });
+        handle_like(&services, &react, "emoji-act-3", CAROL_URI).expect("react");
+        assert_eq!(stored_reaction(&services, &carol.id, &note.id), "🎉");
+
+        let undo = json!({
+            "id": "https://akkoma.example/reactions/3/undo",
+            "type": "Undo",
+            "actor": CAROL_URI,
+            "object": {
+                "id": "https://akkoma.example/reactions/3",
+                "type": "EmojiReact",
+                "actor": CAROL_URI,
+                "object": note_uri,
+            },
+        });
+        let resp = handle_undo(&services, &undo, "emoji-undo-3", CAROL_URI).expect("undo");
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert!(services
+            .reactions
+            .get_reaction(&carol.id, &note.id)
+            .expect("read reaction")
+            .is_none());
     }
 }
 

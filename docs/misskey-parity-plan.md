@@ -88,6 +88,25 @@ DIVERGENCE (decided): per-user `profile.defaultReaction`. Misskey has only per-n
 - Federation: send `EmojiReaction` (`Like` + `_misskey_reaction`, cf. `src/activitypub/objects.rs:884-900`) to emoji-aware servers (Misskey/Sharkey/pinetree); send plain `Like` (Mastodon favourite semantics) to servers without emoji-reaction support (Mastodon, Lemmy). Inbound `Like` without `_misskey_reaction` maps to `FALLBACK`.
 - Status (2026-10-16): LANDED + VERIFIED — wire compat + `i/update`/pack store commit 764ec7a; remainder commit 888f522: heart-click resolution (`notes/reactions/create` param optional, `react_with_default`, DIVERGENCE noted in the manifest), federation split (per-recipient-host `HostCapsStore` + lazy NodeInfo 2.1→2.0 probe off-transaction, 7-day TTL, unknown/failed → emoji-aware for upstream always-sends parity; `UndoLike` re-resolves), inbound no-`_misskey_reaction` → `FALLBACK` test-pinned. `defaultReaction` validation is 1..=260 chars only — pinetree has no custom-emoji registry to check permissions/sensitivity against (documented).
 
+OUT OF SCOPE (initial release; nice-to-have later): Akkoma/Pleroma-family
+`EmojiReact` interop. Akkoma federates emoji reactions as `EmojiReact`
+(`content` = unicode emoji or `:shortcode:`, plus `Emoji` tag objects for
+custom emoji; `builder.ex:74-84`) and only sends bare `Like` for plain
+favorites. UPDATE (2026-10-20): inbound `EmojiReact` now lands — inbox
+`dispatch` routes it through the `Like` path (`src/federation/inbox.rs`)
+and `Undo(EmojiReact)` unreacts, so akkoma→pinetree emoji reacts store on
+the normal per-(user,note) row; the normalizer already passes
+`:name:`/`:name@host:` through verbatim, but foreign shortcodes store
+without rendering (no registry). Outbound stays favourite-only: akkoma
+remains on the plain-`Like` deny-list
+(`src/federation/host_caps.rs:44-54`), so pinetree→akkoma emoji still
+degrades to a ❤ favorite; promoting unicode emoji to an `EmojiReact` emit
+needs a live akkoma round-trip test before claiming (its transmogrifier
+does rewrite Misskey-style `Like`+content into `EmojiReact`, so unicode
+emoji may survive; foreign custom-emoji rendering unverified).
+Plain favorites already interop both ways. (Noted 2026-10-19 from run5
+follow-up analysis; inbound half landed 2026-10-20, outbound unmeasured.)
+
 ## 7. Pinned / featured
 
 Follows Misskey `UserNotePining.ts`, `NotePiningService`, `RoleService pinLimit:5`, `i/pin|unpin.ts`, `UserEntityService.ts:552-553`, `notes/featured.ts`, `users/featured-notes.ts`.

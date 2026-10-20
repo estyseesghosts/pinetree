@@ -1045,6 +1045,7 @@ pub fn render_question(
         .map(|(i, name)| {
             let count = poll.votes.get(i).copied().unwrap_or(0);
             json!({
+                "type": "Note",
                 "name": name,
                 "_misskey_votes": count,
                 "replies": { "type": "Collection", "totalItems": count },
@@ -1661,8 +1662,9 @@ pub fn parse_ap_time_ms(val: &Value) -> Option<i64> {
     }
 }
 
-/// Extract the reaction string from an incoming `Like` activity:
-/// prefers `_misskey_reaction`, then `content`, then the bare-heart fallback.
+/// Extract the reaction string from an incoming `Like`/`EmojiReact`
+/// activity: prefers `_misskey_reaction`, then `content`, then an `Emoji`
+/// tag `name` (Akkoma custom-emoji shape), then the bare-heart fallback.
 pub fn extract_like_reaction(activity: &Value) -> String {
     if let Some(r) = activity
         .get("_misskey_reaction")
@@ -1679,6 +1681,26 @@ pub fn extract_like_reaction(activity: &Value) -> String {
         .filter(|s| !s.is_empty())
     {
         return c.to_string();
+    }
+    // Akkoma custom-emoji `EmojiReact` carries `content: ":name:"` too, but
+    // fall back to the `Emoji` tag name when `content` is absent.
+    if let Some(tag_name) = activity
+        .get("tag")
+        .and_then(Value::as_array)
+        .and_then(|tags| {
+            tags.iter().find_map(|tag| {
+                let map = tag.as_object()?;
+                if map.get("type").and_then(Value::as_str) != Some("Emoji") {
+                    return None;
+                }
+                map.get("name")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            })
+        })
+    {
+        return tag_name.to_string();
     }
     FALLBACK_REACTION.to_string()
 }
@@ -2347,6 +2369,7 @@ mod quote_render_tests {
         assert!(doc.get("endTime").is_some());
         assert!(doc.get("closed").is_none());
         assert_eq!(doc["oneOf"][0]["name"], "red");
+        assert_eq!(doc["oneOf"][0]["type"], "Note");
         assert_eq!(doc["oneOf"][0]["replies"]["totalItems"], 3);
         assert_eq!(doc["oneOf"][0]["_misskey_votes"], 3);
         assert_eq!(doc["oneOf"][1]["replies"]["totalItems"], 7);

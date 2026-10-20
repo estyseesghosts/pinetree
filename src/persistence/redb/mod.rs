@@ -66,6 +66,13 @@ const FOLLOW_REQ_FORWARD: TableDefinition<(&str, &str), &[u8]> =
 const FOLLOW_REQ_REVERSE: TableDefinition<(&str, &str), &[u8]> =
     TableDefinition::new("follow_requests_reverse");
 const REACTIONS: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new("reactions");
+/// Reactions by `(note_id, reaction_id)` (`notes/reactions` read path;
+/// reaction ids are time-ordered so the range reads oldest-first and the
+/// app reverses to newest-first). Written in the same transaction as the
+/// primary `REACTIONS` row; rebuildable derived state, backfilled at open
+/// for older databases.
+const REACTIONS_BY_NOTE: TableDefinition<(&str, &str), &[u8]> =
+    TableDefinition::new("reactions_by_note");
 /// Note drafts by id (`docs/misskey-parity-plan.md` §5; Misskey
 /// `note_draft`). Values are JSON [`NoteDraft`] rows.
 const NOTE_DRAFTS: TableDefinition<&str, &[u8]> = TableDefinition::new("note_drafts");
@@ -155,6 +162,8 @@ const INVITES: TableDefinition<&str, &[u8]> = TableDefinition::new("invites");
 /// unconsumed; `consume_and_create_account` removes it atomically.
 const INVITE_CODES: TableDefinition<&str, &str> = TableDefinition::new("invite_codes");
 
+/// META marker: `REACTIONS_BY_NOTE` has been built from `REACTIONS`.
+const REACTIONS_BY_NOTE_DONE_KEY: &str = "migration:reactions_by_note:v1";
 /// `NOTES_BY_REPLY` backfill version marker: present with value
 /// [`REPLY_INDEX_DONE_VALUE`] once every stored note has been indexed.
 const REPLY_INDEX_DONE_KEY: &str = "migration:notes_by_reply:v1";
@@ -208,6 +217,7 @@ impl RedbStore {
         store.run_reply_index_backfill()?;
         store.run_uri_index_backfill()?;
         store.run_notification_order_backfill()?;
+        store.run_reactions_by_note_backfill()?;
         Ok(store)
     }
 
@@ -258,6 +268,9 @@ impl RedbStore {
         let _ = write_txn.open_table(FOLLOW_REQ_FORWARD).map_err(map_redb_err)?;
         let _ = write_txn.open_table(FOLLOW_REQ_REVERSE).map_err(map_redb_err)?;
         let _ = write_txn.open_table(REACTIONS).map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(REACTIONS_BY_NOTE)
+            .map_err(map_redb_err)?;
         let _ = write_txn.open_table(NOTE_DRAFTS).map_err(map_redb_err)?;
         let _ = write_txn
             .open_table(NOTE_DRAFTS_BY_USER)
@@ -478,6 +491,37 @@ impl RedbStore {
             let mut meta_table = write_txn.open_table(META).map_err(map_redb_err)?;
             meta_table
                 .insert(NOTIFICATION_ORDER_DONE_KEY, "done")
+                .map_err(map_redb_err)?;
+        }
+        self.commit_write(write_txn)
+    }
+
+    /// Build `REACTIONS_BY_NOTE` from the primary `REACTIONS` table.
+    /// Idempotent; the META marker makes later opens a no-op.
+    pub fn run_reactions_by_note_backfill(&self) -> Result<(), PortError> {
+        if self.meta_get(REACTIONS_BY_NOTE_DONE_KEY)?.as_deref() == Some("done") {
+            return Ok(());
+        }
+        let write_txn = self.begin_write()?;
+        {
+            let reactions_table = write_txn.open_table(REACTIONS).map_err(map_redb_err)?;
+            let mut by_note = write_txn
+                .open_table(REACTIONS_BY_NOTE)
+                .map_err(map_redb_err)?;
+            for entry in reactions_table.iter().map_err(map_redb_err)? {
+                let (_, v) = entry.map_err(map_redb_err)?;
+                let reaction: Reaction = decode_json(v.value())?;
+                let reaction_bytes = encode_json(&reaction)?;
+                by_note
+                    .insert(
+                        (reaction.note_id.as_str(), reaction.id.as_str()),
+                        reaction_bytes.as_slice(),
+                    )
+                    .map_err(map_redb_err)?;
+            }
+            let mut meta_table = write_txn.open_table(META).map_err(map_redb_err)?;
+            meta_table
+                .insert(REACTIONS_BY_NOTE_DONE_KEY, "done")
                 .map_err(map_redb_err)?;
         }
         self.commit_write(write_txn)
@@ -909,6 +953,12 @@ impl RedbStore {
             }
         }
         let note_id = self.ids.generate();
+        // Local notes without an explicit URI get the canonical
+        // `{uri_base}/notes/{id}` (the id is fresh, so no conflict check).
+        let note_uri = note_uri.or_else(|| {
+            let base = input.uri_base.trim_end_matches('/');
+            (!base.is_empty()).then(|| format!("{base}/notes/{note_id}"))
+        });
         // Quotes always carry `renote_id` for Misskey API compatibility, so
         // the resolved local target id is the single source of truth: when
         // the application resolved the target but left `target_note_id`
@@ -952,7 +1002,7 @@ impl RedbStore {
             renote_count: 0,
             replies_count: 0,
             reaction_acceptance: input.reaction_acceptance,
-            uri: input.uri,
+            uri: input.uri.or_else(|| note_uri.clone()),
             url: input.url,
             user_host: author.host.clone(),
             is_deleted: false,
@@ -2118,6 +2168,9 @@ impl RedbStore {
         {
             let mut notes_table = write_txn.open_table(NOTES).map_err(map_redb_err)?;
             let mut reactions_table = write_txn.open_table(REACTIONS).map_err(map_redb_err)?;
+            let mut by_note_table = write_txn
+                .open_table(REACTIONS_BY_NOTE)
+                .map_err(map_redb_err)?;
 
             let mut note: Note = match notes_table.get(note_id).map_err(map_redb_err)? {
                 Some(g) => decode_json(g.value())?,
@@ -2145,7 +2198,7 @@ impl RedbStore {
                 None => None,
             };
 
-            if let Some(prev) = existing_opt {
+            if let Some(prev) = &existing_opt {
                 if !upsert {
                     return Err(PortError::Conflict("ALREADY_REACTED".to_string()));
                 }
@@ -2167,6 +2220,16 @@ impl RedbStore {
             reactions_table
                 .insert((user_id, note_id), reaction_bytes.as_slice())
                 .map_err(map_redb_err)?;
+            // Upsert mints a fresh reaction id: drop the stale index row.
+            if let Some(prev) = &existing_opt {
+                let _ = by_note_table.remove((prev.note_id.as_str(), prev.id.as_str()));
+            }
+            by_note_table
+                .insert(
+                    (reaction.note_id.as_str(), reaction.id.as_str()),
+                    reaction_bytes.as_slice(),
+                )
+                .map_err(map_redb_err)?;
         }
         self.enqueue_jobs_in_txn(write_txn, jobs, Some(note_id))?;
         Ok(reaction)
@@ -2185,6 +2248,9 @@ impl RedbStore {
         {
             let mut notes_table = write_txn.open_table(NOTES).map_err(map_redb_err)?;
             let mut reactions_table = write_txn.open_table(REACTIONS).map_err(map_redb_err)?;
+            let mut by_note_table = write_txn
+                .open_table(REACTIONS_BY_NOTE)
+                .map_err(map_redb_err)?;
 
             let mut note: Note = match notes_table.get(note_id).map_err(map_redb_err)? {
                 Some(g) => decode_json(g.value())?,
@@ -2208,6 +2274,7 @@ impl RedbStore {
                     note.reactions.remove(&prev.reaction);
                 }
             }
+            let _ = by_note_table.remove((prev.note_id.as_str(), prev.id.as_str()));
             let note_bytes = encode_json(&note)?;
             notes_table
                 .insert(note.id.as_str(), note_bytes.as_slice())
@@ -5673,6 +5740,9 @@ impl ReactionStore for RedbStore {
         {
             let mut notes_table = write_txn.open_table(NOTES).map_err(map_redb_err)?;
             let mut reactions_table = write_txn.open_table(REACTIONS).map_err(map_redb_err)?;
+            let mut by_note_table = write_txn
+                .open_table(REACTIONS_BY_NOTE)
+                .map_err(map_redb_err)?;
 
             let mut note: Note = match notes_table.get(note_id).map_err(map_redb_err)? {
                 Some(g) => decode_json(g.value())?,
@@ -5700,7 +5770,7 @@ impl ReactionStore for RedbStore {
                 None => None,
             };
 
-            if let Some(prev) = existing_opt {
+            if let Some(prev) = &existing_opt {
                 if !upsert {
                     return Err(PortError::Conflict("ALREADY_REACTED".to_string()));
                 }
@@ -5722,6 +5792,15 @@ impl ReactionStore for RedbStore {
             reactions_table
                 .insert((user_id, note_id), reaction_bytes.as_slice())
                 .map_err(map_redb_err)?;
+            if let Some(prev) = &existing_opt {
+                let _ = by_note_table.remove((prev.note_id.as_str(), prev.id.as_str()));
+            }
+            by_note_table
+                .insert(
+                    (reaction.note_id.as_str(), reaction.id.as_str()),
+                    reaction_bytes.as_slice(),
+                )
+                .map_err(map_redb_err)?;
         }
         self.enqueue_jobs_in_txn(&write_txn, jobs, Some(note_id))?;
         self.commit_write(write_txn)?;
@@ -5741,6 +5820,9 @@ impl ReactionStore for RedbStore {
         {
             let mut notes_table = write_txn.open_table(NOTES).map_err(map_redb_err)?;
             let mut reactions_table = write_txn.open_table(REACTIONS).map_err(map_redb_err)?;
+            let mut by_note_table = write_txn
+                .open_table(REACTIONS_BY_NOTE)
+                .map_err(map_redb_err)?;
 
             let mut note: Note = match notes_table.get(note_id).map_err(map_redb_err)? {
                 Some(g) => decode_json(g.value())?,
@@ -5764,6 +5846,7 @@ impl ReactionStore for RedbStore {
                     note.reactions.remove(&prev.reaction);
                 }
             }
+            let _ = by_note_table.remove((prev.note_id.as_str(), prev.id.as_str()));
             let note_bytes = encode_json(&note)?;
             notes_table
                 .insert(note.id.as_str(), note_bytes.as_slice())
@@ -5801,19 +5884,21 @@ impl ReactionStore for RedbStore {
     }
 
     fn reactions_for_note(&self, note_id: &str) -> Result<Vec<Reaction>, PortError> {
-        // No by-note index exists (reactions are keyed `(user, note)` for
-        // the `users/reactions` read path), so this scans and filters. Reads
-        // are not transaction-size limited; the §8 edit fan-out is the only
-        // caller and pages its deliveries through the standard split.
+        // `REACTIONS_BY_NOTE` range scan: bounded to one note's rows
+        // (oldest-first by time-ordered reaction id; the `notes/reactions`
+        // query reverses to newest-first). Backfilled at open for older DBs.
         let read_txn = self.db.begin_read().map_err(map_redb_err)?;
-        let table = read_txn.open_table(REACTIONS).map_err(map_redb_err)?;
+        let table = read_txn
+            .open_table(REACTIONS_BY_NOTE)
+            .map_err(map_redb_err)?;
         let mut out = Vec::new();
-        for entry in table.iter().map_err(map_redb_err)? {
+        for entry in table
+            .range((note_id, "")..=(note_id, "\u{10ffff}"))
+            .map_err(map_redb_err)?
+        {
             let (_, v) = entry.map_err(map_redb_err)?;
             let reaction: Reaction = decode_json(v.value())?;
-            if reaction.note_id == note_id {
-                out.push(reaction);
-            }
+            out.push(reaction);
         }
         Ok(out)
     }
@@ -6909,6 +6994,33 @@ impl AuthStore for RedbStore {
                 .map_err(map_redb_err)?;
         }
         self.commit_write(write_txn)
+    }
+
+    fn save_actor_keypair_if_absent(
+        &self,
+        record: ActorKeypairRecord,
+    ) -> Result<ActorKeypairRecord, PortError> {
+        // redb serialises write transactions, so the check and the insert are one atomic step.
+        let write_txn = self.begin_write()?;
+        let stored = {
+            let mut table = write_txn.open_table(ACTOR_KEYPAIRS).map_err(map_redb_err)?;
+            let existing: Option<ActorKeypairRecord> = match table.get(record.account_id.as_str()).map_err(map_redb_err)? {
+                Some(g) => Some(decode_json(g.value())?),
+                None => None,
+            };
+            match existing {
+                Some(existing) => existing,
+                None => {
+                    let encoded = encode_json(&record)?;
+                    table
+                        .insert(record.account_id.as_str(), encoded.as_slice())
+                        .map_err(map_redb_err)?;
+                    record
+                }
+            }
+        };
+        self.commit_write(write_txn)?;
+        Ok(stored)
     }
 
     fn get_remote_public_key(
