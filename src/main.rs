@@ -72,6 +72,7 @@ fn build_services(cfg: &Config) -> Result<(Arc<AppServices>, pinetree::streaming
         note_draft_limit: cfg.note_draft_limit,
         scheduled_note_limit: cfg.scheduled_note_limit,
         pin_limit: cfg.pin_limit,
+        default_like: cfg.default_like.clone(),
     });
     Ok((services, hub))
 }
@@ -264,6 +265,12 @@ async fn main() {
                 eprintln!("invalid --pin-limit (want an integer > 0): {limit}");
                 std::process::exit(2);
             });
+        } else if let Some(like) = arg.strip_prefix("--default-like=") {
+            if like.chars().count() == 0 || like.chars().count() > 260 {
+                eprintln!("invalid --default-like (want 1..=260 chars)");
+                std::process::exit(2);
+            }
+            cfg.default_like = Some(like.to_string());
         } else {
             positional.push(arg);
         }

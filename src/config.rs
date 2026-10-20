@@ -53,6 +53,14 @@ pub struct Config {
     /// Maximum pinned notes per account (Misskey `RoleService` `pinLimit`
     /// default 5; §7).
     pub pin_limit: usize,
+    /// Instance-wide default like emoji (Sharkey/Catodon `defaultLike`
+    /// parity): the emoji `notes/like` and reaction-less
+    /// `notes/reactions/create` resolve to when the caller passes no
+    /// `override`/`reaction` and the reactor has no `defaultReaction`.
+    /// `None` (default) means the bare heart ❤. Any unicode emoji or
+    /// local custom `:name:` works; unknown/custom-gated names still fall
+    /// back to ❤ through the reaction gate at use time.
+    pub default_like: Option<String>,
 }
 
 impl Default for Config {
@@ -75,6 +83,7 @@ impl Default for Config {
             note_draft_limit: crate::domain::draft::DEFAULT_NOTE_DRAFT_LIMIT,
             scheduled_note_limit: crate::domain::draft::DEFAULT_SCHEDULED_NOTE_LIMIT,
             pin_limit: crate::domain::pinning::DEFAULT_PIN_LIMIT,
+            default_like: None,
         }
     }
 }
@@ -107,6 +116,12 @@ impl Config {
         }
         if self.pin_limit == 0 {
             return Err("pin_limit must be > 0".to_string());
+        }
+        if let Some(like) = self.default_like.as_deref() {
+            let n = like.chars().count();
+            if n == 0 || n > 260 {
+                return Err("default_like must be 1..=260 chars".to_string());
+            }
         }
         Ok(())
     }
@@ -179,7 +194,8 @@ mod tests {
             "pin_limit": 8,
             "preserved_usernames": ["admin"],
             "prohibited_words": ["spam"],
-            "sensitive_words": ["nsfw"]
+            "sensitive_words": ["nsfw"],
+            "default_like": "👍"
         }"#;
         std::fs::write(&path, body).unwrap();
         let cfg = Config::load_from_file(&path).expect("load");
@@ -192,7 +208,17 @@ mod tests {
         assert_eq!(cfg.scheduled_note_limit, 2);
         assert_eq!(cfg.pin_limit, 8);
         assert_eq!(cfg.preserved_usernames, vec!["admin".to_string()]);
+        assert_eq!(cfg.default_like.as_deref(), Some("👍"));
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn default_like_bounds() {
+        assert!(Config { default_like: None, ..Config::default() }.validate().is_ok());
+        assert!(Config { default_like: Some("👍".to_string()), ..Config::default() }.validate().is_ok());
+        assert!(Config { default_like: Some(":blobcat:".to_string()), ..Config::default() }.validate().is_ok());
+        assert!(Config { default_like: Some(String::new()), ..Config::default() }.validate().is_err());
+        assert!(Config { default_like: Some("r".repeat(261)), ..Config::default() }.validate().is_err());
     }
 
     #[test]

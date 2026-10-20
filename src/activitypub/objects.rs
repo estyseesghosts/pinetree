@@ -1963,6 +1963,7 @@ mod tests {
             note_draft_limit: crate::domain::draft::DEFAULT_NOTE_DRAFT_LIMIT,
             scheduled_note_limit: crate::domain::draft::DEFAULT_SCHEDULED_NOTE_LIMIT,
             pin_limit: crate::domain::pinning::DEFAULT_PIN_LIMIT,
+            default_like: None,
         }
     }
 
@@ -2185,6 +2186,7 @@ mod quote_render_tests {
             note_draft_limit: crate::domain::draft::DEFAULT_NOTE_DRAFT_LIMIT,
             scheduled_note_limit: crate::domain::draft::DEFAULT_SCHEDULED_NOTE_LIMIT,
             pin_limit: crate::domain::pinning::DEFAULT_PIN_LIMIT,
+            default_like: None,
         }
     }
 

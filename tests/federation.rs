@@ -206,6 +206,7 @@ fn boot_node_inner(tag: &'static str) -> FedNode {
         note_draft_limit: pinetree::domain::draft::DEFAULT_NOTE_DRAFT_LIMIT,
         scheduled_note_limit: pinetree::domain::draft::DEFAULT_SCHEDULED_NOTE_LIMIT,
         pin_limit: pinetree::domain::pinning::DEFAULT_PIN_LIMIT,
+        default_like: None,
     });
     let worker = Arc::new(JobWorker {
         clock: store.clock().clone(),
@@ -1467,6 +1468,7 @@ fn federation_remote_media_cache() {
         note_draft_limit: pinetree::domain::draft::DEFAULT_NOTE_DRAFT_LIMIT,
         scheduled_note_limit: pinetree::domain::draft::DEFAULT_SCHEDULED_NOTE_LIMIT,
         pin_limit: pinetree::domain::pinning::DEFAULT_PIN_LIMIT,
+        default_like: None,
     };
     let client = SafeHttpClient::new(SafeHttpConfig {
         allow_private_ips: true,

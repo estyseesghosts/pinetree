@@ -517,13 +517,13 @@ impl AppServices {
     }
 
     /// Heart-click entry point (§6 DIVERGENCE, decided): `None` (absent/null
-    /// `reaction` param) resolves server-side to the reactor's
-    /// `defaultReaction ?? FALLBACK` (bare ❤, U+2764), then runs the exact
-    /// `react` pipeline below — so a stored default goes through
+    /// `reaction` param) resolves server-side to the override/`defaultReaction`/
+    /// instance-`default_like`/❤ chain ([`Self::resolve_like_emoji`]), then runs
+    /// the exact `react` pipeline below — so a stored default goes through
     /// `normalize_reaction` too (`"❤️"` stored → `"❤"` applied; custom
-    /// `":name:"` defaults pass through) and `coerce_reaction` still wins on
-    /// like-only notes. Explicit reactions behave byte-identically to
-    /// [`AppServices::react`].
+    /// `":name:"` defaults pass through the registry gate) and
+    /// `coerce_reaction` still wins on like-only notes. Explicit reactions
+    /// behave byte-identically to [`AppServices::react`].
     pub fn react_with_default(
         &self,
         user_id: &str,
@@ -535,11 +535,7 @@ impl AppServices {
         let reaction = match reaction {
             Some(r) => r,
             None => {
-                resolved = self
-                    .accounts
-                    .find_by_id(user_id)?
-                    .and_then(|a| a.default_reaction)
-                    .unwrap_or_else(|| FALLBACK_REACTION.to_string());
+                resolved = self.resolve_like_emoji(user_id, None)?;
                 &resolved
             }
         };
@@ -585,23 +581,7 @@ impl AppServices {
                 "CANNOT_REACT_TO_RENOTE".to_string(),
             ));
         }
-        let coerced = coerce_reaction(reaction, note.reaction_acceptance, false);
-        // §6 wire compat (Misskey `ReactionService` parity): `likeOnly`
-        // already forced the bare-heart fallback above; every other
-        // reaction is normalized (legacies map, FE0F strip unless ZWJ).
-        let coerced = if coerced == reaction {
-            normalize_reaction(Some(reaction))
-        } else {
-            coerced
-        };
-        // Custom-emoji permission gate (Misskey `ReactionService.create`
-        // parity for the local `:name:` / `:name@.:` shapes): unknown names,
-        // role-gated emoji (no role subsystem — permission unprovable),
-        // `localOnly` on remote notes, and sensitive emoji on
-        // `nonSensitive*` notes all fall back to ❤ (never an error).
-        // `:name@other-host:` shapes never originate locally; they keep the
-        // pre-existing verbatim divergence.
-        let coerced = self.resolve_custom_emoji_reaction(&coerced, &note)?;
+        let coerced = self.resolve_reaction_for_note(user_id, &note, reaction)?;
         // One id for the reaction row and the federated Like, so `unreact`'s
         // Undo(Like) names the activity the remote server received.
         let reaction_id = self.ids.generate();
@@ -651,6 +631,95 @@ impl AppServices {
         }
         self.reactions
             .react(user_id, note_id, &coerced, &reaction_id, upsert, jobs)
+    }
+
+    /// Full reaction-string resolution for one note (§6 wire compat +
+    /// custom-emoji gate): `likeOnly` coercion, legacy/FE0F normalization,
+    /// then [`Self::resolve_custom_emoji_reaction`]. Shared by [`Self::react`]
+    /// and [`Self::like_note`] so both store byte-identical strings.
+    fn resolve_reaction_for_note(
+        &self,
+        user_id: &str,
+        note: &Note,
+        reaction: &str,
+    ) -> Result<String, PortError> {
+        let _ = user_id;
+        let coerced = coerce_reaction(reaction, note.reaction_acceptance, false);
+        // §6 wire compat (Misskey `ReactionService` parity): `likeOnly`
+        // already forced the bare-heart fallback above; every other
+        // reaction is normalized (legacies map, FE0F strip unless ZWJ).
+        let coerced = if coerced == reaction {
+            normalize_reaction(Some(reaction))
+        } else {
+            coerced
+        };
+        // Custom-emoji permission gate (Misskey `ReactionService.create`
+        // parity for the local `:name:` / `:name@.:` shapes): unknown names,
+        // role-gated rows (no role subsystem — permission unprovable),
+        // `localOnly` on remote notes, and sensitive rows on
+        // `nonSensitive*` notes all fall back to ❤ (never an error).
+        // `:name@other-host:` shapes never originate locally; they keep the
+        // pre-existing verbatim divergence.
+        self.resolve_custom_emoji_reaction(&coerced, note)
+    }
+
+    /// Resolve the implicit like emoji: explicit `override` first, then the
+    /// reactor's `defaultReaction`, then the instance `default_like` config
+    /// key, then the bare heart (Sharkey/Catodon `?? serverSettings.defaultLike`
+    /// parity, with the pinetree per-user setting taking precedence over the
+    /// instance one). The result still passes through the reaction gate in
+    /// [`Self::react`], so unusable custom names fall back to ❤ there.
+    fn resolve_like_emoji(
+        &self,
+        user_id: &str,
+        override_emoji: Option<&str>,
+    ) -> Result<String, PortError> {
+        if let Some(r) = override_emoji {
+            return Ok(r.to_string());
+        }
+        if let Some(account) = self.accounts.find_by_id(user_id)? {
+            if let Some(default) = account.default_reaction {
+                return Ok(default);
+            }
+        }
+        Ok(self.default_like.clone().unwrap_or_else(|| FALLBACK_REACTION.to_string()))
+    }
+
+    /// `notes/like` (Sharkey/Catodon parity): react with
+    /// [`Self::resolve_like_emoji`]. Sharkey toggle semantics: re-pressing
+    /// with the reaction that is already stored removes it (`Ok(false)`);
+    /// pressing with a different emoji replaces the stored one through the
+    /// upsert path (`Ok(true)`). Never returns `ALREADY_REACTED`.
+    pub fn like_note(
+        &self,
+        user_id: &str,
+        note_id: &str,
+        override_emoji: Option<&str>,
+    ) -> Result<bool, PortError> {
+        match self.react_with_default(user_id, note_id, override_emoji, false) {
+            Ok(_) => Ok(true),
+            Err(PortError::Conflict(code)) if code == "ALREADY_REACTED" => {
+                let note = match self.notes.get_note(note_id)? {
+                    Some(note) if !note.is_deleted => note,
+                    _ => return Err(PortError::NotFound("NO_SUCH_NOTE".to_string())),
+                };
+                let requested = self.resolve_like_emoji(user_id, override_emoji)?;
+                let requested =
+                    self.resolve_reaction_for_note(user_id, &note, &requested)?;
+                let existing = self
+                    .reactions
+                    .get_reaction(user_id, note_id)?
+                    .map(|row| row.reaction);
+                if existing.as_deref() == Some(requested.as_str()) {
+                    self.unreact(user_id, note_id)?;
+                    Ok(false)
+                } else {
+                    self.react_with_default(user_id, note_id, override_emoji, true)?;
+                    Ok(true)
+                }
+            }
+            Err(other) => Err(other),
+        }
     }
 
     /// Misskey `ReactionService.create` custom-emoji branch parity (local

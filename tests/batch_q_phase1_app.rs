@@ -76,6 +76,7 @@ fn test_services(prefix: &str) -> AppServices {
         note_draft_limit: pinetree::domain::draft::DEFAULT_NOTE_DRAFT_LIMIT,
         scheduled_note_limit: pinetree::domain::draft::DEFAULT_SCHEDULED_NOTE_LIMIT,
         pin_limit: pinetree::domain::pinning::DEFAULT_PIN_LIMIT,
+        default_like: None,
     }
 }
 

@@ -887,3 +887,32 @@ delete-then-add through `create_emoji`.
   upstream `force:true`); import rows attribute the importing user as
   moderator (upstream adds with none); `meta.json` capped at 16 MiB
   (upstream 64 MiB).
+
+## §41 — `notes/like` (Sharkey/Catodon parity, 2026-10-20)
+
+Status: ADDENDUM only. Closes the TODOS "Like-vs-favorite split" item.
+Sharkey `notes/like.ts` and Catodon `notes/like.ts` (both read in the
+reference checkouts) are thin wrappers over `ReactionService.create` with
+`override ?? serverSettings.defaultLike` — there is NO separate like table,
+NO separate activity, and NO `notes/unlike` in either reference. A like
+IS a reaction row; "Sharkey like = Mastodon favourite" is emergent: the
+reaction fan-out already sends bare `Like` to Mastodon-class hosts
+(`host_caps.rs`) and inbound bare `Like` already stores ❤ (parity plan §6).
+
+| Endpoint | Auth | Params → result |
+|---|---|---|
+| `notes/like` (`mod.rs`, before `"notes/reactions/create"`) | credential + `write:reactions` | `noteId*`, `override?` (empty string rejected like `reactions/create`) → 204. Resolution: `override ??` reactor's `defaultReaction ??` instance `default_like` config key `??` ❤ (`AppServices::resolve_like_emoji`, shared with the heart-click path). Sharkey toggle: re-press with the stored reaction unlikes; a different emoji replaces via the upsert path (`AppServices::like_note`; never surfaces `ALREADY_REACTED`). Federates as a normal `Like`; removed with `notes/reactions/delete`. 2 calls/sec bucket (`response.rs`, both references' `1000ms/2` parity). |
+
+`default_like` config key: optional JSON string, 1..=260 chars (same rule as
+`defaultReaction`; custom `:name:` spellings allowed and gated at use time),
+`--default-like=` CLI override, covered by `Config::default_like_bounds` +
+`file_round_trip`. Absent (default) = ❤. Documented here; there is no
+separate config reference doc.
+
+DIVERGENCEs (decided): per-user `defaultReaction` takes precedence over the
+instance `default_like` (neither reference has the per-user setting, so no
+upstream order exists to mirror); unknown/custom-gated `override` values fall
+back to ❤ through the Gap-4 reaction gate instead of erroring; the toggle
+catch in Sharkey's `like.ts` targets an error id its own `create` no longer
+throws — pinetree implements the toggle the endpoint advertises (same →
+unlike, different → replace, matching Catodon's documented replace rule).

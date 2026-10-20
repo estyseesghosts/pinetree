@@ -6505,6 +6505,30 @@ fn api_dispatch_blocking(
             Ok(Json(Value::Array(out)).into_response())
         }
 
+        // `notes/like` (Sharkey/Catodon parity — thin wrapper over the
+        // reaction pipeline, NOT a Misskey favourite/bookmark): reacts with
+        // `override ??` the reactor's `defaultReaction ??` the instance
+        // `default_like` config key `??` ❤. Sharkey toggle semantics: a
+        // re-press with the stored reaction removes it; a different emoji
+        // replaces it. Federates as a normal `Like` (bare to Mastodon-class
+        // hosts = their favourite). `notes/reactions/delete` also removes it.
+        "notes/like" => {
+            check_allowed_fields(&obj, &["noteId", "override"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:reactions")?;
+            state.rate_limiter.check(&rate_key, "notes/like")?;
+            let note_id = required_str(&obj, "noteId")?;
+            let override_emoji = opt_string(&obj, "override")?;
+            if matches!(override_emoji.as_deref(), Some("")) {
+                return Err(ApiError::invalid_param("override", "this field is required"));
+            }
+            state
+                .services
+                .like_note(&caller.account.id, &note_id, override_emoji.as_deref())
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
         "notes/reactions/create" => {
             check_allowed_fields(&obj, &["noteId", "reaction"])?;
             let caller = require_caller(caller)?;
@@ -10496,6 +10520,7 @@ mod tests {
             note_draft_limit: crate::domain::draft::DEFAULT_NOTE_DRAFT_LIMIT,
             scheduled_note_limit: crate::domain::draft::DEFAULT_SCHEDULED_NOTE_LIMIT,
             pin_limit: crate::domain::pinning::DEFAULT_PIN_LIMIT,
+            default_like: None,
         });
         let worker = Arc::new(JobWorker {
             clock: clock.clone(),
@@ -12135,6 +12160,124 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{rest}");
         assert_eq!(rest.as_array().unwrap().len(), ids.len());
+    }
+
+    #[tokio::test]
+    async fn notes_like_reacts_toggles_and_replaces() {
+        let (mut state, clock) = test_state();
+        // The 2/sec `notes/like` bucket would trip on back-to-back test
+        // calls (frozen clock): swap in an open limiter. Bucket behaviour
+        // is covered by the shared limiter tests.
+        state.rate_limiter = Arc::new(RateLimiter::new(clock));
+        let (_, alice_token) = signup_user(&state, "alice").await;
+
+        let (status, value) = call(
+            &state,
+            "notes/create",
+            serde_json::json!({ "text": "like me" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let note_id = value["createdNote"]["id"].as_str().unwrap().to_string();
+
+        // Implicit like resolves to the bare heart (no user/instance default).
+        let (status, _) = call(
+            &state,
+            "notes/like",
+            serde_json::json!({ "noteId": note_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, note_value) = call(
+            &state,
+            "notes/show",
+            serde_json::json!({ "noteId": note_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{note_value}");
+        assert_eq!(note_value["myReaction"], "❤");
+
+        // Same-emoji re-press toggles off (Sharkey parity).
+        let (status, _) = call(
+            &state,
+            "notes/like",
+            serde_json::json!({ "noteId": note_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, note_value) = call(
+            &state,
+            "notes/show",
+            serde_json::json!({ "noteId": note_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{note_value}");
+        assert_eq!(note_value["myReaction"], Value::Null);
+
+        // A different emoji replaces (Catodon parity).
+        for reaction in ["👍", "🎉", "👍"] {
+            let (status, _) = call(
+                &state,
+                "notes/like",
+                serde_json::json!({ "noteId": note_id, "override": reaction }),
+                Some(&alice_token),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{reaction}");
+        }
+        let (status, note_value) = call(
+            &state,
+            "notes/show",
+            serde_json::json!({ "noteId": note_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{note_value}");
+        // 👍 set, 🎉 replaced it, 👍 replaced that back.
+        assert_eq!(note_value["myReaction"], "👍");
+    }
+
+    #[tokio::test]
+    async fn notes_like_rejects_bad_input_and_anonymous() {
+        let (state, _) = test_state();
+        let (_, alice_token) = signup_user(&state, "alice").await;
+
+        // Unknown field.
+        let (status, value) = call(
+            &state,
+            "notes/like",
+            serde_json::json!({ "noteId": "x", "bogus": 1 }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(value["code"], "UNSUPPORTED_FIELD");
+
+        // Anonymous callers are refused.
+        let (status, _) = call(
+            &state,
+            "notes/like",
+            serde_json::json!({ "noteId": "x" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // Unknown note.
+        let (status, value) = call(
+            &state,
+            "notes/like",
+            serde_json::json!({ "noteId": "n00000000000000" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_NOTE");
     }
 
     #[tokio::test]

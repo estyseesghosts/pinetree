@@ -96,4 +96,7 @@ pub struct AppServices {
     pub scheduled_note_limit: usize,
     /// Maximum pinned notes per account (§7; Misskey `pinLimit`).
     pub pin_limit: usize,
+    /// Instance-wide default like emoji (`default_like` config key;
+    /// Sharkey/Catodon `defaultLike` parity). `None` means ❤.
+    pub default_like: Option<String>,
 }

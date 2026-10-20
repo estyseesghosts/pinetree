@@ -142,6 +142,8 @@ impl RateLimiter {
             // bucket; it rides the default open bucket like the other
             // `admin/emoji/*` arms.
             .with_limit("export-custom-emojis", 1, HOUR_MS, None)
+            // Sharkey `notes/like.ts` 2-calls-per-second bucket parity.
+            .with_limit("notes/like", 2, 1_000, None)
             // Every signup attempt from one IP counts (see `check`).
             .with_limit("auth/signup", 20, HOUR_MS, None)
             // MiAuth check polls: every request counts per IP.
