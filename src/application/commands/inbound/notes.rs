@@ -106,6 +106,8 @@ impl AppServices {
                 self.ids.generate()
             ),
         )?);
+        // Batch N WS4: antenna fan-in for federated notes too (same txn).
+        jobs.push(self.antenna_match_job("__PENDING_NOTE_ID__")?);
         jobs.extend(extra_jobs);
         let mut input_with_words = input;
         input_with_words.prohibited_words = self.prohibited_words.clone();

@@ -153,7 +153,14 @@ Follows Misskey `timeline.ts:206-214`, `local-timeline.ts:119-189`, `hybrid-time
 - Local/hybrid keep Misskey parity: `withReplies default false` but keep self-replies (`replyUserId == authorId`); fix pinetree `src/application/queries.rs:191-302`, which today drops all replies when `with_replies=false`, to keep the self-reply exception.
 - Global: `visibility=public AND channelId IS NULL`, no `withReplies`, carries replies (matches both Misskey and pinetree `global_timeline`).
 - Apply §0A filters on every timeline/note read: blocked/muted/suspended authors, blocked hosts, `mutedInstances`, renote-mutes.
-- Word mutes are client-side only (decided, Misskey parity): backend stores `mutedWords/hardMutedWords/mutedInstances` (§0B) and ships them via `MeDetailed`; no server CW injection or hiding. Upstream reference is `frontend/src/utility/check-word-mute.ts` + `use-note.ts`, not `NoteEntityService.hideNote()` (which covers `specified`/`followers` visibility only).
+- Word mutes are SERVER-ENFORCED (Batch N WS8, owner-approved DIVERGENCE
+  from upstream Misskey parity, which enforces them only in the frontend):
+  `hardMutedWords` drop notes in `FeedFilter` on every timeline/note read;
+  `mutedWords` pack viewer-specific `isSoftMuted` (true only when matched
+  AND the note has no CW of its own). See `docs/word-mutes.md` and manifest
+  §31. `mutedInstances` behavior is unchanged (server-side, §12).
+  Upstream reference for the matcher is `frontend/src/utility/check-word-mute.ts`
+  + `use-note.ts`.
 - Status (2026-10-16): LANDED + VERIFIED — commit 764ec7a (home DIVERGENCE kept as decided; local/hybrid self-reply exception fixed; `mutedInstances` + renote-mutes applied on every read; §0A filters wired everywhere incl. streaming capture gates).
 
 ## 13. Profile import / export
@@ -178,8 +185,9 @@ Guide: `docs/implementer-guide-batch-m.md` (status lines there are the spec; thi
 - WP4 — abuse reports + Flag forwarding: LANDED + VERIFIED (Batch M WP4; commit pending).
 - WP5 — instance blocks: LANDED + VERIFIED (2026-10-18) — `cargo test --offline` 417 lib + 99 conformance + integration green; `bash scripts/keystone-sweep.sh` 41/0 KEYSWEEP_OK. `queries.rs::blocked_hosts()` now reads the store; `suspended_or_host_blocked` uses subdomain-aware `host_is_blocked` across all three author slots. Inbound drops before state write + dedup (all activity types). Outbound delivery-time check in `deliver_single` (skip → `Delivered`). `admin/update-meta` `blockedHosts` already wired (WP2) and normalized; `admin/meta` returns it. Conformance Group L (L1–L3). Details + DIVERGENCES: `docs/endpoint-manifest.md` §25 and `state/logs/2026-10-18-batch-m-wp5.md`.
 - WP6 — admin read/user views: LANDED + VERIFIED (commit: WP6; log: `state/logs/2026-10-18-batch-m-wp6.md`). `admin/show-user`, `admin/show-users`, `admin/update-user-note`, `admin/delete-account`, `i/delete-account`. Shared delete machinery; tombstone + follows/requests teardown + log + Delete(Person) job in one transaction. DIVERGENCES: note bodies not deleted in-line (deferred); self-delete logs `deleteAccount` with actor = account.
-- WP7–WP14 — favorites, emoji (+ WP8b remote emoji opt-in), self-service, follower removal, `followRequestAccepted`, `url-preview`, drive extras, self-delete: PENDING (conformance Group J lands with WP7/WP8).
-- WP15 antennas, WP16 user lists: PENDING.
+- WP7–WP14 — favorites (LANDED: `notes/favorites/*`, `i/favorites`, `notes/state`, `isFavorited`, real `export-favorites`; manifest §27), emoji (+ WP8b remote opt-in: LANDED — `emojis`/`emoji`/`admin/emoji/*`, `EmojiStore`, registry maps, opt-in + lazy fetch; manifest §28), `followRequestAccepted` (LANDED — local + inbound accept emit; manifest §27), word mutes (LANDED — `docs/word-mutes.md`, manifest §31), abuse-report routes (LANDED — manifest §24), admin remainder (LANDED — `unset-user-avatar|banner`, `delete-all-files-of-a-user`, `admin/drive/files|show-file`; audit table manifest §30). PENDING: `url-preview`, self-service (WP9), follower removal/remote lookup (WP10), drive `upload-from-url`/`find-by-hash` (WP13), `signin-flow`/OAuth/custom roles/policies (out, guide §8). Conformance Groups J + K1 green.
+- WP15 antennas, WP16 user lists: WP15 LANDED this session (full stack: CRUD + `notes` + `remove-note`, `antenna_match` job + worker, `antenna_notes` capped at 200, `antenna` stream channel, real export/import; manifest §29; conformance Group O green); WP16 PENDING (`src=list` refused with `NO_SUCH_USER_LIST` until lists land).
+- Batch N tail: Sharkey `notes/schedule/*` shim LANDED (thin alias over drafts; manifest §32). MiAuth audit + hardening LANDED (expiry, GET-no-write, suspended-submit gate, required gen-token params; manifest §33). Server-side word mutes LANDED (matcher + hard-drop + soft flag; `docs/word-mutes.md`, manifest §31).
 - §7 smoke-gate fix, §6 remaining docs (phase-3-profile §5 note, testing.md, wiki, AGENTS counts): PENDING, batch end.
 
 ## Build order

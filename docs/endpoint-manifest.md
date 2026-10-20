@@ -344,7 +344,12 @@ Requested presets map to existing machinery, no second list: blacklist = `muting
 - Global: `visibility = public AND channelId IS NULL`, no `withReplies`, carries replies including non-self ones (matches both Misskey and the pre-existing `global_timeline`). The `channelId` conjunct holds trivially: channels are rejected at creation (`UNSUPPORTED_FIELD`), so no stored note has a channel.
 - §0A/§12 read filters (`FeedFilter`/`feed_filter_hides`, extended with `mutedInstances`) apply on every timeline/note read: home, local, hybrid, global, `users/notes`, `notes/show|replies|renotes|children|conversation|search|search-by-tag`, and `users/reactions` (visibility + suspended/host-blocked arm always; mute/block post-filter; no renote-mutes — upstream `users/reactions.ts` applies visibility + blocked-host + suspended only). `mutedInstances` semantics: notes whose author, reply author, or renote author sits on a muted instance are hidden (host compare is case-insensitive; local authors have no host and never match; the list is viewer-scoped, so anonymous/global reads are unaffected). Suspended authors hide for every viewer including anonymous; blocked/muted authors hide only for the affected viewer. `blocked_hosts()` is still the empty extension point (§0A: no instance-block config exists yet).
 - Streaming parity closed (§0A known gaps): `note_eligible_for_channel` now computes the channel rules then applies the same feed filter once (hybrid recurses into the base rules so the filter applies exactly once on the merged verdict); `capture_gate` applies the same feed filter on top of the visibility rules.
-- Word mutes are CLIENT-SIDE ONLY (decided Misskey parity): the backend stores `mutedWords`/`hardMutedWords`/`mutedInstances` (§0B) and ships them via `MeDetailed`, but no timeline, note read, packer, or streaming path consults the word lists (verified: no `muted_words` use outside profile store/pack; pack-level hiding covers specified/followers visibility only, matching `NoteEntityService.hideNote` scope; nested reply/renote expansion nulls invisible targets). Upstream word-mute enforcement lives in the frontend (`check-word-mute.ts` + `use-note.ts`), out of scope here.
+- Word mutes are SERVER-ENFORCED (Batch N WS8, owner-approved DIVERGENCE
+  from upstream Misskey parity, which enforces them only in the frontend):
+  `hardMutedWords` drop notes in `FeedFilter` on every read;
+  `mutedWords` pack viewer-specific `isSoftMuted` (true only when matched
+  AND the note has no CW of its own). See `docs/word-mutes.md`; manifest
+  §31. The old "client-side only" rule is superseded.
 
 ## 20. Superseding note — §13 profile import / export (2026-10-16, `docs/misskey-parity-plan.md`)
 
@@ -384,7 +389,7 @@ Roles (`is_admin`, `is_moderator` on `Account`; fixed built-in only, custom role
 | `admin/show-moderation-logs` (new) | `limit` (1..=100, default 10), `sinceId`, `untilId`, `sinceDate`, `untilDate`, `type`, `userId`, `search` | Credential + `read:admin:show-moderation-log` + moderator. Newest-first cursor page of `[{id, createdAt, type, info, userId, user}]` (upstream `ModerationLogEntityService.pack`; `user` = `UserDetailedNotMe`, `null` for CLI rows). `type` unknown → `[]` (upstream `log.type = :type`). `userId` filters the acting moderator, `search` is a case-insensitive substring of `info`. DIVERGENCE: upstream requires admin (`requireAdmin`); pinetree lets moderators read (guide §3.2). |
 | `admin/reject-quotes` (changed) | unchanged (`userId`, `rejectQuotes`) | Now requires the moderator role (was: any first-party credential — live auth hole, closed WP1). Moderator-target refusal (WP3 refusal rule) → `400 INVALID_PARAM` carrying upstream's `cannot moderate moderator account` message (DIVERGENCE: upstream throws an untyped `Error` here and its API layer answers `500 INTERNAL_ERROR` with a generic message, `ApiCallService.ts:#onExecError`; clients see a failure either way). Each state change writes a Sharkey-shaped moderation-log row `acceptQuotesUser`/`rejectQuotesUser` with payload `{userId, userUsername, userHost}` (`sharkey/…/types.ts:441-450`; guide §3.2's `updateUserRejectQuotes` label superseded by the match-upstream rule), committed atomically with the flag and the `MeUpdated` job. No-change calls stay no-ops (no log row), Sharkey parity. |
 
-Moderation-log action strings match upstream type names where they exist (`ModerationLogService.ts` / Sharkey `types.ts`), so client log UIs can label rows: `suspend`, `unsuspend`, `updateUserNote`, `acceptQuotesUser`, `rejectQuotesUser`, `setRole`, `updateServerSettings`, `createInvitation`, `deleteInvite`, `resolveAbuseReport`, `forwardAbuseReport`, `updateAbuseReportNote`, `addCustomEmoji`, `updateCustomEmoji`, `deleteCustomEmoji`, `deleteAccount`, `createAccount`.
+Moderation-log action strings match upstream type names where they exist (`ModerationLogService.ts` / Sharkey `types.ts`), so client log UIs can label rows: `suspend`, `unsuspend`, `updateUserNote`, `acceptQuotesUser`, `rejectQuotesUser`, `setRole`, `updateServerSettings`, `createInvitation`, `deleteInvite`, `resolveAbuseReport`, `forwardAbuseReport`, `updateAbuseReportNote`, `addCustomEmoji`, `updateCustomEmoji`, `deleteCustomEmoji`, `unsetUserAvatar`, `unsetUserBanner`, `deleteAccount`, `createAccount`. (`deleteAllFilesOfAUser` is pinetree-named: upstream `admin/delete-all-files-of-a-user` writes no log row.)
 
 ## 22. Superseding note — WP2: registration policy + invite codes (2026-10-17, `docs/implementer-guide-batch-m.md`)
 
@@ -451,9 +456,9 @@ DIVERGENCES (recorded; do not "fix" back):
 - Semantics (upstream parity): outgoing follows removed (stay removed), incoming follows kept, follow requests removed in both directions (stay removed). Unsuspend restores sign-in/token/stream/actor-fetch but none of those rows.
 - `NO_SUCH_USER` UUID for the missing-target path is pinetree's `fcd2eef9-…` (one-UUID-per-code convention); do not copy the guide's `1acefcb5-…`.
 
-## §24 — Abuse reports (Batch M WP4)
+## §24 — Abuse reports (Batch M WP4; routes LANDED Batch N WS5 this session)
 
-Endpoints: `users/report-abuse` (credential, `write:report-abuse`), `admin/abuse-user-reports` (moderator), `admin/resolve-abuse-user-report`, `admin/update-abuse-user-report`, `admin/forward-abuse-user-report`.
+Endpoints (`users/report-abuse` answers the packed report; admin resolve/update/forward answer 204): `users/report-abuse` (credential, `write:report-abuse`), `admin/abuse-user-reports` (moderator, `read:admin:abuse-user-reports`), `admin/resolve-abuse-user-report` (moderator, `write:admin:resolve-abuse-user-report`), `admin/update-abuse-user-report` (moderator, same kind upstream), `admin/forward-abuse-user-report` (moderator, same kind upstream). List takes `limit` (default 10)/cursor + `state` (`resolved`/`unresolved`/absent = all) + `reporterOrigin`/`targetUserOrigin` (`combined`/`local`/`remote`). Pack shape: `{id, createdAt, comment, resolved, reporterId, targetUserId, assigneeId, reporter, targetUser, assignee, forwarded, resolvedAs, moderationNote}` (upstream `AbuseUserReportEntityService.pack` parity; assignee null when unset; gone users pack null). Inbound `Flag` (upstream `ApInboxService.flag` parity): the first mentioned LOCAL user becomes the report target, the remote actor the reporter, `content` + the JSON object-URI list the comment; remote-only/empty targets converge quietly (upstream `skip`); atomic dedup + insert (replays converge, no duplicates); blocked-host actors drop before any state write. Overlong inbound comments truncate to the 2048-char column bound (DIVERGENCE: no retry storm). — forwarded Flags from remotes are accepted-and-ignored by the catch-all).
 
 Error codes:
 - `NO_SUCH_USER` `1acefcb5-0959-43fd-9685-b48305736cb5` (target missing / self-report path uses pinetree's own `fcd2eef9-…`? DIVERGENCE: pinetree reuses `fcd2eef9-…` for missing target; report-abuse uses upstream `1acefcb5-…` for no-such-user).
@@ -465,7 +470,7 @@ Storage: `AbuseReportStore` port (required, no defaults) + redb `abuse_reports` 
 
 Flag delivery: `FederateDeliverPayload::Flag` → `render_flag_activity` (type Flag, actor = system actor, content = report comment, object = reported account URI) → existing SSRF-guarded delivery path.
 
-DIVERGENCES: notifications (admin stream/email/webhook) skipped; admins poll. Reporter host always null (local reports only). Origin filters are accepted but applied at storage scan level (no host column resolution beyond account id).
+DIVERGENCES: notifications (admin stream/email/webhook) skipped; admins poll. Reporter host always null (local reports only). Origin filters are accepted but applied at storage scan level (no host column resolution beyond account id). Missing-target `NO_SUCH_USER` emits pinetree's UUID (`fcd2eef9-…`, one-UUID-per-code) instead of upstream `1acefcb5-…`; `CANNOT_REPORT_YOURSELF`/`CANNOT_REPORT_THE_ADMIN` carry verbatim upstream ids. Double-forward refusal answers `400 INVALID_PARAM` carrying upstream's `already been forwarded` message (upstream throws an untyped `Error` → 500). A comment-length violation answers `INVALID_PARAM` via the domain bound (upstream `minLength 1/maxLength 2048` schema parity).
 
 ## §25 — Instance blocks (Batch M WP5)
 
@@ -497,3 +502,138 @@ DIVERGENCES:
 - Note bodies are not deleted in-line; tombstoning leaves them filtered by the read path (transaction-size bound). A cleanup job is deferred.
 - Self-delete logs a `deleteAccount` row with actor = the account itself (upstream logs via `DeleteAccountService`; pinetree records it for audit).
 - `INCORRECT_PASSWORD` is answered as `PortError::Validation("INCORRECT_PASSWORD")` (upstream throws untyped "incorrect password").
+
+## §27 — Favorites, note state, `followRequestAccepted` (Batch N WS2–WS3)
+
+Reference pins: Misskey `2026.10.1-alpha.0` (`./misskey`). Status: LANDED (this session).
+
+| Endpoint | Auth | Params | Response |
+|---|---|---|---|
+| `notes/favorites/create` | credential `write:favorites`, 20/h | `noteId*` | `204 No Content`; `NO_SUCH_NOTE` (missing, deleted, or invisible to the caller — visibility gate then error-maps to `noSuchNote`), `ALREADY_FAVORITED` (upstream `a402c12b-…` verbatim) |
+| `notes/favorites/delete` | credential `write:favorites` (no rate limit, upstream parity) | `noteId*` | `204 No Content`; `NO_SUCH_NOTE` (existence only, no visibility gate — upstream asymmetry), `NOT_FAVORITED` (upstream `b625fc69-…` verbatim) |
+| `i/favorites` | credential `read:favorites` | cursor `limit` 1–100 default 10, `sinceId`/`untilId`/`sinceDate`/`untilDate` | `Note[]` newest-first (favorite-id order); gone notes skipped (upstream `leftJoin` parity) |
+| `notes/state` | credential `read:account` | `noteId*` | `{isFavorited, isMutedThread: false}`; unknown/invisible → `NO_SUCH_NOTE` (D8 indistinguishability); thread-muting stays out (guide §8), so `isMutedThread` is always `false` |
+
+Storage: `FavoriteStore` port (required, no defaults) + redb `favorites` table keyed `(user_id, note_id)` → `NoteFavorite` row. Unique per (account, note); delete leaves the note. `i/export-favorites` now writes real rows (`{id, createdAt, note: {id, text, createdAt, fileIds, replyId, renoteId, poll, cw, visibility, visibleUserIds, localOnly, reactionAcceptance, uri, url, user: {id, name, username, host, uri}}}` per favorite, id-ASC order; upstream `ExportFavoritesProcessorService.serialize` parity; invisible/gone notes skipped).
+
+Packed notes carry `isFavorited` (bool, always present) for the authenticated caller; anonymous callers see `false`.
+
+Notifications: `followRequestAccepted` is now emitted — locally in `accept_follow_request` (notifiee = requester, notifier = acceptor) and on inbound `Accept(Follow)` (same direction). It is a first-class `i/notifications` filter value and streams as a plain `notification` hint (no side-channel, like scheduling/export notifications). Manifest §19's unemitted list no longer contains it; the remaining unemitted entries (`note`, `pollEnded`, `roleAssigned`, `chatRoomInvitationReceived`, `achievementEarned`, `login`, `createToken`, `app`, `test`) stay out per guide §8 (no subsystem to emit them from). `reaction:grouped`/`renote:grouped` remain packer-only pseudo-types; `pollVote`/`groupInvited` remain obsolete-and-dropped.
+
+## §28 — Custom emoji + remote opt-in (Batch N WS1 + WP8b)
+
+Reference pins: Misskey `2026.10.1-alpha.0` (`./misskey`). Status: LANDED (this session).
+
+| Endpoint | Auth | Params | Response |
+|---|---|---|---|
+| `emojis` | none | `{}` | `{emojis: EmojiSimple[]}` local-only, ordered by category then name; 3600s client cache (`cacheSec` parity) |
+| `emoji` | none | `name*` | `EmojiDetailed`; unknown → `NO_SUCH_EMOJI` (400; upstream throws `findOneOrFail` → 500 — pinetree answers the missing-resource shape like every other `NO_SUCH_*`) |
+| `admin/emoji/add` | credential + `write:admin:emoji` + moderator | `name*` (`^[a-zA-Z0-9_]+$`), `fileId*`, `category?`, `aliases[]?`, `license?`, `isSensitive=false`, `localOnly=false`, `roleIdsThatCanBeUsedThisEmojiAsReaction[]?` | `EmojiDetailed`; `NO_SUCH_FILE` (add-endpoint UUID `fc46b5a4-…`), `UNSUPPORTED_FILE_TYPE`, `DUPLICATE_NAME` (all verbatim) |
+| `admin/emoji/update` | credential + `write:admin:emoji` + moderator | `id` xor `name` (+ both = rename when different, `doNameUpdate` parity), optional `fileId`, `category?` (null resets), `aliases[]?`, `license?` (null resets), `isSensitive?`, `localOnly?`, `roleIds…?` | void (204); `NO_SUCH_EMOJI`, `NO_SUCH_FILE`, `SAME_NAME_EMOJI_EXISTS` (all verbatim; `NO_SUCH_FILE` emits the add-endpoint UUID for both — one-UUID-per-code) |
+| `admin/emoji/delete` | credential + `write:admin:emoji` + moderator | `id*` | void (204); `NO_SUCH_EMOJI` |
+| `admin/emoji/list` | credential + `read:admin:emoji` + moderator | `query?`, cursor, `limit` 1–100 (default 10) | `EmojiDetailed[]` local-only, newest-first; `query` matches name/aliases/category (case-insensitive substring) or exact `:name:` tokens (upstream parity) |
+
+Storage: `EmojiStore` port (required, no defaults) + redb `emojis` (id → row) + `emojis_by_name` (lower shortcode → id; case-insensitive uniqueness, conformance J2) + `remote_emojis` ((lower host, lower shortcode) → row). `remote_emojis.media_id` is owned by the lazy-fetch job only.
+
+Packing: note `emojis`/`reactionEmojis` carry the registry (bare shortcode → served drive URL locally; `name@host` → remote URL only for opted-in viewers, else absent). `UserLite.emojis` stays `{}` (profile-emoji attachment is not modeled — documented). `EmojiSimple` omits falsy `localOnly`/`isSensitive` and empty role ids (upstream parity); `url` prefers the served drive URL.
+
+WP8b (DIVERGENCE, owner-approved): per-account `showRemoteEmojis` (default false), set via `i/update`, read back on `i` / `i/update`. Ingest stores metadata only (≤32 AP `Emoji` tags per note/actor object; no fetch; http(s) icon URLs only). Turning the setting on enqueues one bounded `RemoteEmojiFetch` job per known uncached remote row (≤200 per toggle); the job uses the §2 rule 6 SSRF-guarded fetcher, 2 MiB cap, `image/*` content-type + sniff gate, and stores bytes + a drive metadata row, recording the local copy. Packing prefers the cached copy once present; until then the packed URL points at the remote host (documented privacy trade-off). Turning the setting off hides remote emoji without deleting metadata or cached bytes. Inbound drops (blocked hosts) write no metadata (ingest runs after the drop checks).
+
+DIVERGENCES: moderator role stands in for upstream `canManageCustomEmojis` (no custom-role policies); `roleIdsThatCanBeUsedThisEmojiAsReaction` stored but never enforced (same reason); stream broadcasts (`emojiAdded/Updated/Deleted`) not emitted (no broadcast bus — readers poll `emojis`); profile emoji attachment not modeled (`UserLite.emojis` `{}`); remote fetch caching behavior beyond the packed URL (served from the drive row once cached).
+
+Out of scope (guide §8): bulk ops, `import-zip`, `copy`, `list-remote`. `export-custom-emojis` has no dedicated endpoint in this pin and stays out.
+
+## §29 — Antennas (Batch N WS4; guide WP15)
+
+Reference pins: Misskey `2026.10.1-alpha.0` (`./misskey`). Status: LANDED (this session).
+
+| Endpoint | Auth | Params | Response |
+|---|---|---|---|
+| `antennas/list` | credential `read:account` | none | `Antenna[]` of caller, newest-first |
+| `antennas/show` | credential `read:account` | `antennaId*` | `Antenna`; owner-scoped, else `NO_SUCH_ANTENNA` |
+| `antennas/create` | credential `write:account` | `name*` (1–100), `src*` (`home\|all\|users\|list\|users_blacklist`), `userListId?`, `keywords*`, `excludeKeywords*`, `users*`, `caseSensitive*`, `withReplies*`, `withFile*`, `localOnly=false`, `excludeBots=false`, `excludeNotesInSensitiveChannel=false` (accepted, stored, no effect — no channels) | `Antenna`; `EMPTY_KEYWORD`, `TOO_MANY_ANTENNAS` (both verbatim), `NO_SUCH_USER_LIST` for `src=list` (see below) |
+| `antennas/update` | credential `write:account` | `antennaId*` + any create field | `Antenna`; same error set + `NO_SUCH_ANTENNA`; sets `isActive=true`, bumps `lastUsedAt`; id+renaming-name renames (`doNameUpdate` parity, `SAME_NAME_EMOJI_EXISTS` does not apply — antenna names are not unique) |
+| `antennas/delete` | credential `write:account` | `antennaId*` | void (204); `NO_SUCH_ANTENNA`; feed cascade in the same transaction |
+| `antennas/notes` | credential `read:account` | `antennaId*`, cursor, `limit` 1–100 (default 10) | `Note[]` newest-first; reactivates the antenna; read-time visibility/mute/block filtering; gone notes skipped |
+| `antennas/remove-note` | credential `write:account` | `antennaId*`, `noteId*` | void (204); owner-scoped (`NO_SUCH_ANTENNA`); missing rows are no-op |
+| `i/export-antennas` / `i/import-antennas` | credential (1/hr) | export: none; import: `fileId*` | Real now: export writes `[{name, src, keywords, excludeKeywords, users, userListAccts: null, caseSensitive, localOnly, excludeBots, withReplies, withFile, excludeNotesInSensitiveChannel}]` (upstream shape); import validates rows (upstream `exportedAntennaSchema` rules), skips empty-keyword rows (upstream verbatim rule), rewrites `src=list`+`userListAccts` to `src=users` (upstream parity; `src=list` without accts skips), and applies the rest through `create_antenna`. Endpoint pre-check `count + batch >= limit` → `TOO_MANY_ANTENNAS` (import-endpoint UUID `600917d4-…`); malformed JSON → `INVALID_PARAM` (upstream throws 500) |
+| `antenna` stream channel | credential + owned `antennaId` | `params.antennaId*` | `note` frames (detail packs) for matches; anonymous/foreign/unknown ids silently refused (credential-channel parity) |
+
+Storage: `AntennaStore` + `AntennaNoteStore` ports (required, no defaults) + redb `antennas` (id → row), `antennas_by_owner` ((owner, id)), `antenna_notes` ((antenna, note)) tables. `antenna_notes` trims to the newest 200 per antenna in the same append transaction.
+
+Matching (`AntennaService.checkHitAntenna` order): sensitive-channel/bots → `localOnly` → `withReplies=false` drops all replies → visibility (`specified` needs owner-or-in-list; `followers` needs owner-follows-author) → src (`all` matches; `users`/`users_blacklist` compare lowercased `user[@host]` accts; `list` never matches) → `keywords` OR-of-AND over `text + "\n" + cw` (case-insensitive unless `caseSensitive`; empties stripped; null text+cw never matches a non-empty list) → `excludeKeywords` drop → `withFile` drop. Architecture (no in-process cache): note creation enqueues one bounded `AntennaMatch` job (note id) in the same transaction (local + federated notes); the worker matches active antennas and appends feed rows, then publishes the `antenna` event post-commit.
+
+DIVERGENCES (recorded; do not "fix" back): `home` = owner's own notes + notes from followed accounts (upstream `home` is a TODO matching everything, `AntennaService.ts:137-139`); no 7-day auto-deactivation (upstream `CleanProcessorService.ts:51-56`; pinetree caps at 5 antennas per instance instead, enforced = advertised `antennaLimit: 5`); `src=list` refused with `NO_SUCH_USER_LIST` (WP16 user lists pending — no list can exist yet); no `antennaCreated/Updated/Deleted` broadcast events (no broadcast bus; readers poll, stream subscribers get `note` frames); export `userListAccts` always null (no memberships to resolve); read-time filtering uses `FeedFilter` + visibility (upstream uses QueryService visibility + channel-mute brackets — the channel arm is vacuous here).
+
+## §30 — Moderation/admin remainder audit (Batch N WS6)
+
+Upstream `admin/*` (~90 files) vs pinetree's routed set. Verdicts:
+implement / out (with reason) / needs-owner-decision. Reference pins:
+Misskey `2026.10.1-alpha.0` (`./misskey`).
+
+| Upstream group | Verdict | Reason |
+|---|---|---|
+| `abuse-user-reports`, `resolve/update/forward-abuse-user-report`, `users/report-abuse` | **implemented (WS5)** | §24 contract frozen; routes landed Batch N |
+| `abuse-report/notification-recipient/*` (5) | **out** | no email/webhook infra; §24 DIVERGENCE (admins poll) |
+| `unset-user-avatar`, `unset-user-banner` | **implemented (WS6)** | moderator + scope; refusal rule on mod/admin targets (DIVERGENCE — upstream checks the role only); `unsetUserAvatar`/`unsetUserBanner` log rows; no-op when unset |
+| `delete-all-files-of-a-user` | **implemented (WS6)** | `requireAdmin` parity; loops existing `delete_media` machinery; pinetree-named `deleteAllFilesOfAUser` log row with count (upstream logs nothing) |
+| `drive/files`, `drive/show-file` | **implemented (WS6)** | moderator, read-only; new required `MediaStore::list_all_media` port (global newest-first scan; filters in the op); `type` MIME-prefix, `origin` combined/local/remote, `hostname` (null never matches locals, upstream parity); `show-file` `fileId` xor `url` (url matches served `url` or cached `source_url`), `NO_SUCH_FILE` `caf3ca38-…` verbatim |
+| `roles/*` (9), `update-proxy-account`, `captcha/*` (2) | **out** | no custom-roles/captcha/proxy-account subsystems; fixed built-in roles only (§22/§23) |
+| `emoji/*` (12) | **implemented (WS1)** | registry + admin management landed Batch N (§28); bulk/import-zip/copy/list-remote stay out (guide §8) |
+| `ad/*` (4), `announcements/*` (4), `avatar-decorations/*` (4), `promo/create` | **out** | no ads/announcements/decoration/promo subsystems (profile §5 out) |
+| `relays/*` (3) | **out** | no relay infra (stated §17) |
+| `system-webhook/*` (6), `send-email` | **out** | no webhook/email infra |
+| `queue/*` (13), `get-index-stats`, `get-table-stats`, `server-info` | **out** | no BullMQ/admin-queue UI; observability via logs |
+| `accounts/delete` (vs routed `delete-account`) | **out** | duplicate of `delete-account`; one suffices |
+| `federation/update-instance`, `federation/refresh-remote-instance-metadata` | **needs-owner-decision** | touches WP5 blocked-host surface; manual instance edit could be useful, auto-refresh needs fetch infra |
+| `federation/remove-all-following`, `federation/delete-all-files` | **out** (default) | destructive bulk ops; confirm owner really wants them |
+| `drive/clean-remote-files`, `drive/cleanup` | **out** | cleanup needs job infra beyond the delete loop |
+| `accounts/find-by-email`, `get-user-ips`, `reset-password`, `unset-mfa` | **needs-owner-decision** | privacy/email decisions (IP/email lookup, password reset needs email or mint-and-display) |
+
+Suggested default if owners don't weigh in: the WS6 five implemented above stay; everything else stays out with the reasons recorded here.
+
+## §31 — Server-side word mutes (Batch N WS8)
+
+Owner-approved DIVERGENCE from upstream (which enforces word mutes only
+in the frontend). Full semantics + conformance index: `docs/word-mutes.md`.
+
+- Matcher (`src/domain/word_mute.rs`, Misskey-exact): haystack
+  `(cw ?? '') + '\n' + (text ?? '')` trimmed (CW first); self-exempt;
+  empty-text exempt; case-sensitive substring AND-groups (empties dropped,
+  emptied groups never match); `/pattern/flags` bare-string regexes
+  (`i/m/s` honored, `g/d/u` inert, `y` start-anchored, anything else —
+  notably `v` — never matches); self → reply → renote first-match-wins.
+- **Hard** (`hardMutedWords`): `FeedFilter` drop on every timeline/note
+  read (timelines, threads, search, `users/notes`, `notes/show`,
+  `users/reactions`, `antennas/notes`, streaming eligibility + capture).
+- **Soft** (`mutedWords`): no drop; viewer-specific `isSoftMuted` packed
+  on the note when matched AND the note has no CW of its own.
+- Notifications are NOT gated on word mutes.
+- Perf: per-user sets compile once per read/pack (200-char write-time
+  cap); reply/renote bodies resolve through a per-read note cache.
+  Read-time only — FDB-safe (no transaction growth).
+
+## §32 — Sharkey scheduling shim (Batch N tail)
+
+Sharkey `notes/schedule/create|list|delete` as a thin alias over the
+Misskey-model drafts. No new tables, job kinds, or ports. Reference pins:
+Sharkey `2025.4.7` (`./sharkey`).
+
+| Endpoint | Auth | Params | Response |
+|---|---|---|---|
+| `notes/schedule/create` | credential (any; upstream kind `write:notes-schedule` honored as a permission string, first-party passes), drafts 300/hr bucket (DIVERGENCE — no second rate-kind for an alias) | `visibility` (default `public`), `visibleUserIds?`, `cw?`, `reactionAcceptance?`, `noExtract*?` (accepted, ignored — same as drafts), `replyId?`, `renoteId?`, `text?`, `fileIds?`/`mediaIds?` (accept both, 1–16 ids each; `fileIds` wins — upstream `??` parity), `poll?`, `scheduleNote: {scheduledAt!}` (ms epoch, must be future) | Packed schedule-note (see list shape, single entry) |
+| `notes/schedule/list` | credential (`read:notes-schedule`) | `sinceId?`, `untilId?`, `limit` 1–100 (default 10) | Caller’s scheduled drafts, newest-first, upstream shape (`id`, `userId`, `scheduledAt` ISO, `note: {text (default `''`), cw, fileIds + packed `files`, visibility (default `public`), visibleUsers, reactionAcceptance (default null), user, createdAt: scheduledAt-ISO, isSchedule: true, id, renote/reply (packed or null), renoteId/replyId, poll?}`) |
+| `notes/schedule/delete` | credential (`write:notes-schedule`) | `noteId!` (the schedule entry id = draft id) | void (204); unknown → `NO_SUCH_NOTE` (`a58056ba-…`, Sharkey’s UUID); foreign → 403 `PERMISSION_DENIED` (`c0da2fed-…`). Deletes via the draft path (publish job cleared exactly once) |
+
+Rules: the `anyOf` content rule (one of text/renoteId/fileIds/mediaIds/poll; blank text absent) is enforced up front (`INVALID_PARAM`); up-front target checks carry verbatim Sharkey ids (`NO_SUCH_RENOTE_TARGET`, `CANNOT_RENOTE_TO_A_PURE_RENOTE` `fd4cc33e-…` via a dedicated constructor since the shared code maps to Misskey’s `CANNOT_RENOTE` UUID, `NO_SUCH_REPLY_TARGET`, `CANNOT_REPLY_TO_A_PURE_RENOTE` `3ac74a84-…`, `CANNOT_RENOTE_DUE_TO_VISIBILITY`, `YOU_HAVE_BEEN_BLOCKED`, `NO_SUCH_FILE`, `CANNOT_CREATE_ALREADY_EXPIRED_POLL` judged against the *scheduled* time); `expiredAfter` converts to `expiresAt = scheduledAt + expiredAfter` (upstream parity; `expiresAt` wins when both present — DIVERGENCE from the drafts `expiredAfter`-wins rule, which applies only to the drafts endpoints); cap pre-check `count >= scheduled_note_limit` → `SCHEDULE_NOTE_MAX` (`168707c3-…`). No `channelId` exists upstream (nothing to reject); `CANNOT_RENOTE_OUTSIDE_OF_CHANNEL` stays unimplemented with no channel model. No `notes/schedule/update` upstream — edits go through `notes/drafts/update` on the underlying draft. Publish path untouched (`PostScheduledDraft` fires and posts through the normal path).
+
+## §33 — MiAuth hardening (Batch N WS7)
+
+DIVERGENCEs (upstream `2026.10.1-alpha.0` has none of these; all hardening):
+
+- 30-minute approval window (`MIAUTH_APPROVAL_WINDOW_MS`) on MiAuth and legacy sessions (`expires_at_ms`, serde-default `None` for pre-expiry rows). Expired rows read as missing and are deleted on read (check polls `ok: false`; submit re-arms on re-approve; `userkey`/`show`/`accept` see `NO_SUCH_SESSION`/`NO_SUCH_*`).
+- `GET /miauth/:session` never persists (used to upsert a row for any attacker-chosen session id on every view; the page renders from query params, submit persists on approve).
+- Submit refuses suspended approvers (error page; no row/token minted — tokens would die at `authenticate` anyway).
+- `miauth/gen-token` requires `session` + `permission` (upstream `paramDef.required` parity; was optional-with-defaults).
+- Kept lax (upstream parity): permission strings are stored verbatim (upstream filters client-side only; no backend allowlist); `auth/session/generate` accepts any `appSecret` (no app registry; verified late at `userkey`, which answers `authentication_failed` on mismatch — documents `NO_SUCH_APP` as unemittable); the legacy approve URL stays the MiAuth page (legacy approval runs through `auth/accept`, not the URL).
+- Rate limits: submit throttle + `miauth-check` per-IP bucket kept; `miauth/gen-token` rides the API dispatch with no dedicated bucket (upstream also none).

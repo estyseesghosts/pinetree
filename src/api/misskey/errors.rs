@@ -63,6 +63,9 @@ pub const BLOCKING_ID: &str = "4e2206ec-aa4f-4960-b865-6c23ac38e2d9";
 pub const BLOCKED_ID: &str = "c4ab57cc-4e41-45e9-bfd9-584f61e35ce0";
 pub const ALREADY_REACTED_ID: &str = "71efcf98-86d6-4e2b-b2ad-9d032369366b";
 pub const NOT_REACTED_ID: &str = "7f6e1c2d-9f9b-4c1a-9e2a-9b9b9b9b9b02";
+/// Misskey `notes/favorites/create.ts` + `delete.ts` idents (verbatim upstream UUIDs).
+pub const ALREADY_FAVORITED_ID: &str = "a402c12b-34dd-41d2-9d8d-4d2ffd96a1a6";
+pub const NOT_FAVORITED_ID: &str = "b625fc69-635e-4e89-baa6-dbefbef35af5";
 pub const CANNOT_REACT_TO_RENOTE_ID: &str = "eaccdc08-ddef-43fe-908f-d108faad57f5";
 pub const CANNOT_RENOTE_ID: &str = "be9529e9-fe72-4de0-ae43-0b363c4938af";
 pub const BOTH_WITH_REPLIES_AND_WITH_FILES_ID: &str = "91c8cb9f-36ed-46e7-9ca2-7df96ed6e222";
@@ -87,6 +90,36 @@ pub const TOO_MANY_SCHEDULED_NOTES_ID: &str = "22ae69eb-09e3-4541-a850-773cfa45e
 pub const SCHEDULED_AT_REQUIRED_ID: &str = "15e28a55-e74c-4d65-89b7-8880cdaaa87d";
 pub const SCHEDULED_AT_MUST_BE_IN_FUTURE_ID: &str = "e4bed6c9-017e-4934-aed0-01c22cc60ec1";
 pub const NO_SUCH_NOTE_DRAFT_ID: &str = "49cd6b9d-848e-41ee-b0b9-adaca711a6b1";
+/// Misskey `admin/emoji/*` idents (verbatim upstream UUIDs; Batch N WS1).
+/// One UUID per code (§16 convention): `NO_SUCH_EMOJI` takes the update-endpoint
+/// UUID, `NO_SUCH_FILE` on the add/update path takes the add-endpoint UUID.
+pub const NO_SUCH_EMOJI_ID: &str = "684dec9d-a8c2-4364-9aa8-456c49cb1dc8";
+pub const DUPLICATE_NAME_ID: &str = "f7a3462c-4e6e-4069-8421-b9bd4f4c3975";
+pub const SAME_NAME_EMOJI_EXISTS_ID: &str = "7180fe9d-1ee3-bff9-647d-fe9896d2ffb8";
+pub const UNSUPPORTED_FILE_TYPE_ID: &str = "f7599d96-8750-af68-1633-9575d625c1a7";
+pub const EMOJI_ADD_NO_SUCH_FILE_ID: &str = "fc46b5a4-6b92-4c33-ac66-b806659bb5cf";
+/// Misskey `antennas/*` + `i/import-antennas` idents (verbatim upstream
+/// UUIDs; Batch N WS4). One UUID per code (§16 convention): `NO_SUCH_ANTENNA`
+/// takes the update-endpoint UUID; the import endpoint mints its own
+/// `TOO_MANY_ANTENNAS` UUID (`import_too_many_antennas`).
+pub const NO_SUCH_ANTENNA_ID: &str = "10c673ac-8852-48eb-aa1f-f5b67f069290";
+pub const EMPTY_KEYWORD_ID: &str = "53ee222e-1ddd-4f9a-92e5-9fb82ddb463a";
+pub const TOO_MANY_ANTENNAS_ID: &str = "faf47050-e8b5-438c-913c-db2b1576fde4";
+pub const NO_SUCH_USER_LIST_ID: &str = "95063e93-a283-4b8b-9aa5-bcdb8df69a7f";
+pub const IMPORT_ANTENNAS_TOO_MANY_ID: &str = "600917d4-a4cb-4cc5-8ba8-7ac8ea3c7779";
+pub const DRIVE_SHOW_FILE_NO_SUCH_FILE_ID: &str = "caf3ca38-c6e5-472e-a30c-b05377dcc240";
+/// Sharkey `notes/schedule/*` idents (verbatim upstream UUIDs; Batch N
+/// scheduling shim). `CANNOT_REPLY_TO_A_PURE_RENOTE` takes the Sharkey UUID
+/// here — this also fixes the `notes/create` path, which emitted the code
+/// with a generated UUID (the code was already in the known list).
+pub const CANNOT_REPLY_TO_A_PURE_RENOTE_ID: &str = "3ac74a84-8fd5-4bb0-870f-01804f82ce15";
+pub const CANNOT_CREATE_ALREADY_EXPIRED_SCHEDULE_ID: &str = "8a9bfb90-fc7e-4878-a3e8-d97faaf5fb07";
+pub const SCHEDULE_NOTE_MAX_ID: &str = "168707c3-e7da-4031-989e-f42aa3a274b2";
+/// Sharkey per-endpoint UUIDs (same wire code as a pinetree code, different
+/// endpoint UUID — verbatim per the handoff).
+pub const SHARKEY_CANNOT_RERENOTE_ID: &str = "fd4cc33e-2a37-48dd-99cc-9b806eb2031a";
+pub const SCHEDULE_NO_SUCH_NOTE_ID: &str = "a58056ba-8ba1-4323-8ebf-e0b585bc244f";
+pub const SCHEDULE_PERMISSION_DENIED_ID: &str = "c0da2fed-8f61-4c47-a41d-431992607b5c";
 /// Misskey `i/pin.ts` idents (verbatim upstream UUIDs).
 pub const PIN_LIMIT_EXCEEDED_ID: &str = "72dab508-c64d-498f-8740-a8eec1ba385a";
 pub const ALREADY_PINNED_ID: &str = "8b18c2b7-68fe-4edb-9892-c0cbaeb6c913";
@@ -331,6 +364,66 @@ impl ApiError {
         Self::client("That file is too big.", "TOO_BIG_FILE", &id, 400)
     }
 
+    /// Misskey `admin/emoji/add.ts` `NO_SUCH_FILE` (`No such file.`,
+    /// verbatim add-endpoint UUID `fc46b5a4-…`). The update endpoint mints
+    /// its own UUID (`14fb9fd9-…`); pinetree emits the add UUID for both
+    /// (one-UUID-per-code, §16 convention).
+    pub fn emoji_no_such_file() -> Self {
+        Self::client("No such file.", "NO_SUCH_FILE", EMOJI_ADD_NO_SUCH_FILE_ID, 400)
+    }
+
+    /// Misskey `i/import-antennas.ts` `TOO_MANY_ANTENNAS` (`You cannot
+    /// create antenna any more.`, verbatim import-endpoint UUID
+    /// `600917d4-…`). The create/update path emits the create-endpoint UUID
+    /// (`faf47050-…`, one-UUID-per-code).
+    pub fn import_too_many_antennas() -> Self {
+        Self::client(
+            "You cannot create antenna any more.",
+            "TOO_MANY_ANTENNAS",
+            IMPORT_ANTENNAS_TOO_MANY_ID,
+            400,
+        )
+    }
+
+    /// Sharkey `notes/schedule/create.ts` `SCHEDULE_NOTE_MAX` (`Schedule
+    /// note max.`, verbatim UUID).
+    pub fn schedule_note_max() -> Self {
+        Self::client("Schedule note max.", "SCHEDULE_NOTE_MAX", SCHEDULE_NOTE_MAX_ID, 400)
+    }
+
+    /// Sharkey `notes/schedule/create.ts` `CANNOT_RENOTE_TO_A_PURE_RENOTE`
+    /// (`You can not Renote a pure Renote.`, verbatim UUID). The
+    /// `notes/create` path emits the same code under Misskey's
+    /// `CANNOT_RENOTE` UUID (one-UUID-per-code for the shared code
+    /// string); the shim needs Sharkey's UUID verbatim.
+    pub fn sharkey_cannot_rerenote() -> Self {
+        Self::client(
+            "You can not Renote a pure Renote.",
+            "CANNOT_RENOTE_TO_A_PURE_RENOTE",
+            SHARKEY_CANNOT_RERENOTE_ID,
+            400,
+        )
+    }
+
+    /// Sharkey `notes/schedule/delete.ts` `NO_SUCH_NOTE` (`No such note.`,
+    /// verbatim UUID `a58056ba-…` — different from pinetree's
+    /// `NO_SUCH_NOTE` UUID).
+    pub fn schedule_no_such_note() -> Self {
+        Self::client("No such note.", "NO_SUCH_NOTE", SCHEDULE_NO_SUCH_NOTE_ID, 400)
+    }
+
+    /// Sharkey `notes/schedule/delete.ts` `PERMISSION_DENIED`
+    /// (`Permission denied.`, verbatim UUID, HTTP 403).
+    pub fn schedule_permission_denied() -> Self {
+        Self::permission("Permission denied.", "PERMISSION_DENIED", SCHEDULE_PERMISSION_DENIED_ID, 403)
+    }
+
+    /// Misskey `admin/drive/show-file.ts` `NO_SUCH_FILE` (`No such file.`,
+    /// verbatim UUID `caf3ca38-…`).
+    pub fn drive_show_file_no_such_file() -> Self {
+        Self::client("No such file.", "NO_SUCH_FILE", DRIVE_SHOW_FILE_NO_SUCH_FILE_ID, 400)
+    }
+
     /// 500 `INTERNAL_ERROR`.
     pub fn internal() -> Self {
         Self::new(
@@ -478,6 +571,8 @@ fn is_known_client_code(code: &str) -> bool {
             | "NOT_FOLLOWING"
             | "ALREADY_REACTED"
             | "NOT_REACTED"
+            | "ALREADY_FAVORITED"
+            | "NOT_FAVORITED"
             | "CANNOT_REACT_TO_RENOTE"
             | "CANNOT_RENOTE"
             | "CANNOT_RENOTE_TO_A_PURE_RENOTE"
@@ -518,6 +613,16 @@ fn is_known_client_code(code: &str) -> bool {
             | "NO_SUCH_NOTE_DRAFT"
             | "PIN_LIMIT_EXCEEDED"
             | "ALREADY_PINNED"
+            | "NO_SUCH_EMOJI"
+            | "DUPLICATE_NAME"
+            | "SAME_NAME_EMOJI_EXISTS"
+            | "UNSUPPORTED_FILE_TYPE"
+            | "NO_SUCH_ANTENNA"
+            | "EMPTY_KEYWORD"
+            | "TOO_MANY_ANTENNAS"
+            | "NO_SUCH_USER_LIST"
+            | "SCHEDULE_NOTE_MAX"
+            | "CANNOT_CREATE_ALREADY_EXPIRED_SCHEDULE"
             | "FILE_REQUIRED"
             | "INVALID_FILE_NAME"
             | "UNALLOWED_FILE_TYPE"
@@ -736,6 +841,13 @@ fn lookup_known_code(code: &str) -> Option<(&'static str, &'static str, u16, &'s
             "client",
         ),
         "NOT_REACTED" => ("You are not reacting to that note.", NOT_REACTED_ID, 400, "client"),
+        "ALREADY_FAVORITED" => (
+            "You have already favorited that note.",
+            ALREADY_FAVORITED_ID,
+            400,
+            "client",
+        ),
+        "NOT_FAVORITED" => ("You have not favorited that note.", NOT_FAVORITED_ID, 400, "client"),
         "CANNOT_REACT_TO_RENOTE" => (
             "You cannot react to Renote.",
             CANNOT_REACT_TO_RENOTE_ID,
@@ -810,6 +922,27 @@ fn lookup_known_code(code: &str) -> Option<(&'static str, &'static str, u16, &'s
             400,
             "client",
         ),
+        // Sharkey `notes/schedule/*` gates (verbatim code/message/id).
+        // `CANNOT_REPLY_TO_A_PURE_RENOTE` is also emitted by
+        // `notes/create` (same code, now with the verbatim UUID).
+        "CANNOT_REPLY_TO_A_PURE_RENOTE" => (
+            "You can not reply to a pure Renote.",
+            CANNOT_REPLY_TO_A_PURE_RENOTE_ID,
+            400,
+            "client",
+        ),
+        "CANNOT_CREATE_ALREADY_EXPIRED_SCHEDULE" => (
+            "Schedule is already expired.",
+            CANNOT_CREATE_ALREADY_EXPIRED_SCHEDULE_ID,
+            400,
+            "client",
+        ),
+        "SCHEDULE_NOTE_MAX" => (
+            "Schedule note max.",
+            SCHEDULE_NOTE_MAX_ID,
+            400,
+            "client",
+        ),
         // `notes/drafts/*` gates (Misskey `drafts/create|update.ts`
         // verbatim code/message; the create-endpoint UUID is canonical).
         "TOO_MANY_DRAFTS" => (
@@ -852,6 +985,56 @@ fn lookup_known_code(code: &str) -> Option<(&'static str, &'static str, u16, &'s
         "ALREADY_PINNED" => (
             "That note has already been pinned.",
             ALREADY_PINNED_ID,
+            400,
+            "client",
+        ),
+        // `admin/emoji/*` gates (verbatim upstream code/message/id).
+        "NO_SUCH_EMOJI" => (
+            "No such emoji.",
+            NO_SUCH_EMOJI_ID,
+            400,
+            "client",
+        ),
+        "DUPLICATE_NAME" => (
+            "Duplicate name.",
+            DUPLICATE_NAME_ID,
+            400,
+            "client",
+        ),
+        "SAME_NAME_EMOJI_EXISTS" => (
+            "Emoji that have same name already exists.",
+            SAME_NAME_EMOJI_EXISTS_ID,
+            400,
+            "client",
+        ),
+        "UNSUPPORTED_FILE_TYPE" => (
+            "Unsupported file type.",
+            UNSUPPORTED_FILE_TYPE_ID,
+            400,
+            "client",
+        ),
+        // `antennas/*` gates (verbatim upstream code/message/id).
+        "NO_SUCH_ANTENNA" => (
+            "No such antenna.",
+            NO_SUCH_ANTENNA_ID,
+            400,
+            "client",
+        ),
+        "EMPTY_KEYWORD" => (
+            "Either keywords or excludeKeywords is required.",
+            EMPTY_KEYWORD_ID,
+            400,
+            "client",
+        ),
+        "TOO_MANY_ANTENNAS" => (
+            "You cannot create antenna any more.",
+            TOO_MANY_ANTENNAS_ID,
+            400,
+            "client",
+        ),
+        "NO_SUCH_USER_LIST" => (
+            "No such user list.",
+            NO_SUCH_USER_LIST_ID,
             400,
             "client",
         ),

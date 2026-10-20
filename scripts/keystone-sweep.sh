@@ -238,9 +238,9 @@ time.sleep(1.2)
 s, _ = api("notes/delete", {"noteId": R1}, TB)
 check("notes/delete own", s == 204, f"s={s}")
 
-# honest 404 for out-of-profile antennas (Keystone renders "not available")
+# antennas/list is real (Batch N WS4): an empty feed list for a new account.
 s, ae = api("antennas/list", {}, TA)
-check("antennas/list 404", s == 404 and (ae.get("error") or {}).get("code") == "UNKNOWN_API_ENDPOINT", f"s={s}")
+check("antennas/list 200 empty", s == 200 and ae == [], f"s={s} body={json.dumps(ae)[:200]}")
 
 # revoke last (kills the token)
 s, second = api("signin", {"username": "bob", "password": "password123"})

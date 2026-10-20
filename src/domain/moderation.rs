@@ -56,6 +56,13 @@ pub enum ModerationAction {
     /// `createAccount` (pinetree; admin-created accounts, WP2 — upstream
     /// `admin/accounts/create` writes no log).
     CreateAccount,
+    /// `unsetUserAvatar` (upstream).
+    UnsetUserAvatar,
+    /// `unsetUserBanner` (upstream).
+    UnsetUserBanner,
+    /// `deleteAllFilesOfAUser` — pinetree action name (upstream
+    /// `admin/delete-all-files-of-a-user` writes no log row).
+    DeleteAllFilesOfAUser,
 }
 
 impl ModerationAction {
@@ -78,6 +85,9 @@ impl ModerationAction {
             Self::DeleteCustomEmoji => "deleteCustomEmoji",
             Self::DeleteAccount => "deleteAccount",
             Self::CreateAccount => "createAccount",
+            Self::UnsetUserAvatar => "unsetUserAvatar",
+            Self::UnsetUserBanner => "unsetUserBanner",
+            Self::DeleteAllFilesOfAUser => "deleteAllFilesOfAUser",
         }
     }
 
@@ -100,6 +110,9 @@ impl ModerationAction {
             "deleteCustomEmoji" => Self::DeleteCustomEmoji,
             "deleteAccount" => Self::DeleteAccount,
             "createAccount" => Self::CreateAccount,
+            "unsetUserAvatar" => Self::UnsetUserAvatar,
+            "unsetUserBanner" => Self::UnsetUserBanner,
+            "deleteAllFilesOfAUser" => Self::DeleteAllFilesOfAUser,
             _ => return None,
         })
     }
@@ -314,6 +327,10 @@ mod tests {
                 "updateAbuseReportNote",
             ),
             (ModerationAction::AddCustomEmoji, "addCustomEmoji"),
+            (ModerationAction::UpdateCustomEmoji, "updateCustomEmoji"),
+            (ModerationAction::DeleteCustomEmoji, "deleteCustomEmoji"),
+            (ModerationAction::UnsetUserAvatar, "unsetUserAvatar"),
+            (ModerationAction::UnsetUserBanner, "unsetUserBanner"),
             (ModerationAction::DeleteAccount, "deleteAccount"),
         ] {
             assert_eq!(action.as_str(), name);

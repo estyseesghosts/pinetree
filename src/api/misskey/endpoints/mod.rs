@@ -30,7 +30,7 @@ use crate::application::commands::invites::SignupRejection;
 use crate::application::commands::pins::FeaturedCache;
 use crate::application::commands::AppServices;
 use crate::application::ports::{
-    ApiTokenRecord, CreateDraftInput, CreateNoteInput, EditNoteInput, ExportEntity, ImportEntity,
+    AbuseReportFilter, ApiTokenRecord, CreateDraftInput, CreateNoteInput, EditNoteInput, ExportEntity, ImportEntity,
     InviteListFilter, InviteSort, InviteTypeFilter, LegacyAuthSessionRecord, MiAuthSessionRecord,
     ModerationLogFilter, PortError, TimelineCursor,
     UpdateAccountPatch, UpdateDraftPatch,
@@ -40,7 +40,7 @@ use crate::domain::account::{
     NotificationRecieveConfig, ProfileField,
 };
 use crate::domain::instance::InviteCode;
-use crate::domain::moderation::ModerationAction;
+use crate::domain::moderation::{AbuseReportResolution, ModerationAction};
 use crate::domain::note::{
     ReactionAcceptance, Visibility, MAX_CW_API_CHARS, MAX_NOTE_TEXT_CHARS,
 };
@@ -60,9 +60,10 @@ use super::auth::{
 };
 use super::errors::ApiError;
 use super::packers::{
-    pack_blocking, pack_drive_file, pack_following, pack_invite_code, pack_me_detailed,
+    pack_abuse_report, pack_antenna, pack_blocking, pack_drive_file, pack_emoji_detailed, pack_emoji_simple,
+    pack_following, pack_invite_code, pack_me_detailed,
     pack_meta, pack_moderation_log, pack_muting, pack_note, pack_note_draft,
-    pack_note_reaction_with_note,
+    pack_note_reaction_with_note, pack_scheduled_note,
     pack_notification, pack_renote_muting, pack_user_detailed_not_me, pack_user_lite,
     pack_user_relation,
 };
@@ -308,6 +309,12 @@ pub const MAX_JSON_BODY_BYTES: usize = 1_048_576;
 /// Multipart/JSON framing overhead allowed on top of `max_file_size` for
 /// `drive/files/create` (1 MiB).
 pub const UPLOAD_OVERHEAD_BYTES: usize = 1_048_576;
+
+/// MiAuth + legacy auth approval window (Batch N WS7 hardening,
+/// DIVERGENCE — upstream has no expiry on either session type). Sessions
+/// older than this read as missing (deleted on read); 30 minutes covers
+/// the approve-and-poll loop with margin.
+pub const MIAUTH_APPROVAL_WINDOW_MS: i64 = 30 * 60 * 1000;
 
 /// Upload body cap: `max_file_size` + multipart overhead.
 fn upload_cap_bytes(services: &AppServices) -> usize {
@@ -653,16 +660,23 @@ fn opt_draft_hashtag(obj: &Map<String, Value>) -> Result<Option<String>, ApiErro
 }
 
 /// Draft `fileIds` (`minItems: 0, maxItems: 16, uniqueItems` parity).
-fn draft_file_ids(obj: &Map<String, Value>) -> Result<Vec<String>, ApiError> {
-    let ids = str_list(obj, "fileIds")?;
+/// The `key`-parameterized form serves the Sharkey schedule shim, whose
+/// `mediaIds` key carries the same shape (`fileIds` wins when both are
+/// present — upstream `fileIds ?? mediaIds` parity).
+fn draft_file_ids_for_key(obj: &Map<String, Value>, key: &str) -> Result<Vec<String>, ApiError> {
+    let ids = str_list(obj, key)?;
     if ids.len() > 16 {
-        return Err(ApiError::invalid_param("fileIds", "must have at most 16 items"));
+        return Err(ApiError::invalid_param(key, "must have at most 16 items"));
     }
     let mut seen = std::collections::HashSet::new();
     if !ids.iter().all(|id| seen.insert(id)) {
-        return Err(ApiError::invalid_param("fileIds", "must be unique"));
+        return Err(ApiError::invalid_param(key, "must be unique"));
     }
     Ok(ids)
+}
+
+fn draft_file_ids(obj: &Map<String, Value>) -> Result<Vec<String>, ApiError> {
+    draft_file_ids_for_key(obj, "fileIds")
 }
 
 /// Draft `visibleUserIds` (`uniqueItems` parity).
@@ -954,7 +968,6 @@ fn is_unemitted_notification_type(name: &str) -> bool {
             | "pollEnded"
             | "reaction:grouped"
             | "renote:grouped"
-            | "followRequestAccepted"
             | "roleAssigned"
             | "chatRoomInvitationReceived"
             | "achievementEarned"
@@ -988,6 +1001,8 @@ fn notification_kind_for(field: &str, name: &str) -> Result<Option<NotificationK
         "edited" => Ok(Some(NotificationKind::Edited)),
         "reaction" => Ok(Some(NotificationKind::Reaction)),
         "receiveFollowRequest" => Ok(Some(NotificationKind::ReceiveFollowRequest)),
+        // Batch N WS3: locked-account accepts now emit this.
+        "followRequestAccepted" => Ok(Some(NotificationKind::FollowRequestAccepted)),
         // §5: scheduling notifications are now emitted locally.
         "scheduledNotePosted" => Ok(Some(NotificationKind::ScheduledNotePosted)),
         "scheduledNotePostFailed" => Ok(Some(NotificationKind::ScheduledNotePostFailed)),
@@ -1003,9 +1018,10 @@ fn notification_kind_for(field: &str, name: &str) -> Result<Option<NotificationK
 
 /// Every [`NotificationKind`] the local store can emit, for the
 /// exclude-everything early return (`i/notifications` Misskey parity).
-const ALL_NOTIFICATION_KINDS: [NotificationKind; 10] = [
+const ALL_NOTIFICATION_KINDS: [NotificationKind; 11] = [
     NotificationKind::Follow,
     NotificationKind::ReceiveFollowRequest,
+    NotificationKind::FollowRequestAccepted,
     NotificationKind::Mention,
     NotificationKind::Reply,
     NotificationKind::Renote,
@@ -1219,7 +1235,7 @@ fn identicon_svg(id: &str) -> String {
 // --- MiAuth web flow -------------------------------------------------------
 
 async fn miauth_page(
-    State(state): State<ApiState>,
+    State(_state): State<ApiState>,
     Path(session): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
@@ -1227,47 +1243,10 @@ async fn miauth_page(
     let icon = query.get("icon").cloned();
     let callback = query.get("callback").cloned();
     let permission = query.get("permission").cloned();
-    let permission_value = permission.clone().map(Value::String);
-    let permissions = parse_permissions(permission_value.as_ref());
-    let existing = state
-        .services
-        .auth
-        .get_miauth_session(&session)
-        .map_err(ApiError::from_port_error)?;
-    let record = match existing {
-        Some(mut sess) => {
-            if name.is_some() {
-                sess.name = name.clone();
-            }
-            if icon.is_some() {
-                sess.icon_url = icon.clone();
-            }
-            if callback.is_some() {
-                sess.callback = callback.clone();
-            }
-            if query.contains_key("permission") {
-                sess.permissions = permissions.clone();
-            }
-            sess
-        }
-        None => MiAuthSessionRecord {
-            session: session.clone(),
-            name: name.clone(),
-            description: None,
-            icon_url: icon.clone(),
-            callback: callback.clone(),
-            permissions: permissions.clone(),
-            account_id: None,
-            token: None,
-            fetched: false,
-            created_at_ms: state.services.clock.now_ms(),
-        },
-    };
-    state
-        .services
-        .auth
-        .save_miauth_session(record)
-        .map_err(ApiError::from_port_error)?;
+    // Batch N WS7: the GET never writes. Upstream serves a static client
+    // (no write); pinetree used to upsert a row for any attacker-chosen
+    // session id on every page view. The page renders from the query
+    // params; `miauth_submit` persists on approve.
     Ok(Html(render_miauth_page(
         &session,
         name.as_deref(),
@@ -1443,7 +1422,22 @@ async fn miauth_submit(
             None => false,
         };
         match found {
-            Some(account) if verified => account,
+            Some(account) if verified => {
+                // Batch N WS7: suspended accounts cannot approve (their
+                // tokens would die at authenticate anyway; refuse here so
+                // no session row is minted for them).
+                if account.is_suspended {
+                    state
+                        .rate_limiter
+                        .record_auth_failure("auth/miauth", &acct_key, &ip_key);
+                    return Ok(miauth_error_page(
+                        &session,
+                        &fields,
+                        "This account has been suspended.",
+                    ));
+                }
+                account
+            }
             _ => {
                 state
                     .rate_limiter
@@ -1483,6 +1477,7 @@ async fn miauth_submit(
         })
         .map_err(ApiError::from_port_error)?;
 
+    let now_ms = state.services.clock.now_ms();
     let existing = state
         .services
         .auth
@@ -1505,6 +1500,8 @@ async fn miauth_submit(
             sess.account_id = Some(account.id.clone());
             sess.token = Some(raw_token.clone());
             sess.fetched = false;
+            // Re-arm the approval window on every (re-)approve.
+            sess.expires_at_ms = Some(now_ms + MIAUTH_APPROVAL_WINDOW_MS);
             sess
         }
         None => MiAuthSessionRecord {
@@ -1517,7 +1514,8 @@ async fn miauth_submit(
             account_id: Some(account.id.clone()),
             token: Some(raw_token.clone()),
             fetched: false,
-            created_at_ms: state.services.clock.now_ms(),
+            created_at_ms: now_ms,
+            expires_at_ms: Some(now_ms + MIAUTH_APPROVAL_WINDOW_MS),
         },
     };
     state
@@ -1623,6 +1621,145 @@ async fn miauth_check(
 
 /// `limit` with an upstream default other than the 10-row moderation-log
 /// default (the invite listings default to 30 upstream).
+/// Batch N WS4: antenna param helpers (upstream `antennas/*` `paramDef`
+/// parity: required-with-bounds strings, required string arrays, the `src`
+/// enum, optional-with-bounds strings, optional arrays, optional bools, and
+/// nullable strings). Missing/wrong-typed params answer `INVALID_PARAM`
+/// naming the field.
+fn required_string(obj: &Map<String, Value>, key: &str, min: usize, max: usize) -> Result<String, ApiError> {
+    match obj.get(key) {
+        Some(Value::String(s)) => {
+            let n = s.chars().count();
+            if n < min || n > max {
+                return Err(ApiError::invalid_param(key, &format!("must be {min}..={max} chars")));
+            }
+            Ok(s.clone())
+        }
+        _ => Err(ApiError::invalid_param(key, "this field is required")),
+    }
+}
+
+fn opt_bounded_string(obj: &Map<String, Value>, key: &str, min: usize, max: usize) -> Result<Option<String>, ApiError> {
+    match obj.get(key) {
+        None => Ok(None),
+        Some(Value::String(s)) => {
+            let n = s.chars().count();
+            if n < min || n > max {
+                return Err(ApiError::invalid_param(key, &format!("must be {min}..={max} chars")));
+            }
+            Ok(Some(s.clone()))
+        }
+        Some(_) => Err(ApiError::invalid_param(key, "must be a string")),
+    }
+}
+
+fn opt_nullable_string(obj: &Map<String, Value>, key: &str) -> Result<Option<Option<String>>, ApiError> {
+    match obj.get(key) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::String(s)) => Ok(Some(Some(s.clone()))),
+        Some(_) => Err(ApiError::invalid_param(key, "must be a string or null")),
+    }
+}
+
+fn required_antenna_src(obj: &Map<String, Value>) -> Result<crate::domain::antenna::AntennaSrc, ApiError> {
+    match obj.get("src").and_then(Value::as_str) {
+        Some(s) => crate::domain::antenna::AntennaSrc::parse(s)
+            .ok_or_else(|| ApiError::invalid_param("src", "must be one of home, all, users, list, users_blacklist")),
+        None => Err(ApiError::invalid_param("src", "this field is required")),
+    }
+}
+
+fn opt_antenna_src(obj: &Map<String, Value>) -> Result<Option<crate::domain::antenna::AntennaSrc>, ApiError> {
+    match obj.get("src") {
+        None => Ok(None),
+        Some(Value::String(s)) => crate::domain::antenna::AntennaSrc::parse(s)
+            .map(Some)
+            .ok_or_else(|| ApiError::invalid_param("src", "must be one of home, all, users, list, users_blacklist")),
+        Some(_) => Err(ApiError::invalid_param("src", "must be a string")),
+    }
+}
+
+fn required_str_array(obj: &Map<String, Value>, key: &str) -> Result<Vec<String>, ApiError> {
+    match obj.get(key) {
+        Some(Value::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    Value::String(s) => out.push(s.clone()),
+                    _ => return Err(ApiError::invalid_param(key, "must be an array of strings")),
+                }
+            }
+            Ok(out)
+        }
+        _ => Err(ApiError::invalid_param(key, "this field is required")),
+    }
+}
+
+fn opt_str_array(obj: &Map<String, Value>, key: &str) -> Result<Option<Vec<String>>, ApiError> {
+    match obj.get(key) {
+        None => Ok(None),
+        Some(Value::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    Value::String(s) => out.push(s.clone()),
+                    _ => return Err(ApiError::invalid_param(key, "must be an array of strings")),
+                }
+            }
+            Ok(Some(out))
+        }
+        Some(_) => Err(ApiError::invalid_param(key, "must be an array of strings")),
+    }
+}
+
+fn required_str_array_array(obj: &Map<String, Value>, key: &str) -> Result<Vec<Vec<String>>, ApiError> {
+    match obj.get(key) {
+        Some(Value::Array(groups)) => {
+            let mut out = Vec::with_capacity(groups.len());
+            for group in groups {
+                match group {
+                    Value::Array(items) => {
+                        let mut inner = Vec::with_capacity(items.len());
+                        for item in items {
+                            match item {
+                                Value::String(s) => inner.push(s.clone()),
+                                _ => return Err(ApiError::invalid_param(key, "must be an array of string arrays")),
+                            }
+                        }
+                        out.push(inner);
+                    }
+                    _ => return Err(ApiError::invalid_param(key, "must be an array of string arrays")),
+                }
+            }
+            Ok(out)
+        }
+        _ => Err(ApiError::invalid_param(key, "this field is required")),
+    }
+}
+
+fn opt_str_array_array(obj: &Map<String, Value>, key: &str) -> Result<Option<Vec<Vec<String>>>, ApiError> {
+    match obj.get(key) {
+        None => Ok(None),
+        Some(_) => required_str_array_array(obj, key).map(Some),
+    }
+}
+
+fn required_bool(obj: &Map<String, Value>, key: &str) -> Result<bool, ApiError> {
+    match obj.get(key) {
+        Some(Value::Bool(b)) => Ok(*b),
+        _ => Err(ApiError::invalid_param(key, "this field is required")),
+    }
+}
+
+fn opt_bool_opt(obj: &Map<String, Value>, key: &str) -> Result<Option<bool>, ApiError> {
+    match obj.get(key) {
+        None => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(_) => Err(ApiError::invalid_param(key, "must be a boolean")),
+    }
+}
+
 fn get_limit_with_default(
     obj: &Map<String, Value>,
     default: usize,
@@ -2182,13 +2319,21 @@ fn api_dispatch_blocking(
             )?;
             let caller = require_caller(caller)?;
             caller.require_secure()?;
-            let session = obj
-                .get("session")
-                .and_then(Value::as_str)
-                .map(|s| s.to_string())
-                .unwrap_or_else(generate_random_token);
+            // Upstream `gen-token.ts` requires both params; pinetree used
+            // to fill defaults (random session, empty permissions). Batch
+            // N WS7 aligns to upstream (missing → INVALID_PARAM).
+            let session = match obj.get("session") {
+                Some(Value::String(s)) if !s.trim().is_empty() => s.clone(),
+                _ => return Err(ApiError::invalid_param("session", "this field is required")),
+            };
+            if !matches!(obj.get("permission"), Some(Value::Array(_))) {
+                return Err(ApiError::invalid_param("permission", "this field is required"));
+            }
             let permissions = parse_permissions(obj.get("permission"));
             let raw_token = generate_random_token();
+            let now_ms = state.services.clock.now_ms();
+            // Batch N WS7: approval window (DIVERGENCE — upstream has no
+            // expiry). Expired sessions read as missing (deleted on read).
             state
                 .services
                 .auth
@@ -2228,7 +2373,8 @@ fn api_dispatch_blocking(
                     account_id: Some(caller.account.id.clone()),
                     token: Some(raw_token.clone()),
                     fetched: false,
-                    created_at_ms: state.services.clock.now_ms(),
+                    created_at_ms: now_ms,
+                    expires_at_ms: Some(now_ms + MIAUTH_APPROVAL_WINDOW_MS),
                 })
                 .map_err(ApiError::from_port_error)?;
             Ok(Json(serde_json::json!({ "token": raw_token })).into_response())
@@ -2254,6 +2400,17 @@ fn api_dispatch_blocking(
                     account_id: None,
                     access_token: None,
                     created_at_ms: state.services.clock.now_ms(),
+                    // Batch N WS7: same approval window as MiAuth
+                    // (DIVERGENCE — upstream has no expiry). DIVERGENCE
+                    // (kept): pinetree has no app registry, so any
+                    // `appSecret` is accepted here and verified at
+                    // `userkey` time (`NO_SUCH_APP` has nothing to check
+                    // against). The approve URL stays the MiAuth page,
+                    // which mints a fresh unrelated row — legacy approval
+                    // runs through `auth/accept`, not the URL.
+                    expires_at_ms: Some(
+                        state.services.clock.now_ms() + MIAUTH_APPROVAL_WINDOW_MS,
+                    ),
                 })
                 .map_err(ApiError::from_port_error)?;
             let url = format!(
@@ -2508,16 +2665,27 @@ fn api_dispatch_blocking(
                     "alsoKnownAs",
                     "rejectQuotes",
                     "defaultReaction",
+                    // DIVERGENCE (Batch N WP8b): per-user remote-emoji opt-in.
+                    "showRemoteEmojis",
                 ],
             )?;
             let caller = require_caller(caller)?;
             caller.require_permission("write:account")?;
             state.rate_limiter.check(&rate_key, "i/update")?;
             let patch = parse_profile_patch(&obj)?;
+            let show_remote_emojis_on = patch.show_remote_emojis == Some(true);
             let account = state
                 .services
                 .update_profile(&caller.account.id, patch)
                 .map_err(ApiError::from_port_error)?;
+            // WP8b lazy fetch: turning the opt-in on enqueues one bounded
+            // fetch job per known remote emoji (metadata rows only; no fetch
+            // happened at ingest). Off-request, crash-safe, retryable.
+            if show_remote_emojis_on {
+                if let Err(e) = state.services.enqueue_remote_emoji_fetches() {
+                    eprintln!("remote emoji fetch enqueue failed: {e}");
+                }
+            }
             let packed = pack_me_detailed(&account, caller.is_first_party, &state.services)
                 .map_err(ApiError::from_port_error)?;
             Ok(Json(packed).into_response())
@@ -2704,6 +2872,7 @@ fn api_dispatch_blocking(
                 prohibited_words: Vec::new(),
                 sensitive_words: Vec::new(),
                 uri: None,
+                uri_base: String::new(),
                 url: None,
                 extra_mentions: Vec::new(),
                 extra_tags: Vec::new(),
@@ -3143,6 +3312,173 @@ fn api_dispatch_blocking(
             Ok(Json(serde_json::json!({})).into_response())
         }
 
+        // --- Batch N WS6: moderation/admin remainder -----------------------
+        // `admin/unset-user-avatar|banner` (moderator + scope; refusal rule;
+        // unset log rows), `admin/delete-all-files-of-a-user` (admin),
+        // `admin/drive/files` + `admin/drive/show-file` (moderator,
+        // read-only). Everything else in `admin/*` stays out — see the
+        // manifest §30 audit table for the per-endpoint verdict + reason.
+        "admin/unset-user-avatar" | "admin/unset-user-banner" => {
+            check_allowed_fields(&obj, &["userId"])?;
+            let caller = require_caller(caller)?;
+            let avatar = endpoint == "admin/unset-user-avatar";
+            caller.require_permission(if avatar {
+                "write:admin:unset-user-avatar"
+            } else {
+                "write:admin:unset-user-banner"
+            })?;
+            require_moderator(&caller)?;
+            let user_id = required_str(&obj, "userId")?;
+            state
+                .services
+                .unset_user_media(&caller.account.id, &user_id, avatar)
+                .map_err(|e| match e {
+                    // Guide §3.1 blanket rule (DIVERGENCE: upstream checks
+                    // the role only): moderators cannot act on admins or
+                    // other moderators.
+                    PortError::Validation(code) if code == "cannot moderate moderator account" => {
+                        ApiError::invalid_param("userId", &code)
+                    }
+                    other => ApiError::from_port_error(other),
+                })?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "admin/delete-all-files-of-a-user" => {
+            check_allowed_fields(&obj, &["userId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:delete-all-files-of-a-user")?;
+            require_admin(&caller)?;
+            let user_id = required_str(&obj, "userId")?;
+            state
+                .services
+                .delete_all_files_of_a_user(&caller.account.id, &user_id)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "admin/drive/files" => {
+            check_allowed_fields(
+                &obj,
+                &["limit", "sinceId", "untilId", "sinceDate", "untilDate", "userId", "type", "origin", "hostname"],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:admin:drive")?;
+            require_moderator(&caller)?;
+            let cursor = TimelineCursor {
+                since_id: opt_string(&obj, "sinceId")?,
+                until_id: opt_string(&obj, "untilId")?,
+                since_date: opt_i64(&obj, "sinceDate")?,
+                until_date: opt_i64(&obj, "untilDate")?,
+                limit: get_limit_with_default(&obj, 10)?,
+            };
+            let user_id = opt_string(&obj, "userId")?;
+            let type_prefix = match opt_string(&obj, "type")? {
+                None => None,
+                // Upstream `type` is a MIME pattern (`image/*`); honor a
+                // trailing `*` as a prefix match, anything else exact.
+                Some(pattern) => Some(match pattern.strip_suffix('*') {
+                    Some(prefix) => (prefix.to_string(), true),
+                    None => (pattern, false),
+                }),
+            };
+            let origin = opt_string(&obj, "origin")?.unwrap_or_else(|| "local".to_string());
+            if !["combined", "local", "remote"].contains(&origin.as_str()) {
+                return Err(ApiError::invalid_param("origin", "must be one of combined, local, remote"));
+            }
+            let hostname = opt_string(&obj, "hostname")?;
+            let rows = state
+                .services
+                .media
+                .list_all_media(&cursor)
+                .map_err(ApiError::from_port_error)?;
+            let mut out = Vec::new();
+            for meta in &rows {
+                if let Some(user_id) = user_id.as_deref() {
+                    if meta.owner_id.as_deref() != Some(user_id) {
+                        continue;
+                    }
+                }
+                if let Some((pattern, prefix)) = type_prefix.as_ref() {
+                    if *prefix {
+                        if !meta.mime.starts_with(pattern.as_str()) {
+                            continue;
+                        }
+                    } else if meta.mime != *pattern {
+                        continue;
+                    }
+                }
+                // Resolve the owner's host once per row (small pages; the
+                // admin list defaults to 10 rows).
+                let host = match meta.owner_id.as_deref() {
+                    Some(owner) => state
+                        .services
+                        .accounts
+                        .find_by_id(owner)
+                        .map_err(ApiError::from_port_error)?
+                        .and_then(|account| account.host),
+                    None => None,
+                };
+                match origin.as_str() {
+                    "local" if host.is_some() => continue,
+                    "remote" if host.is_none() => continue,
+                    _ => {}
+                }
+                if let Some(hostname) = hostname.as_deref() {
+                    // Upstream: the local host is represented with `null` —
+                    // a hostname filter never matches local files.
+                    match host.as_deref() {
+                        Some(h) if h == hostname => {}
+                        _ => continue,
+                    }
+                }
+                out.push(pack_drive_file(meta, &state.services));
+                if out.len() >= cursor.limit {
+                    break;
+                }
+            }
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        "admin/drive/show-file" => {
+            check_allowed_fields(&obj, &["fileId", "url"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:admin:drive")?;
+            require_moderator(&caller)?;
+            let (file_id, url) = match (obj.get("fileId"), obj.get("url")) {
+                (Some(_), Some(_)) => {
+                    return Err(ApiError::invalid_param("url", "specify either fileId or url, not both"));
+                }
+                (None, None) => {
+                    return Err(ApiError::invalid_param("fileId", "either fileId or url is required"));
+                }
+                (id, url) => (
+                    id.and_then(Value::as_str).map(str::to_string),
+                    url.and_then(Value::as_str).map(str::to_string),
+                ),
+            };
+            let meta = if let Some(file_id) = file_id {
+                state
+                    .services
+                    .media
+                    .get(&file_id)
+                    .map_err(ApiError::from_port_error)?
+            } else {
+                let url = url.unwrap_or_default();
+                let rows = state
+                    .services
+                    .media
+                    .list_all_media(&TimelineCursor { limit: 10_000, ..Default::default() })
+                    .map_err(ApiError::from_port_error)?;
+                rows.into_iter()
+                    .find(|m| m.url == url || m.source_url.as_deref() == Some(url.as_str()))
+            };
+            match meta {
+                Some(meta) => Ok(Json(pack_drive_file(&meta, &state.services)).into_response()),
+                None => Err(ApiError::drive_show_file_no_such_file()),
+            }
+        }
+
         // Batch M §3.2 `admin/show-moderation-logs` (upstream file of the
         // same name): cursor-paged moderation log with `type`/`userId`/
         // `search` filters. DIVERGENCE: upstream requires admin
@@ -3236,6 +3572,488 @@ fn api_dispatch_blocking(
                     .unsuspend_user(&caller.account.id, &user_id)
             };
             result.map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // --- Batch N WS5: abuse reports (Batch M WP4 contract, §24) --------
+        // Upstream: `users/report-abuse` (`write:report-abuse`) + the four
+        // `admin/*` endpoints (moderator role on top of the scope check).
+        // `report_abuse` enforces self/admin refusal in the op; resolve and
+        // forward commit state + log row + jobs in one transaction; the
+        // double-forward and local-target refusals live in the op too.
+        "users/report-abuse" => {
+            check_allowed_fields(&obj, &["userId", "comment"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:report-abuse")?;
+            state.rate_limiter.check(&rate_key, "users/report-abuse")?;
+            let user_id = required_str(&obj, "userId")?;
+            let comment = required_str(&obj, "comment")?;
+            let report = state
+                .services
+                .report_abuse(&caller.account.id, &user_id, &comment)
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(
+                pack_abuse_report(&report, Some(&caller.account.id), &state.services)
+                    .map_err(ApiError::from_port_error)?,
+            )
+            .into_response())
+        }
+
+        "admin/abuse-user-reports" => {
+            check_allowed_fields(
+                &obj,
+                &[
+                    "limit",
+                    "sinceId",
+                    "untilId",
+                    "sinceDate",
+                    "untilDate",
+                    "state",
+                    "reporterOrigin",
+                    "targetUserOrigin",
+                ],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:admin:abuse-user-reports")?;
+            require_moderator(&caller)?;
+            let cursor = parse_cursor(&obj)?;
+            let filter = AbuseReportFilter {
+                state: opt_string(&obj, "state")?,
+                reporter_origin: opt_string(&obj, "reporterOrigin")?
+                    .unwrap_or_else(|| "combined".to_string()),
+                target_origin: opt_string(&obj, "targetUserOrigin")?
+                    .unwrap_or_else(|| "combined".to_string()),
+            };
+            let rows = state
+                .services
+                .list_abuse_reports(filter, &cursor)
+                .map_err(ApiError::from_port_error)?;
+            let viewer_id = Some(caller.account.id.as_str());
+            let mut out = Vec::with_capacity(rows.len());
+            for row in &rows {
+                out.push(
+                    pack_abuse_report(row, viewer_id, &state.services)
+                        .map_err(ApiError::from_port_error)?,
+                );
+            }
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        "admin/resolve-abuse-user-report" => {
+            check_allowed_fields(&obj, &["reportId", "resolvedAs"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:resolve-abuse-user-report")?;
+            require_moderator(&caller)?;
+            let report_id = required_str(&obj, "reportId")?;
+            let resolved_as = match opt_string(&obj, "resolvedAs")? {
+                None => None,
+                Some(s) => match AbuseReportResolution::parse(&s) {
+                    Some(r) => Some(r),
+                    None => return Err(ApiError::invalid_param("resolvedAs", "must be accept, reject, or null")),
+                },
+            };
+            state
+                .services
+                .resolve_abuse_report(&caller.account.id, &report_id, resolved_as)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "admin/update-abuse-user-report" => {
+            check_allowed_fields(&obj, &["reportId", "moderationNote"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:resolve-abuse-user-report")?;
+            require_moderator(&caller)?;
+            let report_id = required_str(&obj, "reportId")?;
+            // Upstream: `moderationNote` optional (absent clears to null;
+            // pinetree stores `""`).
+            let note = opt_string(&obj, "moderationNote")?.unwrap_or_default();
+            state
+                .services
+                .update_abuse_report_note(&caller.account.id, &report_id, note)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "admin/forward-abuse-user-report" => {
+            check_allowed_fields(&obj, &["reportId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:resolve-abuse-user-report")?;
+            require_moderator(&caller)?;
+            let report_id = required_str(&obj, "reportId")?;
+            state
+                .services
+                .forward_abuse_report(&caller.account.id, &report_id)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // --- Batch N WS1: custom emoji (listing + admin management) --------
+        // Upstream `emojis` (public, `{}`), `emoji {name}`, `admin/emoji/
+        // add|update|delete|list` (`canManageCustomEmojis` + kind
+        // `write:admin:emoji` / `read:admin:emoji`). Pinetree has no
+        // custom-role policies, so the role gate is the moderator role
+        // (documented). Every mutation commits state + moderation-log row in
+        // one transaction; bulk ops / import-zip / copy / list-remote stay
+        // out (guide §8).
+        "emojis" => {
+            check_allowed_fields(&obj, &[])?;
+            let rows = state
+                .services
+                .emojis
+                .list_emojis(None, &TimelineCursor { limit: 10_000, ..Default::default() })
+                .map_err(ApiError::from_port_error)?;
+            // Upstream packs `EmojiSimple` ordered by category, name.
+            let mut rows = rows;
+            rows.sort_by(|a, b| {
+                a.category.cmp(&b.category).then_with(|| a.shortcode.cmp(&b.shortcode))
+            });
+            let packed: Vec<Value> = rows
+                .iter()
+                .map(|e| pack_emoji_simple(e, &state.services))
+                .collect();
+            Ok(Json(serde_json::json!({ "emojis": packed })).into_response())
+        }
+
+        "emoji" => {
+            check_allowed_fields(&obj, &["name"])?;
+            let name = required_str(&obj, "name")?;
+            match state.services.emojis.get_emoji_by_name(&name) {
+                Ok(Some(emoji)) => Ok(Json(pack_emoji_detailed(&emoji, &state.services)).into_response()),
+                Ok(None) => Err(ApiError::from_port_error(PortError::NotFound("NO_SUCH_EMOJI".to_string()))),
+                Err(e) => Err(ApiError::from_port_error(e)),
+            }
+        }
+
+        "admin/emoji/add" => {
+            check_allowed_fields(
+                &obj,
+                &[
+                    "name",
+                    "fileId",
+                    "category",
+                    "aliases",
+                    "license",
+                    "isSensitive",
+                    "localOnly",
+                    "roleIdsThatCanBeUsedThisEmojiAsReaction",
+                ],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:emoji")?;
+            require_moderator(&caller)?;
+            state.rate_limiter.check(&rate_key, "admin/emoji/add")?;
+            let name = required_str(&obj, "name")?;
+            if name.is_empty()
+                || name.chars().count() > 128
+                || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                return Err(ApiError::invalid_param("name", "must match ^[a-zA-Z0-9_]+$"));
+            }
+            let file_id = required_str(&obj, "fileId")?;
+            let emoji = state
+                .services
+                .create_emoji(
+                    &caller.account.id,
+                    &name,
+                    &file_id,
+                    opt_string(&obj, "category")?.filter(|s| !s.is_empty()),
+                    parse_string_array(&obj, "aliases", Some(32))?.unwrap_or_default(),
+                    opt_string(&obj, "license")?.filter(|s| !s.is_empty()),
+                    update_bool_field(&obj, "isSensitive")?.unwrap_or(false),
+                    update_bool_field(&obj, "localOnly")?.unwrap_or(false),
+                    parse_string_array(&obj, "roleIdsThatCanBeUsedThisEmojiAsReaction", None)?.unwrap_or_default(),
+                )
+                .map_err(|e| match e {
+                    PortError::NotFound(code) if code == "NO_SUCH_FILE" => ApiError::emoji_no_such_file(),
+                    other => ApiError::from_port_error(other),
+                })?;
+            Ok(Json(pack_emoji_detailed(&emoji, &state.services)).into_response())
+        }
+
+        "admin/emoji/update" => {
+            check_allowed_fields(
+                &obj,
+                &[
+                    "id",
+                    "name",
+                    "fileId",
+                    "category",
+                    "aliases",
+                    "license",
+                    "isSensitive",
+                    "localOnly",
+                    "roleIdsThatCanBeUsedThisEmojiAsReaction",
+                ],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:emoji")?;
+            require_moderator(&caller)?;
+            state.rate_limiter.check(&rate_key, "admin/emoji/update")?;
+            // Upstream `anyOf`: at least one of `id` / `name` addresses the
+            // row; both may be given, in which case a different `name`
+            // renames (`doNameUpdate` in `CustomEmojiService.update`).
+            let (id, name) = match (obj.get("id"), obj.get("name")) {
+                (None, None) => {
+                    return Err(ApiError::invalid_param("id", "either id or name is required"));
+                }
+                (id, name) => (
+                    id.and_then(Value::as_str).map(str::to_string),
+                    name.and_then(Value::as_str).map(str::to_string),
+                ),
+            };
+            // Explicit null resets `category`/`license` (upstream parity);
+            // absent leaves them unchanged.
+            let category = match obj.get("category") {
+                None => None,
+                Some(Value::Null) => Some(None),
+                Some(Value::String(s)) => Some(Some(s.clone())),
+                Some(_) => return Err(ApiError::invalid_param("category", "must be a string or null")),
+            };
+            let license = match obj.get("license") {
+                None => None,
+                Some(Value::Null) => Some(None),
+                Some(Value::String(s)) => Some(Some(s.clone())),
+                Some(_) => return Err(ApiError::invalid_param("license", "must be a string or null")),
+            };
+            let emoji = state
+                .services
+                .update_emoji(
+                    &caller.account.id,
+                    id.as_deref(),
+                    name.as_deref(),
+                    opt_string(&obj, "fileId")?.as_deref(),
+                    category,
+                    parse_string_array(&obj, "aliases", Some(32))?,
+                    license,
+                    update_bool_field(&obj, "isSensitive")?,
+                    update_bool_field(&obj, "localOnly")?,
+                    parse_string_array(&obj, "roleIdsThatCanBeUsedThisEmojiAsReaction", None)?,
+                )
+                .map_err(|e| match e {
+                    PortError::NotFound(code) if code == "NO_SUCH_FILE" => ApiError::emoji_no_such_file(),
+                    other => ApiError::from_port_error(other),
+                })?;
+            Ok(Json(pack_emoji_detailed(&emoji, &state.services)).into_response())
+        }
+
+        "admin/emoji/delete" => {
+            check_allowed_fields(&obj, &["id"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:emoji")?;
+            require_moderator(&caller)?;
+            state.rate_limiter.check(&rate_key, "admin/emoji/delete")?;
+            let id = required_str(&obj, "id")?;
+            state
+                .services
+                .delete_emoji(&caller.account.id, &id)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "admin/emoji/list" => {
+            check_allowed_fields(
+                &obj,
+                &["query", "limit", "sinceId", "untilId", "sinceDate", "untilDate"],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:admin:emoji")?;
+            require_moderator(&caller)?;
+            let cursor = TimelineCursor {
+                since_id: opt_string(&obj, "sinceId")?,
+                until_id: opt_string(&obj, "untilId")?,
+                since_date: opt_i64(&obj, "sinceDate")?,
+                until_date: opt_i64(&obj, "untilDate")?,
+                limit: get_limit_with_default(&obj, 10)?,
+            };
+            let rows = state
+                .services
+                .emojis
+                .list_emojis(opt_string(&obj, "query")?.as_deref(), &cursor)
+                .map_err(ApiError::from_port_error)?;
+            let packed: Vec<Value> = rows
+                .iter()
+                .map(|e| pack_emoji_detailed(e, &state.services))
+                .collect();
+            Ok(Json(Value::Array(packed)).into_response())
+        }
+
+        // --- Batch N WS4: antennas (guide WP15) ---------------------------
+        // `antennas/list|show|create|update|delete|notes|remove-note` +
+        // real `i/export-antennas` / `i/import-antennas` + the `antenna`
+        // stream channel. DIVERGENCEs (manifest §29): `home` = own +
+        // followed notes; no auto-deactivation (instance cap 5); `src=list`
+        // refused (WP16 pending — `NO_SUCH_USER_LIST`, no lists exist).
+        "antennas/list" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:account")?;
+            let rows = state
+                .services
+                .antennas
+                .antennas_by_owner(&caller.account.id)
+                .map_err(ApiError::from_port_error)?;
+            let packed: Vec<Value> = rows.iter().map(|a| pack_antenna(a, &state.services)).collect();
+            Ok(Json(Value::Array(packed)).into_response())
+        }
+
+        "antennas/show" => {
+            check_allowed_fields(&obj, &["antennaId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:account")?;
+            let antenna_id = required_str(&obj, "antennaId")?;
+            match state.services.antennas.get_antenna(&caller.account.id, &antenna_id) {
+                Ok(Some(a)) => Ok(Json(pack_antenna(&a, &state.services)).into_response()),
+                Ok(None) => Err(ApiError::from_port_error(PortError::NotFound("NO_SUCH_ANTENNA".to_string()))),
+                Err(e) => Err(ApiError::from_port_error(e)),
+            }
+        }
+
+        "antennas/create" => {
+            check_allowed_fields(
+                &obj,
+                &[
+                    "name",
+                    "src",
+                    "userListId",
+                    "keywords",
+                    "excludeKeywords",
+                    "users",
+                    "caseSensitive",
+                    "localOnly",
+                    "excludeBots",
+                    "withReplies",
+                    "withFile",
+                    "excludeNotesInSensitiveChannel",
+                ],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state.rate_limiter.check(&rate_key, "antennas/create")?;
+            let antenna = state
+                .services
+                .create_antenna(
+                    &caller.account.id,
+                    required_string(&obj, "name", 1, 100)?,
+                    required_antenna_src(&obj)?,
+                    opt_string(&obj, "userListId")?,
+                    required_str_array_array(&obj, "keywords")?,
+                    required_str_array_array(&obj, "excludeKeywords")?,
+                    required_str_array(&obj, "users")?,
+                    required_bool(&obj, "caseSensitive")?,
+                    opt_bool(&obj, "localOnly", false)?,
+                    opt_bool(&obj, "excludeBots", false)?,
+                    required_bool(&obj, "withReplies")?,
+                    required_bool(&obj, "withFile")?,
+                )
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(pack_antenna(&antenna, &state.services)).into_response())
+        }
+
+        "antennas/update" => {
+            check_allowed_fields(
+                &obj,
+                &[
+                    "antennaId",
+                    "name",
+                    "src",
+                    "userListId",
+                    "keywords",
+                    "excludeKeywords",
+                    "users",
+                    "caseSensitive",
+                    "localOnly",
+                    "excludeBots",
+                    "withReplies",
+                    "withFile",
+                    "excludeNotesInSensitiveChannel",
+                ],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state.rate_limiter.check(&rate_key, "antennas/update")?;
+            let antenna = state
+                .services
+                .update_antenna(
+                    &caller.account.id,
+                    &required_str(&obj, "antennaId")?,
+                    opt_bounded_string(&obj, "name", 1, 100)?,
+                    opt_antenna_src(&obj)?,
+                    opt_nullable_string(&obj, "userListId")?,
+                    opt_str_array_array(&obj, "keywords")?,
+                    opt_str_array_array(&obj, "excludeKeywords")?,
+                    opt_str_array(&obj, "users")?,
+                    opt_bool_opt(&obj, "caseSensitive")?,
+                    opt_bool_opt(&obj, "localOnly")?,
+                    opt_bool_opt(&obj, "excludeBots")?,
+                    opt_bool_opt(&obj, "withReplies")?,
+                    opt_bool_opt(&obj, "withFile")?,
+                )
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(pack_antenna(&antenna, &state.services)).into_response())
+        }
+
+        "antennas/delete" => {
+            check_allowed_fields(&obj, &["antennaId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state.rate_limiter.check(&rate_key, "antennas/delete")?;
+            let antenna_id = required_str(&obj, "antennaId")?;
+            state
+                .services
+                .delete_antenna(&caller.account.id, &antenna_id)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "antennas/notes" => {
+            check_allowed_fields(
+                &obj,
+                &["antennaId", "limit", "sinceId", "untilId", "sinceDate", "untilDate"],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:account")?;
+            let antenna_id = required_str(&obj, "antennaId")?;
+            let cursor = TimelineCursor {
+                since_id: opt_string(&obj, "sinceId")?,
+                until_id: opt_string(&obj, "untilId")?,
+                since_date: opt_i64(&obj, "sinceDate")?,
+                until_date: opt_i64(&obj, "untilDate")?,
+                limit: get_limit_with_default(&obj, 10)?,
+            };
+            let notes = state
+                .services
+                .antenna_notes_for(&caller.account.id, &antenna_id, &cursor)
+                .map_err(ApiError::from_port_error)?;
+            let viewer = Some(caller.account.id.as_str());
+            let mut out = Vec::with_capacity(notes.len());
+            for note in &notes {
+                out.push(
+                    pack_note(note, viewer, &state.services, 0)
+                        .map_err(ApiError::from_port_error)?,
+                );
+            }
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        "antennas/remove-note" => {
+            check_allowed_fields(&obj, &["antennaId", "noteId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            let antenna_id = required_str(&obj, "antennaId")?;
+            let note_id = required_str(&obj, "noteId")?;
+            // Owner-scoped like every other antenna read; unknown rows are
+            // `NO_SUCH_ANTENNA` (upstream parity).
+            if state.services.antennas.get_antenna(&caller.account.id, &antenna_id)
+                .map_err(ApiError::from_port_error)?.is_none()
+            {
+                return Err(ApiError::from_port_error(PortError::NotFound("NO_SUCH_ANTENNA".to_string())));
+            }
+            state
+                .services
+                .antenna_notes
+                .remove_antenna_note(&antenna_id, &note_id)
+                .map_err(ApiError::from_port_error)?;
             Ok(StatusCode::NO_CONTENT.into_response())
         }
 
@@ -3685,12 +4503,12 @@ fn api_dispatch_blocking(
             if meta.size_bytes == 0 {
                 return Err(ApiError::import_empty_file("i/import-antennas"));
             }
-            // DIVERGENCE: upstream `JSON.parse`s here (a malformed file
-            // throws → HTTP 500) and enforces the `antennaLimit` role
-            // policy (`TOO_MANY_ANTENNAS`). Pinetree answers malformed JSON
-            // with `INVALID_PARAM` and skips the limit check (no antenna
-            // subsystem or role limits exist); the worker re-validates rows
-            // and applies zero of them.
+            // Upstream (`import-antennas.ts:77-84`) has no size cap and
+            // reads + parses the file in the endpoint, so this arm does
+            // not use `check_import_file`: missing/foreign → `noSuchFile`,
+            // empty → `emptyFile` (verbatim UUIDs). DIVERGENCE: upstream
+            // `JSON.parse`s here (a malformed file throws → HTTP 500);
+            // pinetree answers malformed JSON with `INVALID_PARAM`.
             let bytes = match state
                 .services
                 .blobs
@@ -3703,11 +4521,26 @@ fn api_dispatch_blocking(
             let parsed: Value = serde_json::from_slice(&bytes).map_err(|_| {
                 ApiError::invalid_param("fileId", "file must contain a JSON array of antennas")
             })?;
-            if !parsed.is_array() {
-                return Err(ApiError::invalid_param(
-                    "fileId",
-                    "file must contain a JSON array of antennas",
-                ));
+            let batch_len = match parsed.as_array() {
+                Some(entries) => entries.len(),
+                None => {
+                    return Err(ApiError::invalid_param(
+                        "fileId",
+                        "file must contain a JSON array of antennas",
+                    ));
+                }
+            };
+            // Upstream pre-check (`import-antennas.ts:81-84`): current count
+            // + batch length at the limit refuses with `TOO_MANY_ANTENNAS`
+            // (import-endpoint UUID `600917d4-…`).
+            let current = state
+                .services
+                .antennas
+                .antennas_by_owner(&caller.account.id)
+                .map_err(ApiError::from_port_error)?
+                .len();
+            if current + batch_len >= crate::domain::antenna::DEFAULT_ANTENNA_LIMIT {
+                return Err(ApiError::import_too_many_antennas());
             }
             state
                 .services
@@ -4007,6 +4840,96 @@ fn api_dispatch_blocking(
                 .unreact(&caller.account.id, &note_id)
                 .map_err(ApiError::from_port_error)?;
             Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // Batch N WS2: favorites + note state (Misskey
+        // `notes/favorites/create|delete.ts`, `i/favorites.ts`,
+        // `notes/state.ts` parity).
+        "notes/favorites/create" => {
+            check_allowed_fields(&obj, &["noteId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:favorites")?;
+            state.rate_limiter.check(&rate_key, "notes/favorites/create")?;
+            let note_id = required_str(&obj, "noteId")?;
+            state
+                .services
+                .favorite_note(&caller.account.id, &note_id)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "notes/favorites/delete" => {
+            check_allowed_fields(&obj, &["noteId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:favorites")?;
+            let note_id = required_str(&obj, "noteId")?;
+            state
+                .services
+                .unfavorite_note(&caller.account.id, &note_id)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "i/favorites" => {
+            check_allowed_fields(
+                &obj,
+                &["limit", "sinceId", "untilId", "sinceDate", "untilDate"],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:favorites")?;
+            let cursor = parse_list_cursor(&obj)?;
+            let favs = state
+                .services
+                .favorites_for_user(&caller.account.id, &cursor)
+                .map_err(ApiError::from_port_error)?;
+            let mut out = Vec::with_capacity(favs.len());
+            for fav in &favs {
+                match state.services.notes.get_note(&fav.note_id) {
+                    Ok(Some(note)) if !note.is_deleted => {
+                        out.push(pack_note(&note, Some(&caller.account.id), &state.services, 0)
+                            .map_err(ApiError::from_port_error)?);
+                    }
+                    // Gone notes are skipped (upstream `leftJoin`s; invisible
+                    // on the wire).
+                    _ => continue,
+                }
+            }
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        "notes/state" => {
+            check_allowed_fields(&obj, &["noteId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:account")?;
+            let note_id = required_str(&obj, "noteId")?;
+            // Unknown or invisible notes are indistinguishable (D8): reuse
+            // the favorite-create visibility gate for the existence check.
+            let note = match state.services.notes.get_note(&note_id) {
+                Ok(Some(n)) if !n.is_deleted => n,
+                _ => return Err(ApiError::from_port_error(PortError::NotFound("NO_SUCH_NOTE".to_string()))),
+            };
+            {
+                use crate::domain::policy::{ViewerContext, is_visible};
+                let viewer_id = &caller.account.id;
+                let follows_author = viewer_id == &note.author_id
+                    || state.services.follows.is_following(viewer_id, &note.author_id)
+                        .map_err(ApiError::from_port_error)?;
+                let viewer = ViewerContext::local_user(viewer_id, follows_author);
+                if !is_visible(&note, &viewer) {
+                    return Err(ApiError::from_port_error(PortError::NotFound("NO_SUCH_NOTE".to_string())));
+                }
+            }
+            let is_favorited = state
+                .services
+                .favorites
+                .is_favorited(&caller.account.id, &note_id)
+                .map_err(ApiError::from_port_error)?;
+            // Thread-muting stays out (guide §8): always false.
+            Ok(Json(serde_json::json!({
+                "isFavorited": is_favorited,
+                "isMutedThread": false,
+            }))
+            .into_response())
         }
 
         // §4 polls (Misskey `notes/polls/vote.ts` parity:
@@ -5153,6 +6076,180 @@ fn api_dispatch_blocking(
             Ok(Json(Value::Number(count.into())).into_response())
         }
 
+        // --- Sharkey scheduling shim (Batch N WS-batch tail) ----------------
+        // `notes/schedule/create|list|delete` as a thin alias over the
+        // Misskey-model drafts (`scheduledAt` + `isActuallyScheduled` →
+        // delayed publish job). No new storage, tables, job kinds, or
+        // ports; the publish path is untouched. Auth/permission/rate-limit:
+        // credential required; the `notes/drafts/create` 300/hr bucket is
+        // reused (DIVERGENCE — upstream kind is `write:notes-schedule`; no
+        // second rate-kind for an alias). No `notes/schedule/update`
+        // upstream — edits go through `notes/drafts/update` on the
+        // underlying draft.
+        "notes/schedule/create" => {
+            check_allowed_fields(
+                &obj,
+                &[
+                    "visibility",
+                    "visibleUserIds",
+                    "cw",
+                    "reactionAcceptance",
+                    "noExtractMentions",
+                    "noExtractHashtags",
+                    "noExtractEmojis",
+                    "replyId",
+                    "renoteId",
+                    "text",
+                    "fileIds",
+                    "mediaIds",
+                    "poll",
+                    "scheduleNote",
+                ],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:notes-schedule")?;
+            // DIVERGENCE (documented): the drafts 300/hr bucket is reused
+            // (upstream kind is `write:notes-schedule`; no second
+            // rate-kind for an alias).
+            state.rate_limiter.check(&rate_key, "notes/drafts/create")?;
+            // Upstream `anyOf`: one of text/renoteId/fileIds/mediaIds/poll.
+            // Blank text counts as absent (upstream `minLength: 1`); a
+            // present-but-blank text is rejected like upstream schema.
+            if matches!(obj.get("text"), Some(Value::String(s)) if s.is_empty()) {
+                return Err(ApiError::invalid_param("text", "must be 1..=3000 chars"));
+            }
+            let has_text = obj.get("text").and_then(Value::as_str).map(|s| !s.is_empty()).unwrap_or(false);
+            let has_content = has_text
+                || obj.get("renoteId").and_then(Value::as_str).map(|s| !s.is_empty()).unwrap_or(false)
+                || obj.get("fileIds").and_then(Value::as_array).map(|a| !a.is_empty()).unwrap_or(false)
+                || obj.get("mediaIds").and_then(Value::as_array).map(|a| !a.is_empty()).unwrap_or(false)
+                || matches!(obj.get("poll"), Some(Value::Object(_)));
+            if !has_content {
+                return Err(ApiError::invalid_param("text", "one of text, renoteId, fileIds, mediaIds, poll is required"));
+            }
+            // `scheduleNote: {scheduledAt!}` (ms epoch — confirmed against
+            // the tail of upstream `create.ts`: `new Date(schedNoteLocalTime)`
+            // where the local time derives from `moment.utc(...).valueOf()`).
+            let scheduled_at_ms = match obj.get("scheduleNote").and_then(|v| v.get("scheduledAt")) {
+                Some(Value::Number(n)) => n.as_i64().ok_or_else(|| ApiError::invalid_param("scheduleNote", "scheduledAt must be an integer"))?,
+                _ => return Err(ApiError::invalid_param("scheduleNote", "scheduleNote.scheduledAt is required")),
+            };
+            // Upstream cap check against the role policy; pinetree's
+            // `scheduled_note_limit` stands in (default 1, instance
+            // configurable — upstream default 5). Overflow answers
+            // Sharkey's `SCHEDULE_NOTE_MAX`, not our `TOO_MANY_SCHEDULED_NOTES`.
+            if state.services.notes.count_scheduled_drafts(&caller.account.id).map_err(ApiError::from_port_error)? >= state.services.scheduled_note_limit {
+                return Err(ApiError::schedule_note_max());
+            }
+            // `fileIds ?? mediaIds` (upstream parity: prefer `fileIds`).
+            let mut file_ids = draft_file_ids_for_key(&obj, "fileIds")?;
+            if file_ids.is_empty() {
+                file_ids = draft_file_ids_for_key(&obj, "mediaIds")?;
+            }
+            // Poll: `expiredAfter` converts against the *scheduled* time
+            // (upstream parity); `expiresAt` wins when present.
+            let poll = parse_draft_poll_param(&obj)?;
+            let (poll_choices, poll_multiple, poll_expires_at_ms, has_poll) = match poll {
+                None => (Vec::new(), false, None, false),
+                Some(p) => {
+                    let expires_at = match (p.expires_at_ms, p.expired_after_ms) {
+                        (Some(Some(expires)), _) => Some(expires),
+                        (_, Some(Some(after))) => Some(scheduled_at_ms.saturating_add(after)),
+                        _ => None,
+                    };
+                    (p.choices, p.multiple.unwrap_or(false), expires_at, true)
+                }
+            };
+            let input = CreateDraftInput {
+                text: opt_draft_text(&obj, "text")?,
+                cw: opt_draft_cw(&obj)?,
+                visibility: parse_visibility(obj.get("visibility"))?,
+                visible_users: draft_visible_user_ids(&obj)?,
+                local_only: false,
+                reply_to: opt_string(&obj, "replyId")?,
+                renote_of: opt_string(&obj, "renoteId")?,
+                file_ids,
+                hashtag: None,
+                reaction_acceptance: parse_reaction_acceptance(obj.get("reactionAcceptance"))?,
+                has_poll,
+                poll_choices,
+                poll_multiple,
+                poll_expires_at_ms,
+                poll_expired_after_ms: None,
+                scheduled_at_ms: Some(scheduled_at_ms),
+                is_actually_scheduled: true,
+            };
+            let draft = state
+                .services
+                .create_scheduled_note(&caller.account.id, input, scheduled_at_ms)
+                .map_err(|e| match e {
+                    // The draft op's own scheduled cap (race with the
+                    // pre-check above) surfaces as Sharkey's code too.
+                    PortError::Validation(code) if code == "TOO_MANY_SCHEDULED_NOTES" => {
+                        ApiError::schedule_note_max()
+                    }
+                    PortError::Validation(code) if code == "SHARKEY_CANNOT_RERENOTE" => {
+                        ApiError::sharkey_cannot_rerenote()
+                    }
+                    other => ApiError::from_port_error(other),
+                })?;
+            Ok(Json(pack_scheduled_note(&draft, &caller.account, &state.services)
+                .map_err(ApiError::from_port_error)?)
+            .into_response())
+        }
+
+        "notes/schedule/list" => {
+            check_allowed_fields(&obj, &["sinceId", "untilId", "limit"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:notes-schedule")?;
+            let cursor = TimelineCursor {
+                since_id: opt_string(&obj, "sinceId")?,
+                until_id: opt_string(&obj, "untilId")?,
+                since_date: None,
+                until_date: None,
+                limit: get_limit_with_default(&obj, 10)?,
+            };
+            let drafts = state
+                .services
+                .list_drafts(&caller.account.id, &cursor, Some(true))
+                .map_err(ApiError::from_port_error)?;
+            let mut out = Vec::with_capacity(drafts.len());
+            for draft in &drafts {
+                out.push(pack_scheduled_note(draft, &caller.account, &state.services)
+                    .map_err(ApiError::from_port_error)?);
+            }
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        "notes/schedule/delete" => {
+            check_allowed_fields(&obj, &["noteId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:notes-schedule")?;
+            let note_id = required_str(&obj, "noteId")?;
+            // The schedule id IS the draft id. Unknown → Sharkey's
+            // `NO_SUCH_NOTE` (`a58056ba-…`); foreign → 403
+            // `PERMISSION_DENIED` (`c0da2fed-…`).
+            let stored = state
+                .services
+                .notes
+                .get_draft(&note_id)
+                .map_err(ApiError::from_port_error)?;
+            match stored {
+                None => return Err(ApiError::schedule_no_such_note()),
+                Some(draft) if draft.user_id != caller.account.id => {
+                    return Err(ApiError::schedule_permission_denied())
+                }
+                _ => {}
+            }
+            // Delete via the draft path so the publish job is cleared
+            // exactly once (no double-publish, no orphan job).
+            state
+                .services
+                .delete_draft(&caller.account.id, &note_id)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
         "i/pin" => {
             check_allowed_fields(&obj, &["noteId"])?;
             let caller = require_caller(caller)?;
@@ -5422,6 +6519,8 @@ fn parse_profile_patch(obj: &Map<String, Value>) -> Result<UpdateAccountPatch, A
         verified_links: None,
         reject_quotes: update_bool_field(obj, "rejectQuotes")?,
         default_reaction: bounded_nullable_string(obj, "defaultReaction", 260)?,
+        // DIVERGENCE (Batch N WP8b): plain bool, absent = unchanged.
+        show_remote_emojis: update_bool_field(obj, "showRemoteEmojis")?,
         moderator_note: None,
     })
 }
@@ -5841,6 +6940,10 @@ mod tests {
             blocks: store.clone(),
             mutes: store.clone(),
             reactions: store.clone(),
+            favorites: store.clone(),
+            emojis: store.clone(),
+            antennas: store.clone(),
+            antenna_notes: store.clone(),
             polls: store.clone(),
             jobs: store.clone(),
             media: store.clone(),
@@ -6871,6 +7974,171 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{value}");
         assert!(value["accessToken"].as_str().is_some());
         assert_eq!(value["user"]["username"], "frank");
+    }
+
+    #[tokio::test]
+    async fn miauth_hardening_expiry_params_suspension() {
+        let (state, clock) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (_, _bob_token) = signup_user(&state, "bob").await;
+
+        // The approval page renders without persisting anything (Batch N
+        // WS7: the GET never writes, even for attacker-chosen ids).
+        let mut query = HashMap::new();
+        query.insert("name".to_string(), "Probe".to_string());
+        let response = miauth_page(
+            State(state.clone()),
+            Path("probe-sess".to_string()),
+            Query(query),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            state.services.auth.get_miauth_session("probe-sess").unwrap().is_none(),
+            "GET minted no row"
+        );
+
+        // gen-token requires both params (upstream parity).
+        let (status, value) = call(
+            &state,
+            "miauth/gen-token",
+            serde_json::json!({ "permission": ["read:account"] }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "INVALID_PARAM");
+        let (status, value) = call(
+            &state,
+            "miauth/gen-token",
+            serde_json::json!({ "session": "s1" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "INVALID_PARAM");
+
+        // Mint, then let the approval window lapse: check reads ok:false
+        // and the row is gone (deleted on read).
+        let (status, value) = call(
+            &state,
+            "miauth/gen-token",
+            serde_json::json!({ "session": "expiry-sess", "permission": ["read:account"] }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        clock.advance_ms(31 * 60 * 1000);
+        let response = miauth_check(
+            State(state.clone()),
+            test_peer(),
+            HeaderMap::new(),
+            Path("expiry-sess".to_string()),
+        )
+        .await
+        .unwrap();
+        let (status, value, _) = read_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value["ok"], false);
+        assert!(
+            state.services.auth.get_miauth_session("expiry-sess").unwrap().is_none(),
+            "expired row deleted on read"
+        );
+
+        // Fresh session still approves after unrelated expiry.
+        let (status, value) = call(
+            &state,
+            "miauth/gen-token",
+            serde_json::json!({ "session": "fresh-sess", "permission": ["read:account"] }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+
+        // Fresh session still approves after unrelated expiry.
+        let response = miauth_check(
+            State(state.clone()),
+            test_peer(),
+            HeaderMap::new(),
+            Path("fresh-sess".to_string()),
+        )
+        .await
+        .unwrap();
+        let (status, value, _) = read_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value["ok"], true);
+
+        // Suspended accounts cannot approve: submit renders the error page
+        // and mints no session row.
+        let (carol_id, _) = signup_user(&state, "carol").await;
+        state.services.set_role(None, &alice_id, false, true).expect("moderator");
+        state.services.suspend_user(&alice_id, &carol_id).expect("suspend");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
+        let response = miauth_submit(
+            State(state.clone()),
+            test_peer(),
+            Path("susp-sess".to_string()),
+            headers,
+            Bytes::from("username=carol&password=s3cret-pw"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("suspended"), "{body:?}");
+        assert!(
+            state.services.auth.get_miauth_session("susp-sess").unwrap().is_none(),
+            "no session row minted for a suspended approver"
+        );
+
+        // Legacy sessions expire the same way: userkey on an expired token
+        // reads as missing (NO_SUCH_SESSION, never PENDING).
+        let (status, value) = call(
+            &state,
+            "auth/session/generate",
+            serde_json::json!({ "appSecret": "s3cret" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let legacy_token = value["token"].as_str().unwrap().to_string();
+        clock.advance_ms(31 * 60 * 1000);
+        let (status, value) = call(
+            &state,
+            "auth/session/userkey",
+            serde_json::json!({ "appSecret": "s3cret", "token": legacy_token }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_SESSION");
+
+        // Wrong appSecret on userkey fails closed (late, like upstream).
+        let (status, value) = call(
+            &state,
+            "auth/session/generate",
+            serde_json::json!({ "appSecret": "s3cret" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let legacy_token = value["token"].as_str().unwrap().to_string();
+        let (status, value) = call(
+            &state,
+            "auth/session/userkey",
+            serde_json::json!({ "appSecret": "wrong", "token": legacy_token }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{value}");
     }
 
     #[tokio::test]
@@ -13169,7 +14437,654 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parity_no_subsystem_exports_are_empty_but_valid() {
+    async fn batch_n_favorites_crud_state_pack_and_errors() {
+        let (state, _) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (_, bob_token) = signup_user(&state, "bob").await;
+
+        // Alice posts; Bob favorites it.
+        let (status, created) = call(
+            &state,
+            "notes/create",
+            serde_json::json!({ "text": "fav target" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let note_id = created["createdNote"]["id"].as_str().unwrap().to_string();
+
+        let (status, _) = call(
+            &state,
+            "notes/favorites/create",
+            serde_json::json!({ "noteId": note_id }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // Duplicate → ALREADY_FAVORITED with the upstream UUID.
+        let (status, value) = call(
+            &state,
+            "notes/favorites/create",
+            serde_json::json!({ "noteId": note_id }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "ALREADY_FAVORITED");
+        assert_eq!(value["error"]["id"], "a402c12b-34dd-41d2-9d8d-4d2ffd96a1a6");
+
+        // notes/show packs isFavorited for the favoriter only.
+        let (status, shown) = call(&state, "notes/show", serde_json::json!({ "noteId": note_id }), Some(&bob_token)).await;
+        assert_eq!(status, StatusCode::OK, "{shown}");
+        assert_eq!(shown["isFavorited"], true);
+        let (status, shown) = call(&state, "notes/show", serde_json::json!({ "noteId": note_id }), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::OK, "{shown}");
+        assert_eq!(shown["isFavorited"], false);
+
+        // notes/state shape.
+        let (status, st) = call(&state, "notes/state", serde_json::json!({ "noteId": note_id }), Some(&bob_token)).await;
+        assert_eq!(status, StatusCode::OK, "{st}");
+        assert_eq!(st, serde_json::json!({ "isFavorited": true, "isMutedThread": false }));
+
+        // i/favorites lists the note.
+        let (status, favs) = call(&state, "i/favorites", serde_json::json!({}), Some(&bob_token)).await;
+        assert_eq!(status, StatusCode::OK, "{favs}");
+        assert!(favs.as_array().unwrap().iter().any(|n| n["id"] == note_id), "{favs:?}");
+
+        // Unfavorite; second delete → NOT_FAVORITED with the upstream UUID.
+        let (status, _) = call(&state, "notes/favorites/delete", serde_json::json!({ "noteId": note_id }), Some(&bob_token)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, value) = call(&state, "notes/favorites/delete", serde_json::json!({ "noteId": note_id }), Some(&bob_token)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NOT_FAVORITED");
+        assert_eq!(value["error"]["id"], "b625fc69-635e-4e89-baa6-dbefbef35af5");
+
+        // Unknown note → NO_SUCH_NOTE on both paths.
+        let (status, value) = call(&state, "notes/favorites/create", serde_json::json!({ "noteId": "aaaaaaaaaaaaaaaa" }), Some(&bob_token)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_NOTE");
+        let (status, value) = call(&state, "notes/state", serde_json::json!({ "noteId": "aaaaaaaaaaaaaaaa" }), Some(&bob_token)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_NOTE");
+
+        // Invisible (followers-only, strangers) note → NO_SUCH_NOTE on create.
+        let (status, created) = call(
+            &state,
+            "notes/create",
+            serde_json::json!({ "text": "locked", "visibility": "followers" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let priv_id = created["createdNote"]["id"].as_str().unwrap().to_string();
+        let (status, value) = call(&state, "notes/favorites/create", serde_json::json!({ "noteId": priv_id }), Some(&bob_token)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_NOTE");
+        let _ = alice_id;
+    }
+
+    #[tokio::test]
+    async fn batch_n_follow_request_accepted_emitted_and_filterable() {
+        let (state, _) = test_state();
+        let (_, alice_token) = signup_user(&state, "alice").await;
+        let (bob_id, bob_token) = signup_user(&state, "bob").await;
+
+        // Bob locks his account; Alice's follow becomes a pending request.
+        let (status, _) = call(&state, "i/update", serde_json::json!({ "isLocked": true }), Some(&bob_token)).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(&state, "following/create", serde_json::json!({ "userId": bob_id }), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Bob accepts; the worker emits followRequestAccepted to Alice.
+        let (alice_id, _) = {
+            let (status, me) = call(&state, "i", serde_json::json!({}), Some(&alice_token)).await;
+            assert_eq!(status, StatusCode::OK);
+            (me["id"].as_str().unwrap().to_string(), ())
+        };
+        let (status, _) = call(&state, "following/requests/accept", serde_json::json!({ "userId": alice_id }), Some(&bob_token)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        state.worker.drain(100).unwrap();
+        let (status, notifs) = call(
+            &state,
+            "i/notifications",
+            serde_json::json!({ "limit": 20, "markAsRead": false, "includeTypes": ["followRequestAccepted"] }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{notifs}");
+        assert!(
+            notifs.as_array().unwrap().iter().any(|n| n["type"] == "followRequestAccepted"),
+            "{notifs:?}"
+        );
+        // Excluding it hides it.
+        let (status, notifs) = call(
+            &state,
+            "i/notifications",
+            serde_json::json!({ "limit": 20, "markAsRead": false, "excludeTypes": ["followRequestAccepted"] }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{notifs}");
+        assert!(
+            notifs.as_array().unwrap().iter().all(|n| n["type"] != "followRequestAccepted"),
+            "{notifs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_n_admin_remainder_unset_media_files() {
+        let (state, _) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (bob_id, bob_token) = signup_user(&state, "bob").await;
+        let (carol_id, carol_token) = signup_user(&state, "carol").await;
+        state.services.set_role(None, &alice_id, false, true).expect("moderator");
+        state.services.set_role(None, &carol_id, true, false).expect("admin");
+
+        // Non-moderator cannot unset.
+        let (status, _) = call(&state, "admin/unset-user-avatar", serde_json::json!({ "userId": bob_id }), Some(&bob_token)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // Bob sets an avatar first.
+        let png = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x62, 0x60, 0x01, 0x00, 0x00, 0xFF, 0xFF, 0x03, 0x00, 0x00, 0x06, 0x00, 0x05,
+            0x72, 0x76, 0x01, 0x82, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42,
+            0x60, 0x82,
+        ];
+        let file = state.services.upload_media(&bob_id, "a.png".to_string(), &png, None, false, true).expect("upload");
+        let (status, _) = call(&state, "i/update", serde_json::json!({ "avatarId": file.id }), Some(&bob_token)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Moderator unsets → 204, avatar cleared, log row written.
+        let (status, _) = call(&state, "admin/unset-user-avatar", serde_json::json!({ "userId": bob_id }), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, shown) = call(&state, "users/show", serde_json::json!({ "userId": bob_id }), None).await;
+        assert_eq!(status, StatusCode::OK, "{shown}");
+        assert!(shown.get("avatarId").is_none() || shown["avatarId"].is_null(), "{shown:?}");
+        let (status, logs) = call(&state, "admin/show-moderation-logs", serde_json::json!({ "type": "unsetUserAvatar" }), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::OK, "{logs}");
+        assert_eq!(logs.as_array().unwrap().len(), 1, "{logs:?}");
+
+        // Second unset is a no-op (no second row).
+        let (status, _) = call(&state, "admin/unset-user-avatar", serde_json::json!({ "userId": bob_id }), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, logs) = call(&state, "admin/show-moderation-logs", serde_json::json!({ "type": "unsetUserAvatar" }), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::OK, "{logs}");
+        assert_eq!(logs.as_array().unwrap().len(), 1, "{logs:?}");
+
+        // Refusal rule on admins (DIVERGENCE from upstream's role-only gate).
+        let (status, value) = call(&state, "admin/unset-user-avatar", serde_json::json!({ "userId": carol_id }), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "INVALID_PARAM");
+        // Unknown target → NO_SUCH_USER.
+        let (status, value) = call(&state, "admin/unset-user-banner", serde_json::json!({ "userId": "aaaaaaaaaaaaaaaa" }), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_USER");
+
+        // delete-all-files: moderator (non-admin) refused; admin clears.
+        let (status, _) = call(&state, "admin/delete-all-files-of-a-user", serde_json::json!({ "userId": bob_id }), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, files) = call(&state, "drive/files", serde_json::json!({}), Some(&bob_token)).await;
+        assert_eq!(status, StatusCode::OK, "{files}");
+        assert!(!files.as_array().unwrap().is_empty(), "bob has files");
+        let (status, _) = call(&state, "admin/delete-all-files-of-a-user", serde_json::json!({ "userId": bob_id }), Some(&carol_token)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, files) = call(&state, "drive/files", serde_json::json!({}), Some(&bob_token)).await;
+        assert_eq!(status, StatusCode::OK, "{files}");
+        assert!(files.as_array().unwrap().is_empty(), "{files:?}");
+
+        // admin/drive/files: moderator can list with filters.
+        let (status, rows) = call(&state, "admin/drive/files", serde_json::json!({ "limit": 10 }), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::OK, "{rows}");
+        let (status, rows) = call(&state, "admin/drive/files", serde_json::json!({ "userId": bob_id, "origin": "combined" }), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::OK, "{rows}");
+        assert!(rows.as_array().unwrap().is_empty(), "{rows:?}");
+        // Non-moderator refused.
+        let (status, _) = call(&state, "admin/drive/files", serde_json::json!({}), Some(&bob_token)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn batch_n_admin_drive_show_file() {
+        let (state, _) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (_, bob_token) = signup_user(&state, "bob").await;
+        state.services.set_role(None, &alice_id, false, true).expect("moderator");
+        let file = state.services.upload_media(&alice_id, "s.png".to_string(), b"fakepng-bytes", None, false, true).expect("upload");
+
+        // By fileId (any owner — admin view).
+        let (status, shown) = call(&state, "admin/drive/show-file", serde_json::json!({ "fileId": file.id }), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::OK, "{shown}");
+        assert_eq!(shown["id"], file.id);
+        // By served url.
+        let (status, shown) = call(&state, "admin/drive/show-file", serde_json::json!({ "url": shown["url"] }), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::OK, "{shown}");
+        assert_eq!(shown["id"], file.id);
+        // Unknown → verbatim NO_SUCH_FILE.
+        let (status, value) = call(&state, "admin/drive/show-file", serde_json::json!({ "fileId": "aaaaaaaaaaaaaaaa" }), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_FILE");
+        assert_eq!(value["error"]["id"], "caf3ca38-c6e5-472e-a30c-b05377dcc240");
+        // Both/neither → INVALID_PARAM.
+        let (status, _) = call(&state, "admin/drive/show-file", serde_json::json!({ "fileId": file.id, "url": "x" }), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = call(&state, "admin/drive/show-file", serde_json::json!({}), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // Non-moderator refused.
+        let (status, _) = call(&state, "admin/drive/show-file", serde_json::json!({ "fileId": file.id }), Some(&bob_token)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn batch_n_abuse_reports_wire_up() {
+        use crate::application::ports::CreateAccountInput;
+
+        let (state, _) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (bob_id, bob_token) = signup_user(&state, "bob").await;
+
+        // Self-report → CANNOT_REPORT_YOURSELF (verbatim upstream id).
+        let (status, value) = call(
+            &state,
+            "users/report-abuse",
+            serde_json::json!({ "userId": alice_id, "comment": "me" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "CANNOT_REPORT_YOURSELF");
+        assert_eq!(value["error"]["id"], "1e13149e-b1e8-43cf-902e-c01dbfcb202f");
+
+        // Make Bob an admin (CLI set-role path); reporting him →
+        // CANNOT_REPORT_THE_ADMIN.
+        state.services.set_role(None, &bob_id, true, false).expect("set role");
+        let (status, value) = call(
+            &state,
+            "users/report-abuse",
+            serde_json::json!({ "userId": bob_id, "comment": "him" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "CANNOT_REPORT_THE_ADMIN");
+
+        // Alice reports Carol (plain user).
+        let (carol_id, _) = signup_user(&state, "carol").await;
+        let (status, report) = call(
+            &state,
+            "users/report-abuse",
+            serde_json::json!({ "userId": carol_id, "comment": "spam" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{report}");
+        let report_id = report["id"].as_str().unwrap().to_string();
+        assert_eq!(report["comment"], "spam");
+        assert_eq!(report["resolved"], false);
+        assert_eq!(report["reporterId"], serde_json::json!(alice_id));
+
+        // Non-moderator cannot list.
+        let (status, _) = call(&state, "admin/abuse-user-reports", serde_json::json!({}), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // Promote Alice to moderator; list shows the report.
+        state.services.set_role(None, &alice_id, false, true).expect("set role");
+        let (status, rows) = call(&state, "admin/abuse-user-reports", serde_json::json!({}), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::OK, "{rows}");
+        assert!(rows.as_array().unwrap().iter().any(|r| r["id"] == report_id), "{rows:?}");
+
+        // Resolve as accept → resolved + assignee set.
+        let (status, _) = call(
+            &state,
+            "admin/resolve-abuse-user-report",
+            serde_json::json!({ "reportId": report_id, "resolvedAs": "accept" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, rows) = call(
+            &state,
+            "admin/abuse-user-reports",
+            serde_json::json!({ "state": "resolved" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{rows}");
+        let row = rows.as_array().unwrap().iter().find(|r| r["id"] == report_id).cloned().unwrap();
+        assert_eq!(row["resolved"], true);
+        assert_eq!(row["resolvedAs"], "accept");
+        assert_eq!(row["assigneeId"], serde_json::json!(alice_id));
+
+        // Moderation-note update round-trips.
+        let (status, _) = call(
+            &state,
+            "admin/update-abuse-user-report",
+            serde_json::json!({ "reportId": report_id, "moderationNote": "handled" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, rows) = call(&state, "admin/abuse-user-reports", serde_json::json!({}), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::OK, "{rows}");
+        let row = rows.as_array().unwrap().iter().find(|r| r["id"] == report_id).cloned().unwrap();
+        assert_eq!(row["moderationNote"], "handled");
+
+        // Unknown report → NO_SUCH_ABUSE_REPORT.
+        let (status, value) = call(
+            &state,
+            "admin/resolve-abuse-user-report",
+            serde_json::json!({ "reportId": "aaaaaaaaaaaaaaaa", "resolvedAs": "reject" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_ABUSE_REPORT");
+
+        // Forward on a local target is refused.
+        let (status, value) = call(
+            &state,
+            "admin/forward-abuse-user-report",
+            serde_json::json!({ "reportId": report_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+
+        // Remote target: report → forward enqueues the Flag job and marks
+        // the report forwarded; a second forward is refused.
+        let remote = state
+            .services
+            .accounts
+            .create_account(CreateAccountInput {
+                handle: "rina".to_string(),
+                host: Some("remote.example".to_string()),
+                display_name: None,
+                description: None,
+                location: None,
+                birthday: None,
+                uri: Some("https://remote.example/users/rina".to_string()),
+                inbox: Some("https://remote.example/inbox".to_string()),
+                shared_inbox: None,
+                is_bot: false,
+                is_cat: false,
+                is_locked: false,
+                preserved_usernames: Vec::new(),
+            }, None)
+            .expect("remote account");
+        let (status, report) = call(
+            &state,
+            "users/report-abuse",
+            serde_json::json!({ "userId": remote.id, "comment": "remote spam" }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{report}");
+        let remote_report = report["id"].as_str().unwrap().to_string();
+        let before = state.services.jobs.pending_count().expect("pending");
+        let (status, _) = call(
+            &state,
+            "admin/forward-abuse-user-report",
+            serde_json::json!({ "reportId": remote_report }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(
+            state.services.jobs.pending_count().expect("pending") > before,
+            "the Flag delivery job is enqueued"
+        );
+        let (status, value) = call(
+            &state,
+            "admin/forward-abuse-user-report",
+            serde_json::json!({ "reportId": remote_report }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+    }
+
+    #[tokio::test]
+    async fn batch_n_emoji_admin_pack_and_opt_in() {
+        use crate::domain::moderation::ModerationAction;
+
+        let (state, _) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (_, bob_token) = signup_user(&state, "bob").await;
+
+        // Public listing starts empty in the Misskey `{emojis: [...]}` shape.
+        let (status, body) = call(&state, "emojis", serde_json::json!({}), None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, serde_json::json!({ "emojis": [] }));
+
+        // Non-moderator add is refused with no state change.
+        let (status, _) = call(
+            &state,
+            "admin/emoji/add",
+            serde_json::json!({ "name": "blobcat", "fileId": "aaaaaaaaaaaaaaaa" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // Moderator: unknown file → upstream add-UUID NO_SUCH_FILE.
+        state.services.set_role(None, &alice_id, false, true).expect("set role");
+        let (status, value) = call(
+            &state,
+            "admin/emoji/add",
+            serde_json::json!({ "name": "blobcat", "fileId": "aaaaaaaaaaaaaaaa" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_FILE");
+        assert_eq!(value["error"]["id"], "fc46b5a4-6b92-4c33-ac66-b806659bb5cf");
+
+        // Bad shortcode → INVALID_PARAM naming name.
+        let file = state
+            .services
+            .upload_media(&alice_id, "e.png".to_string(), &[
+                0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+                0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+                0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
+                0x9C, 0x62, 0x60, 0x01, 0x00, 0x00, 0xFF, 0xFF, 0x03, 0x00, 0x00, 0x06, 0x00, 0x05,
+                0x72, 0x76, 0x01, 0x82, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42,
+                0x60, 0x82,
+            ], None, false, true)
+            .expect("upload png");
+        let (status, value) = call(
+            &state,
+            "admin/emoji/add",
+            serde_json::json!({ "name": "has-dash", "fileId": file.id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "INVALID_PARAM");
+
+        // Non-image file → UNSUPPORTED_FILE_TYPE.
+        let text = state
+            .services
+            .upload_media(&alice_id, "t.txt".to_string(), b"hello", None, false, true)
+            .expect("upload text");
+        let (status, value) = call(
+            &state,
+            "admin/emoji/add",
+            serde_json::json!({ "name": "blobcat", "fileId": text.id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "UNSUPPORTED_FILE_TYPE");
+        assert_eq!(value["error"]["id"], "f7599d96-8750-af68-1633-9575d625c1a7");
+
+        // Happy-path add packs `EmojiDetailed`.
+        let (status, packed) = call(
+            &state,
+            "admin/emoji/add",
+            serde_json::json!({ "name": "blobcat", "fileId": file.id, "category": "c", "aliases": ["bc"] }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{packed}");
+        let emoji_id = packed["id"].as_str().unwrap().to_string();
+        assert_eq!(packed["name"], "blobcat");
+        assert!(packed["url"].as_str().unwrap().ends_with(&format!("/files/{}", file.id)));
+
+        // Duplicate (case-insensitive) → DUPLICATE_NAME.
+        let (status, value) = call(
+            &state,
+            "admin/emoji/add",
+            serde_json::json!({ "name": "BlobCat", "fileId": file.id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "DUPLICATE_NAME");
+
+        // Moderation log row committed with the add.
+        let (status, logs) = call(
+            &state,
+            "admin/show-moderation-logs",
+            serde_json::json!({ "type": "addCustomEmoji" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{logs}");
+        assert_eq!(logs.as_array().unwrap().len(), 1, "{logs:?}");
+
+        // Public `emojis` + single `emoji` serve it.
+        let (status, body) = call(&state, "emojis", serde_json::json!({}), None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let names: Vec<&str> = body["emojis"].as_array().unwrap().iter().map(|e| e["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["blobcat"]);
+        let (status, single) = call(&state, "emoji", serde_json::json!({ "name": "blobcat" }), None).await;
+        assert_eq!(status, StatusCode::OK, "{single}");
+        assert_eq!(single["id"], serde_json::json!(emoji_id));
+        let (status, value) = call(&state, "emoji", serde_json::json!({ "name": "nope" }), None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_EMOJI");
+
+        // Update by name: category reset via explicit null.
+        let (status, updated) = call(
+            &state,
+            "admin/emoji/update",
+            serde_json::json!({ "name": "blobcat", "category": null, "isSensitive": true }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{updated}");
+        assert!(updated.get("category").is_none() || updated["category"].is_null());
+        assert_eq!(updated["isSensitive"], true);
+
+        // Update on a missing row → NO_SUCH_EMOJI.
+        let (status, value) = call(
+            &state,
+            "admin/emoji/update",
+            serde_json::json!({ "id": "aaaaaaaaaaaaaaaa" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_EMOJI");
+
+        // A second emoji, then rename onto the taken name → SAME_NAME_EMOJI_EXISTS.
+        let (status, second) = call(
+            &state,
+            "admin/emoji/add",
+            serde_json::json!({ "name": "free", "fileId": file.id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        let second_id = second["id"].as_str().unwrap().to_string();
+        let (status, value) = call(
+            &state,
+            "admin/emoji/update",
+            serde_json::json!({ "id": second_id, "name": "BLOBCAT" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "SAME_NAME_EMOJI_EXISTS");
+        assert_eq!(value["error"]["id"], "7180fe9d-1ee3-bff9-647d-fe9896d2ffb8");
+        // Rename to a free name succeeds.
+        let (status, renamed) = call(
+            &state,
+            "admin/emoji/update",
+            serde_json::json!({ "id": second_id, "name": "freed" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{renamed}");
+        assert_eq!(renamed["name"], "freed");
+
+        // Admin list with a query filter.
+        let (status, rows) = call(
+            &state,
+            "admin/emoji/list",
+            serde_json::json!({ "query": "blob" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{rows}");
+        assert_eq!(rows.as_array().unwrap().len(), 1, "{rows:?}");
+
+        // Delete → NO_CONTENT; the name resolves empty afterwards.
+        let (status, _) = call(
+            &state,
+            "admin/emoji/delete",
+            serde_json::json!({ "id": emoji_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, value) = call(&state, "emoji", serde_json::json!({ "name": "blobcat" }), None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_EMOJI");
+
+        // WP8b opt-in: `i/update {showRemoteEmojis}` round-trips on `i`.
+        let (status, _) = call(&state, "i/update", serde_json::json!({ "showRemoteEmojis": true }), Some(&bob_token)).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, me) = call(&state, "i", serde_json::json!({}), Some(&bob_token)).await;
+        assert_eq!(status, StatusCode::OK, "{me}");
+        assert_eq!(me["showRemoteEmojis"], true);
+
+        // Seed one remote-emoji row directly (ingest path is covered by the
+        // federation unit tests); a note packs its URL for the opted-in
+        // viewer only.
+        state
+            .services
+            .emojis
+            .upsert_remote_emoji(crate::domain::emoji::RemoteEmoji::new(
+                "remote.example", "party", "https://remote.example/e/party.png", 1_700_000_000_000,
+            ).unwrap())
+            .expect("seed remote emoji");
+        let (status, created) = call(&state, "notes/create", serde_json::json!({ "text": "hi" }), Some(&bob_token)).await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let note_id = created["createdNote"]["id"].as_str().unwrap().to_string();
+        let (status, shown) = call(&state, "notes/show", serde_json::json!({ "noteId": note_id }), Some(&bob_token)).await;
+        assert_eq!(status, StatusCode::OK, "{shown}");
+        assert_eq!(shown["emojis"]["party@remote.example"], "https://remote.example/e/party.png");
+        // Opted-out viewers see local-only maps.
+        let (status, shown) = call(&state, "notes/show", serde_json::json!({ "noteId": note_id }), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::OK, "{shown}");
+        assert!(shown["emojis"].get("party@remote.example").is_none(), "{shown:?}");
+        // Anonymous viewers likewise.
+        let (status, shown) = call(&state, "notes/show", serde_json::json!({ "noteId": note_id }), None).await;
+        assert_eq!(status, StatusCode::OK, "{shown}");
+        assert!(shown["emojis"].get("party@remote.example").is_none(), "{shown:?}");
+
+        // Moderator-only gate on list/update/delete (bob is a plain user).
+        let (status, _) = call(&state, "admin/emoji/list", serde_json::json!({}), Some(&bob_token)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let _ = ModerationAction::AddCustomEmoji;
+    }
+
+    #[tokio::test]
+    async fn parity_empty_exports_are_valid() {
         let (state, _) = test_state();
         let (_, alice_token) = signup_user(&state, "alice").await;
 
@@ -13196,7 +15111,9 @@ mod tests {
             seen.insert(entity, String::from_utf8(bytes).unwrap());
         }
         // Zero user lists export as zero CSV rows; antennas/clips/favorites
-        // export as empty JSON arrays (what upstream writes when empty).
+        // export as empty JSON arrays (what upstream writes when empty —
+        // antennas/favorites now have subsystems, so this is the empty case
+        // of the real exporters).
         assert_eq!(seen["userList"], "");
         assert_eq!(seen["antenna"], "[]");
         assert_eq!(seen["clip"], "[]");
@@ -13239,23 +15156,520 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parity_import_antennas_validates_but_applies_nothing() {
+    async fn batch_n_antennas_crud_notes_and_errors() {
+        let (state, _) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (bob_id, bob_token) = signup_user(&state, "bob").await;
+
+        // Bad src → INVALID_PARAM.
+        let (status, value) = call(
+            &state,
+            "antennas/create",
+            serde_json::json!({
+                "name": "x", "src": "nope", "keywords": [["x"]],
+                "excludeKeywords": [], "users": [],
+                "caseSensitive": false, "withReplies": true, "withFile": false,
+            }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "INVALID_PARAM");
+
+        // Empty keywords → EMPTY_KEYWORD (verbatim id).
+        let (status, value) = call(
+            &state,
+            "antennas/create",
+            serde_json::json!({
+                "name": "x", "src": "all", "keywords": [[" "]], "excludeKeywords": [],
+                "users": [], "caseSensitive": false, "withReplies": true, "withFile": false,
+            }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "EMPTY_KEYWORD");
+        assert_eq!(value["error"]["id"], "53ee222e-1ddd-4f9a-92e5-9fb82ddb463a");
+
+        // src=list is refused (WP16 pending): NO_SUCH_USER_LIST.
+        let (status, value) = call(
+            &state,
+            "antennas/create",
+            serde_json::json!({
+                "name": "x", "src": "list", "userListId": "aaaaaaaaaaaaaaaa",
+                "keywords": [["x"]], "excludeKeywords": [], "users": [],
+                "caseSensitive": false, "withReplies": true, "withFile": false,
+            }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_USER_LIST");
+
+        // Happy path: keyword antenna over everything.
+        let (status, packed) = call(
+            &state,
+            "antennas/create",
+            serde_json::json!({
+                "name": "kw", "src": "all", "keywords": [["hello"]],
+                "excludeKeywords": [["spam"]], "users": [],
+                "caseSensitive": false, "withReplies": false, "withFile": false,
+            }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{packed}");
+        let antenna_id = packed["id"].as_str().unwrap().to_string();
+        assert_eq!(packed["src"], "all");
+        assert_eq!(packed["hasUnreadNote"], false);
+        assert_eq!(packed["isActive"], true);
+
+        // Cap: 4 more succeed, the 6th refuses with TOO_MANY_ANTENNAS.
+        for i in 0..4 {
+            let (status, _) = call(
+                &state,
+                "antennas/create",
+                serde_json::json!({
+                    "name": format!("extra{i}"), "src": "all", "keywords": [["z"]],
+                    "excludeKeywords": [], "users": [],
+                    "caseSensitive": false, "withReplies": true, "withFile": false,
+                }),
+                Some(&alice_token),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{i}");
+        }
+        let (status, value) = call(
+            &state,
+            "antennas/create",
+            serde_json::json!({
+                "name": "toomany", "src": "all", "keywords": [["z"]],
+                "excludeKeywords": [], "users": [],
+                "caseSensitive": false, "withReplies": true, "withFile": false,
+            }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "TOO_MANY_ANTENNAS");
+        assert_eq!(value["error"]["id"], "faf47050-e8b5-438c-913c-db2b1576fde4");
+
+        // Show + list.
+        let (status, shown) = call(&state, "antennas/show", serde_json::json!({ "antennaId": antenna_id }), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::OK, "{shown}");
+        assert_eq!(shown["name"], "kw");
+        let (status, rows) = call(&state, "antennas/list", serde_json::json!({}), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::OK, "{rows}");
+        assert_eq!(rows.as_array().unwrap().len(), 5, "{rows:?}");
+        // Foreign viewers see nothing (owner-scoped).
+        let (status, value) = call(&state, "antennas/show", serde_json::json!({ "antennaId": antenna_id }), Some(&bob_token)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_ANTENNA");
+        assert_eq!(value["error"]["id"], "10c673ac-8852-48eb-aa1f-f5b67f069290");
+
+        // Update: rename + narrow to users-source.
+        let (status, updated) = call(
+            &state,
+            "antennas/update",
+            serde_json::json!({ "antennaId": antenna_id, "name": "kw2", "src": "users", "users": ["bob"] }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{updated}");
+        assert_eq!(updated["name"], "kw2");
+        assert_eq!(updated["src"], "users");
+
+        // Notes flow is covered below against a fresh src=all antenna; first
+        // reset this one and check the empty feed + remove-note on empty.
+        let (status, notes) = call(&state, "antennas/notes", serde_json::json!({ "antennaId": antenna_id }), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::OK, "{notes}");
+        assert_eq!(notes.as_array().unwrap().len(), 0, "{notes:?}");
+        let (status, _) = call(
+            &state,
+            "antennas/remove-note",
+            serde_json::json!({ "antennaId": antenna_id, "noteId": "aaaaaaaaaaaaaaaa" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // Feed: a fresh match-all antenna collects a matching note through
+        // the worker (note-create transaction enqueues the match job).
+        // (An empty keyword list is EMPTY_KEYWORD at the API — like
+        // upstream — so the antenna carries a real keyword.)
+        let (status, packed) = call(
+            &state,
+            "antennas/create",
+            serde_json::json!({
+                "name": "all2", "src": "all", "keywords": [["hello"]],
+                "excludeKeywords": [], "users": [],
+                "caseSensitive": false, "withReplies": true, "withFile": false,
+            }),
+            Some(&bob_token),
+        )
+        .await;
+        // Bob already has 0 antennas; this is fine — but Alice is at cap, so
+        // use Bob's account for the feed antenna.
+        assert_eq!(status, StatusCode::OK, "{packed}");
+        let feed_id = packed["id"].as_str().unwrap().to_string();
+        let (status, created) = call(&state, "notes/create", serde_json::json!({ "text": "hello world" }), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let note_id = created["createdNote"]["id"].as_str().unwrap().to_string();
+        state.worker.drain(200).unwrap();
+        let (status, notes) = call(&state, "antennas/notes", serde_json::json!({ "antennaId": feed_id }), Some(&bob_token)).await;
+        assert_eq!(status, StatusCode::OK, "{notes}");
+        assert!(notes.as_array().unwrap().iter().any(|n| n["id"] == note_id), "{notes:?}");
+        // Read-time visibility filtering: a followers-only note from a
+        // stranger stays out of Bob's feed.
+        let (status, created) = call(
+            &state,
+            "notes/create",
+            serde_json::json!({ "text": "locked hello", "visibility": "followers" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let locked_id = created["createdNote"]["id"].as_str().unwrap().to_string();
+        state.worker.drain(200).unwrap();
+        let (status, notes) = call(&state, "antennas/notes", serde_json::json!({ "antennaId": feed_id }), Some(&bob_token)).await;
+        assert_eq!(status, StatusCode::OK, "{notes}");
+        assert!(!notes.as_array().unwrap().iter().any(|n| n["id"] == locked_id), "{notes:?}");
+        // remove-note drops the visible one.
+        let (status, _) = call(
+            &state,
+            "antennas/remove-note",
+            serde_json::json!({ "antennaId": feed_id, "noteId": note_id }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, notes) = call(&state, "antennas/notes", serde_json::json!({ "antennaId": feed_id }), Some(&bob_token)).await;
+        assert_eq!(status, StatusCode::OK, "{notes}");
+        assert!(!notes.as_array().unwrap().iter().any(|n| n["id"] == note_id), "{notes:?}");
+
+        // Delete cascades; the feed is gone afterwards.
+        let (status, _) = call(&state, "antennas/delete", serde_json::json!({ "antennaId": feed_id }), Some(&bob_token)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, value) = call(&state, "antennas/notes", serde_json::json!({ "antennaId": feed_id }), Some(&bob_token)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_ANTENNA");
+        let _ = (alice_id, bob_id);
+    }
+
+    #[tokio::test]
+    async fn batch_n_word_mutes_soft_flag_packed_hard_dropped() {
+        let (state, _) = test_state();
+        let (_, alice_token) = signup_user(&state, "alice").await;
+        let (_, bob_token) = signup_user(&state, "bob").await;
+
+        // Alice: soft /spoiler/i, hard /secret/i (i/update transport is the
+        // Misskey `/pattern/flags` string form).
+        let (status, _) = call(
+            &state,
+            "i/update",
+            serde_json::json!({
+                "mutedWords": ["/spoiler/i"],
+                "hardMutedWords": ["/secret/i"],
+            }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Bob posts a soft hit, a hard hit, and a plain note.
+        let (status, soft) = call(&state, "notes/create", serde_json::json!({ "text": "a spoiler here" }), Some(&bob_token)).await;
+        assert_eq!(status, StatusCode::OK, "{soft}");
+        let soft_id = soft["createdNote"]["id"].as_str().unwrap().to_string();
+        let (status, hard) = call(&state, "notes/create", serde_json::json!({ "text": "a secret here" }), Some(&bob_token)).await;
+        assert_eq!(status, StatusCode::OK, "{hard}");
+        let hard_id = hard["createdNote"]["id"].as_str().unwrap().to_string();
+        let (status, plain) = call(&state, "notes/create", serde_json::json!({ "text": "just a note" }), Some(&bob_token)).await;
+        assert_eq!(status, StatusCode::OK, "{plain}");
+        let plain_id = plain["createdNote"]["id"].as_str().unwrap().to_string();
+
+        // Soft hit packs the viewer flag; hard hit reads as missing.
+        let (status, shown) = call(&state, "notes/show", serde_json::json!({ "noteId": soft_id }), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::OK, "{shown}");
+        assert_eq!(shown["isSoftMuted"], true);
+        let (status, shown) = call(&state, "notes/show", serde_json::json!({ "noteId": plain_id }), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::OK, "{shown}");
+        assert_eq!(shown["isSoftMuted"], false);
+        let (status, value) = call(&state, "notes/show", serde_json::json!({ "noteId": hard_id }), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_NOTE");
+
+        // Bob (no mutes) sees everything unflagged.
+        let (status, shown) = call(&state, "notes/show", serde_json::json!({ "noteId": soft_id }), Some(&bob_token)).await;
+        assert_eq!(status, StatusCode::OK, "{shown}");
+        assert_eq!(shown["isSoftMuted"], false);
+    }
+
+    #[tokio::test]
+    async fn sharkey_schedule_shim_crud_and_errors() {
         let (state, clock) = test_state();
         let (alice_id, alice_token) = signup_user(&state, "alice").await;
-        let valid = serde_json::json!([{
-            "name": "a",
-            "src": "home",
-            "keywords": [["x"]],
-            "excludeKeywords": [],
-            "users": [],
-            "userListAccts": null,
-            "caseSensitive": false,
-            "localOnly": false,
-            "excludeBots": false,
-            "withReplies": false,
-            "withFile": false,
-            "excludeNotesInSensitiveChannel": false,
-        }]);
+        let (bob_id, bob_token) = signup_user(&state, "bob").await;
+
+        // scheduleNote.scheduledAt is required and must be in the future.
+        let (status, value) = call(
+            &state,
+            "notes/schedule/create",
+            serde_json::json!({ "text": "x" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "INVALID_PARAM");
+        let past = clock.now_ms() - 1_000;
+        let (status, value) = call(
+            &state,
+            "notes/schedule/create",
+            serde_json::json!({ "text": "x", "scheduleNote": { "scheduledAt": past } }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "CANNOT_CREATE_ALREADY_EXPIRED_SCHEDULE");
+        assert_eq!(value["error"]["id"], "8a9bfb90-fc7e-4878-a3e8-d97faaf5fb07");
+
+        // anyOf content rule.
+        let future = clock.now_ms() + 3_600_000;
+        let (status, value) = call(
+            &state,
+            "notes/schedule/create",
+            serde_json::json!({ "scheduleNote": { "scheduledAt": future } }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "INVALID_PARAM");
+
+        // Up-front target errors carry verbatim Sharkey ids.
+        let (status, value) = call(
+            &state,
+            "notes/schedule/create",
+            serde_json::json!({ "renoteId": "aaaaaaaaaaaaaaaa", "scheduleNote": { "scheduledAt": future } }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_RENOTE_TARGET");
+        let (status, value) = call(
+            &state,
+            "notes/schedule/create",
+            serde_json::json!({ "replyId": "aaaaaaaaaaaaaaaa", "text": "x", "scheduleNote": { "scheduledAt": future } }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_REPLY_TARGET");
+        let (status, value) = call(
+            &state,
+            "notes/schedule/create",
+            serde_json::json!({ "renoteId": "aaaaaaaaaaaaaaaa", "scheduleNote": { "scheduledAt": future } }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_RENOTE_TARGET");
+
+        // Pure-renote gates.
+        let (status, created) = call(&state, "notes/create", serde_json::json!({ "text": "target" }), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let target_id = created["createdNote"]["id"].as_str().unwrap().to_string();
+        let (status, created) = call(&state, "notes/create", serde_json::json!({ "renoteId": target_id }), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let pure_id = created["createdNote"]["id"].as_str().unwrap().to_string();
+        let (status, value) = call(
+            &state,
+            "notes/schedule/create",
+            serde_json::json!({ "renoteId": pure_id, "scheduleNote": { "scheduledAt": future } }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "CANNOT_RENOTE_TO_A_PURE_RENOTE");
+        assert_eq!(value["error"]["id"], "fd4cc33e-2a37-48dd-99cc-9b806eb2031a");
+        let (status, value) = call(
+            &state,
+            "notes/schedule/create",
+            serde_json::json!({ "replyId": pure_id, "text": "x", "scheduleNote": { "scheduledAt": future } }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "CANNOT_REPLY_TO_A_PURE_RENOTE");
+        assert_eq!(value["error"]["id"], "3ac74a84-8fd5-4bb0-870f-01804f82ce15");
+
+        // Renote visibility gate.
+        let (status, created) = call(
+            &state,
+            "notes/create",
+            serde_json::json!({ "text": "followers only", "visibility": "followers" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let followers_id = created["createdNote"]["id"].as_str().unwrap().to_string();
+        let (status, value) = call(
+            &state,
+            "notes/schedule/create",
+            serde_json::json!({ "renoteId": followers_id, "scheduleNote": { "scheduledAt": future } }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "CANNOT_RENOTE_DUE_TO_VISIBILITY");
+
+        // Poll expiry is judged against the scheduled time, not now.
+        let (status, value) = call(
+            &state,
+            "notes/schedule/create",
+            serde_json::json!({
+                "text": "x",
+                "poll": { "choices": ["a", "b"], "expiresAt": future - 1 },
+                "scheduleNote": { "scheduledAt": future },
+            }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "CANNOT_CREATE_ALREADY_EXPIRED_POLL");
+
+        // Happy path: full shape + defaults, packed schedule-note shape.
+        // `mediaIds` is accepted as the file-key form (upstream parity;
+        // `fileIds` wins when both are present).
+        let media = state.services.upload_media(&alice_id, "sched.png".to_string(), b"fakepng", None, false, true).expect("upload");
+        let (status, packed) = call(
+            &state,
+            "notes/schedule/create",
+            serde_json::json!({
+                "text": "sched hello",
+                "visibility": "public",
+                "mediaIds": [media.id],
+                "scheduleNote": { "scheduledAt": future },
+            }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{packed}");
+        assert_eq!(packed["userId"], alice_id);
+        assert!(packed["scheduledAt"].as_str().unwrap().ends_with('Z'), "{packed:?}");
+        assert_eq!(packed["note"]["text"], "sched hello");
+        assert_eq!(packed["note"]["isSchedule"], true);
+        assert_eq!(packed["note"]["visibility"], "public");
+        assert_eq!(packed["note"]["reactionAcceptance"], Value::Null);
+        assert!(packed["note"]["visibleUsers"].as_array().unwrap().is_empty());
+        assert_eq!(packed["note"]["fileIds"].as_array().unwrap().len(), 1, "{packed:?}");
+        let schedule_id = packed["id"].as_str().unwrap().to_string();
+
+        // Second scheduled entry overflows the default limit of 1.
+        let (status, value) = call(
+            &state,
+            "notes/schedule/create",
+            serde_json::json!({ "text": "y", "scheduleNote": { "scheduledAt": future } }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "SCHEDULE_NOTE_MAX");
+        assert_eq!(value["error"]["id"], "168707c3-e7da-4031-989e-f42aa3a274b2");
+
+        // List shows the entry in the upstream shape.
+        let (status, rows) = call(&state, "notes/schedule/list", serde_json::json!({}), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::OK, "{rows}");
+        assert_eq!(rows.as_array().unwrap().len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["id"], schedule_id);
+
+        // Delete: unknown id → NO_SUCH_NOTE (a58056ba); foreign → 403.
+        let (status, value) = call(&state, "notes/schedule/delete", serde_json::json!({ "noteId": "aaaaaaaaaaaaaaaa" }), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_NOTE");
+        assert_eq!(value["error"]["id"], "a58056ba-8ba1-4323-8ebf-e0b585bc244f");
+        let (status, value) = call(&state, "notes/schedule/delete", serde_json::json!({ "noteId": schedule_id }), Some(&bob_token)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{value}");
+        assert_eq!(value["code"], "PERMISSION_DENIED");
+        assert_eq!(value["error"]["id"], "c0da2fed-8f61-4c47-a41d-431992607b5c");
+
+        // Delete then advance past the time: nothing posts (job cleared).
+        let (status, _) = call(&state, "notes/schedule/delete", serde_json::json!({ "noteId": schedule_id }), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        clock.advance_ms(3_601_000);
+        state.worker.drain(100).unwrap();
+        let (status, rows) = call(&state, "notes/schedule/list", serde_json::json!({}), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::OK, "{rows}");
+        assert!(rows.as_array().unwrap().is_empty(), "{rows:?}");
+
+        // End to end: a shim-created entry publishes through the normal path.
+        let fire_at = clock.now_ms() + 60_000;
+        let (status, packed) = call(
+            &state,
+            "notes/schedule/create",
+            serde_json::json!({ "text": "fires", "scheduleNote": { "scheduledAt": fire_at } }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{packed}");
+        state.worker.drain(100).unwrap();
+        let (status, mine) = call(&state, "users/notes", serde_json::json!({ "userId": alice_id }), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::OK, "{mine}");
+        assert!(!mine.as_array().unwrap().iter().any(|n| n["text"] == "fires"), "not yet due");
+        clock.advance_ms(61_000);
+        state.worker.drain(100).unwrap();
+        let (status, mine) = call(&state, "users/notes", serde_json::json!({ "userId": alice_id }), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::OK, "{mine}");
+        assert!(mine.as_array().unwrap().iter().any(|n| n["text"] == "fires"), "{mine:?}");
+        let _ = bob_id;
+    }
+
+    #[tokio::test]
+    async fn batch_n_import_antennas_applies_valid_rows() {
+        let (state, clock) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let valid = serde_json::json!([
+            {
+                "name": "a",
+                "src": "all",
+                "keywords": [["x"]],
+                "excludeKeywords": [],
+                "users": [],
+                "userListAccts": null,
+                "caseSensitive": false,
+                "localOnly": false,
+                "excludeBots": false,
+                "withReplies": true,
+                "withFile": false,
+            },
+            // Empty-keyword rows skip (upstream verbatim rule).
+            {
+                "name": "empty",
+                "src": "all",
+                "keywords": [[""]],
+                "excludeKeywords": [],
+                "users": [],
+                "caseSensitive": false,
+                "localOnly": false,
+                "excludeBots": false,
+                "withReplies": true,
+                "withFile": false,
+            },
+            // `src=list` + accts rewrites to `users` (upstream parity).
+            {
+                "name": "listed",
+                "src": "list",
+                "keywords": [["y"]],
+                "excludeKeywords": [],
+                "users": [],
+                "userListAccts": ["bob@example.com"],
+                "caseSensitive": false,
+                "localOnly": false,
+                "excludeBots": false,
+                "withReplies": true,
+                "withFile": false,
+            },
+            // Schema-invalid rows skip.
+            { "name": "broken" },
+        ]);
         let file = state
             .services
             .upload_media(
@@ -13275,9 +15689,18 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
-        // No antenna subsystem exists: the job validates rows, applies zero,
-        // and still completes (imports never notify).
+        // The worker applies 2 rows (a, listed), skips 2 (empty, broken);
+        // imports never notify.
         state.worker.drain(100).unwrap();
+        let (status, rows) = call(&state, "antennas/list", serde_json::json!({}), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::OK, "{rows}");
+        let names: Vec<&str> = rows.as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"a"), "{rows:?}");
+        assert!(names.contains(&"listed"), "{rows:?}");
+        assert_eq!(rows.as_array().unwrap().len(), 2, "{rows:?}");
+        let listed = rows.as_array().unwrap().iter().find(|r| r["name"] == "listed").unwrap();
+        assert_eq!(listed["src"], "users");
+        assert_eq!(listed["users"], serde_json::json!(["bob@example.com"]));
 
         // Malformed JSON is INVALID_PARAM (DIVERGENCE: upstream throws 500).
         clock.advance_ms(3_600_000);

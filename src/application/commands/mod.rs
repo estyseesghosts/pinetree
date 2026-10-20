@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::application::ports::{
-    AbuseReportStore, AccountStore, ActivityDedup, AuthStore, BlobStore, BlockStore, Clock, FollowStore, HostCapsStore,
+    AbuseReportStore, AccountStore, ActivityDedup, AntennaNoteStore, AntennaStore, AuthStore, BlobStore, BlockStore, Clock, EmojiStore, FavoriteStore, FollowStore, HostCapsStore,
     IdGenerator, InstanceSettingsStore, InviteStore, JobQueue, MediaStore, ModerationLogStore,
     MuteStore, NoteStore, NotificationStore, PollStore, ReactionStore, StreamingSink,
 };
@@ -9,9 +9,12 @@ use crate::federation::delivery::SafeHttpClient;
 
 pub mod accounts;
 pub mod abuse_reports;
+pub mod antennas;
 pub mod blocks;
 pub mod drafts;
+pub mod emoji;
 pub mod exports;
+pub mod favorites;
 pub mod follows;
 pub mod helpers;
 pub mod inbound;
@@ -40,6 +43,10 @@ pub struct AppServices {
     pub blocks: Arc<dyn BlockStore>,
     pub mutes: Arc<dyn MuteStore>,
     pub reactions: Arc<dyn ReactionStore>,
+    pub favorites: Arc<dyn FavoriteStore>,
+    pub emojis: Arc<dyn EmojiStore>,
+    pub antennas: Arc<dyn AntennaStore>,
+    pub antenna_notes: Arc<dyn AntennaNoteStore>,
     pub polls: Arc<dyn PollStore>,
     pub jobs: Arc<dyn JobQueue>,
     pub media: Arc<dyn MediaStore>,

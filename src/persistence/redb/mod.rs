@@ -13,7 +13,7 @@ use crate::application::ports::{
     InviteSort, InviteStore, InviteTypeFilter,
     AbuseReportFilter, Job, JobQueue, LegacyAuthSessionRecord, MediaStore, MiAuthSessionRecord, ModerationLogFilter,
     AbuseReportStore, ModerationLogStore, MuteStore, NewJob,
-    NoteStore, NotificationStore, PollChoiceCount, PollStore, PortError, ReactionStore,
+    NoteStore, NotificationStore, PollChoiceCount, PollStore, PortError, ReactionStore, FavoriteStore, EmojiStore, AntennaStore, AntennaNoteStore,
     RemotePublicKeyRecord, TimelineCursor, UpdateAccountPatch, MAX_JOBS_PER_TXN, MAX_JOB_ATTEMPTS,
 };
 use crate::domain::account::{validate_local_username, Account};
@@ -35,6 +35,9 @@ use crate::domain::policy::{narrow_on_create, NarrowingInput};
 use crate::domain::quote::{QuoteAuthorizationState, QuoteReference, QuoteStamp};
 use crate::domain::poll::{Poll, PollVote};
 use crate::domain::reaction::Reaction;
+use crate::domain::favorite::NoteFavorite;
+use crate::domain::antenna::Antenna;
+use crate::domain::emoji::{CustomEmoji, RemoteEmoji};
 
 const ACCOUNTS: TableDefinition<&str, &[u8]> = TableDefinition::new("accounts");
 const HANDLE_INDEX: TableDefinition<&str, &str> = TableDefinition::new("handle_index");
@@ -85,6 +88,29 @@ const NOTE_DRAFTS_BY_USER: TableDefinition<(&str, &str), u8> =
 /// Values are JSON [`UserNotePining`] rows (which carry the pinning id
 /// used for oldest-first ordering).
 const PINNINGS: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new("pinnings");
+/// Note favorites keyed `(user_id, note_id)` (`UNIQUE(user,note)`;
+/// Misskey `MiNoteFavorite` parity). Values are JSON [`NoteFavorite`] rows.
+const FAVORITES: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new("favorites");
+/// Local custom emoji by id (Batch N WS1; Misskey `MiEmoji`, host null).
+/// Values are JSON [`CustomEmoji`] rows.
+const EMOJIS: TableDefinition<&str, &[u8]> = TableDefinition::new("emojis");
+/// Unique shortcode index (lowercased shortcode → emoji id), case-insensitive
+/// parity with the account-handle rule (conformance J2).
+const EMOJIS_BY_NAME: TableDefinition<&str, &str> = TableDefinition::new("emojis_by_name");
+/// Remote-emoji metadata keyed `(lower host, lower shortcode)` (WP8b opt-in;
+/// metadata only, no fetch at ingest). Values are JSON [`RemoteEmoji`] rows.
+const REMOTE_EMOJIS: TableDefinition<(&str, &str), &[u8]> =
+    TableDefinition::new("remote_emojis");
+/// Antennas by id (Batch N WS4; guide WP15). Values are JSON [`Antenna`] rows.
+const ANTENNAS: TableDefinition<&str, &[u8]> = TableDefinition::new("antennas");
+/// Owner index `(owner_id, antenna_id)` (listing + per-owner cap).
+const ANTENNAS_BY_OWNER: TableDefinition<(&str, &str), u8> =
+    TableDefinition::new("antennas_by_owner");
+/// Per-antenna feeds `(antenna_id, note_id)` (aidx note ids are
+/// time-ordered, so reverse ranges read newest-first). Written with the trim
+/// in the same transaction as the append.
+const ANTENNA_NOTES: TableDefinition<(&str, &str), u8> =
+    TableDefinition::new("antenna_notes");
 /// Polls by note id (`docs/misskey-parity-plan.md` §4; Misskey `MiPoll`).
 const POLLS: TableDefinition<&str, &[u8]> = TableDefinition::new("polls");
 /// Poll votes keyed `(user_id, note_id, choice)` (`UNIQUE(user,note,choice)`
@@ -276,6 +302,13 @@ impl RedbStore {
             .open_table(NOTE_DRAFTS_BY_USER)
             .map_err(map_redb_err)?;
         let _ = write_txn.open_table(PINNINGS).map_err(map_redb_err)?;
+        let _ = write_txn.open_table(FAVORITES).map_err(map_redb_err)?;
+        let _ = write_txn.open_table(EMOJIS).map_err(map_redb_err)?;
+        let _ = write_txn.open_table(EMOJIS_BY_NAME).map_err(map_redb_err)?;
+        let _ = write_txn.open_table(REMOTE_EMOJIS).map_err(map_redb_err)?;
+        let _ = write_txn.open_table(ANTENNAS).map_err(map_redb_err)?;
+        let _ = write_txn.open_table(ANTENNAS_BY_OWNER).map_err(map_redb_err)?;
+        let _ = write_txn.open_table(ANTENNA_NOTES).map_err(map_redb_err)?;
         let _ = write_txn.open_table(POLLS).map_err(map_redb_err)?;
         let _ = write_txn.open_table(POLL_VOTES).map_err(map_redb_err)?;
         let _ = write_txn.open_table(JOBS).map_err(map_redb_err)?;
@@ -2424,6 +2457,10 @@ impl RedbStore {
             if let Some(v) = patch.default_reaction {
                 acc.default_reaction = v;
             }
+            // DIVERGENCE (Batch N WP8b): per-user remote-emoji opt-in.
+            if let Some(v) = patch.show_remote_emojis {
+                acc.show_remote_emojis = v;
+            }
             if let Some(v) = patch.moderator_note {
                 acc.moderator_note = v;
             }
@@ -3043,6 +3080,32 @@ impl AbuseReportStore for RedbStore {
         self.commit_write(write_txn)?;
         Ok(report)
     }
+
+    fn create_flag_report(
+        &self,
+        activity_id: &str,
+        report: AbuseReport,
+    ) -> Result<Option<AbuseReport>, PortError> {
+        report.validate()?;
+        let write_txn = self.begin_write()?;
+        let inserted = {
+            let mut dedup = write_txn.open_table(ACTIVITY_DEDUP).map_err(map_redb_err)?;
+            if dedup.get(activity_id).map_err(map_redb_err)?.is_some() {
+                None
+            } else {
+                dedup.insert(activity_id, 1u8).map_err(map_redb_err)?;
+                drop(dedup);
+                let mut table = write_txn.open_table(ABUSE_REPORTS).map_err(map_redb_err)?;
+                let bytes = encode_json(&report)?;
+                table
+                    .insert(report.id.as_str(), bytes.as_slice())
+                    .map_err(map_redb_err)?;
+                Some(report)
+            }
+        };
+        self.commit_write(write_txn)?;
+        Ok(inserted)
+    }
 }
 
 impl InstanceSettingsStore for RedbStore {
@@ -3487,6 +3550,7 @@ impl RedbStore {
             ],
             reject_quotes: false,
             default_reaction: None,
+            show_remote_emojis: false,
             moderator_note: None,
         };
         account.validate()?;
@@ -4780,6 +4844,665 @@ impl NoteStore for RedbStore {
         // matching the upstream `pins.map(...)` pin order.
         out.sort_by(|a: &UserNotePining, b: &UserNotePining| a.id.cmp(&b.id));
         Ok(out)
+    }
+}
+
+impl FavoriteStore for RedbStore {
+    fn favorite_note(
+        &self,
+        favorite: NoteFavorite,
+        jobs: Vec<NewJob>,
+    ) -> Result<NoteFavorite, PortError> {
+        favorite
+            .validate()
+            .map_err(|e| PortError::Validation(format!("{e:?}")))?;
+        let write_txn = self.begin_write()?;
+        {
+            let mut fav_table = write_txn.open_table(FAVORITES).map_err(map_redb_err)?;
+            if fav_table
+                .get((favorite.user_id.as_str(), favorite.note_id.as_str()))
+                .map_err(map_redb_err)?
+                .is_some()
+            {
+                drop(fav_table);
+                let _ = write_txn.abort();
+                return Err(PortError::Conflict("ALREADY_FAVORITED".to_string()));
+            }
+            let encoded = encode_json(&favorite)?;
+            fav_table
+                .insert(
+                    (favorite.user_id.as_str(), favorite.note_id.as_str()),
+                    encoded.as_slice(),
+                )
+                .map_err(map_redb_err)?;
+        }
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)?;
+        Ok(favorite)
+    }
+
+    fn unfavorite_note(&self, user_id: &str, note_id: &str) -> Result<bool, PortError> {
+        let write_txn = self.begin_write()?;
+        let removed = {
+            let mut fav_table = write_txn.open_table(FAVORITES).map_err(map_redb_err)?;
+            fav_table
+                .remove((user_id, note_id))
+                .map_err(map_redb_err)?
+                .is_some()
+        };
+        self.commit_write(write_txn)?;
+        Ok(removed)
+    }
+
+    fn is_favorited(&self, user_id: &str, note_id: &str) -> Result<bool, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let fav_table = read_txn.open_table(FAVORITES).map_err(map_redb_err)?;
+        Ok(fav_table
+            .get((user_id, note_id))
+            .map_err(map_redb_err)?
+            .is_some())
+    }
+
+    fn favorites_by_user(
+        &self,
+        user_id: &str,
+        cursor: &TimelineCursor,
+    ) -> Result<Vec<NoteFavorite>, PortError> {
+        let limit = if cursor.limit == 0 { 10 } else { cursor.limit };
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let fav_table = read_txn.open_table(FAVORITES).map_err(map_redb_err)?;
+        let mut out: Vec<NoteFavorite> = Vec::new();
+        for entry in fav_table
+            .range((user_id, "")..=(user_id, "\u{10ffff}"))
+            .map_err(map_redb_err)?
+        {
+            let (_, v) = entry.map_err(map_redb_err)?;
+            out.push(decode_json(v.value())?);
+        }
+        // Newest-first by favorite id (aidx ids are time-ordered).
+        out.sort_by(|a: &NoteFavorite, b: &NoteFavorite| b.id.cmp(&a.id));
+        out.retain(|f| matches_cursor(&f.id, cursor));
+        out.truncate(limit);
+        Ok(out)
+    }
+}
+
+impl EmojiStore for RedbStore {
+    fn create_emoji(
+        &self,
+        emoji: CustomEmoji,
+        log: ModerationLogEntry,
+        jobs: Vec<NewJob>,
+    ) -> Result<CustomEmoji, PortError> {
+        emoji
+            .validate()
+            .map_err(|e| PortError::Validation(format!("{e:?}")))?;
+        let lower = emoji.shortcode.to_ascii_lowercase();
+        let write_txn = self.begin_write()?;
+        {
+            let mut by_name = write_txn.open_table(EMOJIS_BY_NAME).map_err(map_redb_err)?;
+            if by_name
+                .get(lower.as_str())
+                .map_err(map_redb_err)?
+                .is_some()
+            {
+                drop(by_name);
+                let _ = write_txn.abort();
+                return Err(PortError::Conflict("DUPLICATE_NAME".to_string()));
+            }
+            by_name
+                .insert(lower.as_str(), emoji.id.as_str())
+                .map_err(map_redb_err)?;
+            drop(by_name);
+            let mut table = write_txn.open_table(EMOJIS).map_err(map_redb_err)?;
+            let encoded = encode_json(&emoji)?;
+            table
+                .insert(emoji.id.as_str(), encoded.as_slice())
+                .map_err(map_redb_err)?;
+        }
+        self.append_log_in_txn(&write_txn, &log)?;
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)?;
+        Ok(emoji)
+    }
+
+    fn update_emoji(
+        &self,
+        emoji: CustomEmoji,
+        log: ModerationLogEntry,
+        jobs: Vec<NewJob>,
+    ) -> Result<CustomEmoji, PortError> {
+        emoji
+            .validate()
+            .map_err(|e| PortError::Validation(format!("{e:?}")))?;
+        let lower = emoji.shortcode.to_ascii_lowercase();
+        let write_txn = self.begin_write()?;
+        {
+            let mut table = write_txn.open_table(EMOJIS).map_err(map_redb_err)?;
+            let existing: Option<CustomEmoji> = match table
+                .get(emoji.id.as_str())
+                .map_err(map_redb_err)?
+            {
+                Some(guard) => Some(decode_json(guard.value())?),
+                None => None,
+            };
+            let Some(existing) = existing else {
+                drop(table);
+                let _ = write_txn.abort();
+                return Err(PortError::NotFound("NO_SUCH_EMOJI".to_string()));
+            };
+            let mut by_name = write_txn.open_table(EMOJIS_BY_NAME).map_err(map_redb_err)?;
+            if existing.shortcode.to_ascii_lowercase() != lower {
+                if by_name
+                    .get(lower.as_str())
+                    .map_err(map_redb_err)?
+                    .is_some()
+                {
+                    drop(by_name);
+                    drop(table);
+                    let _ = write_txn.abort();
+                    return Err(PortError::Conflict("SAME_NAME_EMOJI_EXISTS".to_string()));
+                }
+                let _ = by_name.remove(existing.shortcode.to_ascii_lowercase().as_str());
+                by_name
+                    .insert(lower.as_str(), emoji.id.as_str())
+                    .map_err(map_redb_err)?;
+            }
+            drop(by_name);
+            let encoded = encode_json(&emoji)?;
+            table
+                .insert(emoji.id.as_str(), encoded.as_slice())
+                .map_err(map_redb_err)?;
+        }
+        self.append_log_in_txn(&write_txn, &log)?;
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)?;
+        Ok(emoji)
+    }
+
+    fn delete_emoji(&self, id: &str, log: ModerationLogEntry, jobs: Vec<NewJob>) -> Result<bool, PortError> {
+        let write_txn = self.begin_write()?;
+        let removed = {
+            let mut table = write_txn.open_table(EMOJIS).map_err(map_redb_err)?;
+            let existing: Option<CustomEmoji> = match table
+                .get(id)
+                .map_err(map_redb_err)?
+            {
+                Some(guard) => Some(decode_json(guard.value())?),
+                None => None,
+            };
+            let Some(existing) = existing else {
+                return Ok(false);
+            };
+            let _ = table.remove(id);
+            drop(table);
+            let mut by_name = write_txn.open_table(EMOJIS_BY_NAME).map_err(map_redb_err)?;
+            let _ = by_name.remove(existing.shortcode.to_ascii_lowercase().as_str());
+            true
+        };
+        self.append_log_in_txn(&write_txn, &log)?;
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)?;
+        Ok(removed)
+    }
+
+    fn get_emoji(&self, id: &str) -> Result<Option<CustomEmoji>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(EMOJIS).map_err(map_redb_err)?;
+        match table.get(id).map_err(map_redb_err)? {
+            Some(guard) => Ok(Some(decode_json(guard.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn get_emoji_by_name(&self, shortcode: &str) -> Result<Option<CustomEmoji>, PortError> {
+        let lower = shortcode.to_ascii_lowercase();
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let by_name = read_txn.open_table(EMOJIS_BY_NAME).map_err(map_redb_err)?;
+        let Some(guard) = by_name.get(lower.as_str()).map_err(map_redb_err)? else {
+            return Ok(None);
+        };
+        let id: String = guard.value().to_string();
+        drop(guard);
+        drop(by_name);
+        drop(read_txn);
+        self.get_emoji(&id)
+    }
+
+    fn list_emojis(
+        &self,
+        query: Option<&str>,
+        cursor: &TimelineCursor,
+    ) -> Result<Vec<CustomEmoji>, PortError> {
+        let limit = if cursor.limit == 0 { 10 } else { cursor.limit.min(100) };
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(EMOJIS).map_err(map_redb_err)?;
+        let mut out: Vec<CustomEmoji> = Vec::new();
+        for entry in table.iter().map_err(map_redb_err)? {
+            let (_, v) = entry.map_err(map_redb_err)?;
+            let emoji: CustomEmoji = decode_json(v.value())?;
+            if let Some(q) = query {
+                let q = q.trim();
+                if !q.is_empty() {
+                    // Exact `:name:` tokens match by name; anything else is a
+                    // case-insensitive substring over name/aliases/category.
+                    if q.starts_with(':') && q.ends_with(':') && q.len() >= 2 {
+                        let want = q.trim_matches(':').to_ascii_lowercase();
+                        if emoji.shortcode.to_ascii_lowercase() != want {
+                            continue;
+                        }
+                    } else {
+                        let needle = q.to_ascii_lowercase();
+                        let hay_name = emoji.shortcode.to_ascii_lowercase();
+                        let hay_cat = emoji.category.as_deref().unwrap_or("").to_ascii_lowercase();
+                        let in_aliases = emoji
+                            .aliases
+                            .iter()
+                            .any(|a| a.to_ascii_lowercase().contains(&needle));
+                        if !hay_name.contains(&needle) && !hay_cat.contains(&needle) && !in_aliases {
+                            continue;
+                        }
+                    }
+                }
+            }
+            out.push(emoji);
+        }
+        // Newest-first by emoji id (aidx ids are time-ordered).
+        out.sort_by(|a, b| b.id.cmp(&a.id));
+        out.retain(|e| matches_cursor(&e.id, cursor));
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    fn all_local_emojis(&self) -> Result<Vec<CustomEmoji>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(EMOJIS).map_err(map_redb_err)?;
+        let mut out = Vec::new();
+        for entry in table.iter().map_err(map_redb_err)? {
+            let (_, v) = entry.map_err(map_redb_err)?;
+            out.push(decode_json(v.value())?);
+        }
+        Ok(out)
+    }
+
+    fn upsert_remote_emoji(
+        &self,
+        emoji: RemoteEmoji,
+    ) -> Result<RemoteEmoji, PortError> {
+        let write_txn = self.begin_write()?;
+        let merged = {
+            let mut table = write_txn.open_table(REMOTE_EMOJIS).map_err(map_redb_err)?;
+            let existing: Option<RemoteEmoji> = match table
+                .get((emoji.host.as_str(), emoji.shortcode.as_str()))
+                .map_err(map_redb_err)?
+            {
+                Some(guard) => Some(decode_json(guard.value())?),
+                None => None,
+            };
+            let merged = match existing {
+                // Never touch `media_id`: the lazy-fetch job owns it.
+                Some(mut prev) => {
+                    prev.remote_url = emoji.remote_url.clone();
+                    prev
+                }
+                None => emoji,
+            };
+            let encoded = encode_json(&merged)?;
+            table
+                .insert(
+                    (merged.host.as_str(), merged.shortcode.as_str()),
+                    encoded.as_slice(),
+                )
+                .map_err(map_redb_err)?;
+            merged
+        };
+        self.commit_write(write_txn)?;
+        Ok(merged)
+    }
+
+    fn get_remote_emoji(
+        &self,
+        host: &str,
+        shortcode: &str,
+    ) -> Result<Option<RemoteEmoji>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(REMOTE_EMOJIS).map_err(map_redb_err)?;
+        match table
+            .get((host.to_ascii_lowercase().as_str(), shortcode.to_ascii_lowercase().as_str()))
+            .map_err(map_redb_err)?
+        {
+            Some(guard) => Ok(Some(decode_json(guard.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn all_remote_emojis(&self) -> Result<Vec<RemoteEmoji>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(REMOTE_EMOJIS).map_err(map_redb_err)?;
+        let mut out = Vec::new();
+        for entry in table.iter().map_err(map_redb_err)? {
+            let (_, v) = entry.map_err(map_redb_err)?;
+            out.push(decode_json(v.value())?);
+        }
+        Ok(out)
+    }
+
+    fn set_remote_emoji_media(
+        &self,
+        host: &str,
+        shortcode: &str,
+        media_id: &str,
+    ) -> Result<(), PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            let mut table = write_txn.open_table(REMOTE_EMOJIS).map_err(map_redb_err)?;
+            let key = (
+                host.to_ascii_lowercase(),
+                shortcode.to_ascii_lowercase(),
+            );
+            let existing: Option<RemoteEmoji> = match table
+                .get((key.0.as_str(), key.1.as_str()))
+                .map_err(map_redb_err)?
+            {
+                Some(guard) => Some(decode_json(guard.value())?),
+                None => None,
+            };
+            // A deleted row converges quietly (no retry can recreate it).
+            if let Some(mut row) = existing {
+                row.media_id = Some(media_id.to_string());
+                let encoded = encode_json(&row)?;
+                table
+                    .insert((row.host.as_str(), row.shortcode.as_str()), encoded.as_slice())
+                    .map_err(map_redb_err)?;
+            }
+        }
+        self.commit_write(write_txn)?;
+        Ok(())
+    }
+}
+
+impl AntennaStore for RedbStore {
+    fn create_antenna(
+        &self,
+        antenna: Antenna,
+        jobs: Vec<NewJob>,
+    ) -> Result<Antenna, PortError> {
+        antenna
+            .validate()
+            .map_err(|e| match e {
+                crate::domain::id::DomainError::Validation(msg) => PortError::Validation(msg),
+                crate::domain::id::DomainError::Conflict(msg) => PortError::Conflict(msg),
+                crate::domain::id::DomainError::NotFound(msg) => PortError::NotFound(msg),
+                crate::domain::id::DomainError::StorageUnavailable(msg) => {
+                    PortError::StorageUnavailable(msg)
+                }
+            })?;
+        let write_txn = self.begin_write()?;
+        {
+            let mut table = write_txn.open_table(ANTENNAS).map_err(map_redb_err)?;
+            let encoded = encode_json(&antenna)?;
+            table
+                .insert(antenna.id.as_str(), encoded.as_slice())
+                .map_err(map_redb_err)?;
+            drop(table);
+            let mut by_owner = write_txn.open_table(ANTENNAS_BY_OWNER).map_err(map_redb_err)?;
+            by_owner
+                .insert(
+                    (antenna.owner_id.as_str(), antenna.id.as_str()),
+                    1u8,
+                )
+                .map_err(map_redb_err)?;
+        }
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)?;
+        Ok(antenna)
+    }
+
+    fn update_antenna(
+        &self,
+        antenna: Antenna,
+        jobs: Vec<NewJob>,
+    ) -> Result<Antenna, PortError> {
+        antenna
+            .validate()
+            .map_err(|e| match e {
+                crate::domain::id::DomainError::Validation(msg) => PortError::Validation(msg),
+                crate::domain::id::DomainError::Conflict(msg) => PortError::Conflict(msg),
+                crate::domain::id::DomainError::NotFound(msg) => PortError::NotFound(msg),
+                crate::domain::id::DomainError::StorageUnavailable(msg) => {
+                    PortError::StorageUnavailable(msg)
+                }
+            })?;
+        let write_txn = self.begin_write()?;
+        {
+            let mut table = write_txn.open_table(ANTENNAS).map_err(map_redb_err)?;
+            let existing: Option<Antenna> = match table
+                .get(antenna.id.as_str())
+                .map_err(map_redb_err)?
+            {
+                Some(guard) => Some(decode_json(guard.value())?),
+                None => None,
+            };
+            match existing {
+                Some(prev) if prev.owner_id == antenna.owner_id => {}
+                _ => {
+                    drop(table);
+                    let _ = write_txn.abort();
+                    return Err(PortError::NotFound("NO_SUCH_ANTENNA".to_string()));
+                }
+            }
+            let encoded = encode_json(&antenna)?;
+            table
+                .insert(antenna.id.as_str(), encoded.as_slice())
+                .map_err(map_redb_err)?;
+        }
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)?;
+        Ok(antenna)
+    }
+
+    fn delete_antenna(&self, owner_id: &str, id: &str) -> Result<bool, PortError> {
+        let write_txn = self.begin_write()?;
+        let removed = {
+            let mut table = write_txn.open_table(ANTENNAS).map_err(map_redb_err)?;
+            let existing: Option<Antenna> = match table
+                .get(id)
+                .map_err(map_redb_err)?
+            {
+                Some(guard) => Some(decode_json(guard.value())?),
+                None => None,
+            };
+            let Some(prev) = existing else {
+                return Ok(false);
+            };
+            if prev.owner_id != owner_id {
+                return Ok(false);
+            }
+            let _ = table.remove(id);
+            drop(table);
+            let mut by_owner = write_txn.open_table(ANTENNAS_BY_OWNER).map_err(map_redb_err)?;
+            let _ = by_owner.remove((owner_id, id));
+            drop(by_owner);
+            let mut notes_table = write_txn.open_table(ANTENNA_NOTES).map_err(map_redb_err)?;
+            let stale: Vec<(String, String)> = notes_table
+                .range((id, "")..=(id, "\u{10ffff}"))
+                .map_err(map_redb_err)?
+                .filter_map(|entry| {
+                    entry.ok().map(|(k, _)| {
+                        let (a, n) = k.value();
+                        (a.to_string(), n.to_string())
+                    })
+                })
+                .collect();
+            for (a, n) in stale {
+                let _ = notes_table.remove((a.as_str(), n.as_str()));
+            }
+            true
+        };
+        self.commit_write(write_txn)?;
+        Ok(removed)
+    }
+
+    fn get_antenna(&self, owner_id: &str, id: &str) -> Result<Option<Antenna>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(ANTENNAS).map_err(map_redb_err)?;
+        match table.get(id).map_err(map_redb_err)? {
+            Some(guard) => {
+                let antenna: Antenna = decode_json(guard.value())?;
+                Ok(if antenna.owner_id == owner_id { Some(antenna) } else { None })
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn antennas_by_owner(&self, owner_id: &str) -> Result<Vec<Antenna>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let by_owner = read_txn.open_table(ANTENNAS_BY_OWNER).map_err(map_redb_err)?;
+        let table = read_txn.open_table(ANTENNAS).map_err(map_redb_err)?;
+        let mut out = Vec::new();
+        for entry in by_owner
+            .range((owner_id, "")..=(owner_id, "\u{10ffff}"))
+            .map_err(map_redb_err)?
+        {
+            let (k, _) = entry.map_err(map_redb_err)?;
+            let (_, antenna_id) = k.value();
+            if let Some(guard) = table.get(antenna_id).map_err(map_redb_err)? {
+                out.push(decode_json(guard.value())?);
+            }
+        }
+        // Newest-first by antenna id (aidx ids are time-ordered).
+        out.sort_by(|a: &Antenna, b: &Antenna| b.id.cmp(&a.id));
+        Ok(out)
+    }
+
+    fn all_active_antennas(&self) -> Result<Vec<Antenna>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(ANTENNAS).map_err(map_redb_err)?;
+        let mut out = Vec::new();
+        for entry in table.iter().map_err(map_redb_err)? {
+            let (_, v) = entry.map_err(map_redb_err)?;
+            let antenna: Antenna = decode_json(v.value())?;
+            if antenna.is_active {
+                out.push(antenna);
+            }
+        }
+        Ok(out)
+    }
+
+    fn touch_antenna(&self, owner_id: &str, id: &str, now_ms: i64) -> Result<(), PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            let mut table = write_txn.open_table(ANTENNAS).map_err(map_redb_err)?;
+            let existing: Option<Antenna> = match table
+                .get(id)
+                .map_err(map_redb_err)?
+            {
+                Some(guard) => Some(decode_json(guard.value())?),
+                None => None,
+            };
+            if let Some(mut antenna) = existing {
+                if antenna.owner_id != owner_id {
+                    return Ok(());
+                }
+                antenna.is_active = true;
+                antenna.last_used_at_ms = now_ms;
+                let encoded = encode_json(&antenna)?;
+                table
+                    .insert(id, encoded.as_slice())
+                    .map_err(map_redb_err)?;
+            }
+        }
+        self.commit_write(write_txn)?;
+        Ok(())
+    }
+}
+
+impl AntennaNoteStore for RedbStore {
+    fn append_antenna_note(&self, antenna_id: &str, note_id: &str) -> Result<(), PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            let mut table = write_txn.open_table(ANTENNA_NOTES).map_err(map_redb_err)?;
+            table
+                .insert((antenna_id, note_id), 1u8)
+                .map_err(map_redb_err)?;
+            // Trim to the newest CAP entries: note ids are time-ordered, so
+            // the oldest rows sort first — drop the overflow head.
+            let ids: Vec<String> = table
+                .range((antenna_id, "")..=(antenna_id, "\u{10ffff}"))
+                .map_err(map_redb_err)?
+                .filter_map(|entry| {
+                    entry.ok().map(|(k, _)| {
+                        let (_, n) = k.value();
+                        n.to_string()
+                    })
+                })
+                .collect();
+            if ids.len() > crate::domain::antenna::ANTENNA_NOTES_CAP {
+                let drop_n = ids.len() - crate::domain::antenna::ANTENNA_NOTES_CAP;
+                for stale in ids.iter().take(drop_n) {
+                    let _ = table.remove((antenna_id, stale.as_str()));
+                }
+            }
+        }
+        self.commit_write(write_txn)?;
+        Ok(())
+    }
+
+    fn remove_antenna_note(&self, antenna_id: &str, note_id: &str) -> Result<(), PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            let mut table = write_txn.open_table(ANTENNA_NOTES).map_err(map_redb_err)?;
+            let _ = table.remove((antenna_id, note_id));
+        }
+        self.commit_write(write_txn)?;
+        Ok(())
+    }
+
+    fn delete_antenna_notes(&self, antenna_id: &str) -> Result<(), PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            let mut table = write_txn.open_table(ANTENNA_NOTES).map_err(map_redb_err)?;
+            let stale: Vec<String> = table
+                .range((antenna_id, "")..=(antenna_id, "\u{10ffff}"))
+                .map_err(map_redb_err)?
+                .filter_map(|entry| {
+                    entry.ok().map(|(k, _)| {
+                        let (_, n) = k.value();
+                        n.to_string()
+                    })
+                })
+                .collect();
+            for stale in stale {
+                let _ = table.remove((antenna_id, stale.as_str()));
+            }
+        }
+        self.commit_write(write_txn)?;
+        Ok(())
+    }
+
+    fn antenna_notes(
+        &self,
+        antenna_id: &str,
+        cursor: &TimelineCursor,
+    ) -> Result<Vec<String>, PortError> {
+        let limit = if cursor.limit == 0 { 10 } else { cursor.limit.min(100) };
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(ANTENNA_NOTES).map_err(map_redb_err)?;
+        let mut ids: Vec<String> = table
+            .range((antenna_id, "")..=(antenna_id, "\u{10ffff}"))
+            .map_err(map_redb_err)?
+            .filter_map(|entry| {
+                entry.ok().map(|(k, _)| {
+                    let (_, n) = k.value();
+                    n.to_string()
+                })
+            })
+            .collect();
+        // Newest-first by note id (aidx ids are time-ordered).
+        ids.sort_by(|a, b| b.cmp(a));
+        ids.retain(|id| matches_cursor(id, cursor));
+        ids.truncate(limit);
+        Ok(ids)
     }
 }
 
@@ -6670,6 +7393,21 @@ impl MediaStore for RedbStore {
         out.sort_by(|a, b| b.id.cmp(&a.id));
         Ok(out)
     }
+
+    fn list_all_media(&self, cursor: &TimelineCursor) -> Result<Vec<MediaMeta>, PortError> {
+        let limit = if cursor.limit == 0 { 10 } else { cursor.limit.min(100) };
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(MEDIA_META).map_err(map_redb_err)?;
+        let mut out: Vec<MediaMeta> = Vec::new();
+        for entry in table.iter().map_err(map_redb_err)? {
+            let (_, v) = entry.map_err(map_redb_err)?;
+            out.push(decode_json(v.value())?);
+        }
+        out.sort_by(|a, b| b.id.cmp(&a.id));
+        out.retain(|m| matches_cursor(&m.id, cursor));
+        out.truncate(limit);
+        Ok(out)
+    }
 }
 
 impl NotificationStore for RedbStore {
@@ -6884,10 +7622,27 @@ impl AuthStore for RedbStore {
     fn get_miauth_session(&self, session_id: &str) -> Result<Option<MiAuthSessionRecord>, PortError> {
         let read_txn = self.db.begin_read().map_err(map_redb_err)?;
         let table = read_txn.open_table(MIAUTH_SESSIONS).map_err(map_redb_err)?;
-        match table.get(session_id).map_err(map_redb_err)? {
-            Some(g) => Ok(Some(decode_json(g.value())?)),
-            None => Ok(None),
+        let sess_opt: Option<MiAuthSessionRecord> = match table.get(session_id).map_err(map_redb_err)? {
+            Some(g) => Some(decode_json(g.value())?),
+            None => None,
+        };
+        drop(table);
+        drop(read_txn);
+        // Batch N WS7: expired rows read as missing (deleted on read, so a
+        // re-poll after the approval window converges to `ok: false`).
+        if let Some(sess) = sess_opt {
+            if sess.expires_at_ms.is_some_and(|exp| exp <= self.clock.now_ms()) {
+                let write_txn = self.begin_write()?;
+                {
+                    let mut table = write_txn.open_table(MIAUTH_SESSIONS).map_err(map_redb_err)?;
+                    let _ = table.remove(session_id);
+                }
+                self.commit_write(write_txn)?;
+                return Ok(None);
+            }
+            return Ok(Some(sess));
         }
+        Ok(None)
     }
 
     fn consume_miauth_session(
@@ -6905,6 +7660,12 @@ impl AuthStore for RedbStore {
                     None => None,
                 };
             match sess_opt {
+                // Expired rows are dropped, never vended (one-shot stays
+                // one-shot; the poller sees `ok: false`).
+                Some(sess) if sess.expires_at_ms.is_some_and(|exp| exp <= self.clock.now_ms()) => {
+                    let _ = table.remove(session_id);
+                    None
+                }
                 Some(mut sess)
                     if !sess.fetched && sess.token.is_some() && sess.account_id.is_some() =>
                 {
@@ -6939,10 +7700,26 @@ impl AuthStore for RedbStore {
     fn get_legacy_session(&self, token: &str) -> Result<Option<LegacyAuthSessionRecord>, PortError> {
         let read_txn = self.db.begin_read().map_err(map_redb_err)?;
         let table = read_txn.open_table(LEGACY_SESSIONS).map_err(map_redb_err)?;
-        match table.get(token).map_err(map_redb_err)? {
-            Some(g) => Ok(Some(decode_json(g.value())?)),
-            None => Ok(None),
+        let sess_opt: Option<LegacyAuthSessionRecord> = match table.get(token).map_err(map_redb_err)? {
+            Some(g) => Some(decode_json(g.value())?),
+            None => None,
+        };
+        drop(table);
+        drop(read_txn);
+        // Batch N WS7: expired rows read as missing (deleted on read).
+        if let Some(sess) = sess_opt {
+            if sess.expires_at_ms.is_some_and(|exp| exp <= self.clock.now_ms()) {
+                let write_txn = self.begin_write()?;
+                {
+                    let mut table = write_txn.open_table(LEGACY_SESSIONS).map_err(map_redb_err)?;
+                    let _ = table.remove(token);
+                }
+                self.commit_write(write_txn)?;
+                return Ok(None);
+            }
+            return Ok(Some(sess));
         }
+        Ok(None)
     }
 
     fn take_legacy_session(
@@ -6960,6 +7737,11 @@ impl AuthStore for RedbStore {
                     None => None,
                 };
             match existing {
+                // Expired rows are dropped, never vended (Batch N WS7).
+                Some(s) if s.expires_at_ms.is_some_and(|exp| exp <= self.clock.now_ms()) => {
+                    let _ = table.remove(token);
+                    None
+                }
                 Some(s) if s.account_id.is_some() && s.access_token.is_some() => {
                     table.remove(token).map_err(map_redb_err)?;
                     Some(s)

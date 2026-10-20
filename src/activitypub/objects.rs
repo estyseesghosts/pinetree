@@ -1349,6 +1349,10 @@ pub struct ParsedRemoteNote {
     pub cc: Vec<String>,
     pub mentioned_actor_uris: Vec<String>,
     pub hashtags: Vec<String>,
+    /// Pre-parsed AP `Emoji` tags (`(shortcode, icon_url)`), capped at
+    /// 32 per object (WP8b ingest cap, stated in the session log).
+    /// WP8b ingest source (metadata only).
+    pub emojis: Vec<(String, String)>,
     pub attachments: Vec<ParsedAttachment>,
     pub sensitive: bool,
     /// The attached poll when the object carries `oneOf`/`anyOf`
@@ -1460,6 +1464,7 @@ pub fn parse_remote_note(obj_val: &Value) -> Result<ParsedRemoteNote, String> {
 
     let mut mentioned_actor_uris = Vec::new();
     let mut hashtags = Vec::new();
+    let mut emojis: Vec<(String, String)> = Vec::new();
     if let Some(tag_val) = obj.get("tag") {
         let items: Vec<&Value> = match tag_val {
             Value::Array(arr) => arr.iter().collect(),
@@ -1483,6 +1488,16 @@ pub fn parse_remote_note(obj_val: &Value) -> Result<ParsedRemoteNote, String> {
                         if !clean.is_empty() && !hashtags.contains(&clean) {
                             hashtags.push(clean);
                         }
+                    }
+                }
+                // WP8b: remote-emoji metadata only (no fetch at ingest).
+                // Capped per object; unparseable entries are skipped.
+                "Emoji" => {
+                    if emojis.len() >= 32 {
+                        continue;
+                    }
+                    if let Some((shortcode, url)) = crate::domain::emoji::parse_emoji_tag(item) {
+                        emojis.push((shortcode, url));
                     }
                 }
                 _ => {}
@@ -1573,6 +1588,7 @@ pub fn parse_remote_note(obj_val: &Value) -> Result<ParsedRemoteNote, String> {
         cc,
         mentioned_actor_uris,
         hashtags,
+        emojis,
         attachments,
         sensitive,
         poll: parse_question_poll(obj),
@@ -1890,6 +1906,10 @@ mod tests {
             blocks: store.clone(),
             mutes: store.clone(),
             reactions: store.clone(),
+            favorites: store.clone(),
+            emojis: store.clone(),
+            antennas: store.clone(),
+            antenna_notes: store.clone(),
             polls: store.clone(),
             jobs: store.clone(),
             media: store.clone(),
@@ -2102,6 +2122,10 @@ mod quote_render_tests {
             blocks: store.clone(),
             mutes: store.clone(),
             reactions: store.clone(),
+            favorites: store.clone(),
+            emojis: store.clone(),
+            antennas: store.clone(),
+            antenna_notes: store.clone(),
             polls: store.clone(),
             jobs: store.clone(),
             media: store.clone(),

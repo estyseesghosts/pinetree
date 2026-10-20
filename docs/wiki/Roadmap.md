@@ -11,6 +11,7 @@ From `sns-server-proposal.md` §9 (the proposal wins on any disagreement).
 | 3 | Client compatibility and streaming: streaming channels, note capture, notifications, attachments, richer note fields, endpoint coverage driven by real client tests | Every endpoint in the declared compatibility profile passes contract tests against the target client versions | ✅ done 2026-10-16 |
 | Quote posts | FEP-044f canonical outbound + legacy inbound compat + Misskey projection + request/accept/reject/revoke workflow | 4-server + elixir interop green, conformance Group Q | ✅ done 2026-10-16 |
 | Branched replies | Indexed direct-child lookup + migration, visibility-aware `notes/replies`, pending parents with fail-closed reads, durable resolver + opt-in repair | Full suite + reply-burst stress `STRESS_OK items=28` green | ✅ done 2026-10-16 |
+| — | Daily-use batch (Batch N): favorites + note state, custom emoji (+ remote opt-in), `followRequestAccepted`, antennas + `antenna` stream channel, abuse-report routes, admin remainder (`unset-user-avatar|banner`, `delete-all-files-of-a-user`, `admin/drive/files|show-file`), server-side word mutes, MiAuth hardening, Sharkey `notes/schedule/*` shim | ✅ done 2026-10-20 (manifest §§27–33; `SMOKE_ALL_OK`, keystone 41/0) |
 | 4 | FoundationDB multi-node: full FDB adapter, durable multi-worker jobs, global directory, owner routing, secure cross-node ops, shared media | `@a@xyz` on node `foo` and `@b@xyz` on `bar` keep canonical identities, interact locally and federate externally as one instance; restarts, duplicate jobs, routing, account moves tested | planned |
 | 5 | Scale and hardening: benchmark contention, timeline strategies, queue growth, big follower lists, federation backlogs, node failure; add caches/hybrid fan-out only when measured | Documented performance targets and budgets met for small redb and representative multi-node deployments | planned |
 
@@ -24,4 +25,4 @@ From `sns-server-proposal.md` §9 (the proposal wins on any disagreement).
 
 ## Later / explicitly deferred
 
-Polls and `_misskey_votes`, newer HTTP message signatures (RFC 9421), OAuth, public-internet federation soak, Mastodon client API (non-goal), antennas/clips/pages/Reversi/chat and other legacy Misskey features (non-goals unless a target client requires them).
+Newer HTTP message signatures (RFC 9421), OAuth, public-internet federation soak, Mastodon client API (non-goal), user lists, clips/pages/Reversi/chat and other legacy Misskey features (non-goals unless a target client requires them). Antennas, custom emoji, favorites, and polls shipped (Batch N + parity batch); word mutes are server-enforced by owner decision.

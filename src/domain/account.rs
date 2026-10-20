@@ -205,6 +205,11 @@ pub struct Account {
     /// Resolved server-side by §6; stored/validated/packed here.
     #[serde(default)]
     pub default_reaction: Option<String>,
+    /// DIVERGENCE (Batch N WP8b, owner-approved): per-user remote custom
+    /// emoji opt-in, default false (upstream has no such field). Read back
+    /// on `i` / `i/update`.
+    #[serde(default)]
+    pub show_remote_emojis: bool,
 }
 
 fn default_true() -> bool {
@@ -448,6 +453,7 @@ impl Account {
             email_notification_types: default_email_notification_types(),
             reject_quotes: false,
             default_reaction: None,
+            show_remote_emojis: false,
         })
     }
 
@@ -663,6 +669,7 @@ mod tests {
             email_notification_types: default_email_notification_types(),
             reject_quotes: false,
             default_reaction: None,
+            show_remote_emojis: false,
         }
     }
 

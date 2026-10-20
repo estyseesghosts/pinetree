@@ -18,7 +18,7 @@ use crate::domain::follow::Follow;
 use crate::domain::instance::InviteCode;
 use crate::domain::muting::{Muting, RenoteMuting};
 use crate::domain::media::MediaMeta;
-use crate::domain::moderation::ModerationLogEntry;
+use crate::domain::moderation::{AbuseReport, ModerationLogEntry};
 use crate::domain::note::{Note, Visibility};
 use crate::domain::notification::{Notification, NotificationKind};
 use crate::domain::reaction::Reaction;
@@ -507,6 +507,317 @@ pub fn pack_moderation_log(
     }))
 }
 
+/// `AbuseUserReport` (upstream `AbuseUserReportEntityService.pack`):
+/// `{id, createdAt, comment, resolved, reporterId, targetUserId,
+/// assigneeId, reporter, targetUser, assignee, forwarded, resolvedAs,
+/// moderationNote}` with the three users packed as `UserDetailedNotMe`
+/// (`Null` when the account row is gone; assignee is `Null` when unset).
+pub fn pack_abuse_report(
+    report: &AbuseReport,
+    viewer_id: Option<&str>,
+    services: &AppServices,
+) -> Result<Value, PortError> {
+    let created_at = format_millis(
+        services
+            .ids
+            .parse_time(&report.id)
+            .unwrap_or_else(|_| services.clock.now_ms()),
+    );
+    let pack_user_opt = |id: &str| -> Result<Value, PortError> {
+        match services.accounts.find_by_id(id)? {
+            Some(account) => pack_user_detailed_not_me(&account, viewer_id, services),
+            None => Ok(Value::Null),
+        }
+    };
+    Ok(serde_json::json!({
+        "id": report.id,
+        "createdAt": created_at,
+        "comment": report.comment,
+        "resolved": report.resolved,
+        "reporterId": report.reporter,
+        "targetUserId": report.target_account,
+        "assigneeId": report.assignee,
+        "reporter": pack_user_opt(&report.reporter)?,
+        "targetUser": pack_user_opt(&report.target_account)?,
+        "assignee": match report.assignee.as_deref() {
+            Some(id) => pack_user_opt(id)?,
+            None => Value::Null,
+        },
+        "forwarded": report.forwarded,
+        "resolvedAs": report.resolved_as.map(|r| r.as_str()),
+        "moderationNote": report.moderation_note,
+    }))
+}
+
+/// Custom emoji packs (Batch N WS1; Misskey `EmojiEntityService` parity).
+/// `EmojiSimple {aliases, name, category, url, localOnly?, isSensitive?,
+/// roleIds…?}` omits falsy `localOnly`/`isSensitive` and empty `roleIds`
+/// (upstream `omit` parity); `url` prefers the served drive URL. `EmojiDetailed`
+/// adds `id/host/license` (+ stored media flags verbatim).
+pub fn pack_emoji_simple(
+    emoji: &crate::domain::emoji::CustomEmoji,
+    services: &AppServices,
+) -> Value {
+    let mut obj = Map::new();
+    obj.insert("name".to_string(), Value::String(emoji.shortcode.clone()));
+    if let Some(category) = emoji.category.as_deref() {
+        obj.insert("category".to_string(), Value::String(category.to_string()));
+    }
+    obj.insert(
+        "aliases".to_string(),
+        Value::Array(
+            emoji.aliases.iter().cloned().map(Value::String).collect(),
+        ),
+    );
+    obj.insert("url".to_string(), emoji_url(emoji, services));
+    if emoji.local_only {
+        obj.insert("localOnly".to_string(), Value::Bool(true));
+    }
+    if emoji.is_sensitive {
+        obj.insert("isSensitive".to_string(), Value::Bool(true));
+    }
+    if !emoji.role_ids.is_empty() {
+        obj.insert(
+            "roleIdsThatCanBeUsedThisEmojiAsReaction".to_string(),
+            Value::Array(emoji.role_ids.iter().cloned().map(Value::String).collect()),
+        );
+    }
+    Value::Object(obj)
+}
+
+pub fn pack_emoji_detailed(
+    emoji: &crate::domain::emoji::CustomEmoji,
+    services: &AppServices,
+) -> Value {
+    let mut obj = match pack_emoji_simple(emoji, services) {
+        Value::Object(map) => map,
+        other => return other,
+    };
+    obj.insert("id".to_string(), Value::String(emoji.id.clone()));
+    obj.insert("host".to_string(), Value::Null);
+    obj.insert(
+        "license".to_string(),
+        emoji.license.clone().map(Value::String).unwrap_or(Value::Null),
+    );
+    // Stored (never enforced — pinetree has no custom-role subsystem).
+    obj.insert("localOnly".to_string(), Value::Bool(emoji.local_only));
+    obj.insert("isSensitive".to_string(), Value::Bool(emoji.is_sensitive));
+    obj.insert(
+        "roleIdsThatCanBeUsedThisEmojiAsReaction".to_string(),
+        Value::Array(emoji.role_ids.iter().cloned().map(Value::String).collect()),
+    );
+    Value::Object(obj)
+}
+
+/// Served URL for one local emoji: the drive file's URL, falling back to
+/// the canonical `/emojis/:name` path when the file row is gone (upstream
+/// renders `publicUrl || originalUrl`; pinetree has one served URL).
+fn emoji_url(emoji: &crate::domain::emoji::CustomEmoji, services: &AppServices) -> Value {
+    if let Some(media_id) = emoji.media_id.as_deref() {
+        if let Ok(Some(meta)) = services.media.get(media_id) {
+            return Value::String(meta.url.clone());
+        }
+    }
+    Value::String(format!(
+        "{}/emojis/{}",
+        services.public_url.trim_end_matches('/'),
+        emoji.shortcode
+    ))
+}
+
+/// Registry maps for note packs (Batch N WS1 + WP8b): bare shortcode → URL
+/// for local emoji, plus `name@host` → URL for remote emoji when the viewer
+/// opted in (`showRemoteEmojis`). Both the `emojis` and `reactionEmojis`
+/// slots carry the same registry (pinetree does not track per-note emoji
+/// use; clients look up by name — documented simplification).
+/// With the setting off, remote custom reactions render as their
+/// `:name@host:` text and no remote URL is packed.
+pub fn emoji_maps_for_viewer(services: &AppServices, show_remote: bool) -> (Value, Value) {
+    let mut map = Map::new();
+    if let Ok(rows) = services.emojis.all_local_emojis() {
+        let mut rows = rows;
+        rows.sort_by(|a, b| a.shortcode.cmp(&b.shortcode));
+        for emoji in &rows {
+            map.insert(emoji.shortcode.clone(), emoji_url(emoji, services));
+        }
+    }
+    if show_remote {
+        if let Ok(rows) = services.emojis.all_remote_emojis() {
+            let mut rows = rows;
+            rows.sort_by(|a, b| (&a.host, &a.shortcode).cmp(&(&b.host, &b.shortcode)));
+            for remote in &rows {
+                let url = match remote.media_id.as_deref() {
+                    // Lazily cached copy: the drive file's served URL.
+                    Some(media_id) => match services.media.get(media_id) {
+                        Ok(Some(meta)) => meta.url.clone(),
+                        _ => remote.remote_url.clone(),
+                    },
+                    // Until cached, the packed URL points at the remote host
+                    // (the documented privacy trade-off).
+                    None => remote.remote_url.clone(),
+                };
+                map.insert(format!("{}@{}", remote.shortcode, remote.host), Value::String(url));
+            }
+        }
+    }
+    let value = Value::Object(map);
+    (value.clone(), value)
+}
+
+/// Antenna pack (Batch N WS4; upstream `AntennaEntityService.pack`
+/// parity): `{id, createdAt, name, keywords, excludeKeywords, src,
+/// userListId, users, caseSensitive, localOnly, excludeBots, withReplies,
+/// withFile, excludeNotesInSensitiveChannel, isActive, hasUnreadNote:
+/// false (upstream TODO), notify: false (back-compat)}`.
+pub fn pack_antenna(
+    antenna: &crate::domain::antenna::Antenna,
+    services: &AppServices,
+) -> Value {
+    let created_at = format_millis(
+        services
+            .ids
+            .parse_time(&antenna.id)
+            .unwrap_or_else(|_| services.clock.now_ms()),
+    );
+    serde_json::json!({
+        "id": antenna.id,
+        "createdAt": created_at,
+        "name": antenna.name,
+        "keywords": antenna.keywords,
+        "excludeKeywords": antenna.exclude_keywords,
+        "src": antenna.src.as_str(),
+        "userListId": antenna.user_list_id,
+        "users": antenna.users,
+        "caseSensitive": antenna.case_sensitive,
+        "localOnly": antenna.local_only,
+        "excludeBots": antenna.exclude_bots,
+        "withReplies": antenna.with_replies,
+        "withFile": antenna.with_file,
+        "excludeNotesInSensitiveChannel": antenna.exclude_notes_in_sensitive_channel,
+        "isActive": antenna.is_active,
+        "hasUnreadNote": false,
+        "notify": false,
+    })
+}
+
+/// Sharkey scheduled-note pack (Batch N scheduling shim; upstream
+/// `notes/schedule/list.ts` shape): `{id, userId, scheduledAt: ISO, note:
+/// {text (default `''`), cw, fileIds (+ packed `files`), visibility
+/// (default `public`), visibleUsers (packed UserLite),
+/// reactionAcceptance (default null), user (packed caller), createdAt:
+/// scheduledAt-ISO, isSchedule: true, id, renote/reply (packed or null),
+/// renoteId/replyId, poll?}}`. Missing reply/renote targets or files pack
+/// as null / are skipped (never an error).
+pub fn pack_scheduled_note(
+    draft: &NoteDraft,
+    viewer: &Account,
+    services: &AppServices,
+) -> Result<Value, PortError> {
+    let scheduled_at_ms = draft.scheduled_at_ms.unwrap_or_else(|| services.clock.now_ms());
+    let scheduled_at = format_millis(scheduled_at_ms);
+    let mut files = Vec::new();
+    let mut file_ids = Vec::new();
+    for fid in &draft.file_ids {
+        if let Some(meta) = services.media.get(fid)? {
+            file_ids.push(Value::String(meta.id.clone()));
+            files.push(pack_drive_file(&meta, services));
+        }
+    }
+    let mut visible_users = Vec::new();
+    for id in &draft.visible_user_ids {
+        if let Some(account) = services.accounts.find_by_id(id)? {
+            visible_users.push(pack_user_lite(&account, &services.public_url, services.clock.now_ms()));
+        }
+    }
+    let pack_target = |id: Option<&String>| -> Result<Value, PortError> {
+        match id {
+            Some(id) => match services.notes.get_note(id)? {
+                Some(note) if !note.is_deleted => {
+                    pack_note(&note, Some(&viewer.id), services, 0)
+                }
+                _ => Ok(Value::Null),
+            },
+            None => Ok(Value::Null),
+        }
+    };
+    let renote = pack_target(draft.renote_id.as_ref())?;
+    let reply = pack_target(draft.reply_id.as_ref())?;
+    let poll = match services.polls.get_poll(&draft.id)? {
+        Some(poll) => {
+            let choices: Vec<Value> = poll
+                .choices
+                .iter()
+                .map(|text| {
+                    serde_json::json!({ "isVoted": false, "text": text, "votes": 0 })
+                })
+                .collect();
+            serde_json::json!({
+                "multiple": poll.multiple,
+                "expiresAt": poll.expires_at_ms.map(format_millis).map(Value::String).unwrap_or(Value::Null),
+                "choices": choices,
+            })
+        }
+        // Draft poll columns (the poll row is created at post time).
+        None if draft.has_poll => serde_json::json!({
+            "multiple": draft.poll_multiple,
+            "expiresAt": draft.poll_expires_at_ms.map(format_millis).map(Value::String).unwrap_or(Value::Null),
+            "choices": draft.poll_choices.iter().map(|text| {
+                serde_json::json!({ "isVoted": false, "text": text, "votes": 0 })
+            }).collect::<Vec<_>>(),
+        }),
+        None => Value::Null,
+    };
+    let mut note = Map::new();
+    note.insert(
+        "text".to_string(),
+        draft.text.clone().map(Value::String).unwrap_or_else(|| Value::String(String::new())),
+    );
+    note.insert(
+        "cw".to_string(),
+        draft.cw.clone().map(Value::String).unwrap_or(Value::Null),
+    );
+    note.insert("fileIds".to_string(), Value::Array(file_ids));
+    note.insert("files".to_string(), Value::Array(files));
+    note.insert(
+        "visibility".to_string(),
+        serde_json::to_value(&draft.visibility).unwrap_or(Value::String("public".to_string())),
+    );
+    note.insert("visibleUsers".to_string(), Value::Array(visible_users));
+    note.insert(
+        "user".to_string(),
+        pack_user_lite(viewer, &services.public_url, services.clock.now_ms()),
+    );
+    note.insert(
+        "reactionAcceptance".to_string(),
+        draft.reaction_acceptance
+            .as_ref()
+            .and_then(|a| serde_json::to_value(a).ok())
+            .unwrap_or(Value::Null),
+    );
+    note.insert("createdAt".to_string(), Value::String(scheduled_at.clone()));
+    note.insert("isSchedule".to_string(), Value::Bool(true));
+    note.insert("id".to_string(), Value::String(draft.id.clone()));
+    note.insert("renote".to_string(), renote);
+    note.insert("reply".to_string(), reply);
+    note.insert(
+        "renoteId".to_string(),
+        draft.renote_id.clone().map(Value::String).unwrap_or(Value::Null),
+    );
+    note.insert(
+        "replyId".to_string(),
+        draft.reply_id.clone().map(Value::String).unwrap_or(Value::Null),
+    );
+    if !poll.is_null() {
+        note.insert("poll".to_string(), poll);
+    }
+    Ok(serde_json::json!({
+        "id": draft.id,
+        "userId": draft.user_id,
+        "scheduledAt": scheduled_at,
+        "note": note,
+    }))
+}
+
 /// `NoteReaction` + `Note` (`note-reaction.ts`
 /// `packedNoteReactionWithNoteSchema`):
 /// `{id, createdAt, user: UserLite, type, note: Note}`. `createdAt`
@@ -837,6 +1148,12 @@ pub fn pack_me_detailed(
         "defaultReaction".to_string(),
         opt_string(&account.default_reaction),
     );
+    // DIVERGENCE (Batch N WP8b): per-user remote-emoji opt-in (upstream has
+    // no such field).
+    obj.insert(
+        "showRemoteEmojis".to_string(),
+        Value::Bool(account.show_remote_emojis),
+    );
     if include_secrets {
         obj.insert("email".to_string(), Value::Null);
         obj.insert("emailVerified".to_string(), Value::Null);
@@ -931,6 +1248,60 @@ fn pack_nested_note(
 }
 
 /// `Note` (`note.ts` `packedNoteSchema`): `user` packed inline, `files`
+/// Batch N WS8 soft-mute flag: true when the viewer's `mutedWords` set
+/// transitively matches the note (self → reply → renote, first match wins;
+/// the viewer's own notes never match). Callers additionally require the
+/// note to carry no CW of its own (the Keystone badge rule).
+fn soft_muted_for_viewer(
+    services: &AppServices,
+    viewer: &str,
+    note: &Note,
+) -> Result<bool, PortError> {
+    let Some(account) = services.accounts.find_by_id(viewer)? else {
+        return Ok(false);
+    };
+    if account.muted_words.is_empty() {
+        return Ok(false);
+    }
+    let compiled =
+        crate::domain::word_mute::CompiledWordMute::compile(&account.muted_words);
+    if compiled.is_empty() {
+        return Ok(false);
+    }
+    if compiled.matches_note(note.cw.as_deref(), note.text.as_deref(), &note.author_id, viewer) {
+        return Ok(true);
+    }
+    if let Some(reply_id) = note.reply_id.as_deref() {
+        if let Some(reply) = services.notes.get_note(reply_id)? {
+            if !reply.is_deleted
+                && compiled.matches_note(
+                    reply.cw.as_deref(),
+                    reply.text.as_deref(),
+                    &reply.author_id,
+                    viewer,
+                )
+            {
+                return Ok(true);
+            }
+        }
+    }
+    if let Some(renote_id) = note.renote_id.as_deref() {
+        if let Some(target) = services.notes.get_note(renote_id)? {
+            if !target.is_deleted
+                && compiled.matches_note(
+                    target.cw.as_deref(),
+                    target.text.as_deref(),
+                    &target.author_id,
+                    viewer,
+                )
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// from `file_ids`, `myReaction` for `viewer_id`, `visibleUserIds` for
 /// specified notes, and one level of nested `reply`/`renote` when
 /// `depth == 0` and visible to the viewer.
@@ -1022,7 +1393,20 @@ pub fn pack_note(
         "reactions".to_string(),
         serde_json::to_value(&note.reactions).unwrap_or(Value::Object(Map::new())),
     );
-    obj.insert("reactionEmojis".to_string(), Value::Object(Map::new()));
+    // Batch N WS1 + WP8b: registry maps (bare shortcode → URL locally,
+    // `name@host` remotes only for opted-in viewers).
+    let show_remote = match viewer_id {
+        Some(viewer) => services
+            .accounts
+            .find_by_id(viewer)
+            .ok()
+            .flatten()
+            .map(|a| a.show_remote_emojis)
+            .unwrap_or(false),
+        None => false,
+    };
+    let (emojis_map, reaction_emojis_map) = emoji_maps_for_viewer(services, show_remote);
+    obj.insert("reactionEmojis".to_string(), reaction_emojis_map);
     obj.insert(
         "fileIds".to_string(),
         Value::Array(note.file_ids.iter().map(|id| Value::String(id.clone())).collect()),
@@ -1115,8 +1499,32 @@ pub fn pack_note(
         "tags".to_string(),
         Value::Array(note.tags.iter().map(|tag| Value::String(tag.clone())).collect()),
     );
-    obj.insert("emojis".to_string(), Value::Object(Map::new()));
+    obj.insert("emojis".to_string(), emojis_map);
     obj.insert("myReaction".to_string(), my_reaction);
+    // Batch N WS2: `isFavorited` for the authenticated caller (upstream
+    // `NoteEntityService` packs it; anonymous callers see no field — Misskey
+    // omits it, but a null keeps the shape stable; use bool always).
+    let is_favorited = match viewer_id {
+        Some(viewer) => services
+            .favorites
+            .is_favorited(viewer, &note.id)
+            .unwrap_or(false),
+        None => false,
+    };
+    obj.insert("isFavorited".to_string(), Value::Bool(is_favorited));
+    // Batch N WS8: viewer-specific soft word-mute flag (Keystone badge
+    // rule): true when the viewer's soft set transitively matches AND the
+    // note has no CW of its own. Hard mutes drop the note upstream of the
+    // packer (`FeedFilter`); notifications are never gated.
+    let is_soft_muted = match viewer_id {
+        Some(viewer) => {
+            let no_cw = note.cw.as_deref().map(str::is_empty).unwrap_or(true);
+            no_cw
+                && soft_muted_for_viewer(services, viewer, note).unwrap_or(false)
+        }
+        None => false,
+    };
+    obj.insert("isSoftMuted".to_string(), Value::Bool(is_soft_muted));
     // §4 polls (Misskey `note.ts` `poll` + `hasPoll` parity): the poll with
     // per-requester `isVoted` flags (Misskey `populatePoll` parity), or
     // `poll: null` + `hasPoll: false` when the note carries none.
@@ -2032,6 +2440,7 @@ mod tests {
         fn resolve(&self, _id: &str, _resolved_as: Option<crate::domain::moderation::AbuseReportResolution>, _assignee: Option<String>, _log: crate::domain::moderation::ModerationLogEntry, _jobs: Vec<crate::application::ports::NewJob>) -> Result<crate::domain::moderation::AbuseReport, PortError> { unavailable("resolve") }
         fn set_note(&self, _id: &str, _note: String, _log: Option<crate::domain::moderation::ModerationLogEntry>, _jobs: Vec<crate::application::ports::NewJob>) -> Result<crate::domain::moderation::AbuseReport, PortError> { unavailable("set_note") }
         fn mark_forwarded(&self, _id: &str, _log: crate::domain::moderation::ModerationLogEntry, _jobs: Vec<crate::application::ports::NewJob>) -> Result<crate::domain::moderation::AbuseReport, PortError> { unavailable("mark_forwarded") }
+        fn create_flag_report(&self, _activity_id: &str, report: crate::domain::moderation::AbuseReport) -> Result<Option<crate::domain::moderation::AbuseReport>, PortError> { Ok(Some(report)) }
     }
 
     impl MuteStore for Mem {
@@ -2125,6 +2534,155 @@ mod tests {
                 .collect())
         }
     }
+
+    impl crate::application::ports::FavoriteStore for Mem {
+        fn favorite_note(
+            &self,
+            _favorite: crate::domain::favorite::NoteFavorite,
+            _jobs: Vec<NewJob>,
+        ) -> Result<crate::domain::favorite::NoteFavorite, PortError> {
+            unavailable("favorite_note")
+        }
+        fn unfavorite_note(&self, _user_id: &str, _note_id: &str) -> Result<bool, PortError> {
+            Ok(false)
+        }
+        fn is_favorited(&self, _user_id: &str, _note_id: &str) -> Result<bool, PortError> {
+            Ok(false)
+        }
+        fn favorites_by_user(
+            &self,
+            _user_id: &str,
+            _cursor: &crate::application::ports::TimelineCursor,
+        ) -> Result<Vec<crate::domain::favorite::NoteFavorite>, PortError> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl crate::application::ports::EmojiStore for Mem {
+        fn create_emoji(
+            &self,
+            _emoji: crate::domain::emoji::CustomEmoji,
+            _log: crate::domain::moderation::ModerationLogEntry,
+            _jobs: Vec<NewJob>,
+        ) -> Result<crate::domain::emoji::CustomEmoji, PortError> {
+            unavailable("create_emoji")
+        }
+        fn update_emoji(
+            &self,
+            _emoji: crate::domain::emoji::CustomEmoji,
+            _log: crate::domain::moderation::ModerationLogEntry,
+            _jobs: Vec<NewJob>,
+        ) -> Result<crate::domain::emoji::CustomEmoji, PortError> {
+            unavailable("update_emoji")
+        }
+        fn delete_emoji(
+            &self,
+            _id: &str,
+            _log: crate::domain::moderation::ModerationLogEntry,
+            _jobs: Vec<NewJob>,
+        ) -> Result<bool, PortError> {
+            Ok(false)
+        }
+        fn get_emoji(&self, _id: &str) -> Result<Option<crate::domain::emoji::CustomEmoji>, PortError> {
+            Ok(None)
+        }
+        fn get_emoji_by_name(&self, _shortcode: &str) -> Result<Option<crate::domain::emoji::CustomEmoji>, PortError> {
+            Ok(None)
+        }
+        fn list_emojis(
+            &self,
+            _query: Option<&str>,
+            _cursor: &crate::application::ports::TimelineCursor,
+        ) -> Result<Vec<crate::domain::emoji::CustomEmoji>, PortError> {
+            Ok(Vec::new())
+        }
+        fn all_local_emojis(&self) -> Result<Vec<crate::domain::emoji::CustomEmoji>, PortError> {
+            Ok(Vec::new())
+        }
+        fn upsert_remote_emoji(
+            &self,
+            emoji: crate::domain::emoji::RemoteEmoji,
+        ) -> Result<crate::domain::emoji::RemoteEmoji, PortError> {
+            Ok(emoji)
+        }
+        fn get_remote_emoji(
+            &self,
+            _host: &str,
+            _shortcode: &str,
+        ) -> Result<Option<crate::domain::emoji::RemoteEmoji>, PortError> {
+            Ok(None)
+        }
+        fn all_remote_emojis(&self) -> Result<Vec<crate::domain::emoji::RemoteEmoji>, PortError> {
+            Ok(Vec::new())
+        }
+        fn set_remote_emoji_media(
+            &self,
+            _host: &str,
+            _shortcode: &str,
+            _media_id: &str,
+        ) -> Result<(), PortError> {
+            Ok(())
+        }
+    }
+
+    impl crate::application::ports::AntennaStore for Mem {
+        fn create_antenna(
+            &self,
+            _antenna: crate::domain::antenna::Antenna,
+            _jobs: Vec<NewJob>,
+        ) -> Result<crate::domain::antenna::Antenna, PortError> {
+            unavailable("create_antenna")
+        }
+        fn update_antenna(
+            &self,
+            _antenna: crate::domain::antenna::Antenna,
+            _jobs: Vec<NewJob>,
+        ) -> Result<crate::domain::antenna::Antenna, PortError> {
+            unavailable("update_antenna")
+        }
+        fn delete_antenna(&self, _owner_id: &str, _id: &str) -> Result<bool, PortError> {
+            Ok(false)
+        }
+        fn get_antenna(
+            &self,
+            _owner_id: &str,
+            _id: &str,
+        ) -> Result<Option<crate::domain::antenna::Antenna>, PortError> {
+            Ok(None)
+        }
+        fn antennas_by_owner(
+            &self,
+            _owner_id: &str,
+        ) -> Result<Vec<crate::domain::antenna::Antenna>, PortError> {
+            Ok(Vec::new())
+        }
+        fn all_active_antennas(&self) -> Result<Vec<crate::domain::antenna::Antenna>, PortError> {
+            Ok(Vec::new())
+        }
+        fn touch_antenna(&self, _owner_id: &str, _id: &str, _now_ms: i64) -> Result<(), PortError> {
+            Ok(())
+        }
+    }
+
+    impl crate::application::ports::AntennaNoteStore for Mem {
+        fn append_antenna_note(&self, _antenna_id: &str, _note_id: &str) -> Result<(), PortError> {
+            Ok(())
+        }
+        fn remove_antenna_note(&self, _antenna_id: &str, _note_id: &str) -> Result<(), PortError> {
+            Ok(())
+        }
+        fn delete_antenna_notes(&self, _antenna_id: &str) -> Result<(), PortError> {
+            Ok(())
+        }
+        fn antenna_notes(
+            &self,
+            _antenna_id: &str,
+            _cursor: &crate::application::ports::TimelineCursor,
+        ) -> Result<Vec<String>, PortError> {
+            Ok(Vec::new())
+        }
+    }
+
 
     impl JobQueue for Mem {
         fn claim_next(
@@ -2310,6 +2868,15 @@ mod tests {
             out.sort_by(|a, b| b.id.cmp(&a.id));
             Ok(out)
         }
+        fn list_all_media(
+            &self,
+            _cursor: &crate::application::ports::TimelineCursor,
+        ) -> Result<Vec<MediaMeta>, PortError> {
+            let mut out: Vec<MediaMeta> =
+                self.media.lock().unwrap().values().cloned().collect();
+            out.sort_by(|a, b| b.id.cmp(&a.id));
+            Ok(out)
+        }
     }
 
     impl BlobStore for Mem {
@@ -2409,6 +2976,10 @@ mod tests {
             blocks: mem.clone(),
             mutes: mem.clone(),
             reactions: mem.clone(),
+            favorites: mem.clone(),
+            emojis: mem.clone(),
+            antennas: mem.clone(),
+            antenna_notes: mem.clone(),
             polls: mem.clone(),
             jobs: mem.clone(),
             media: mem.clone(),

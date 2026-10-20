@@ -233,11 +233,11 @@ Backend-agnostic, same cases both adapters (FDB inherits). Atomicity rule (§2.3
 - **I3 registration policy persists**: `InstanceSettings.registration` (upstream `disableRegistration`) round-trips through `InstanceSettingsStore` and each write commits with its `updateServerSettings` row. The gate itself is application logic (`AppServices::signup`); its enforcement is asserted by the endpoint test `wp2_signup_policy_gate_and_invite_claim` (closed + no code → plain 400, nothing created).
 - **I4 claim happy path + refusals**: a valid unexpired code creates the account, marks `usedBy`/`usedAt`, and drops the index row; re-consuming the same code, an unknown code, and an expired code all fail `NotFound` and create nothing (upstream's signup gate 400s for all three).
 
-### Group J — favorites and emoji (cases land with WP7/WP8)
+### Group J — favorites and emoji (Batch N WS1 lands the emoji half; favorites landed WS2)
 
-- **J1 favorite uniqueness** per (account, note) under concurrency.
-- **J2 emoji shortcode unique case-insensitively** (account-handle rule, C2).
-- **J3 favorite delete leaves the note**.
+- **J1 favorite uniqueness** per (account, note) under concurrency. Executed: `tests/conformance.rs` `j1_favorite_uniqueness` green (this session; redb).
+- **J2 emoji shortcode unique case-insensitively** (account-handle rule, C2) + rename conflict + delete-frees-name + remote (host, shortcode) uniqueness with cache-preserving upserts. Executed: `tests/conformance.rs` `j2_emoji_uniqueness` green (this session; redb).
+- **J3 favorite delete leaves the note**. Executed: `tests/conformance.rs` `j3_favorite_delete_leaves_note` green (this session; redb).
 
 ### Group K — abuse reports (Batch M WP4)
 
@@ -247,6 +247,11 @@ Backend-agnostic, same cases both adapters (FDB inherits). Atomicity rule (§2.3
 - **K4 note-update atomicity** (note + conditional log row in one txn).
 
 Ports: `AbuseReportStore`. redb implemented; K1–K4 storage paths present (K2/K3 exercised by unit-level store semantics).
+
+### Group O — antennas (Batch N WS4; executed: `tests/conformance.rs` `o1_antenna_feed_trim_and_cascade` green this session; redb)
+
+- **O1 feed trim + cascade**: `antenna_notes` appends newest-first and trims to the newest 200 in the same append transaction; single-row removal is idempotent; `delete_antenna` cascades the feed rows.
+- Match order, visibility/src/keyword gates, and the DIVERGENCEs are covered by domain unit tests (`src/domain/antenna.rs`) and the endpoint test `batch_n_antennas_crud_notes_and_errors` (create/update/delete/list/notes/remove-note, error ids, cap, export/import application).
 
 ### Group L — instance blocks (Batch M WP5)
 

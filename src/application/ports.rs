@@ -114,6 +114,8 @@ pub struct UpdateAccountPatch {
     pub reject_quotes: Option<bool>,
     /// DIVERGENCE (§6 per-user default reaction, 1..=260 chars).
     pub default_reaction: Option<Option<String>>,
+    /// DIVERGENCE (Batch N WP8b remote-emoji opt-in, default false).
+    pub show_remote_emojis: Option<bool>,
     /// Batch M WP6 `admin/update-user-note`: moderator-only note text.
     /// `Some(Some(text))` sets, `Some(None)` clears, `None` leaves unchanged.
     pub moderator_note: Option<Option<String>>,
@@ -230,6 +232,12 @@ pub struct CreateNoteInput {
     pub sensitive_words: Vec<String>,
     #[serde(default)]
     pub uri: Option<String>,
+    /// Public URL base (`https://domain`, no trailing slash). When `uri` is
+    /// `None`, storage derives the canonical `{uri_base}/notes/{id}` once the
+    /// note id is generated. `#[serde(default)]` keeps in-flight job payloads
+    /// decodable.
+    #[serde(default)]
+    pub uri_base: String,
     #[serde(default)]
     pub url: Option<String>,
     #[serde(default)]
@@ -270,6 +278,7 @@ impl CreateNoteInput {
             prohibited_words: Vec::new(),
             sensitive_words: Vec::new(),
             uri: None,
+            uri_base: String::new(),
             url: None,
             extra_mentions: Vec::new(),
             extra_tags: Vec::new(),
@@ -780,6 +789,21 @@ pub enum JobKind {
     /// streaming event, no notification. Reuses the worker's standard
     /// lease/backoff.
     UnfollowAll,
+    /// Remote custom-emoji lazy fetch (Batch N WP8b): download one known
+    /// remote-emoji image off-request after a user opts in via
+    /// `showRemoteEmojis`. The payload is [`RemoteEmojiFetchPayload`].
+    /// Idempotent: an already-cached row or a gone row converges quietly;
+    /// fetch failures (non-image content type, oversize, network) converge
+    /// quietly too — the packed URL keeps pointing at the remote host (the
+    /// documented privacy trade-off). Only storage faults retry.
+    RemoteEmojiFetch,
+    /// Antenna fan-in (Batch N WS4; guide WP15): one bounded job per created
+    /// note carrying the note id. The worker loads the active antennas,
+    /// matches, and appends `antenna_notes` rows (trimmed to the newest 200
+    /// per antenna in the same transaction). Idempotent: a gone note
+    /// converges quietly; replays re-match harmlessly (rows are keyed
+    /// `(antenna, note)`). Only storage faults retry.
+    AntennaMatch,
 }
 
 /// Maximum `fail()` retries before a job is auto-quarantined as
@@ -1184,6 +1208,123 @@ pub trait ReactionStore: Send + Sync {
     }
 }
 
+/// Note favorites (`notes/favorites/*`, `i/favorites`, `notes/state`;
+/// Misskey `MiNoteFavorite` parity: unique over (user, note)).
+pub trait FavoriteStore: Send + Sync {
+    fn favorite_note(
+        &self,
+        favorite: crate::domain::favorite::NoteFavorite,
+        jobs: Vec<NewJob>,
+    ) -> Result<crate::domain::favorite::NoteFavorite, PortError>;
+    fn unfavorite_note(&self, user_id: &str, note_id: &str) -> Result<bool, PortError>;
+    fn is_favorited(&self, user_id: &str, note_id: &str) -> Result<bool, PortError>;
+    /// Favorites of `user_id`, newest-first (favorite-id order), cursor-paged.
+    fn favorites_by_user(
+        &self,
+        user_id: &str,
+        cursor: &TimelineCursor,
+    ) -> Result<Vec<crate::domain::favorite::NoteFavorite>, PortError>;
+}
+
+/// Custom + remote emoji (Batch N WS1 + WP8b; Misskey `MiEmoji` parity:
+/// local rows unique on case-insensitive shortcode, remote rows unique on
+/// (lower host, lower shortcode)).
+pub trait EmojiStore: Send + Sync {
+    fn create_emoji(
+        &self,
+        emoji: crate::domain::emoji::CustomEmoji,
+        log: ModerationLogEntry,
+        jobs: Vec<NewJob>,
+    ) -> Result<crate::domain::emoji::CustomEmoji, PortError>;
+    fn update_emoji(
+        &self,
+        emoji: crate::domain::emoji::CustomEmoji,
+        log: ModerationLogEntry,
+        jobs: Vec<NewJob>,
+    ) -> Result<crate::domain::emoji::CustomEmoji, PortError>;
+    fn delete_emoji(&self, id: &str, log: ModerationLogEntry, jobs: Vec<NewJob>) -> Result<bool, PortError>;
+    fn get_emoji(&self, id: &str) -> Result<Option<crate::domain::emoji::CustomEmoji>, PortError>;
+    fn get_emoji_by_name(&self, shortcode: &str) -> Result<Option<crate::domain::emoji::CustomEmoji>, PortError>;
+    /// Local emoji, cursor-paged (`limit` default 10, 1..=100), newest-first,
+    /// with optional case-insensitive substring `query` over
+    /// name/aliases/category or exact `:name:` tokens (upstream list parity).
+    fn list_emojis(
+        &self,
+        query: Option<&str>,
+        cursor: &TimelineCursor,
+    ) -> Result<Vec<crate::domain::emoji::CustomEmoji>, PortError>;
+    /// Every local emoji (pack path; single-node scan, bounded by the admin
+    /// list — no per-note queries).
+    fn all_local_emojis(&self) -> Result<Vec<crate::domain::emoji::CustomEmoji>, PortError>;
+    /// Metadata-only remote-emoji upsert (AP `Emoji` tag ingest; no fetch).
+    /// Updates `remote_url` when the (host, shortcode) row exists, inserts
+    /// otherwise. Never touches `media_id`.
+    fn upsert_remote_emoji(
+        &self,
+        emoji: crate::domain::emoji::RemoteEmoji,
+    ) -> Result<crate::domain::emoji::RemoteEmoji, PortError>;
+    fn get_remote_emoji(
+        &self,
+        host: &str,
+        shortcode: &str,
+    ) -> Result<Option<crate::domain::emoji::RemoteEmoji>, PortError>;
+    /// Every known remote-emoji metadata row (lazy-fetch fan-out source).
+    fn all_remote_emojis(&self) -> Result<Vec<crate::domain::emoji::RemoteEmoji>, PortError>;
+    /// Record the lazily fetched local copy (`media_id`) for one remote row.
+    fn set_remote_emoji_media(
+        &self,
+        host: &str,
+        shortcode: &str,
+        media_id: &str,
+    ) -> Result<(), PortError>;
+}
+
+/// Antennas (Batch N WS4; guide WP15): rules + per-antenna feeds.
+/// `create`/`update` take the moderation-style log? No — upstream publishes
+/// `antennaCreated/Updated/Deleted` broadcast events, not moderation-log
+/// rows. Pinetree publishes the `antenna` stream event post-commit through
+/// `StreamingSink` (no moderation rows; admins need no log here either).
+pub trait AntennaStore: Send + Sync {
+    fn create_antenna(
+        &self,
+        antenna: crate::domain::antenna::Antenna,
+        jobs: Vec<NewJob>,
+    ) -> Result<crate::domain::antenna::Antenna, PortError>;
+    fn update_antenna(
+        &self,
+        antenna: crate::domain::antenna::Antenna,
+        jobs: Vec<NewJob>,
+    ) -> Result<crate::domain::antenna::Antenna, PortError>;
+    fn delete_antenna(&self, owner_id: &str, id: &str) -> Result<bool, PortError>;
+    fn get_antenna(&self, owner_id: &str, id: &str) -> Result<Option<crate::domain::antenna::Antenna>, PortError>;
+    /// Owner's antennas, newest-first.
+    fn antennas_by_owner(&self, owner_id: &str) -> Result<Vec<crate::domain::antenna::Antenna>, PortError>;
+    /// Every active antenna (match sweep source; worker pages in memory —
+    /// bounded by the per-instance antenna count).
+    fn all_active_antennas(&self) -> Result<Vec<crate::domain::antenna::Antenna>, PortError>;
+    /// Touch `is_active` + `last_used_at_ms` (read-path reactivation,
+    /// upstream `notes.ts` parity).
+    fn touch_antenna(&self, owner_id: &str, id: &str, now_ms: i64) -> Result<(), PortError>;
+}
+
+/// Per-antenna feeds: `(antenna_id, note_id)` rows, newest-first reads,
+/// trimmed to [`ANTENNA_NOTES_CAP`] on append (same transaction).
+pub trait AntennaNoteStore: Send + Sync {
+    /// Append `(antenna, note)` (deduplicated by key) and trim the feed to
+    /// the newest [`ANTENNA_NOTES_CAP`] entries — one transaction.
+    fn append_antenna_note(&self, antenna_id: &str, note_id: &str) -> Result<(), PortError>;
+    /// Remove one entry (idempotent).
+    fn remove_antenna_note(&self, antenna_id: &str, note_id: &str) -> Result<(), PortError>;
+    /// Remove every entry of one antenna (delete cascade).
+    fn delete_antenna_notes(&self, antenna_id: &str) -> Result<(), PortError>;
+    /// Newest-first note ids of one antenna, cursor-paged.
+    fn antenna_notes(
+        &self,
+        antenna_id: &str,
+        cursor: &TimelineCursor,
+    ) -> Result<Vec<String>, PortError>;
+}
+
 pub trait ActivityDedup: Send + Sync {
     fn check_and_record(&self, activity_id: &str) -> Result<bool, PortError>;
     /// Read-only replay gate (Phase 2.6 slice 7): report whether
@@ -1514,6 +1655,21 @@ pub struct UnfollowAllPayload {
     pub after: Option<String>,
 }
 
+/// Payload of a `JobKind::RemoteEmojiFetch` job (Batch N WP8b): one remote
+/// emoji to fetch-and-cache after a user opted in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteEmojiFetchPayload {
+    pub host: String,
+    pub shortcode: String,
+}
+
+/// Payload of a `JobKind::AntennaMatch` job (Batch N WS4): the committed
+/// note to fan into antenna feeds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AntennaMatchPayload {
+    pub note_id: String,
+}
+
 /// Payload of a `JobKind::PostScheduledDraft` job: the draft to post.
 /// `scheduled_at_ms` is the `scheduled_at` the job was armed for — the
 /// handler converges quietly when the stored draft no longer matches
@@ -1692,6 +1848,10 @@ pub trait MediaStore: Send + Sync {
     /// Newest-first metadata rows owned by `owner_id` (Phase 3
     /// `drive/files`). Ordering is by row id (aidx ids are time-ordered).
     fn list_by_owner(&self, owner_id: &str) -> Result<Vec<MediaMeta>, PortError>;
+    /// Newest-first metadata rows across all owners (Batch N WS6
+    /// `admin/drive/files`). Backends return rows in any order; the
+    /// application op sorts newest-first and pages.
+    fn list_all_media(&self, cursor: &TimelineCursor) -> Result<Vec<MediaMeta>, PortError>;
 }
 
 pub trait BlobStore: Send + Sync {
@@ -1748,6 +1908,11 @@ pub struct MiAuthSessionRecord {
     pub token: Option<String>,
     pub fetched: bool,
     pub created_at_ms: i64,
+    /// Approval deadline (Batch N WS7 hardening; upstream has no expiry).
+    /// `None` = no deadline (rows written before expiry existed). New rows
+    /// always carry `Some`; expired rows read as missing (deleted on read).
+    #[serde(default)]
+    pub expires_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1760,6 +1925,10 @@ pub struct LegacyAuthSessionRecord {
     pub account_id: Option<String>,
     pub access_token: Option<String>,
     pub created_at_ms: i64,
+    /// Approval deadline (Batch N WS7 hardening; upstream has no expiry).
+    /// `None` = no deadline (rows written before expiry existed).
+    #[serde(default)]
+    pub expires_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1809,6 +1978,19 @@ pub trait AuthStore: Send + Sync {
     fn save_actor_keypair(&self, record: ActorKeypairRecord) -> Result<(), PortError> {
         let _ = record;
         Ok(())
+    }
+    /// Store `record` only if the account has no keypair yet, and return the keypair that is stored
+    /// afterwards (the existing one when another caller won). Concurrent first fetches of an actor
+    /// must all see one key, so stores should make this atomic; the default is get-then-save.
+    fn save_actor_keypair_if_absent(
+        &self,
+        record: ActorKeypairRecord,
+    ) -> Result<ActorKeypairRecord, PortError> {
+        if let Some(existing) = self.get_actor_keypair(&record.account_id)? {
+            return Ok(existing);
+        }
+        self.save_actor_keypair(record.clone())?;
+        Ok(record)
     }
     fn get_remote_public_key(
         &self,
@@ -2118,7 +2300,6 @@ pub struct AbuseReportFilter {
 
 pub trait AbuseReportStore: Send + Sync {
     fn create(&self, report: AbuseReport) -> Result<AbuseReport, PortError>;
-
     fn get(&self, id: &str) -> Result<Option<AbuseReport>, PortError>;
 
     /// Batch M WP6: number of abuse reports whose target is `account_id`.
@@ -2159,6 +2340,17 @@ pub trait AbuseReportStore: Send + Sync {
         log: ModerationLogEntry,
         jobs: Vec<NewJob>,
     ) -> Result<AbuseReport, PortError>;
+
+    /// Inbound `Flag` (upstream `ApInboxService.flag` parity): atomically
+    /// check-and-record `activity_id` and insert `report`. `Ok(None)` on
+    /// replay (already seen). The target must be a local account id; the
+    /// reporter may be remote (its account id is stored; host is derivable
+    /// from the account row).
+    fn create_flag_report(
+        &self,
+        activity_id: &str,
+        report: AbuseReport,
+    ) -> Result<Option<AbuseReport>, PortError>;
 }
 
 /// Invite codes (Batch M WP2). Whole-port methods: any `log` row commits

@@ -485,6 +485,26 @@ fn curl_args(
     args
 }
 
+static EXTRA_CA: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Bench only (`--federation-extra-ca=PATH`): trust the CA bundle at `path` for outbound HTTPS,
+/// for a lab whose servers present a private CA. curl's `--cacert` replaces its default roots,
+/// so the file must hold every CA the node needs. Verification stays on. First call wins.
+pub fn set_extra_ca(path: std::path::PathBuf) {
+    let _ = EXTRA_CA.set(path);
+}
+
+/// Insert `--cacert PATH` before the URL (the last argument).
+fn with_extra_ca(mut args: Vec<String>, ca: Option<&std::path::Path>) -> Vec<String> {
+    if let Some(ca) = ca {
+        let url = args.pop();
+        args.push("--cacert".to_string());
+        args.push(ca.display().to_string());
+        args.extend(url);
+    }
+    args
+}
+
 impl SafeHttpClient {
     pub fn new(config: SafeHttpConfig) -> Self {
         Self { config }
@@ -677,14 +697,17 @@ impl SafeHttpClient {
     ) -> Result<SafeHttpResponse, SendError> {
         let addr = addrs[0];
         let timeout_secs = self.config.timeout.as_secs().max(1);
-        let args = curl_args(
-            method,
-            full_url,
-            &format!("{}:{}:{}", parsed.host, parsed.port, addr.ip()),
-            extra_headers,
-            body.is_some(),
-            timeout_secs,
-            max_response_bytes,
+        let args = with_extra_ca(
+            curl_args(
+                method,
+                full_url,
+                &format!("{}:{}:{}", parsed.host, parsed.port, addr.ip()),
+                extra_headers,
+                body.is_some(),
+                timeout_secs,
+                max_response_bytes,
+            ),
+            EXTRA_CA.get().map(|p| p.as_path()),
         );
         let mut cmd = Command::new("curl");
         for a in &args {
@@ -1345,6 +1368,12 @@ pub fn upsert_remote_actor_from_doc(
         &parsed.public_key_pem,
     )?;
 
+    // WP8b remote-emoji metadata ingest (actor documents, no fetch).
+    // Idempotent upserts; only storage faults propagate.
+    if !parsed.emojis.is_empty() {
+        services.ingest_remote_emoji_tags(&parsed.host, &parsed.emojis)?;
+    }
+
     Ok((account, parsed))
 }
 
@@ -1535,6 +1564,16 @@ mod tests {
         assert_eq!(size_err.kind, SendErrorKind::TooLarge);
 
         drop(handle);
+    }
+
+    #[test]
+    fn extra_ca_is_added_before_the_url_and_is_off_by_default() {
+        let args = || curl_args("GET", "https://mastodon.lab/x", "mastodon.lab:443:127.0.0.1", &[], false, 10, 1024);
+        assert_eq!(with_extra_ca(args(), None), args());
+        let with = with_extra_ca(args(), Some(std::path::Path::new("/ca.crt")));
+        let n = with.len();
+        assert_eq!(&with[n - 3..], ["--cacert", "/ca.crt", "https://mastodon.lab/x"]);
+        assert!(!with.iter().any(|a| a == "-k" || a == "--insecure"));
     }
 
     #[test]

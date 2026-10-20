@@ -60,6 +60,7 @@ struct CallerInfo {
 enum ChannelKind {
     Main,
     Timeline(TimelineChannel),
+    Antenna { antenna_id: String },
 }
 
 #[derive(Debug, Clone)]
@@ -253,7 +254,7 @@ async fn handle_client_message(
             ) else {
                 return;
             };
-            connect_channel(caller, channels, id, channel, body, sender).await;
+            connect_channel(state, caller, channels, id, channel, body, sender).await;
         }
         "disconnect" => {
             if let Some(id) = body.and_then(|b| b.get("id")).and_then(Value::as_str) {
@@ -310,6 +311,7 @@ async fn handle_client_message(
 }
 
 async fn connect_channel(
+    state: &ApiState,
     caller: &Option<CallerInfo>,
     channels: &mut HashMap<String, ChannelSub>,
     id: &str,
@@ -317,6 +319,54 @@ async fn connect_channel(
     body: Option<&Value>,
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
 ) {
+    // The `antenna` channel needs the owner check up front (credential +
+    // owned `antennaId`); every other channel resolves below.
+    if channel == "antenna" {
+        let Some(caller) = caller else {
+            return;
+        };
+        let antenna_id = body
+            .and_then(|b| b.get("params"))
+            .and_then(|p| p.get("antennaId"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if antenna_id.is_empty() {
+            return;
+        }
+        let services = state.services.clone();
+        let owner = caller.account_id.clone();
+        let antenna_id_query = antenna_id.clone();
+        let owned = tokio::task::spawn_blocking(move || {
+            services
+                .antennas
+                .get_antenna(&owner, &antenna_id_query)
+                .map(|row| row.is_some())
+                .unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false);
+        if !owned {
+            // Unknown channel on connect answers UNSUPPORTED_CHANNEL, but a
+            // foreign antenna is an auth refusal: silently ignored (Misskey
+            // credential-channel parity — the channel is never added).
+            return;
+        }
+        if channels.contains_key(id) {
+            channels.remove(id);
+        }
+        if channels.len() >= MAX_CHANNELS_PER_CONNECTION {
+            return;
+        }
+        channels.insert(
+            id.to_string(),
+            ChannelSub {
+                kind: ChannelKind::Antenna { antenna_id },
+                params: TimelineChannelParams::default(),
+            },
+        );
+        return;
+    }
     let kind = match channel {
         "main" => ChannelKind::Main,
         "homeTimeline" => ChannelKind::Timeline(TimelineChannel::Home),
@@ -423,7 +473,7 @@ async fn dispatch_hub_message(
                     ChannelKind::Timeline(which) => {
                         Some((id.clone(), ChannelKind::Timeline(*which), sub.params))
                     }
-                    ChannelKind::Main => None,
+                    ChannelKind::Main | ChannelKind::Antenna { .. } => None,
                 })
                 .collect();
             if timeline.is_empty() {
@@ -631,6 +681,59 @@ async fn dispatch_hub_message(
         // when the suspended account is this connection's viewer. The arm
         // exists for exhaustiveness only.
         HubMessage::UserSuspended { .. } => {}
+        HubMessage::AntennaNote { antenna_id, note_id } => {
+            // Batch N WS4: fan one matched note out to this connection's
+            // `antenna` channels subscribed to that antenna. Read-time
+            // visibility + mute/block filtering applies (upstream `onEvent`
+            // parity); packing is the detail shape.
+            let targets: Vec<String> = channels
+                .iter()
+                .filter_map(|(id, sub)| match &sub.kind {
+                    ChannelKind::Antenna { antenna_id: mine } if mine == &antenna_id => {
+                        Some(id.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            if targets.is_empty() {
+                return;
+            }
+            let services = state.services.clone();
+            let viewer = viewer_id.map(|s| s.to_string());
+            let packed = tokio::task::spawn_blocking(move || {
+                let note = match services.notes.get_note(&note_id) {
+                    Ok(Some(note)) if !note.is_deleted => note,
+                    _ => return None,
+                };
+                let viewer_ref = viewer.as_deref();
+                let filter = services.feed_filter(viewer_ref).ok()?;
+                let mut account_cache = std::collections::HashMap::new();
+                let mut note_cache = std::collections::HashMap::new();
+                let follows_cache = services.follows_cache(viewer_ref).ok()?;
+                let viewer_ctx = services.viewer_ctx(viewer_ref, &note.author_id, &follows_cache);
+                if !crate::domain::policy::is_visible(&note, &viewer_ctx) {
+                    return None;
+                }
+                if services
+                    .feed_filter_hides(&filter, &note, &mut account_cache, &mut note_cache)
+                    .unwrap_or(true)
+                {
+                    return None;
+                }
+                crate::api::misskey::packers::pack_note(&note, viewer_ref, &services, 0).ok()
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some(packed) = packed {
+                for id in targets {
+                    let frame = channel_frame(&id, "note", packed.clone());
+                    if sender.send(frame).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
     }
 }
 

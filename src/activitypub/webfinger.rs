@@ -903,6 +903,7 @@ mod tests {
         fn resolve(&self, _id: &str, _resolved_as: Option<crate::domain::moderation::AbuseReportResolution>, _assignee: Option<String>, _log: crate::domain::moderation::ModerationLogEntry, _jobs: Vec<crate::application::ports::NewJob>) -> Result<crate::domain::moderation::AbuseReport, PortError> { unavailable("resolve") }
         fn set_note(&self, _id: &str, _note: String, _log: Option<crate::domain::moderation::ModerationLogEntry>, _jobs: Vec<crate::application::ports::NewJob>) -> Result<crate::domain::moderation::AbuseReport, PortError> { unavailable("set_note") }
         fn mark_forwarded(&self, _id: &str, _log: crate::domain::moderation::ModerationLogEntry, _jobs: Vec<crate::application::ports::NewJob>) -> Result<crate::domain::moderation::AbuseReport, PortError> { unavailable("mark_forwarded") }
+        fn create_flag_report(&self, _activity_id: &str, report: crate::domain::moderation::AbuseReport) -> Result<Option<crate::domain::moderation::AbuseReport>, PortError> { Ok(Some(report)) }
     }
 
     impl MuteStore for Mem {
@@ -985,6 +986,155 @@ mod tests {
             Ok(Vec::new())
         }
     }
+
+    impl crate::application::ports::FavoriteStore for Mem {
+        fn favorite_note(
+            &self,
+            _favorite: crate::domain::favorite::NoteFavorite,
+            _jobs: Vec<NewJob>,
+        ) -> Result<crate::domain::favorite::NoteFavorite, PortError> {
+            unavailable("favorite_note")
+        }
+        fn unfavorite_note(&self, _user_id: &str, _note_id: &str) -> Result<bool, PortError> {
+            Ok(false)
+        }
+        fn is_favorited(&self, _user_id: &str, _note_id: &str) -> Result<bool, PortError> {
+            Ok(false)
+        }
+        fn favorites_by_user(
+            &self,
+            _user_id: &str,
+            _cursor: &crate::application::ports::TimelineCursor,
+        ) -> Result<Vec<crate::domain::favorite::NoteFavorite>, PortError> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl crate::application::ports::EmojiStore for Mem {
+        fn create_emoji(
+            &self,
+            _emoji: crate::domain::emoji::CustomEmoji,
+            _log: crate::domain::moderation::ModerationLogEntry,
+            _jobs: Vec<NewJob>,
+        ) -> Result<crate::domain::emoji::CustomEmoji, PortError> {
+            unavailable("create_emoji")
+        }
+        fn update_emoji(
+            &self,
+            _emoji: crate::domain::emoji::CustomEmoji,
+            _log: crate::domain::moderation::ModerationLogEntry,
+            _jobs: Vec<NewJob>,
+        ) -> Result<crate::domain::emoji::CustomEmoji, PortError> {
+            unavailable("update_emoji")
+        }
+        fn delete_emoji(
+            &self,
+            _id: &str,
+            _log: crate::domain::moderation::ModerationLogEntry,
+            _jobs: Vec<NewJob>,
+        ) -> Result<bool, PortError> {
+            Ok(false)
+        }
+        fn get_emoji(&self, _id: &str) -> Result<Option<crate::domain::emoji::CustomEmoji>, PortError> {
+            Ok(None)
+        }
+        fn get_emoji_by_name(&self, _shortcode: &str) -> Result<Option<crate::domain::emoji::CustomEmoji>, PortError> {
+            Ok(None)
+        }
+        fn list_emojis(
+            &self,
+            _query: Option<&str>,
+            _cursor: &crate::application::ports::TimelineCursor,
+        ) -> Result<Vec<crate::domain::emoji::CustomEmoji>, PortError> {
+            Ok(Vec::new())
+        }
+        fn all_local_emojis(&self) -> Result<Vec<crate::domain::emoji::CustomEmoji>, PortError> {
+            Ok(Vec::new())
+        }
+        fn upsert_remote_emoji(
+            &self,
+            emoji: crate::domain::emoji::RemoteEmoji,
+        ) -> Result<crate::domain::emoji::RemoteEmoji, PortError> {
+            Ok(emoji)
+        }
+        fn get_remote_emoji(
+            &self,
+            _host: &str,
+            _shortcode: &str,
+        ) -> Result<Option<crate::domain::emoji::RemoteEmoji>, PortError> {
+            Ok(None)
+        }
+        fn all_remote_emojis(&self) -> Result<Vec<crate::domain::emoji::RemoteEmoji>, PortError> {
+            Ok(Vec::new())
+        }
+        fn set_remote_emoji_media(
+            &self,
+            _host: &str,
+            _shortcode: &str,
+            _media_id: &str,
+        ) -> Result<(), PortError> {
+            Ok(())
+        }
+    }
+
+    impl crate::application::ports::AntennaStore for Mem {
+        fn create_antenna(
+            &self,
+            _antenna: crate::domain::antenna::Antenna,
+            _jobs: Vec<NewJob>,
+        ) -> Result<crate::domain::antenna::Antenna, PortError> {
+            unavailable("create_antenna")
+        }
+        fn update_antenna(
+            &self,
+            _antenna: crate::domain::antenna::Antenna,
+            _jobs: Vec<NewJob>,
+        ) -> Result<crate::domain::antenna::Antenna, PortError> {
+            unavailable("update_antenna")
+        }
+        fn delete_antenna(&self, _owner_id: &str, _id: &str) -> Result<bool, PortError> {
+            Ok(false)
+        }
+        fn get_antenna(
+            &self,
+            _owner_id: &str,
+            _id: &str,
+        ) -> Result<Option<crate::domain::antenna::Antenna>, PortError> {
+            Ok(None)
+        }
+        fn antennas_by_owner(
+            &self,
+            _owner_id: &str,
+        ) -> Result<Vec<crate::domain::antenna::Antenna>, PortError> {
+            Ok(Vec::new())
+        }
+        fn all_active_antennas(&self) -> Result<Vec<crate::domain::antenna::Antenna>, PortError> {
+            Ok(Vec::new())
+        }
+        fn touch_antenna(&self, _owner_id: &str, _id: &str, _now_ms: i64) -> Result<(), PortError> {
+            Ok(())
+        }
+    }
+
+    impl crate::application::ports::AntennaNoteStore for Mem {
+        fn append_antenna_note(&self, _antenna_id: &str, _note_id: &str) -> Result<(), PortError> {
+            Ok(())
+        }
+        fn remove_antenna_note(&self, _antenna_id: &str, _note_id: &str) -> Result<(), PortError> {
+            Ok(())
+        }
+        fn delete_antenna_notes(&self, _antenna_id: &str) -> Result<(), PortError> {
+            Ok(())
+        }
+        fn antenna_notes(
+            &self,
+            _antenna_id: &str,
+            _cursor: &crate::application::ports::TimelineCursor,
+        ) -> Result<Vec<String>, PortError> {
+            Ok(Vec::new())
+        }
+    }
+
 
     impl JobQueue for Mem {
         fn claim_next(
@@ -1104,6 +1254,12 @@ mod tests {
             // Test double stores no media rows.
             Ok(Vec::new())
         }
+        fn list_all_media(
+            &self,
+            _cursor: &crate::application::ports::TimelineCursor,
+        ) -> Result<Vec<crate::domain::media::MediaMeta>, PortError> {
+            Ok(Vec::new())
+        }
     }
 
     impl BlobStore for Mem {
@@ -1210,6 +1366,10 @@ mod tests {
             blocks: mem.clone(),
             mutes: mem.clone(),
             reactions: mem.clone(),
+            favorites: mem.clone(),
+            emojis: mem.clone(),
+            antennas: mem.clone(),
+            antenna_notes: mem.clone(),
             polls: mem.clone(),
             jobs: mem.clone(),
             media: mem.clone(),

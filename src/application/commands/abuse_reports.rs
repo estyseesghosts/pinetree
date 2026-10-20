@@ -25,7 +25,9 @@ impl AppServices {
         if reporter_id == target_account_id {
             return Err(PortError::Validation("CANNOT_REPORT_YOURSELF".to_string()));
         }
-        if target.has_moderator_powers() {
+        // Upstream checks `roleService.isAdministrator` (admin-only); reporting
+        // a moderator is legitimate there. Pinetree matches it.
+        if target.is_admin {
             return Err(PortError::Validation("CANNOT_REPORT_THE_ADMIN".to_string()));
         }
         let report = AbuseReport::new(
@@ -113,6 +115,70 @@ impl AppServices {
         self.abuse_reports.set_note(report_id, note, log, Vec::new())
     }
 
+    /// Inbound `Flag` (upstream `ApInboxService.flag` parity): the first
+    /// mentioned LOCAL user becomes the report target, the remote actor the
+    /// reporter; `content` plus the JSON object-URI list become the comment
+    /// (upstream `comment` shape). Unknown/remote-only targets converge
+    /// quietly (`Ok(None)`, upstream `skip`). The dedup mark and the report
+    /// commit in one transaction, so replays converge to `Ok(None)` with no
+    /// duplicates. Instance blocks drop before any state write (WP5
+    /// discipline — the caller checks first; this op re-checks the actor).
+    /// No moderation-log row (upstream logs only resolve/forward/note-update
+    /// via `report()`, which is log-free too).
+    pub fn handle_inbound_flag(
+        &self,
+        activity_id: &str,
+        actor_id: &str,
+        object_uris: &[String],
+        content: Option<&str>,
+    ) -> Result<Option<AbuseReport>, PortError> {
+        // Instance block (WP5): drop before any state write or dedup record.
+        if self.inbound_host_blocked(actor_id) {
+            return Ok(None);
+        }
+        let base = self.public_url.trim_end_matches('/').to_string();
+        let prefix = format!("{base}/users/");
+        let mut target_id: Option<String> = None;
+        for uri in object_uris {
+            let uri = uri.trim();
+            if let Some(id) = uri.strip_prefix(&prefix) {
+                let id = id.split(['/', '?', '#']).next().unwrap_or("").to_string();
+                if id.is_empty() {
+                    continue;
+                }
+                match self.accounts.find_by_id(&id)? {
+                    Some(account) if account.is_local() => {
+                        target_id = Some(account.id);
+                        break;
+                    }
+                    _ => continue,
+                }
+            }
+        }
+        let Some(target_id) = target_id else {
+            return Ok(None);
+        };
+        let comment = match content.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(content) => {
+                let uris = serde_json::to_string_pretty(object_uris).unwrap_or_else(|_| "[]".to_string());
+                format!("{content}\n{uris}")
+            }
+            None => serde_json::to_string_pretty(object_uris).unwrap_or_else(|_| "[]".to_string()),
+        };
+        // DIVERGENCE (documented): the report column is 1..=2048 chars
+        // (upstream `report-abuse` paramDef). An overlong inbound comment
+        // truncates instead of failing the inbox delivery (no retry storm).
+        let comment: String = comment.chars().take(2048).collect();
+        let report = AbuseReport::new(
+            self.ids.generate(),
+            target_id,
+            actor_id.to_string(),
+            comment,
+            self.now_ms(),
+        )?;
+        self.abuse_reports.create_flag_report(activity_id, report)
+    }
+
     pub fn forward_abuse_report(
         &self,
         moderator_id: &str,
@@ -129,6 +195,14 @@ impl AppServices {
         if target.is_local() {
             return Err(PortError::Validation(
                 "cannot forward a local report".to_string(),
+            ));
+        }
+        // Upstream refuses a second forward ("already been forwarded").
+        // Upstream throws a plain `Error` (→ 500); pinetree answers 400
+        // `INVALID_PARAM` carrying the message (WP1 refusal-row precedent).
+        if report.forwarded {
+            return Err(PortError::Validation(
+                "INVALID_PARAM already been forwarded".to_string(),
             ));
         }
         let inbox_url = self

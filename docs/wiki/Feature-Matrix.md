@@ -25,22 +25,22 @@ Legend: ✅ supported · 🟡 partial/subset · ❌ not supported (yet) · ⛔ d
 | Legacy `auth/session/*` | ✅ | ✅ | ✅ |
 | OAuth / IndieAuth | ❌ (🗓 only if a target client needs it) | ✅ | ✅ |
 | Mastodon client API | ⛔ | ❌ | ✅ |
-| Streaming (`/streaming`, channels, note capture) | ✅ (5 channels + capture) | ✅ | ✅ |
+| Streaming (`/streaming`, channels, note capture) | ✅ (6 channels + capture) | ✅ | ✅ |
 | Timelines home / local / hybrid | ✅ | ✅ | ✅ |
 | Global timeline | ✅ | ✅ | ✅ |
-| Other timelines (user lists, hashtag, antenna, role, channel, bubble) | ❌ | ✅ (no bubble) | ✅ (incl. bubble) |
+| Other timelines (user lists, hashtag, antenna, role, channel, bubble) | 🟡 (antenna feed + stream; no user lists yet) | ✅ (no bubble) | ✅ (incl. bubble) |
 | Notes: text, CW, visibility, reply, renote, files, localOnly | ✅ | ✅ | ✅ |
 | Quote notes | ✅ (FEP-044f + legacy compat + authorization workflow) | ✅ | ✅ |
 | Branched reply threads | ✅ (indexed children, pending parents fail-closed, durable resolver) | ✅ | ✅ |
 | Polls | ❌ (deferred) | ✅ | ✅ |
 | Note editing | ❌ | ❌ | ✅ |
 | Reactions (unicode) | ✅ | ✅ | ✅ |
-| Custom-emoji reactions / emoji management | ❌ | ✅ | ✅ |
+| Custom-emoji reactions / emoji management | ✅ (registry + admin API + remote opt-in) | ✅ | ✅ |
 | Notifications list | ✅ (list) | ✅ | ✅ |
 | Follow / unfollow | ✅ | ✅ | ✅ |
 | Follow requests (locked accounts) | ✅ (list/accept/reject/cancel) | ✅ | ✅ |
 | Mute / block / renote-mute | ❌ | ✅ | ✅ |
-| User lists, antennas, clips, pages, flash, gallery, channels | ❌ | ✅ | ✅ |
+| User lists, antennas, clips, pages, flash, gallery, channels | 🟡 (antennas done; rest out) | ✅ | ✅ |
 | Drive: upload | ✅ | ✅ | ✅ |
 | Drive: folders, listing, management | 🟡 (listing/show/update/delete; no folders) | ✅ | ✅ |
 | Search (notes/users) | 🟡 (notes + tag + user search, substring) | ✅ | ✅ |

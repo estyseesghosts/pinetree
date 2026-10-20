@@ -35,10 +35,15 @@ pub struct FeedFilter {
     /// `generateMutedUserQueryForNotes` instance parity). Local authors (no
     /// host) never match. Empty for anonymous viewers.
     pub muted_instances: Vec<String>,
+    /// Viewer-compiled hard word mutes (Batch N WS8; `hardMutedWords`).
+    /// Empty for anonymous viewers or viewers with no hard mutes (the
+    /// common case — the hard-mute arm of `feed_filter_hides` is then a
+    /// single `is_empty` check, zero per-note regex cost).
+    pub hard_mutes: crate::domain::word_mute::CompiledWordMute,
 }
 
 impl AppServices {
-    fn viewer_ctx(
+    pub(crate) fn viewer_ctx(
         &self,
         viewer_id: Option<&str>,
         author_id: &str,
@@ -64,7 +69,7 @@ impl AppServices {
         Ok(following.into_iter().map(|f| f.followee_id).collect())
     }
 
-    fn follows_cache(
+    pub(crate) fn follows_cache(
         &self,
         viewer_id: Option<&str>,
     ) -> Result<HashMap<String, bool>, PortError> {
@@ -88,6 +93,7 @@ impl AppServices {
             blocked_by: HashSet::new(),
             renote_muted: HashSet::new(),
             muted_instances: Vec::new(),
+            hard_mutes: crate::domain::word_mute::CompiledWordMute::default(),
         };
         if let Some(viewer) = viewer_id {
             filter.muted = self.mutes.muted_ids_for(viewer)?.into_iter().collect();
@@ -106,17 +112,18 @@ impl AppServices {
                 .blocked_by_ids_for(viewer)?
                 .into_iter()
                 .collect();
-            // §12 `mutedInstances`: the viewer's own list (lowercased; host
-            // comparison is case-insensitive). Missing viewers fail open to
-            // an empty list.
-            filter.muted_instances = self
-                .accounts
-                .find_by_id(viewer)?
-                .map(|account| account.muted_instances)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|host| host.to_lowercase())
-                .collect();
+            // §12 `mutedInstances` + Batch N WS8 hard word mutes: the
+            // viewer's own lists (lowercased hosts; missing viewers fail
+            // open to empty lists).
+            if let Some(account) = self.accounts.find_by_id(viewer)? {
+                filter.muted_instances = account
+                    .muted_instances
+                    .into_iter()
+                    .map(|host| host.to_lowercase())
+                    .collect();
+                filter.hard_mutes =
+                    crate::domain::word_mute::CompiledWordMute::compile(&account.hard_muted_words);
+            }
         }
         Ok(filter)
     }
@@ -159,12 +166,14 @@ impl AppServices {
     ///   anonymously too).
     ///
     /// `account_cache` memoizes author lookups across a single read so a
-    /// feed scan does one storage read per distinct author.
+    /// feed scan does one storage read per distinct author; `note_cache`
+    /// does the same for reply/renote bodies (hard word mutes).
     pub fn feed_filter_hides(
         &self,
         filter: &FeedFilter,
         note: &Note,
         account_cache: &mut HashMap<String, Option<Account>>,
+        note_cache: &mut HashMap<String, Option<Note>>,
     ) -> Result<bool, PortError> {
         // The renote author's id comes from the target row; a missing
         // target behaves like upstream's NULL `renoteUserId` (no hiding).
@@ -214,6 +223,81 @@ impl AppServices {
         // Suspended / host-blocked authors (anonymous viewers included).
         if self.suspended_or_host_blocked(&involved, account_cache)? {
             return Ok(true);
+        }
+        // Hard word mutes (Batch N WS8): transitive match over the note,
+        // its reply, and its renote (self-notes exempt inside the matcher).
+        // Last on purpose — reply/renote bodies cost storage reads, so
+        // already-hidden notes never pay for them.
+        if !filter.hard_mutes.is_empty()
+            && self.note_hard_muted(filter, note, note_cache)?
+        {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Fetch one note through a per-read cache (shared across a page/scan
+    /// so repeated reply/renote targets read storage once).
+    fn cached_note(
+        &self,
+        note_cache: &mut HashMap<String, Option<Note>>,
+        note_id: &str,
+    ) -> Result<Option<Note>, PortError> {
+        if let Some(hit) = note_cache.get(note_id) {
+            return Ok(hit.clone());
+        }
+        let note = self.notes.get_note(note_id)?;
+        note_cache.insert(note_id.to_string(), note.clone());
+        Ok(note)
+    }
+
+    /// Transitive hard-mute check (`checkNoteWordMute` parity): the note
+    /// itself, then its reply, then its renote — first match hides.
+    /// Pending (unresolved-parent) replies carry no body and are skipped.
+    fn note_hard_muted(
+        &self,
+        filter: &FeedFilter,
+        note: &Note,
+        note_cache: &mut HashMap<String, Option<Note>>,
+    ) -> Result<bool, PortError> {
+        let Some(viewer) = filter.viewer_id.as_deref() else {
+            return Ok(false);
+        };
+        if filter.hard_mutes.matches_note(
+            note.cw.as_deref(),
+            note.text.as_deref(),
+            &note.author_id,
+            viewer,
+        ) {
+            return Ok(true);
+        }
+        if let Some(reply_id) = note.reply_id.as_deref() {
+            if let Some(reply) = self.cached_note(note_cache, reply_id)? {
+                if !reply.is_deleted
+                    && filter.hard_mutes.matches_note(
+                        reply.cw.as_deref(),
+                        reply.text.as_deref(),
+                        &reply.author_id,
+                        viewer,
+                    )
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        if let Some(renote_id) = note.renote_id.as_deref() {
+            if let Some(target) = self.cached_note(note_cache, renote_id)? {
+                if !target.is_deleted
+                    && filter.hard_mutes.matches_note(
+                        target.cw.as_deref(),
+                        target.text.as_deref(),
+                        &target.author_id,
+                        viewer,
+                    )
+                {
+                    return Ok(true);
+                }
+            }
         }
         Ok(false)
     }
@@ -294,9 +378,10 @@ impl AppServices {
     ) -> Result<Vec<Note>, PortError> {
         let filter = self.feed_filter(viewer_id)?;
         let mut account_cache: HashMap<String, Option<Account>> = HashMap::new();
+        let mut note_cache: HashMap<String, Option<Note>> = HashMap::new();
         let mut out = Vec::with_capacity(notes.len());
         for note in notes {
-            if self.feed_filter_hides(&filter, &note, &mut account_cache)? {
+            if self.feed_filter_hides(&filter, &note, &mut account_cache, &mut note_cache)? {
                 continue;
             }
             out.push(note);
@@ -385,7 +470,8 @@ impl AppServices {
         // replies/renotes) read as missing, like invisible notes.
         let filter = self.feed_filter(viewer_id)?;
         let mut account_cache: HashMap<String, Option<Account>> = HashMap::new();
-        if self.feed_filter_hides(&filter, &note, &mut account_cache)? {
+        let mut note_cache: HashMap<String, Option<Note>> = HashMap::new();
+        if self.feed_filter_hides(&filter, &note, &mut account_cache, &mut note_cache)? {
             return Err(PortError::NotFound("NO_SUCH_NOTE".to_string()));
         }
         Ok(note)
@@ -593,7 +679,8 @@ impl AppServices {
         }
         let filter = self.feed_filter(viewer_id)?;
         let mut account_cache: HashMap<String, Option<Account>> = HashMap::new();
-        Ok(!self.feed_filter_hides(&filter, note, &mut account_cache)?)
+        let mut note_cache: HashMap<String, Option<Note>> = HashMap::new();
+        Ok(!self.feed_filter_hides(&filter, note, &mut account_cache, &mut note_cache)?)
     }
 
     /// Channel rules shared by [`AppServices::note_eligible_for_channel`]
@@ -717,7 +804,8 @@ impl AppServices {
         }
         let filter = self.feed_filter(viewer_id)?;
         let mut account_cache: HashMap<String, Option<Account>> = HashMap::new();
-        Ok(!self.feed_filter_hides(&filter, &note, &mut account_cache)?)
+        let mut note_cache: HashMap<String, Option<Note>> = HashMap::new();
+        Ok(!self.feed_filter_hides(&filter, &note, &mut account_cache, &mut note_cache)?)
     }
 
     // --- Phase 3 note relations / search -----------------------------------
@@ -820,6 +908,7 @@ impl AppServices {
         let cache = self.follows_cache(viewer_id)?;
         let feed_filter = self.feed_filter(viewer_id)?;
         let mut filter_accounts: HashMap<String, Option<Account>> = HashMap::new();
+        let mut filter_notes: HashMap<String, Option<Note>> = HashMap::new();
         let mut visible: Vec<Note> = Vec::new();
         let mut scan = TimelineCursor {
             since_id: cursor.since_id.clone(),
@@ -845,7 +934,7 @@ impl AppServices {
                 }
                 // §0A: blocked/muted/suspended authors filter like
                 // invisible notes.
-                if self.feed_filter_hides(&feed_filter, &note, &mut filter_accounts)? {
+                if self.feed_filter_hides(&feed_filter, &note, &mut filter_accounts, &mut filter_notes)? {
                     continue;
                 }
                 visible.push(note);
@@ -930,6 +1019,7 @@ impl AppServices {
         let cache = self.follows_cache(viewer_id)?;
         let feed_filter = self.feed_filter(viewer_id)?;
         let mut filter_accounts: HashMap<String, Option<Account>> = HashMap::new();
+        let mut filter_notes: HashMap<String, Option<Note>> = HashMap::new();
         let mut chain: Vec<Note> = Vec::new();
         let mut current = target.reply_id.clone();
         let mut depth = 0usize;
@@ -943,7 +1033,7 @@ impl AppServices {
             };
             let viewer = self.viewer_ctx(viewer_id, &parent.author_id, &cache);
             if is_visible(&parent, &viewer)
-                && !self.feed_filter_hides(&feed_filter, &parent, &mut filter_accounts)?
+                && !self.feed_filter_hides(&feed_filter, &parent, &mut filter_accounts, &mut filter_notes)?
             {
                 chain.push(parent.clone());
             }
@@ -1369,6 +1459,10 @@ mod timeline_tests {
             blocks: store.clone(),
             mutes: store.clone(),
             reactions: store.clone(),
+            favorites: store.clone(),
+            emojis: store.clone(),
+            antennas: store.clone(),
+            antenna_notes: store.clone(),
             polls: store.clone(),
             jobs: store.clone(),
             media: store.clone(),
@@ -1792,43 +1886,86 @@ mod timeline_tests {
     }
 
     #[test]
-    fn word_mutes_stay_client_side() {
-        // §12 decided parity: `mutedWords`/`hardMutedWords` ship via
-        // `MeDetailed` (§0B) but NEVER hide notes server-side. Upstream
-        // word-mute enforcement lives in the frontend
-        // (`check-word-mute.ts` + `use-note.ts`), not in
-        // `NoteEntityService.hideNote` (specified/followers only).
+    fn word_mutes_server_enforced_hard_drops_soft_keeps() {
+        // Batch N WS8 (owner-approved DIVERGENCE from upstream, which
+        // enforces word mutes only in the frontend): hard mutes drop the
+        // note on every read surface; soft mutes do NOT drop (they pack
+        // `isSoftMuted` when the note has no CW of its own — see the
+        // packer tests). Matching is Misskey-exact (transitive,
+        // self-exempt, case-sensitive AND-groups, `/regex/flags` bare
+        // strings, CW-first haystack).
         let (services, alice, bob) = accounts();
         services
             .update_profile(
                 &alice,
                 UpdateAccountPatch {
                     muted_words: Some(vec![ProfileMuteWord::Single("/spoiler/i".to_string())]),
-                    hard_muted_words: Some(vec![ProfileMuteWord::Single("/secret/i".to_string())]),
+                    hard_muted_words: Some(vec![
+                        ProfileMuteWord::Single("/secret/i".to_string()),
+                        ProfileMuteWord::And(vec!["foo".to_string(), "bar".to_string()]),
+                    ]),
                     ..Default::default()
                 },
             )
             .unwrap();
-        let note = services.post_note(&bob, "a spoiler and a secret", None).unwrap();
-        let cursor = TimelineCursor::with_limit(10);
+        let plain = services.post_note(&bob, "just a note", None).unwrap();
+        let soft_hit = services.post_note(&bob, "a spoiler here", None).unwrap();
+        let hard_regex = services.post_note(&bob, "a secret here", None).unwrap();
+        let hard_and = services.post_note(&bob, "foo and bar", None).unwrap();
+        let partial_and = services.post_note(&bob, "only foo", None).unwrap();
+        // A CW of its own does not save a hard-mute hit (drop), but keeps
+        // the soft badge off (packed `isSoftMuted` requires no own CW).
+        let mut cw_input = CreateNoteInput::simple_public(&bob, "a spoiler body");
+        cw_input.cw = Some("cw here".to_string());
+        let cw_soft = services.create_note(cw_input).unwrap();
+        // Reply-transitive: bob replies to alice's note with a secret.
+        let alice_root = services.post_note(&alice, "alice root", None).unwrap();
+        let transitive = services.post_note(&bob, "holds a SECRET", Some(&alice_root.id)).unwrap();
+        // Self-notes never match: alice's own secret stays visible to her.
+        let own = services.post_note(&alice, "my own secret", None).unwrap();
+
+        let cursor = TimelineCursor::with_limit(30);
         let local = ids(
             services
                 .local_timeline(Some(&alice), &cursor, false, true, true)
                 .unwrap(),
         );
-        assert!(local.contains(&note.id), "word mutes do not filter timelines");
-        services.notes_show(&note.id, Some(&alice)).unwrap();
+        assert!(local.contains(&plain.id), "plain survives");
+        assert!(local.contains(&soft_hit.id), "soft never drops");
+        assert!(local.contains(&cw_soft.id), "soft with CW never drops");
+        assert!(!local.contains(&hard_regex.id), "hard regex drops");
+        assert!(!local.contains(&hard_and.id), "hard AND-group drops");
+        assert!(local.contains(&partial_and.id), "partial AND-group survives");
+        assert!(!local.contains(&transitive.id), "reply-transitive hard drops");
+        assert!(local.contains(&own.id), "self-notes exempt");
+
+        // notes/show fails closed on hard hits (like invisible notes).
+        services.notes_show(&hard_regex.id, Some(&alice)).unwrap_err();
+        services.notes_show(&soft_hit.id, Some(&alice)).unwrap();
+        // Streaming gates agree.
+        assert!(
+            !services
+                .note_eligible_for_channel(
+                    TimelineChannel::Local,
+                    Some(&alice),
+                    &hard_regex,
+                    &channel_params(true)
+                )
+                .unwrap(),
+            "hard drops gate streaming"
+        );
         assert!(
             services
                 .note_eligible_for_channel(
                     TimelineChannel::Local,
                     Some(&alice),
-                    &note,
+                    &soft_hit,
                     &channel_params(true)
                 )
                 .unwrap(),
-            "word mutes do not gate streaming"
+            "soft never gates streaming"
         );
+        assert!(!services.capture_gate(Some(&alice), &hard_and.id).unwrap());
     }
 }
 

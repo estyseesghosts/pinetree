@@ -121,13 +121,15 @@ return `400 UNSUPPORTED_FIELD`. The exact contract is
 - Profile import/export: 8 exports (`following`, `blocking`, `mute`, `notes`,
   `antennas`, `clips`, `favorites`, `user-lists`) + 5 imports with upstream
   error codes and an `exportCompleted` notification. (Entities pinetree has no
-  model for — lists, antennas, clips, favorites — export empty valid files and
-  import zero rows; that is documented, not silent.)
+  model for — user lists, clips — export empty valid files and import zero
+  rows; antennas and favorites export/import real rows. That is documented,
+  not silent.)
 
 **Streaming:**
 
 - Authenticated WebSocket `/streaming` (`?i=` or Bearer): `main`,
-  `homeTimeline`, `localTimeline`, `hybridTimeline`, `globalTimeline`.
+  `homeTimeline`, `localTimeline`, `hybridTimeline`, `globalTimeline`,
+  `antenna` (owner-scoped `params.antennaId`, `note` frames for matches).
 - Note capture (`subNote`/`unsubNote` + aliases, `reacted`/`unreacted`/`deleted`
   with the visibility gate), `readNotification`, `pollVoted`, `edited` note
   updates, unknown channels answered with `UNSUPPORTED_CHANNEL`.
@@ -187,27 +189,30 @@ rather than a broken half-implementation:
   Mastodon-family servers stays in scope; the Mastodon API itself is a
   non-goal (Sharkey ships one; pinetree never will unless the proposal
   changes).
-- **No custom-emoji subsystem.** No emoji listing/management endpoints, no
-  registry. Foreign `:shortcode:` reactions store verbatim but never render.
-  Outbound reactions to Akkoma/Pleroma-family hosts degrade to a plain `Like`
-  (❤ favorite) until an `EmojiReact` emit shape passes a live round-trip test.
-- **No antennas, clips, channels, pages, drive folders, user lists, chat,
+- **Custom emoji are instance-curated.** Public `emojis`/`emoji` listing,
+  `admin/emoji/add|update|delete|list` (moderator), shortcode registry with
+  case-insensitive uniqueness, remote-emoji opt-in per user
+  (`showRemoteEmojis`, metadata ingest + lazy fetch). Foreign `:shortcode:`
+  reactions store verbatim. Outbound reactions to Akkoma/Pleroma-family hosts
+  degrade to a plain `Like` (❤ favorite) until an `EmojiReact` emit shape
+  passes a live round-trip test.
+- **No clips, channels, pages, drive folders, user lists, chat,
   Reversi, or search-by-hashtag.** No featured/mentions/user-list timelines,
   no `drive` streaming channel, no `notes/user-list-timeline`,
   no `notifications/flush`, no `signin-flow`, no 2FA/passkeys/webhooks.
+  Antennas, favorites, and custom emoji shipped (Batch N); user lists are
+  still out (antenna `src=list` is refused until they land).
 - **No OAuth.** MiAuth + API tokens only (OAuth lands only if a target client
   requires it).
 - **No thread muting, no Move activity handling, no RFC 9421 or Linked-Data
   signatures,** no `_misskey_content` (never emitted, by decision), no polls
   over deleted/expired edge beyond documented errors.
-- **No favorites, url-preview, follower-removal, or `followRequestAccepted`
-  notification yet** (Batch M work packages WP7–WP14 are specified in
+- **No url-preview, self-service (password/token/apps), follower-removal,
+  or remote lookup yet** (Batch M work packages WP9–WP10 are specified in
   `docs/implementer-guide-batch-m.md` §§5 but not implemented).
-- **User-facing abuse reporting is not wired up.** The storage, application
-  ops, and outbound `Flag` rendering exist below the HTTP layer, but
-  `users/report-abuse` and the `admin/abuse-user-reports` family are *not*
-  routed, and inbound `Flag` activities are not handled. Admins currently
-  moderate via suspend/delete/notes/blocks instead.
+- **Abuse reporting is wired up** (`users/report-abuse` + the
+  `admin/abuse-user-reports` family with `Flag` forwarding); admins poll the
+  list (no mail/webhook notifications).
 
 ---
 
@@ -230,9 +235,11 @@ Things that work but with documented limits you may trip over:
   upstream.
 - **Actor RSA keys generate lazily on first use** — slow in debug builds, so
   the first remote fetch of a new account can time out for peers.
-- **Word mutes are client-side by design** (Misskey parity): the server stores
-  `mutedWords`/`hardMutedWords` and ships them on `MeDetailed` but never
-  hides notes itself.
+- **Word mutes are server-enforced** (owner-approved divergence from
+  upstream, which enforces them client-side only): `hardMutedWords` drop
+  notes on every read; `mutedWords` pack a viewer-specific `isSoftMuted`
+  flag (true only when matched and the note has no CW of its own). See
+  `docs/word-mutes.md`.
 - **Private follow lists have no per-user visibility knobs yet** — the profile
   stores the fields, lists gate on the documented rule (self/follower/public).
 - **No per-destination delivery tuning, no timeline indexes beyond the
@@ -254,6 +261,7 @@ Things that work but with documented limits you may trip over:
 | — | Quote posts (FEP-044f) and branched replies on top | Done |
 | — | Misskey parity batch: polls, editing, drafts/scheduling, blocks/mutes, private lists, pins, notification grouping/filtering, import/export | Done |
 | — | Moderation batch (Batch M, pre-Phase 4): roles, registration/invites, suspension, instance blocks, admin views; abuse-report plumbing below the API layer | Mostly done — WP1–WP6 landed, WP7+ pending |
+| — | Daily-use batch (Batch N): favorites + note state, custom emoji (+ remote opt-in), `followRequestAccepted`, antennas, abuse-report routes, admin remainder, word mutes (server-side), MiAuth hardening, Sharkey schedule shim | Done (this session) — `url-preview`, self-service, follower removal, user lists still pending |
 | 4 | Multi-node on FoundationDB | Planned — not started |
 | 5 | Scale & hardening | Planned |
 

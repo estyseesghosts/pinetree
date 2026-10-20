@@ -190,6 +190,16 @@ impl JobWorker {
                     Err(_) => Ok(Disposition::Retry { retry_after_ms: None }),
                 }
             }
+            // Antenna fan-in (Batch N WS4): match one committed note into
+            // every active antenna. Bad payloads quarantine; a gone note
+            // converges quietly; only storage faults retry.
+            JobKind::AntennaMatch => match self.handle_antenna_match(&job.payload) {
+                Ok(()) => Ok(Disposition::Done),
+                Err(PortError::Validation(reason)) => {
+                    Ok(Disposition::Quarantine(format!("bad-payload: {reason}")))
+                }
+                Err(_) => Ok(Disposition::Retry { retry_after_ms: None }),
+            },
             // Poll expiry (§4): publish the `pollEnded` streaming event
             // once the poll has expired. Bad payloads quarantine; a gone
             // note/poll or a not-yet-expired poll completes quietly (a
@@ -214,14 +224,25 @@ impl JobWorker {
                 }
                 Err(_) => Ok(Disposition::Retry { retry_after_ms: None }),
             },
+            // Remote custom-emoji lazy fetch (Batch N WP8b): download one
+            // known remote icon off-request. Bad payloads quarantine; a
+            // gone/already-cached row or an unusable fetch converges quietly
+            // (Done — the packed URL keeps pointing at the remote host).
+            // Only storage faults retry.
+            JobKind::RemoteEmojiFetch => match self.handle_remote_emoji_fetch(&job.payload) {
+                Ok(()) => Ok(Disposition::Done),
+                Err(PortError::Validation(reason)) => {
+                    Ok(Disposition::Quarantine(format!("bad-payload: {reason}")))
+                }
+                Err(_) => Ok(Disposition::Retry { retry_after_ms: None }),
+            },
             // Profile export (§13): build the file, store it in the caller's
             // drive, and fan out the `exportCompleted` Notify follow-up —
             // committed atomically with the export job's completion, so the
             // notification can never be lost or duplicated. Bad payloads
             // quarantine; a gone user converges quietly (no follow-up);
             // only storage faults retry.
-            JobKind::Export => match self.handle_export(&job.payload) {
-                Ok(None) => Ok(Disposition::Done),
+            JobKind::Export => match self.handle_export(&job.payload) {                Ok(None) => Ok(Disposition::Done),
                 Ok(Some(notify)) => Ok(Disposition::Fanout(vec![notify])),
                 Err(PortError::Validation(reason)) => {
                     Ok(Disposition::Quarantine(format!("bad-payload: {reason}")))
@@ -418,8 +439,10 @@ impl JobWorker {
             // `notification` hint above (no note/user side-channel: the
             // posted note / failed draft rides in the packed body).
             // `exportCompleted` (§13) likewise: the drive file rides in the
-            // packed body (`fileId`).
-            NotificationKind::ScheduledNotePosted
+            // packed body (`fileId`). `followRequestAccepted` likewise:
+            // the packed body carries the acceptor.
+            NotificationKind::FollowRequestAccepted
+            | NotificationKind::ScheduledNotePosted
             | NotificationKind::ScheduledNotePostFailed
             | NotificationKind::ExportCompleted => {}
         }
@@ -474,6 +497,27 @@ impl JobWorker {
             Err(PortError::NotFound(_)) => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    /// Run one `RemoteEmojiFetch` job (Batch N WP8b): fetch-and-cache one
+    /// known remote emoji. Gone/already-cached rows and unusable fetches
+    /// converge quietly inside; only storage faults retry.
+    fn handle_remote_emoji_fetch(&self, payload: &[u8]) -> Result<(), PortError> {
+        use crate::application::ports::RemoteEmojiFetchPayload;
+        let parsed: RemoteEmojiFetchPayload = serde_json::from_slice(payload)
+            .map_err(|e| PortError::Validation(format!("remote-emoji payload invalid: {e}")))?;
+        self.services
+            .fetch_remote_emoji(&parsed.host, &parsed.shortcode)
+    }
+
+    /// Run one `AntennaMatch` job (Batch N WS4): fan one committed note
+    /// into matching antenna feeds (+ post-commit stream events). Gone
+    /// notes converge quietly; only storage faults retry.
+    fn handle_antenna_match(&self, payload: &[u8]) -> Result<(), PortError> {
+        use crate::application::ports::AntennaMatchPayload;
+        let parsed: AntennaMatchPayload = serde_json::from_slice(payload)
+            .map_err(|e| PortError::Validation(format!("antenna-match payload invalid: {e}")))?;
+        self.services.match_antenna_note(&parsed.note_id)
     }
 
     /// Run one `PollExpiry` job (§4): publish the `pollEnded` streaming

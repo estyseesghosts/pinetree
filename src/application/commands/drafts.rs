@@ -277,6 +277,7 @@ impl AppServices {
             prohibited_words: Vec::new(),
             sensitive_words: Vec::new(),
             uri: None,
+            uri_base: String::new(),
             url: None,
             extra_mentions: Vec::new(),
             extra_tags: Vec::new(),
@@ -434,6 +435,108 @@ fn draft_poll_input(draft: &NoteDraft, now_ms: i64) -> Option<PollInput> {
     })
 }
 
+impl AppServices {
+    /// Sharkey `notes/schedule/create` shim over [`Self::create_draft`]:
+    /// the caller passes an already-shape-checked [`CreateDraftInput`]
+    /// (with `is_actually_scheduled = true` and poll `expiredAfter`
+    /// normalized to `expiresAt`) plus the absolute `scheduled_at_ms`.
+    /// Up-front checks the draft path defers to post time (verbatim
+    /// Sharkey codes): pure-renote reply/renote targets, renote
+    /// visibility narrowing, poll expiry against the *scheduled* time,
+    /// and the schedule cap (`SCHEDULE_NOTE_MAX`, not the draft op's
+    /// `TOO_MANY_SCHEDULED_NOTES`). Everything else (existence, blocks,
+    /// files, shape) flows through `create_draft` unchanged.
+    pub fn create_scheduled_note(
+        &self,
+        author_id: &str,
+        mut input: CreateDraftInput,
+        scheduled_at_ms: i64,
+    ) -> Result<NoteDraft, PortError> {
+        self.accounts.get_owner(author_id)?;
+        if self.notes.count_scheduled_drafts(author_id)? >= self.scheduled_note_limit {
+            return Err(PortError::Validation("SCHEDULE_NOTE_MAX".to_string()));
+        }
+        // Upstream validates the schedule time before anything else.
+        if scheduled_at_ms <= self.now_ms() {
+            return Err(PortError::Validation(
+                "CANNOT_CREATE_ALREADY_EXPIRED_SCHEDULE".to_string(),
+            ));
+        }
+        // Poll expiry is judged against the scheduled time, not now.
+        if input.has_poll {
+            if let Some(expires_at) = input.poll_expires_at_ms {
+                if expires_at < scheduled_at_ms {
+                    return Err(PortError::Validation(
+                        "CANNOT_CREATE_ALREADY_EXPIRED_POLL".to_string(),
+                    ));
+                }
+            }
+        }
+        // Pure-renote and visibility gates (verbatim Sharkey codes; the
+        // draft path defers these to post time).
+        if let Some(renote_id) = input.renote_of.as_deref() {
+            let target = match self.notes.get_note(renote_id)? {
+                Some(note) if !note.is_deleted => note,
+                _ => return Err(PortError::NotFound("NO_SUCH_RENOTE_TARGET".to_string())),
+            };
+            if Self::is_pure_renote_shape(&target, &self.polls.get_poll(&target.id)?) {
+                return Err(PortError::Validation(
+                    "SHARKEY_CANNOT_RERENOTE".to_string(),
+                ));
+            }
+            if target.author_id != author_id
+                && matches!(
+                    target.visibility,
+                    crate::domain::note::Visibility::Followers
+                        | crate::domain::note::Visibility::Specified
+                )
+            {
+                return Err(PortError::Validation(
+                    "CANNOT_RENOTE_DUE_TO_VISIBILITY".to_string(),
+                ));
+            }
+            if target.author_id != author_id
+                && self.blocks.is_blocking(&target.author_id, author_id)?
+            {
+                return Err(PortError::Validation("YOU_HAVE_BEEN_BLOCKED".to_string()));
+            }
+        }
+        if let Some(reply_id) = input.reply_to.as_deref() {
+            let target = match self.notes.get_note(reply_id)? {
+                Some(note) if !note.is_deleted => note,
+                _ => return Err(PortError::NotFound("NO_SUCH_REPLY_TARGET".to_string())),
+            };
+            if Self::is_pure_renote_shape(&target, &self.polls.get_poll(&target.id)?) {
+                return Err(PortError::Validation(
+                    "CANNOT_REPLY_TO_A_PURE_RENOTE".to_string(),
+                ));
+            }
+            if target.author_id != author_id
+                && self.blocks.is_blocking(&target.author_id, author_id)?
+            {
+                return Err(PortError::Validation("YOU_HAVE_BEEN_BLOCKED".to_string()));
+            }
+        }
+        input.is_actually_scheduled = true;
+        input.scheduled_at_ms = Some(scheduled_at_ms);
+        self.create_draft(author_id, input)
+    }
+
+    /// Pure-renote shape for the schedule shim's up-front gates: a renote
+    /// carrying no commentary (text, CW, reply, files, or poll).
+    fn is_pure_renote_shape(
+        note: &crate::domain::note::Note,
+        poll: &Option<crate::domain::poll::Poll>,
+    ) -> bool {
+        note.renote_id.is_some()
+            && note.text.is_none()
+            && note.cw.is_none()
+            && note.reply_id.is_none()
+            && note.file_ids.is_empty()
+            && poll.is_none()
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -471,6 +574,10 @@ mod tests {
             blocks: store.clone(),
             mutes: store.clone(),
             reactions: store.clone(),
+            favorites: store.clone(),
+            emojis: store.clone(),
+            antennas: store.clone(),
+            antenna_notes: store.clone(),
             polls: store.clone(),
             jobs: store.clone(),
             media: store.clone(),

@@ -32,6 +32,10 @@ pub(crate) fn test_services(prefix: &str) -> AppServices {
         blocks: store.clone(),
         mutes: store.clone(),
         reactions: store.clone(),
+        favorites: store.clone(),
+        emojis: store.clone(),
+        antennas: store.clone(),
+        antenna_notes: store.clone(),
         polls: store.clone(),
         jobs: store.clone(),
         media: store.clone(),
@@ -58,6 +62,38 @@ pub(crate) fn test_services(prefix: &str) -> AppServices {
         scheduled_note_limit: crate::domain::draft::DEFAULT_SCHEDULED_NOTE_LIMIT,
         pin_limit: crate::domain::pinning::DEFAULT_PIN_LIMIT,
     }
+}
+
+/// Every remote server fetching a new actor at once must be served the same key: concurrent first
+/// calls to `ensure_actor_keypair` may each generate a keypair, but only one may be stored and returned.
+#[test]
+fn concurrent_ensure_actor_keypair_yields_one_key() {
+    let services = test_services("keys-concurrent");
+    let alice = services.create_account("alice", None).unwrap();
+    let keys: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..8)
+            .map(|_| scope.spawn(|| services.ensure_actor_keypair(&alice.id).unwrap()))
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert!(keys.windows(2).all(|w| w[0] == w[1]), "callers saw different keys");
+    let stored = services.auth.get_actor_keypair(&alice.id).unwrap().unwrap();
+    assert_eq!(stored, keys[0], "the stored key is the one every caller got");
+}
+
+/// Concurrent first fetches of any actor each provision the instance `system_actor`; none may fail.
+#[test]
+fn concurrent_ensure_system_actor_all_succeed() {
+    let services = test_services("system-actor-concurrent");
+    let results: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..8).map(|_| scope.spawn(|| services.ensure_system_actor())).collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for r in &results {
+        assert!(r.is_ok(), "{r:?}");
+    }
+    let first = results[0].as_ref().unwrap();
+    assert!(results.iter().all(|r| r.as_ref().unwrap().0.id == first.0.id && r.as_ref().unwrap().1 == first.1));
 }
 
 #[test]

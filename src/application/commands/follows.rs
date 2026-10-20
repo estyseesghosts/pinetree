@@ -112,6 +112,17 @@ impl AppServices {
             },
             format!("accept-request:{follower_id}:{followee_id}:{}", self.ids.generate()),
         )?);
+        // Batch N WS3: the requester learns its request was accepted
+        // (Misskey `UserFollowingService.acceptFollowRequest` parity:
+        // `createNotification(followerId, followeeId, 'followRequestAccepted')`).
+        jobs.push(self.notify_job(
+            follower_id,
+            followee_id,
+            NotificationKind::FollowRequestAccepted,
+            None,
+            None,
+            "follow-request-accepted",
+        )?);
         if let (Some(follower), Some(followee)) = (
             self.accounts.find_by_id(follower_id)?,
             self.accounts.find_by_id(followee_id)?,

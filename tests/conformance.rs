@@ -28,9 +28,9 @@ use std::time::{Duration, Instant};
 
 use pinetree::application::commands::AppServices;
 use pinetree::application::ports::{
-    AccountStore, ActivityDedup, BlockStore, BlobStore, ConsumeInviteInput, CreateAccountInput,
+    AccountStore, ActivityDedup, AntennaNoteStore, AntennaStore, BlockStore, BlobStore, ConsumeInviteInput, CreateAccountInput,
     CreateInviteInput, CreateNoteInput,
-    EditNoteInput, FollowStore, InsertMediaInput, InstanceSettingsPatch, InstanceSettingsStore,
+    EditNoteInput, EmojiStore, FavoriteStore, FollowStore, InsertMediaInput, InstanceSettingsPatch, InstanceSettingsStore,
     InviteStore, JobKind, JobQueue,
     MediaStore, ModerationLogFilter, ModerationLogStore, MuteStore, NewJob,
     NoopStreamingSink, NoteStore, NotificationStore, PollExpiryPayload, PollStore, PortError,
@@ -43,6 +43,7 @@ use pinetree::domain::moderation::{ModerationAction, ModerationLogEntry};
 use pinetree::domain::poll::{PollInput, PollVote};
 use pinetree::domain::draft::NoteDraft;
 use pinetree::domain::note::{Note, Visibility};
+use pinetree::domain::favorite::NoteFavorite;
 use pinetree::domain::pinning::UserNotePining;
 use pinetree::domain::policy::{
     ViewerContext, is_eligible_for_federated_timeline, is_eligible_for_federation_delivery,
@@ -70,6 +71,10 @@ pub trait ConformanceStore:
         + BlockStore
         + MuteStore
         + ReactionStore
+        + FavoriteStore
+        + EmojiStore
+        + AntennaStore
+        + AntennaNoteStore
         + PollStore
         + ModerationLogStore
         + InstanceSettingsStore
@@ -87,6 +92,10 @@ impl<T> ConformanceStore for T where
         + BlockStore
         + MuteStore
         + ReactionStore
+        + FavoriteStore
+        + EmojiStore
+        + AntennaStore
+        + AntennaNoteStore
         + PollStore
         + ModerationLogStore
         + InstanceSettingsStore
@@ -1005,6 +1014,10 @@ fn open_worker_stack(
         blocks: store.clone(),
         mutes: store.clone(),
         reactions: store.clone(),
+        favorites: store.clone(),
+        emojis: store.clone(),
+        antennas: store.clone(),
+        antenna_notes: store.clone(),
         polls: store.clone(),
         jobs: store.clone(),
         media: store.clone(),
@@ -5986,6 +5999,271 @@ fn h1_suspend_atomicity() {
     let clock = test_clock();
     let store = factory.open(clock.clone());
     case_h1_suspend_atomicity(&*store, &clock);
+}
+
+/// J1 (Batch N WS2): the favorite is unique per (account, note). A second
+/// insert for the same pair fails `Conflict(ALREADY_FAVORITED)`; a
+/// different account or a different note succeeds.
+fn case_j1_favorite_uniqueness<S: ConformanceStore>(store: &S, clock: &ManualClock) {
+    let alice = create_user(store, "j1_alice");
+    let bob = create_user(store, "j1_bob");
+    let note = note_with_job(store, clock, &alice.id, "fav me", "j1:n1");
+    let other = note_with_job(store, clock, &alice.id, "fav me too", "j1:n2");
+    let fav = NoteFavorite {
+        id: "j1fav000000000001".to_string(),
+        user_id: bob.id.clone(),
+        note_id: note.id.clone(),
+    };
+    store
+        .favorite_note(fav.clone(), Vec::new())
+        .expect("first favorite lands");
+    let err = store
+        .favorite_note(
+            NoteFavorite {
+                id: "j1fav000000000002".to_string(),
+                user_id: bob.id.clone(),
+                note_id: note.id.clone(),
+            },
+            Vec::new(),
+        )
+        .expect_err("duplicate favorite conflicts");
+    assert!(is_conflict(&err), "got {err:?}");
+    // Same note, different account: fine.
+    store
+        .favorite_note(
+            NoteFavorite {
+                id: "j1fav000000000003".to_string(),
+                user_id: alice.id.clone(),
+                note_id: note.id.clone(),
+            },
+            Vec::new(),
+        )
+        .expect("other account may favorite");
+    // Same account, different note: fine.
+    store
+        .favorite_note(
+            NoteFavorite {
+                id: "j1fav000000000004".to_string(),
+                user_id: bob.id.clone(),
+                note_id: other.id.clone(),
+            },
+            Vec::new(),
+        )
+        .expect("other note may be favorited");
+    assert!(store.is_favorited(&bob.id, &note.id).expect("lookup"));
+    assert!(!store.is_favorited(&bob.id, "missing").expect("lookup"));
+}
+
+/// J3 (Batch N WS2): deleting a favorite removes the row but leaves the
+/// note; deleting again reports `false` (the endpoint maps it to
+/// `NOT_FAVORITED`).
+fn case_j3_favorite_delete_leaves_note<S: ConformanceStore>(store: &S, clock: &ManualClock) {
+    let alice = create_user(store, "j3_alice");
+    let note = note_with_job(store, clock, &alice.id, "still here", "j3:n1");
+    store
+        .favorite_note(
+            NoteFavorite {
+                id: "j3fav000000000001".to_string(),
+                user_id: alice.id.clone(),
+                note_id: note.id.clone(),
+            },
+            Vec::new(),
+        )
+        .expect("favorite lands");
+    assert!(store.unfavorite_note(&alice.id, &note.id).expect("unfavorite"));
+    assert!(!store.unfavorite_note(&alice.id, &note.id).expect("second delete"));
+    assert!(
+        store.get_note(&note.id).expect("lookup").is_some(),
+        "the note survives the unfavorite"
+    );
+}
+
+#[test]
+fn j1_favorite_uniqueness() {
+    let factory = RedbFactory::fresh("j1");
+    let clock = test_clock();
+    let store = factory.open(clock.clone());
+    case_j1_favorite_uniqueness(&*store, &clock);
+}
+
+/// J2 (Batch N WS1): the local shortcode is unique case-insensitively
+/// (account-handle rule, C2). A second create with different case fails
+/// `Conflict(DUPLICATE_NAME)`; a rename onto a taken name fails
+/// `Conflict(SAME_NAME_EMOJI_EXISTS)`; delete frees the name. Remote rows
+/// are unique per (host, lower shortcode) and upserts never clear the
+/// cached `media_id`.
+fn case_j2_emoji_uniqueness<S: ConformanceStore>(store: &S) {
+    use pinetree::domain::emoji::{CustomEmoji, RemoteEmoji};
+    use pinetree::domain::moderation::{ModerationAction, ModerationLogEntry};
+    let log = |id: &str| {
+        ModerationLogEntry::new(
+            id.to_string(),
+            Some("mod".to_string()),
+            ModerationAction::AddCustomEmoji,
+            None,
+            serde_json::json!({}),
+            1_700_000_000_000,
+        )
+        .unwrap()
+    };
+    let emoji = |id: &str, shortcode: &str| CustomEmoji {
+        id: id.to_string(),
+        shortcode: shortcode.to_string(),
+        category: None,
+        media_id: None,
+        aliases: Vec::new(),
+        license: None,
+        is_sensitive: false,
+        local_only: false,
+        role_ids: Vec::new(),
+        created_at_ms: 1_700_000_000_000,
+    };
+    store
+        .create_emoji(emoji("e1", "BlobCat"), log("l1"), Vec::new())
+        .expect("first emoji lands");
+    let err = store
+        .create_emoji(emoji("e2", "blobcat"), log("l2"), Vec::new())
+        .expect_err("case-insensitive duplicate conflicts");
+    assert!(matches!(err, PortError::Conflict(ref code) if code == "DUPLICATE_NAME"), "got {err:?}");
+    // Same name + same case also conflicts.
+    let err = store
+        .create_emoji(emoji("e3", "BlobCat"), log("l3"), Vec::new())
+        .expect_err("exact duplicate conflicts");
+    assert!(matches!(err, PortError::Conflict(ref code) if code == "DUPLICATE_NAME"), "got {err:?}");
+    // Lookup is case-insensitive too.
+    assert!(store.get_emoji_by_name("BLOBCAT").expect("lookup").is_some());
+    // A second emoji renames onto the taken name → SAME_NAME_EMOJI_EXISTS.
+    store
+        .create_emoji(emoji("e4", "free"), log("l4"), Vec::new())
+        .expect("second emoji lands");
+    let mut renamed = emoji("e4", "BLOBCAT");
+    renamed.category = Some("c".to_string());
+    let err = store
+        .update_emoji(renamed, log("l5"), Vec::new())
+        .expect_err("rename onto taken name conflicts");
+    assert!(
+        matches!(err, PortError::Conflict(ref code) if code == "SAME_NAME_EMOJI_EXISTS"),
+        "got {err:?}"
+    );
+    // Delete frees the name for reuse.
+    assert!(store.delete_emoji("e1", log("l6"), Vec::new()).expect("delete"));
+    store
+        .create_emoji(emoji("e5", "blobcat"), log("l7"), Vec::new())
+        .expect("name reusable after delete");
+
+    // Remote rows: unique per (host, lower shortcode), case-insensitive.
+    let remote = RemoteEmoji::new("R.Example", "Party", "https://r.example/p.png", 1).unwrap();
+    store.upsert_remote_emoji(remote).expect("remote lands");
+    let again = RemoteEmoji::new("r.example", "party", "https://r.example/p2.png", 2).unwrap();
+    let merged = store.upsert_remote_emoji(again).expect("re-upsert");
+    assert_eq!(merged.remote_url, "https://r.example/p2.png");
+    assert_eq!(merged.first_seen_ms, 1, "first-seen is stable across upserts");
+    // A different host is a different row.
+    let other = RemoteEmoji::new("other.example", "party", "https://o.example/p.png", 3).unwrap();
+    store.upsert_remote_emoji(other).expect("other host lands");
+    // Caching a local copy survives later upserts.
+    store
+        .set_remote_emoji_media("r.example", "party", "mid1")
+        .expect("cache media");
+    let recached = RemoteEmoji::new("r.example", "PARTY", "https://r.example/p3.png", 4).unwrap();
+    let merged = store.upsert_remote_emoji(recached).expect("upsert keeps cache");
+    assert_eq!(merged.media_id.as_deref(), Some("mid1"));
+    assert_eq!(merged.remote_url, "https://r.example/p3.png");
+}
+
+#[test]
+fn j2_emoji_uniqueness() {
+    let factory = RedbFactory::fresh("j2");
+    let store = factory.open(test_clock());
+    case_j2_emoji_uniqueness(&*store);
+}
+
+/// O1 (Batch N WS4; Group O — antennas): per-antenna feeds append
+/// newest-first, trim to the newest 200 in the same transaction, drop
+/// single rows idempotently, and cascade on antenna delete.
+fn case_o1_antenna_feed_trim<S: ConformanceStore>(store: &S) {
+    use pinetree::domain::antenna::{Antenna, AntennaSrc};
+    let owner = create_user(store, "k1_owner");
+    let antenna = Antenna {
+        id: "ant00000000000001".to_string(),
+        owner_id: owner.id.clone(),
+        name: "k".to_string(),
+        src: AntennaSrc::All,
+        user_list_id: None,
+        // Non-empty: the store enforces the upstream EMPTY_KEYWORD rule.
+        keywords: vec![vec!["x".to_string()]],
+        exclude_keywords: Vec::new(),
+        users: Vec::new(),
+        case_sensitive: false,
+        with_replies: true,
+        with_file: false,
+        local_only: false,
+        exclude_bots: false,
+        exclude_notes_in_sensitive_channel: false,
+        is_active: true,
+        last_used_at_ms: 0,
+        created_at_ms: 0,
+    };
+    store.create_antenna(antenna, Vec::new()).expect("create");
+    // Owner cap accounting sees the row.
+    assert_eq!(store.antennas_by_owner(&owner.id).expect("list").len(), 1);
+    // 205 sequential note ids (aidx-ordered): the feed keeps the newest 200.
+    for i in 0..205 {
+        store
+            .append_antenna_note("ant00000000000001", &format!("nid{i:020}"))
+            .expect("append");
+    }
+    // Reads page at most 100 (upstream `notes.ts` parity): two pages cover
+    // the trimmed 200, newest-first, oldest kept is #5.
+    let page = |limit: usize, until_id: Option<String>| {
+        store
+            .antenna_notes(
+                "ant00000000000001",
+                &pinetree::application::ports::TimelineCursor { limit, until_id, ..Default::default() },
+            )
+            .expect("read")
+    };
+    let page1 = page(100, None);
+    assert_eq!(page1.len(), 100);
+    assert_eq!(page1[0], "nid00000000000000000204", "newest first");
+    let page2 = page(100, page1.last().cloned());
+    assert_eq!(page2.len(), 100);
+    assert_eq!(page2[99], "nid00000000000000000005", "oldest kept is #5");
+    assert!(
+        !page1.contains(&"nid00000000000000000004".to_string())
+            && !page2.contains(&"nid00000000000000000004".to_string()),
+        "overflow head trimmed"
+    );
+    // Single-row removal is idempotent.
+    store
+        .remove_antenna_note("ant00000000000001", "nid00000000000000000204")
+        .expect("remove");
+    store
+        .remove_antenna_note("ant00000000000001", "nid00000000000000000204")
+        .expect("second remove converges");
+    let ids = page(100, None);
+    assert_eq!(ids.len(), 100, "a full page still reads after one removal");
+    assert_eq!(ids[0], "nid00000000000000000203");
+    // Delete cascades the feed rows.
+    assert!(store.delete_antenna(&owner.id, "ant00000000000001").expect("delete"));
+    assert!(!store.delete_antenna(&owner.id, "ant00000000000001").expect("second delete"));
+    let ids = page(100, None);
+    assert!(ids.is_empty(), "cascade cleared the feed");
+}
+
+#[test]
+fn o1_antenna_feed_trim_and_cascade() {
+    let factory = RedbFactory::fresh("o1");
+    let store = factory.open(test_clock());
+    case_o1_antenna_feed_trim(&*store);
+}
+
+#[test]
+fn j3_favorite_delete_leaves_note() {
+    let factory = RedbFactory::fresh("j3");
+    let clock = test_clock();
+    let store = factory.open(clock.clone());
+    case_j3_favorite_delete_leaves_note(&*store, &clock);
 }
 
 #[test]

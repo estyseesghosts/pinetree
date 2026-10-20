@@ -7,7 +7,7 @@ use super::AppServices;
 use crate::application::events::StreamingEvent;
 use crate::application::ports::{
     InstanceSettingsPatch, JobKind, ModerationLogFilter, NewJob, PortError, TimelineCursor,
-    UnfollowAllPayload,
+    UnfollowAllPayload, UpdateAccountPatch,
 };
 use crate::domain::account::Account;
 use crate::domain::instance::{InstanceSettings, RegistrationPolicy};
@@ -318,5 +318,109 @@ impl AppServices {
             now_ms,
         )?;
         self.instance_settings.update(patch, log)
+    }
+}
+
+impl AppServices {
+    /// Batch N WS6 `admin/unset-user-avatar` / `admin/unset-user-banner`
+    /// (upstream files of the same names): clear the target's avatar or
+    /// banner. Moderator refused on admin/moderator targets (guide §3.1
+    /// blanket rule; DIVERGENCE — upstream checks the role only). Missing
+    /// targets are `NO_SUCH_USER` (upstream throws untyped `user not
+    /// found` → 500). A target with nothing set is a no-op success with
+    /// no log row (upstream parity).
+    pub fn unset_user_media(
+        &self,
+        moderator_id: &str,
+        account_id: &str,
+        avatar: bool,
+    ) -> Result<Account, PortError> {
+        let target = self
+            .accounts
+            .find_by_id(account_id)?
+            .ok_or_else(|| PortError::NotFound("NO_SUCH_USER".to_string()))?;
+        if target.has_moderator_powers() {
+            return Err(PortError::Validation(
+                "cannot moderate moderator account".to_string(),
+            ));
+        }
+        let (action, file_id) = if avatar {
+            (ModerationAction::UnsetUserAvatar, target.avatar_id.clone())
+        } else {
+            (ModerationAction::UnsetUserBanner, target.banner_id.clone())
+        };
+        let Some(file_id) = file_id else {
+            // Nothing set: no-op success, exactly like upstream's early
+            // return (no state change, no log row).
+            return Ok(target);
+        };
+        let log = ModerationLogEntry::new(
+            self.ids.generate(),
+            Some(moderator_id.to_string()),
+            action,
+            Some(account_id.to_string()),
+            serde_json::json!({
+                "userId": account_id,
+                "userUsername": target.username,
+                "userHost": target.host,
+                "fileId": file_id,
+            }),
+            self.clock.now_ms(),
+        )?;
+        let patch = if avatar {
+            UpdateAccountPatch {
+                avatar_id: Some(None),
+                ..Default::default()
+            }
+        } else {
+            UpdateAccountPatch {
+                banner_id: Some(None),
+                ..Default::default()
+            }
+        };
+        self.moderation
+            .update_account_logged(account_id, patch, log, Vec::new())
+    }
+
+    /// Batch N WS6 `admin/delete-all-files-of-a-user` (upstream file of the
+    /// same name): delete every drive file row (metadata + bytes) of one
+    /// account, upstream `requireAdmin` parity. One loop over the owner's
+    /// rows; each row deletes in its own storage transaction (bounded
+    /// per-row work, same as the interactive `drive/files/delete` path).
+    /// Upstream writes no moderation-log row; pinetree logs a pinetree-named
+    /// `deleteAllFilesOfAUser` row with the count (documented).
+    pub fn delete_all_files_of_a_user(
+        &self,
+        admin_id: &str,
+        account_id: &str,
+    ) -> Result<usize, PortError> {
+        let target = self
+            .accounts
+            .find_by_id(account_id)?
+            .ok_or_else(|| PortError::NotFound("NO_SUCH_USER".to_string()))?;
+        let mut deleted = 0usize;
+        for meta in self.media.list_by_owner(account_id)? {
+            self.media.delete_metadata(&meta.id)?;
+            // Blob bytes are content-addressed and may be shared; the
+            // interactive delete path removes them per file — keep the same
+            // behavior here (same machinery, no second path).
+            let _ = self.blobs.delete(&meta.blob_key);
+            deleted += 1;
+        }
+        let log = ModerationLogEntry::new(
+            self.ids.generate(),
+            Some(admin_id.to_string()),
+            ModerationAction::DeleteAllFilesOfAUser,
+            Some(account_id.to_string()),
+            serde_json::json!({
+                "userId": account_id,
+                "userUsername": target.username,
+                "userHost": target.host,
+                "count": deleted,
+            }),
+            self.clock.now_ms(),
+        )?;
+        self.moderation.append(log)?;
+        Ok(deleted)
     }
 }

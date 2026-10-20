@@ -171,6 +171,13 @@ impl AppServices {
                 "inbound-accept:{follower_id}:{followee_id}:{}",
                 self.ids.generate()
             ),
+        )?, self.notify_job(
+            follower_id,
+            followee_id,
+            NotificationKind::FollowRequestAccepted,
+            None,
+            None,
+            "inbound-accept",
         )?];
         match self.dedup.record_follow_activity(
             activity_id,

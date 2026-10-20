@@ -37,6 +37,9 @@ pub enum StreamingEvent {
         followee_id: String,
     },
     MeUpdated { account_id: String },
+    /// One antenna feed gained a note (Batch N WS4): the worker publishes
+    /// this post-commit per match; the `antenna` stream channel packs it.
+    AntennaNote { antenna_id: String, note_id: String },
     /// The account was suspended (Batch M WP3): drop its open `/streaming`
     /// connections (upstream publishes `userChangeSuspendedState`; the
     /// pinned upstream only invalidates caches with it, so the socket drop

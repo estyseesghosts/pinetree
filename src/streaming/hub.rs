@@ -44,6 +44,8 @@ pub enum HubMessage {
     PollEnded { note_id: String },
     /// A captured note was edited: subscribers refetch it.
     NoteUpdated { note_id: String },
+    /// An antenna feed gained a note (Batch N WS4).
+    AntennaNote { antenna_id: String, note_id: String },
     /// A note was deleted.
     NoteDeleted { note_id: String },
     /// A `main`-channel event for one user.
@@ -139,6 +141,11 @@ impl StreamingSink for BroadcastStreamingSink {
             }
             StreamingEvent::NoteUpdated { note_id } => {
                 self.hub.send(HubMessage::NoteUpdated { note_id });
+            }
+            // Batch N WS4: an antenna feed gained a note (published
+            // post-commit by the match worker, one per match).
+            StreamingEvent::AntennaNote { antenna_id, note_id } => {
+                self.hub.send(HubMessage::AntennaNote { antenna_id, note_id });
             }
             // The bare `MeUpdated` marker wakes `main` channels, which pack
             // `MeDetailed` on receipt (per-connection token scoping).

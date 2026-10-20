@@ -13,6 +13,7 @@ impl AppServices {
     #[allow(clippy::too_many_lines)]
     pub fn create_note(&self, mut input: CreateNoteInput) -> Result<Note, PortError> {
         self.accounts.get_owner(&input.author_id)?;
+        input.uri_base = self.public_url.trim_end_matches('/').to_string();
 
         // `reply_parent_uri` is inbox-only (`docs/replies.md` Slice B):
         // local replies resolve their target synchronously (or fail with
@@ -131,6 +132,11 @@ impl AppServices {
             },
             format!("note-create:{}:{}", input.author_id, self.ids.generate()),
         )?);
+
+        // Batch N WS4: one bounded `antenna_match` job per created note,
+        // committed in the same transaction (`__PENDING_NOTE_ID__` is
+        // substituted with the committed id in-txn, same mechanism).
+        jobs.push(self.antenna_match_job("__PENDING_NOTE_ID__")?);
 
         if !input.local_only {
             // MVP fan-out: the worker resolves recipient inboxes at delivery

@@ -72,6 +72,10 @@ impl LiveServer {
             blocks: store.clone(),
             mutes: store.clone(),
             reactions: store.clone(),
+            favorites: store.clone(),
+            emojis: store.clone(),
+            antennas: store.clone(),
+            antenna_notes: store.clone(),
             polls: store.clone(),
             jobs: store.clone(),
             media: store.clone(),
@@ -298,13 +302,71 @@ async fn credential_channels_need_auth_and_unknown_channels_error() {
     })).await;
     // Unknown channel → explicit UNSUPPORTED_CHANNEL error frame.
     send(&mut ws, serde_json::json!({
-        "type": "connect", "body": { "channel": "antenna", "id": "a" },
+        "type": "connect", "body": { "channel": "userList", "id": "u" },
     })).await;
     let frame = recv(&mut ws).await;
     assert_eq!(frame["type"], "error");
     assert_eq!(frame["body"]["code"], "UNSUPPORTED_CHANNEL");
-    assert_eq!(frame["body"]["channel"], "antenna");
+    assert_eq!(frame["body"]["channel"], "userList");
+    // Anonymous `antenna`: a credential channel, silently ignored (no frame).
+    send(&mut ws, serde_json::json!({
+        "type": "connect", "body": { "channel": "antenna", "id": "a", "params": { "antennaId": "x" } },
+    })).await;
     recv_nothing(&mut ws).await;
+}
+
+#[tokio::test]
+async fn antenna_channel_streams_matches_to_owner_only() {
+    let srv = LiveServer::start().await;
+    let (_, alice_token) = srv.signup("alice").await;
+    let (_, bob_token) = srv.signup("bob").await;
+
+    // Alice owns a match-all antenna (keywords required by the API —
+    // like upstream, an empty list is EMPTY_KEYWORD).
+    let (status, packed) = srv
+        .api(
+            "antennas/create",
+            serde_json::json!({
+                "name": "all", "src": "all", "keywords": [["hello"]],
+                "excludeKeywords": [], "users": [],
+                "caseSensitive": false, "withReplies": true, "withFile": false,
+            }),
+            Some(&alice_token),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let antenna_id = packed["id"].as_str().unwrap().to_string();
+
+    // Owner connects: no ack frame, but the channel is live.
+    let mut alice_ws = connect(&srv.ws_url(&format!("?i={alice_token}"))).await;
+    send(&mut alice_ws, serde_json::json!({
+        "type": "connect",
+        "body": { "channel": "antenna", "id": "a", "params": { "antennaId": antenna_id } },
+    })).await;
+    // Stranger's socket on the same antenna id: silently refused (no frames).
+    let mut bob_ws = connect(&srv.ws_url(&format!("?i={bob_token}"))).await;
+    send(&mut bob_ws, serde_json::json!({
+        "type": "connect",
+        "body": { "channel": "antenna", "id": "b", "params": { "antennaId": antenna_id } },
+    })).await;
+    // Unknown antenna id on the owner's socket: silently refused too.
+    send(&mut alice_ws, serde_json::json!({
+        "type": "connect",
+        "body": { "channel": "antenna", "id": "c", "params": { "antennaId": "aaaaaaaaaaaaaaaa" } },
+    })).await;
+
+    // Bob posts: Alice's antenna channel gets the `note` event, Bob's gets
+    // nothing (and Alice's unknown-id channel gets nothing).
+    let (status, created) = srv
+        .api("notes/create", serde_json::json!({ "text": "hello antennas" }), Some(&bob_token))
+        .await;
+    assert_eq!(status, 200);
+    let note_id = created["createdNote"]["id"].as_str().unwrap().to_string();
+    let frame = recv(&mut alice_ws).await;
+    let (id, event, body) = channel_body(&frame);
+    assert_eq!((id, event), ("a", "note"));
+    assert_eq!(body["id"], note_id);
+    recv_nothing(&mut bob_ws).await;
 }
 
 #[tokio::test]

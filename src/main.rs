@@ -40,6 +40,10 @@ fn build_services(cfg: &Config) -> Result<(Arc<AppServices>, pinetree::streaming
         blocks: store.clone() as Arc<dyn BlockStore>,
         mutes: store.clone() as Arc<dyn MuteStore>,
         reactions: store.clone() as Arc<dyn ReactionStore>,
+        favorites: store.clone(),
+        emojis: store.clone(),
+        antennas: store.clone(),
+        antenna_notes: store.clone(),
         polls: store.clone() as Arc<dyn PollStore>,
         jobs: store.clone() as Arc<dyn JobQueue>,
         media: store.clone() as Arc<dyn MediaStore>,
@@ -185,9 +189,15 @@ async fn main() {
     let mut cfg = Config::default();
     let mut positional: Vec<String> = Vec::new();
     let mut debug_federation_flag = false;
+    let mut debug_weak_rate_limits_flag = false;
     for arg in std::env::args().skip(1) {
         if arg == "--debug-federation" {
             debug_federation_flag = true;
+        } else if arg == "--debug-weak-rate-limits" {
+            debug_weak_rate_limits_flag = true;
+        } else if let Some(path) = arg.strip_prefix("--federation-extra-ca=") {
+            pinetree::federation::delivery::set_extra_ca(path.into());
+            eprintln!("federation extra CA in force (--federation-extra-ca={path}): not for production");
         } else if let Some(mode) = arg.strip_prefix("--mode=") {
             cfg.mode = match mode {
                 "single" => DeploymentMode::Single,
@@ -282,7 +292,13 @@ async fn main() {
         base_backoff_ms: 1_000,
     });
     let _worker_handle = worker.clone().spawn(Duration::from_millis(50));
-    let rate_limiter = Arc::new(RateLimiter::with_misskey_defaults(services.clock.clone()));
+    let mut rate_limiter = RateLimiter::with_misskey_defaults(services.clock.clone());
+    if debug_weak_rate_limits_flag {
+        // Load tests only: 10x the endpoint bucket counts (same factor as birchtree).
+        rate_limiter = rate_limiter.with_weakened_limits(10);
+        eprintln!("debug rate-limit weakening is in force (x10, --debug-weak-rate-limits): not for production");
+    }
+    let rate_limiter = Arc::new(rate_limiter);
     let api_state = ApiState {
         services,
         worker,

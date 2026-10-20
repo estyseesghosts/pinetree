@@ -19,6 +19,9 @@ pub enum NotificationKind {
     /// note; sent to the reply author on `notes/edit`). Wire type `edited`
     /// (a Sharkey addition — Misskey `notificationTypes` has no such entry).
     Edited,
+    /// A locked account accepted a follow request (Misskey
+    /// `followRequestAccepted`: emitted to the requester on accept).
+    FollowRequestAccepted,
     /// A profile export finished (Misskey `exportCompleted`: carries
     /// `exportedEntity` + `fileId`, no notifier — see
     /// `NotificationEntityService.ts:188-191`). Pinetree rows require a
@@ -45,6 +48,7 @@ impl NotificationKind {
             NotificationKind::ScheduledNotePosted => "scheduledNotePosted",
             NotificationKind::ScheduledNotePostFailed => "scheduledNotePostFailed",
             NotificationKind::Edited => "edited",
+            NotificationKind::FollowRequestAccepted => "followRequestAccepted",
             NotificationKind::ExportCompleted => "exportCompleted",
         }
     }

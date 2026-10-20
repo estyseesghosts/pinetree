@@ -55,6 +55,9 @@ pub struct ParsedRemoteActor {
     pub location: Option<String>,
     pub icon_url: Option<String>,
     pub image_url: Option<String>,
+    /// Pre-parsed AP `Emoji` tags (`(shortcode, icon_url)`), capped at 32.
+    /// WP8b ingest source for actor documents (metadata only).
+    pub emojis: Vec<(String, String)>,
 }
 
 impl ParsedRemoteActor {
@@ -332,6 +335,26 @@ pub fn parse_remote_actor(doc: &Value) -> Result<ParsedRemoteActor, String> {
     let icon_url = extract_image_url(obj.get("icon"));
     let image_url = extract_image_url(obj.get("image"));
 
+    // WP8b: actor-document `Emoji` tags (profile emoji), metadata only.
+    let mut emojis: Vec<(String, String)> = Vec::new();
+    if let Some(tag_val) = obj.get("tag") {
+        let items: Vec<&serde_json::Value> = match tag_val {
+            serde_json::Value::Array(arr) => arr.iter().collect(),
+            other => vec![other],
+        };
+        for item in items {
+            if emojis.len() >= 32 {
+                break;
+            }
+            if item.get("type").and_then(|v| v.as_str()) != Some("Emoji") {
+                continue;
+            }
+            if let Some((shortcode, url)) = crate::domain::emoji::parse_emoji_tag(item) {
+                emojis.push((shortcode, url));
+            }
+        }
+    }
+
     Ok(ParsedRemoteActor {
         uri,
         actor_type,
@@ -355,6 +378,7 @@ pub fn parse_remote_actor(doc: &Value) -> Result<ParsedRemoteActor, String> {
         location,
         icon_url,
         image_url,
+        emojis,
     })
 }
 
@@ -1017,6 +1041,10 @@ mod tests {
             blocks: store.clone(),
             mutes: store.clone(),
             reactions: store.clone(),
+            favorites: store.clone(),
+            emojis: store.clone(),
+            antennas: store.clone(),
+            antenna_notes: store.clone(),
             polls: store.clone(),
             jobs: store.clone(),
             media: store.clone(),
