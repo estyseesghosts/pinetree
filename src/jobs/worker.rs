@@ -339,6 +339,8 @@ impl JobWorker {
             draft_id: None,
             file_id: notify.file_id.clone(),
             exported_entity: notify.exported_entity.clone(),
+            clip_id: notify.clip_id.clone(),
+            page_id: notify.page_id.clone(),
             is_read: false,
         };
         let stored = match self.notifications.insert_notification(notification) {
@@ -449,6 +451,8 @@ impl JobWorker {
             | NotificationKind::ScheduledNotePosted
             | NotificationKind::ScheduledNotePostFailed
             | NotificationKind::ExportCompleted
+            | NotificationKind::ClipUpdated
+            | NotificationKind::PageLiked
             | NotificationKind::Test => {}
         }
         Ok(())

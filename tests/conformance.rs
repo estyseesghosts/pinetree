@@ -44,7 +44,7 @@ use pinetree::domain::poll::{PollInput, PollVote};
 use pinetree::domain::draft::NoteDraft;
 use pinetree::domain::note::{Note, Visibility};
 use pinetree::domain::favorite::NoteFavorite;
-use pinetree::domain::clip::{Clip, ClipFavorite, ClipNote, CLIP_LIMIT_PER_OWNER, CLIP_NOTES_PER_CLIP};
+use pinetree::domain::clip::{Clip, ClipFavorite, ClipFollow, ClipNote, CLIP_LIMIT_PER_OWNER, CLIP_NOTES_PER_CLIP};
 use pinetree::domain::collection::CollectionTier;
 use pinetree::domain::page::{Page, PageFont, PageLike};
 use pinetree::domain::pinning::UserNotePining;
@@ -5542,7 +5542,7 @@ fn n1_notifications_newest_first_across_kinds() {
     for (i, (label, kind)) in rows.iter().enumerate() {
         let id = format!("notify:{label}:{:016}", i + 1);
         store
-            .insert_notification(Notification {
+            .insert_notification(Notification { clip_id: None, page_id: None,
                 id: id.clone(),
                 notifiee_id: me.id.clone(),
                 notifier_id: who.id.clone(),
@@ -7054,6 +7054,7 @@ fn k_clip(owner: &str, name: &str) -> Clip {
         approved_actor_uris: Vec::new(),
         created_at_ms: 1,
         last_clipped_at_ms: None,
+        updated_at_ms: 1,
     }
 }
 
@@ -7087,10 +7088,10 @@ fn x1_clip_crud_and_cap_race() {
     // Owner-scoped update; foreign update is a miss.
     let mut renamed = clip.clone();
     renamed.name = "a2".to_string();
-    assert!(store.update_clip(renamed).expect("update").is_some());
+    assert!(store.update_clip(renamed, Vec::new()).expect("update").is_some());
     let mut foreign = clip.clone();
     foreign.owner_id = "mallory".to_string();
-    assert!(store.update_clip(foreign).expect("foreign").is_none());
+    assert!(store.update_clip(foreign, Vec::new()).expect("foreign").is_none());
     assert_eq!(store.clips_by_owner("alice").expect("list").len(), 1);
     // Cap race.
     let results: Vec<_> = std::thread::scope(|scope| {
@@ -7120,7 +7121,7 @@ fn x1_clip_crud_and_cap_race() {
         "losers report TOO_MANY_CLIPS"
     );
     // Foreign-owner delete is a miss, not a delete.
-    assert!(!store.delete_clip("mallory", "kclip-alice-a").expect("foreign"));
+    assert!(!store.delete_clip("mallory", "kclip-alice-a", Vec::new()).expect("foreign"));
     assert!(store.get_clip("kclip-alice-a").expect("get").is_some());
 }
 
@@ -7147,8 +7148,8 @@ fn x2_clip_notes_favorites_and_cascade() {
             .last_clipped_at_ms,
         Some(100)
     );
-    assert!(store.remove_clip_note("kclip-alice-a", "n1", Vec::new()).expect("remove"));
-    assert!(!store.remove_clip_note("kclip-alice-a", "n1", Vec::new()).expect("re-remove"));
+    assert!(store.remove_clip_note("kclip-alice-a", "n1", 2, Vec::new()).expect("remove"));
+    assert!(!store.remove_clip_note("kclip-alice-a", "n1", 2, Vec::new()).expect("re-remove"));
     assert!(
         store
             .get_clip("kclip-alice-a")
@@ -7180,7 +7181,7 @@ fn x2_clip_notes_favorites_and_cascade() {
     assert!(store.unfavorite_clip("bob", "kclip-alice-a").expect("unfav"));
     assert!(!store.unfavorite_clip("bob", "kclip-alice-a").expect("re-unfav"));
     store.favorite_clip(k_clip_fav("bob", "kclip-alice-a")).expect("re-fav");
-    assert!(store.delete_clip("alice", "kclip-alice-a").expect("delete"));
+    assert!(store.delete_clip("alice", "kclip-alice-a", Vec::new()).expect("delete"));
     assert!(store.clip_note_ids("kclip-alice-a").expect("ids").is_empty(), "memberships cascaded");
     assert_eq!(store.clip_favorite_count("kclip-alice-a").expect("count"), 0, "favorites cascaded");
     assert!(store.clip_favorites_by_user("bob").expect("favs").is_empty());
@@ -7206,10 +7207,14 @@ fn k_page(owner: &str, name: &str) -> Page {
         align_center: false,
         hide_title_when_pinned: false,
         tier: CollectionTier::Listed,
+        visibility: Visibility::Public,
+        visible_user_ids: Vec::new(),
         federate: false,
         approved_actor_uris: Vec::new(),
         uri: None,
         remote_attachments: Vec::new(),
+        remote_published_ms: None,
+        remote_updated_ms: None,
         liked_count: 0,
         created_at_ms: 1,
         updated_at_ms: 1,
@@ -7266,7 +7271,7 @@ fn y1_page_crud_and_slug_race() {
     assert!(matches!(clash, Err(PortError::Conflict(msg)) if msg == "NAME_ALREADY_EXISTS"));
     // Like, then delete cascades the like row.
     assert!(store.like_page(k_page_like("bob", "kpage-alice-hello"), Vec::new()).expect("like"));
-    assert!(store.delete_page("kpage-alice-hello").expect("delete"));
+    assert!(store.delete_page("kpage-alice-hello", Vec::new()).expect("delete"));
     assert!(store.get_page("kpage-alice-hello").expect("get").is_none());
     assert!(store.get_page_by_name("alice", "hello").expect("by-name").is_none());
     assert!(!store.is_page_liked("bob", "kpage-alice-hello").expect("liked"));
@@ -7325,6 +7330,104 @@ fn y3_page_uri_index_round_trip() {
     renamed.name = "remote2".to_string();
     store.update_page(renamed, Vec::new()).expect("update");
     assert!(store.get_page_by_uri("https://remote.example/pages/1").expect("by-uri").is_some());
-    assert!(store.delete_page(&found.id).expect("delete"));
+    assert!(store.delete_page(&found.id, Vec::new()).expect("delete"));
     assert!(store.get_page_by_uri("https://remote.example/pages/1").expect("gone").is_none());
+}
+
+// Group Z (Phase 2b/2a: clip follows + clip tombstones). Follows are
+// cheap rows: duplicate converges, unfollow idempotent, delete cascades
+// follows in the same commit; tombstones are tiny uri → deleted_at rows,
+// kept forever in v1 (documented).
+
+fn k_clip_follow(user: &str, clip_id: &str) -> ClipFollow {
+    ClipFollow {
+        id: format!("kcfol-{user}-{clip_id}"),
+        user_id: user.to_string(),
+        clip_id: clip_id.to_string(),
+        created_at_ms: 1,
+    }
+}
+
+/// Z1: follow converges (duplicate → false), unfollow idempotent, list
+/// newest-first bounded, delete cascades follows.
+#[test]
+fn z1_clip_follow_converges_and_cascades() {
+    let factory = RedbFactory::fresh("z1");
+    let clock = test_clock();
+    let store = factory.open(clock);
+    store.create_clip(k_clip("alice", "a")).expect("create");
+    assert!(store.follow_clip(k_clip_follow("bob", "kclip-alice-a")).expect("follow"));
+    // Duplicate converges (idempotent bool).
+    assert!(!store.follow_clip(k_clip_follow("bob", "kclip-alice-a")).expect("dup"));
+    assert!(store.is_following_clip("bob", "kclip-alice-a").expect("is"));
+    assert!(!store.is_following_clip("carol", "kclip-alice-a").expect("isnt"));
+    store.follow_clip(k_clip_follow("carol", "kclip-alice-a")).expect("follow2");
+    let followers = store.followers_of_clip("kclip-alice-a", 100).expect("list");
+    assert_eq!(followers.len(), 2);
+    let mine = store.followed_clips_of("bob").expect("mine");
+    assert_eq!(mine.len(), 1);
+    assert_eq!(mine[0].clip_id, "kclip-alice-a");
+    // Unfollow idempotent.
+    assert!(store.unfollow_clip("bob", "kclip-alice-a").expect("unfollow"));
+    assert!(!store.unfollow_clip("bob", "kclip-alice-a").expect("re-unfollow"));
+    assert!(!store.is_following_clip("bob", "kclip-alice-a").expect("gone"));
+    // Delete cascades the remaining follow.
+    assert!(store
+        .delete_clip("alice", "kclip-alice-a", Vec::new())
+        .expect("delete"));
+    assert!(store.followers_of_clip("kclip-alice-a", 100).expect("empty").is_empty());
+    assert!(store.followed_clips_of("carol").expect("empty2").is_empty());
+}
+
+/// Z2: clip tombstones record + read (delete path writes one; serving
+/// maps it to `Tombstone` instead of 404).
+#[test]
+fn z2_clip_tombstone_round_trip() {
+    let factory = RedbFactory::fresh("z2");
+    let clock = test_clock();
+    let store = factory.open(clock);
+    assert!(store.clip_tombstone("https://local.example/clips/x").expect("miss").is_none());
+    store
+        .record_clip_tombstone("https://local.example/clips/x", 42)
+        .expect("record");
+    assert_eq!(
+        store.clip_tombstone("https://local.example/clips/x").expect("hit"),
+        Some(42)
+    );
+    // Re-record overwrites (idempotent converge on replay).
+    store
+        .record_clip_tombstone("https://local.example/clips/x", 43)
+        .expect("re-record");
+    assert_eq!(
+        store.clip_tombstone("https://local.example/clips/x").expect("hit2"),
+        Some(43)
+    );
+}
+
+/// Y4: visibility columns + origin timestamps round-trip (old rows decode
+/// as Public via `#[serde(default)]`; covered implicitly by every older
+/// fixture, asserted explicitly here).
+#[test]
+fn y4_page_visibility_columns_round_trip() {
+    let factory = RedbFactory::fresh("y4");
+    let clock = test_clock();
+    let store = factory.open(clock);
+    let mut page = k_page("alice", "gated");
+    page.visibility = Visibility::Followers;
+    page.remote_published_ms = Some(100);
+    page.remote_updated_ms = Some(200);
+    store.create_page(page, Vec::new()).expect("create");
+    let found = store.get_page("kpage-alice-gated").expect("get").expect("found");
+    assert_eq!(found.visibility, Visibility::Followers);
+    assert!(found.visible_user_ids.is_empty());
+    assert_eq!(found.remote_published_ms, Some(100));
+    assert_eq!(found.remote_updated_ms, Some(200));
+    // Specified with listed readers round-trips.
+    let mut spec = k_page("alice", "spec");
+    spec.visibility = Visibility::Specified;
+    spec.visible_user_ids = vec!["bob".to_string()];
+    store.create_page(spec, Vec::new()).expect("create2");
+    let found2 = store.get_page("kpage-alice-spec").expect("get2").expect("found2");
+    assert_eq!(found2.visibility, Visibility::Specified);
+    assert_eq!(found2.visible_user_ids, vec!["bob".to_string()]);
 }

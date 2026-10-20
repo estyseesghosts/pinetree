@@ -1865,7 +1865,7 @@ async fn federation_clips_listed_unlisted_approved_and_sync() {
 
     // Federation switches ON on A (B serves nothing in this test).
     a.services
-        .update_instance_settings(&alice_id, None, None, Some(true), None, a.services.clock.now_ms())
+        .update_instance_settings(&alice_id, None, None, Some(true), None, None, a.services.clock.now_ms())
         .expect("federateClips on");
 
     // Alice: public note + followers-only note + listed federated clip.
@@ -2037,7 +2037,7 @@ async fn federation_clips_listed_unlisted_approved_and_sync() {
 
     // Switch off ⇒ zero footprint: routes 404, advertisement gone.
     a.services
-        .update_instance_settings(&alice_id, None, None, Some(false), None, a.services.clock.now_ms())
+        .update_instance_settings(&alice_id, None, None, Some(false), None, None, a.services.clock.now_ms())
         .expect("federateClips off");
     let r = http_get(&client, &clip_uri, "application/activity+json");
     assert_eq!(r.status, 404, "switch off 404s collections");
@@ -2089,7 +2089,7 @@ async fn federation_pages_article_round_trip_update_and_likes() {
 
     // Federation switches ON on A.
     a.services
-        .update_instance_settings(&alice_id, None, None, None, Some(true), a.services.clock.now_ms())
+        .update_instance_settings(&alice_id, None, None, None, Some(true), None, a.services.clock.now_ms())
         .expect("federatePages on");
 
     // Bob follows alice BEFORE the page exists (fan-out resolves at send).
@@ -2225,4 +2225,447 @@ async fn federation_pages_article_round_trip_update_and_likes() {
     assert!(content.contains("hi"), "readable content kept: {content:?}");
     assert!(a.services.notes.find_by_uri(&format!("{}/articles/evil-1", b.base_url)).expect("evil note lookup").is_none(),
         "no shadow note row");
+}
+
+/// Phase 2 gates (clips): subscribe handshake (`Follow`/`Undo` converge,
+/// forged updates ignored), `Update`/`Delete` converge incl.
+/// tier-restriction pruning, fan-out receipt at followers, author +
+/// follower notifications, TTL + `updated` revalidation, tombstone at the
+/// deleted URI.
+#[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+async fn federation_clip_follow_sync_update_delete() {
+    use pinetree::activitypub::federated_collections::{
+        evict_remote_clip_cache, remote_clip_cached_for, resolve_remote_clip,
+        resolve_remote_clip_with_ttl,
+    };
+    use pinetree::domain::notification::NotificationKind;
+
+    let a = boot_node("clip2-a");
+    let b = boot_node("clip2-b");
+    let client = test_client();
+    let deadline = Duration::from_secs(25);
+
+    let v = api_json(
+        &api_post(&client, &format!("{}/api/signup", a.base_url), None, &json!({"username": "alice", "password": "s3cret-pw"})),
+        "A signup alice",
+    );
+    let alice_id = v["id"].as_str().unwrap().to_string();
+    let alice_token = v["token"].as_str().unwrap().to_string();
+    let v = api_json(
+        &api_post(&client, &format!("{}/api/signup", b.base_url), None, &json!({"username": "bob", "password": "s3cret-pw"})),
+        "B signup bob",
+    );
+    let bob_id = v["id"].as_str().unwrap().to_string();
+    let bob_token = v["token"].as_str().unwrap().to_string();
+    let v = api_json(
+        &api_post(&client, &format!("{}/api/signup", b.base_url), None, &json!({"username": "mallory", "password": "s3cret-pw"})),
+        "B signup mallory",
+    );
+    let mallory_id = v["id"].as_str().unwrap().to_string();
+    a.services.ensure_actor_keypair(&alice_id).expect("alice key");
+    b.services.ensure_actor_keypair(&bob_id).expect("bob key");
+    b.services.ensure_actor_keypair(&mallory_id).expect("mallory key");
+    let alice_uri = format!("{}/users/{}", a.base_url, alice_id);
+    let bob_uri = format!("{}/users/{}", b.base_url, bob_id);
+    let mallory_uri = format!("{}/users/{}", b.base_url, mallory_id);
+    a.services
+        .update_instance_settings(&alice_id, None, None, Some(true), None, None, a.services.clock.now_ms())
+        .expect("federateClips on");
+
+    // Alice: public note + listed federated clip.
+    let n1 = api_json(
+        &api_post(&client, &format!("{}/api/notes/create", a.base_url), Some(&alice_token), &json!({"text": "clip me"})),
+        "A note n1",
+    )["createdNote"]["id"].as_str().unwrap().to_string();
+    let n1_uri = format!("{}/notes/{}", a.base_url, n1);
+    let clip = api_json(
+        &api_post(&client, &format!("{}/api/clips/create", a.base_url), Some(&alice_token),
+            &json!({"name": "x", "isPublic": true, "visibility": "listed", "federate": true})),
+        "A clip create",
+    );
+    let clip_id = clip["id"].as_str().unwrap().to_string();
+    let clip_uri = format!("{}/clips/{}", a.base_url, clip_id);
+    let r = api_post(&client, &format!("{}/api/clips/add-note", a.base_url), Some(&alice_token),
+        &json!({"clipId": clip_id, "noteId": n1}));
+    assert_eq!(r.status, 204);
+
+    // Served doc carries `updated` (Phase 2a revalidation stamp).
+    let doc: Value = serde_json::from_slice(
+        &http_get(&client, &clip_uri, "application/activity+json").body,
+    ).expect("collection json");
+    assert!(doc.get("updated").and_then(Value::as_str).is_some(), "updated served: {doc}");
+
+    // Bob follows alice (fan-out edge) + B primes its membership cache.
+    let v = api_json(
+        &api_post(&client, &format!("{}/api/users/show", b.base_url), Some(&bob_token), &json!({"username": "alice", "host": a.host})),
+        "B resolves alice",
+    );
+    let alice_on_b = v["id"].as_str().unwrap().to_string();
+    let r = api_post(&client, &format!("{}/api/following/create", b.base_url), Some(&bob_token), &json!({"userId": alice_on_b}));
+    assert!((200..300).contains(&r.status));
+    pump_until(&a, &b, "A sees bob as follower", deadline, &mut || {
+        a.services.accounts.find_by_uri(&bob_uri).expect("lookup bob")
+            .map(|acc| a.services.follows.is_following(&acc.id, &alice_id).unwrap_or(false))
+            .unwrap_or(false)
+    })
+    .await;
+    let bob_on_a = a.services.accounts.find_by_uri(&bob_uri).expect("bob on A").expect("bob row").id;
+    let uris = resolve_remote_clip(&b.services, &clip_uri).expect("prime");
+    assert_eq!(uris, vec![n1_uri.clone()]);
+
+    // Subscribe handshake: bob's Follow(clip) → alice's personal inbox.
+    let alice_inbox = format!("{}/users/{}/inbox", a.base_url, alice_id);
+    let follow = json!({
+        "id": format!("{}/activities/bob-follow-clip", b.base_url),
+        "type": "Follow", "actor": bob_uri, "object": clip_uri,
+    });
+    let body = serde_json::to_vec(&follow).unwrap();
+    let r = signed_post_to_inbox(&client, &b.services, &bob_id, &alice_inbox, &body, None);
+    assert!((200..300).contains(&r.status), "follow POST: {}", r.status);
+    assert!(a.services.clips.is_following_clip(&bob_on_a, &clip_id).expect("is-following"));
+    // Undo converges; re-follow for the later steps.
+    let undo = json!({
+        "id": format!("{}/activities/bob-unfollow-clip", b.base_url),
+        "type": "Undo", "actor": bob_uri,
+        "object": {"id": format!("{}/activities/bob-follow-clip", b.base_url), "type": "Follow", "actor": bob_uri, "object": clip_uri},
+    });
+    let body = serde_json::to_vec(&undo).unwrap();
+    let r = signed_post_to_inbox(&client, &b.services, &bob_id, &alice_inbox, &body, None);
+    assert!((200..300).contains(&r.status));
+    assert!(!a.services.clips.is_following_clip(&bob_on_a, &clip_id).expect("unfollowed"));
+    let body = serde_json::to_vec(&follow).unwrap();
+    let r = signed_post_to_inbox(&client, &b.services, &bob_id, &alice_inbox, &body, None);
+    assert!((200..300).contains(&r.status));
+    assert!(a.services.clips.is_following_clip(&bob_on_a, &clip_id).expect("re-follow"));
+
+    // Forged Update (mallory-signed, empty items) is ignored: cache intact.
+    let forged = json!({
+        "id": format!("{}/activities/forged-update", b.base_url),
+        "type": "Update", "actor": mallory_uri,
+        "object": {"id": clip_uri, "type": "OrderedCollection", "attributedTo": alice_uri, "orderedItems": []},
+    });
+    let body = serde_json::to_vec(&forged).unwrap();
+    let r = signed_post_to_inbox(&client, &b.services, &mallory_id, &format!("{}/inbox", b.base_url), &body, None);
+    assert!((200..300).contains(&r.status));
+    // (Delivered to B's own inbox: B holds no such clip → converges quietly.)
+    assert_eq!(
+        remote_clip_cached_for(&clip_uri),
+        Some(vec![n1_uri.clone()]),
+        "forged update ignored"
+    );
+
+    // Owner-signed Update with an embedded full document applies in one
+    // round trip (refresh-or-evict): bogus member lands in B's cache.
+    let bogus = format!("{}/notes/bogus", a.base_url);
+    let owner_update = json!({
+        "id": format!("{}/activities/alice-update-1", a.base_url),
+        "type": "Update", "actor": alice_uri,
+        "object": {"id": clip_uri, "type": "OrderedCollection", "attributedTo": alice_uri,
+            "updated": doc.get("updated").cloned().unwrap_or(Value::Null),
+            "orderedItems": [bogus]},
+    });
+    let body = serde_json::to_vec(&owner_update).unwrap();
+    // Sign as alice@A, deliver to B's shared inbox.
+    let r = signed_post_to_inbox(&client, &a.services, &alice_id, &format!("{}/inbox", b.base_url), &body, None);
+    assert!((200..300).contains(&r.status));
+    assert_eq!(
+        remote_clip_cached_for(&clip_uri),
+        Some(vec![bogus.clone()]),
+        "owner update applies embedded doc"
+    );
+    // Re-prime honestly for the steps below.
+    evict_remote_clip_cache(&clip_uri);
+    let uris = resolve_remote_clip(&b.services, &clip_uri).expect("re-prime");
+    assert_eq!(uris, vec![n1_uri.clone()]);
+
+    // Metadata edit notifies clip followers (bob) with the clip ref.
+    let r = api_post(&client, &format!("{}/api/clips/update", a.base_url), Some(&alice_token),
+        &json!({"clipId": clip_id, "name": "renamed"}));
+    assert!((200..300).contains(&r.status), "rename: {}", String::from_utf8_lossy(&r.body));
+    drain_all(&a, &b);
+    // Update fan-out refreshes B's cache (entry present again post-drain).
+    let _ = resolve_remote_clip_with_ttl(&b.services, &clip_uri, Duration::from_secs(600)).expect("post-update resolve");
+    let notes = a.services.notifications.list_notifications(&bob_on_a, 50).expect("notifs");
+    assert!(
+        notes.iter().any(|n| n.kind == NotificationKind::ClipUpdated && n.clip_id.as_deref() == Some(clip_id.as_str())),
+        "bob notified of metadata edit: {:?}",
+        notes.iter().map(|n| (&n.kind, &n.clip_id)).collect::<Vec<_>>()
+    );
+
+    // Membership: bob's note clipped → author notified + Add delivered.
+    let v = api_json(
+        &api_post(&client, &format!("{}/api/users/show", a.base_url), Some(&alice_token), &json!({"username": "bob", "host": b.host})),
+        "A resolves bob",
+    );
+    let bob_on_a2 = v["id"].as_str().unwrap().to_string();
+    assert_eq!(bob_on_a, bob_on_a2);
+    let r = api_post(&client, &format!("{}/api/following/create", a.base_url), Some(&alice_token), &json!({"userId": bob_on_a}));
+    assert!((200..300).contains(&r.status));
+    pump_until(&a, &b, "B sees alice as follower", deadline, &mut || {
+        b.services.accounts.find_by_uri(&alice_uri).expect("lookup alice")
+            .map(|acc| b.services.follows.is_following(&acc.id, &bob_id).unwrap_or(false))
+            .unwrap_or(false)
+    })
+    .await;
+    let bn = api_json(
+        &api_post(&client, &format!("{}/api/notes/create", b.base_url), Some(&bob_token), &json!({"text": "bob note"})),
+        "B note",
+    )["createdNote"]["id"].as_str().unwrap().to_string();
+    let bn_uri = format!("{}/notes/{}", b.base_url, bn);
+    pump_until(&a, &b, "A ingests bob note", deadline, &mut || {
+        a.services.notes.notes_by_author(&bob_on_a, &pinetree::application::ports::TimelineCursor::with_limit(10))
+            .map(|ns| !ns.is_empty()).unwrap_or(false)
+    })
+    .await;
+    let a_copy = a.services.notes.notes_by_author(&bob_on_a, &pinetree::application::ports::TimelineCursor::with_limit(10))
+        .expect("a copy").into_iter().next().expect("a copy row").id;
+    let r = api_post(&client, &format!("{}/api/clips/add-note", a.base_url), Some(&alice_token),
+        &json!({"clipId": clip_id, "noteId": a_copy}));
+    assert_eq!(r.status, 204);
+    drain_all(&a, &b);
+    let notes = a.services.notifications.list_notifications(&bob_on_a, 50).expect("notifs2");
+    assert!(
+        notes.iter().any(|n| n.kind == NotificationKind::ClipUpdated && n.note_id.is_some()),
+        "author notified of membership: {:?}",
+        notes.iter().map(|n| (&n.kind, &n.note_id)).collect::<Vec<_>>()
+    );
+    // Add arrives at B: cache evicted, refetch converges on the new member.
+    let uris = resolve_remote_clip_with_ttl(&b.services, &clip_uri, Duration::from_secs(600)).expect("post-add");
+    assert!(uris.contains(&bn_uri), "Add converged: {uris:?}");
+
+    // Delete: tombstone served at the URI; receivers evict + prune.
+    let r = api_post(&client, &format!("{}/api/clips/delete", a.base_url), Some(&alice_token), &json!({"clipId": clip_id}));
+    assert_eq!(r.status, 204, "delete: {}", String::from_utf8_lossy(&r.body));
+    drain_all(&a, &b);
+    let r = http_get(&client, &clip_uri, "application/activity+json");
+    assert_eq!(r.status, 410, "tombstone, not 404: {}", r.status);
+    let tomb: Value = serde_json::from_slice(&r.body).expect("tomb json");
+    assert_eq!(tomb["type"], Value::String("Tombstone".to_string()));
+    assert_eq!(tomb["formerType"], Value::String("OrderedCollection".to_string()));
+    assert_eq!(remote_clip_cached_for(&clip_uri), None, "B evicted on Delete");
+    // Deletion notifies followers with the clip ref.
+    let notes = a.services.notifications.list_notifications(&bob_on_a, 50).expect("notifs3");
+    assert!(
+        notes.iter().any(|n| n.kind == NotificationKind::ClipUpdated && n.clip_id.as_deref() == Some(clip_id.as_str())),
+        "follower notified of delete"
+    );
+
+    // Tier-restriction pruning: re-listed clip → restrict → Delete fans
+    // out, remote follow pruned, capability fetch still serves.
+    let clip2 = api_json(
+        &api_post(&client, &format!("{}/api/clips/create", a.base_url), Some(&alice_token),
+            &json!({"name": "y", "isPublic": true, "visibility": "listed", "federate": true})),
+        "A clip2 create",
+    );
+    let clip2_id = clip2["id"].as_str().unwrap().to_string();
+    let clip2_uri = format!("{}/clips/{}", a.base_url, clip2_id);
+    let r = api_post(&client, &format!("{}/api/clips/add-note", a.base_url), Some(&alice_token),
+        &json!({"clipId": clip2_id, "noteId": n1}));
+    assert_eq!(r.status, 204);
+    let follow2 = json!({
+        "id": format!("{}/activities/bob-follow-clip2", b.base_url),
+        "type": "Follow", "actor": bob_uri, "object": clip2_uri,
+    });
+    let body = serde_json::to_vec(&follow2).unwrap();
+    let r = signed_post_to_inbox(&client, &b.services, &bob_id, &alice_inbox, &body, None);
+    assert!((200..300).contains(&r.status));
+    assert!(a.services.clips.is_following_clip(&bob_on_a, &clip2_id).expect("following2"));
+    let uris = resolve_remote_clip(&b.services, &clip2_uri).expect("prime2");
+    assert_eq!(uris, vec![n1_uri.clone()]);
+    let r = api_post(&client, &format!("{}/api/clips/update", a.base_url), Some(&alice_token),
+        &json!({"clipId": clip2_id, "visibility": "unlisted"}));
+    assert!((200..300).contains(&r.status), "restrict: {}", String::from_utf8_lossy(&r.body));
+    drain_all(&a, &b);
+    assert_eq!(remote_clip_cached_for(&clip2_uri), None, "B evicted on restrict");
+    assert!(!a.services.clips.is_following_clip(&bob_on_a, &clip2_id).expect("pruned"), "remote follow pruned");
+    // Capability fetch still serves with zero broadcast.
+    let items = clip_items(&http_get(&client, &clip2_uri, "application/activity+json"), "unlisted bearer");
+    assert_eq!(items, vec![n1_uri.clone()]);
+    let _ = mallory_id;
+}
+
+/// Phase 2 gates (pages): gated `Article` → remote page row (not a note)
+/// for the followers audience; strangers get 403/404 with zero content
+/// bytes on every surface (show/AP/like/featured); `Update`/`Delete`/`Like`
+/// converge; origin timestamps survive the round trip; non-public content
+/// never appears in unauthorized readers' packs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+async fn federation_page_gated_visibility_and_lifecycle() {
+    use pinetree::domain::note::Visibility;
+
+    let a = boot_node("page2-a");
+    let b = boot_node("page2-b");
+    let client = test_client();
+    let deadline = Duration::from_secs(25);
+
+    let v = api_json(
+        &api_post(&client, &format!("{}/api/signup", a.base_url), None, &json!({"username": "alice", "password": "s3cret-pw"})),
+        "A signup alice",
+    );
+    let alice_id = v["id"].as_str().unwrap().to_string();
+    let alice_token = v["token"].as_str().unwrap().to_string();
+    let v = api_json(
+        &api_post(&client, &format!("{}/api/signup", b.base_url), None, &json!({"username": "bob", "password": "s3cret-pw"})),
+        "B signup bob",
+    );
+    let bob_id = v["id"].as_str().unwrap().to_string();
+    let bob_token = v["token"].as_str().unwrap().to_string();
+    let v = api_json(
+        &api_post(&client, &format!("{}/api/signup", b.base_url), None, &json!({"username": "mallory", "password": "s3cret-pw"})),
+        "B signup mallory",
+    );
+    let mallory_id = v["id"].as_str().unwrap().to_string();
+    let mallory_token = v["token"].as_str().unwrap().to_string();
+    a.services.ensure_actor_keypair(&alice_id).expect("alice key");
+    b.services.ensure_actor_keypair(&bob_id).expect("bob key");
+    b.services.ensure_actor_keypair(&mallory_id).expect("mallory key");
+    let alice_uri = format!("{}/users/{}", a.base_url, alice_id);
+    a.services
+        .update_instance_settings(&alice_id, None, None, None, Some(true), None, a.services.clock.now_ms())
+        .expect("federatePages on");
+
+    // Bob follows alice (Create(Article) fan-out edge).
+    let v = api_json(
+        &api_post(&client, &format!("{}/api/users/show", b.base_url), Some(&bob_token), &json!({"username": "alice", "host": a.host})),
+        "B resolves alice",
+    );
+    let alice_on_b = v["id"].as_str().unwrap().to_string();
+    let r = api_post(&client, &format!("{}/api/following/create", b.base_url), Some(&bob_token), &json!({"userId": alice_on_b}));
+    assert!((200..300).contains(&r.status));
+    pump_until(&a, &b, "A sees bob as follower", deadline, &mut || {
+        a.services.accounts.find_by_uri(&format!("{}/users/{}", b.base_url, bob_id)).expect("lookup bob")
+            .map(|acc| a.services.follows.is_following(&acc.id, &alice_id).unwrap_or(false))
+            .unwrap_or(false)
+    })
+    .await;
+
+    // Alice creates a followers-visibility page (federate defaults on).
+    let body = json!({
+        "title": "Secret Plans", "name": "secret-plans",
+        "content": [{"type": "text", "text": "followers hello"}],
+        "variables": [], "script": "",
+        "pageVisibility": "followers",
+    });
+    let page = api_json(
+        &api_post(&client, &format!("{}/api/pages/create", a.base_url), Some(&alice_token), &body),
+        "A page create",
+    );
+    let page_id = page["id"].as_str().unwrap().to_string();
+    let article_uri = format!("{}/pages/{}", a.base_url, page_id);
+    // Local default would be Public; assert the gate took the param.
+    assert_eq!(a.services.pages.get_page(&page_id).expect("get").expect("row").visibility, Visibility::Followers);
+
+    // Fan-out delivers Create(Article) to bob's inbox → B materializes a
+    // remote page row (NOT a note) with Followers visibility.
+    pump_until(&a, &b, "B materializes gated page", deadline, &mut || {
+        b.services.pages.get_page_by_uri(&article_uri).expect("lookup").is_some()
+    })
+    .await;
+    let b_row = b.services.pages.get_page_by_uri(&article_uri).expect("lookup").expect("row");
+    assert_eq!(b_row.visibility, Visibility::Followers);
+    assert_eq!(b_row.owner_id, alice_on_b);
+    assert_eq!(b_row.script, "");
+    assert!(b.services.notes.find_by_uri(&article_uri).expect("note lookup").is_none(), "no shadow note");
+    // Origin timestamps survive the round trip (stored on the materialized
+    // row; remote pages are deliver-only, never re-served: B's copy has
+    // `federate: false` so its AP surface stays 404).
+    // Origin timestamps survive the round trip (stored on the materialized
+    // row; remote pages are deliver-only, never re-served: B's copy has
+    // `federate: false` so its AP surface stays 404). Owner AP fetches are
+    // not exercised over the loopback server (the gate resolves keys over
+    // HTTP, so a local signer would self-fetch; production nodes never do
+    // this — owner reads go through the API, covered below).
+    let first_published = b_row.remote_published_ms;
+    assert!(first_published.is_some(), "origin timestamp stored");
+
+    // Stranger surfaces: 403 signed / 404 anonymous with zero content bytes.
+    let r = signed_get_to_url(&client, &b.services, &mallory_id, &article_uri, "application/activity+json");
+    assert_eq!(r.status, 403, "stranger signed → 403");
+    assert!(!String::from_utf8_lossy(&r.body).contains("followers hello"), "zero content bytes (403)");
+    let r = http_get(&client, &article_uri, "application/activity+json");
+    assert_eq!(r.status, 404, "anonymous → 404");
+    assert!(!String::from_utf8_lossy(&r.body).contains("followers hello"), "zero content bytes (404)");
+    // pages/show hides from strangers (B-side copy, mallory viewer;
+    // Misskey surfaces NO_SUCH_PAGE as HTTP 400 with the code).
+    let r = api_post(&client, &format!("{}/api/pages/show", b.base_url), Some(&mallory_token), &json!({"pageId": b_row.id}));
+    assert_eq!(r.status, 400, "show hides: {}", String::from_utf8_lossy(&r.body));
+    assert!(String::from_utf8_lossy(&r.body).contains("NO_SUCH_PAGE"));
+    assert!(!String::from_utf8_lossy(&r.body).contains("followers hello"), "show leaks nothing");
+    // pages/like by a stranger is rejected without a distinguishing error.
+    let r = api_post(&client, &format!("{}/api/pages/like", b.base_url), Some(&mallory_token), &json!({"pageId": b_row.id}));
+    assert_eq!(r.status, 400, "like hides: {}", r.status);
+    assert!(String::from_utf8_lossy(&r.body).contains("NO_SUCH_PAGE"));
+    // Owner + follower still read.
+    let r = api_post(&client, &format!("{}/api/pages/show", a.base_url), Some(&alice_token), &json!({"pageId": page_id}));
+    assert!((200..300).contains(&r.status), "owner reads");
+    let r = api_post(&client, &format!("{}/api/pages/show", b.base_url), Some(&bob_token), &json!({"pageId": b_row.id}));
+    assert!((200..300).contains(&r.status), "follower reads");
+
+    // Like converges + notifies the owner (closes the silent-likes gap).
+    let r = api_post(&client, &format!("{}/api/pages/like", b.base_url), Some(&bob_token), &json!({"pageId": b_row.id}));
+    assert_eq!(r.status, 204, "bob likes: {}", String::from_utf8_lossy(&r.body));
+    drain_all(&a, &b);
+    assert_eq!(a.services.pages.get_page(&page_id).expect("get").expect("row").liked_count, 1);
+    let notes = a.services.notifications.list_notifications(&alice_id, 50).expect("notifs");
+    assert!(
+        notes.iter().any(|n| n.kind == pinetree::domain::notification::NotificationKind::PageLiked
+            && n.page_id.as_deref() == Some(page_id.as_str())),
+        "owner notified of page like"
+    );
+    // Featured is public-only (pure query): the gated page never surfaces,
+    // even for followers. A public control page does — for everyone.
+    let open = api_json(
+        &api_post(&client, &format!("{}/api/pages/create", a.base_url), Some(&alice_token), &json!({
+            "title": "Open Plans", "name": "open-plans",
+            "content": [{"type": "text", "text": "open hello"}],
+            "variables": [], "script": "",
+        })),
+        "A open page create",
+    );
+    let open_uri = format!("{}/pages/{}", a.base_url, open["id"].as_str().unwrap());
+    pump_until(&a, &b, "B materializes open page", deadline, &mut || {
+        b.services.pages.get_page_by_uri(&open_uri).expect("lookup").is_some()
+    })
+    .await;
+    let open_copy = b.services.pages.get_page_by_uri(&open_uri).expect("lookup").expect("open row").id;
+    let r = api_post(&client, &format!("{}/api/pages/like", b.base_url), Some(&bob_token), &json!({"pageId": open_copy}));
+    assert_eq!(r.status, 204);
+    drain_all(&a, &b);
+    let featured_bob: Value = serde_json::from_slice(
+        &api_post(&client, &format!("{}/api/pages/featured", b.base_url), Some(&bob_token), &json!({})).body,
+    ).expect("featured json");
+    let bl = featured_bob.as_array().cloned().unwrap_or_default();
+    assert!(!bl.iter().any(|p| p["id"] == b_row.id), "featured never lists gated");
+    assert!(bl.iter().any(|p| p["id"] == open_copy), "featured lists public for follower");
+    let featured_mal: Value = serde_json::from_slice(
+        &api_post(&client, &format!("{}/api/pages/featured", b.base_url), Some(&mallory_token), &json!({})).body,
+    ).expect("featured json");
+    let ml = featured_mal.as_array().cloned().unwrap_or_default();
+    assert!(!ml.iter().any(|p| p["id"] == b_row.id), "featured hides gated");
+    assert!(ml.iter().any(|p| p["id"] == open_copy), "featured lists public for stranger");
+
+    // Update converges (visibility carried forward).
+    let r = api_post(&client, &format!("{}/api/pages/update", a.base_url), Some(&alice_token),
+        &json!({"pageId": page_id, "title": "Secret Plans v2"}));
+    assert!((200..300).contains(&r.status), "update: {}", String::from_utf8_lossy(&r.body));
+    pump_until(&a, &b, "B refreshes page", deadline, &mut || {
+        b.services.pages.get_page_by_uri(&article_uri).expect("lookup")
+            .map(|p| p.title == "Secret Plans v2").unwrap_or(false)
+    })
+    .await;
+    let b_row2 = b.services.pages.get_page_by_uri(&article_uri).expect("lookup").expect("row");
+    assert_eq!(b_row2.visibility, Visibility::Followers);
+    assert!(
+        b_row2.remote_updated_ms != b_row.remote_updated_ms,
+        "origin updated tracks the new served doc"
+    );
+
+    // Delete converges (retracts the materialized row).
+    let r = api_post(&client, &format!("{}/api/pages/delete", a.base_url), Some(&alice_token), &json!({"pageId": page_id}));
+    assert_eq!(r.status, 204, "delete: {}", String::from_utf8_lossy(&r.body));
+    pump_until(&a, &b, "B retracts page", deadline, &mut || {
+        b.services.pages.get_page_by_uri(&article_uri).expect("lookup").is_none()
+    })
+    .await;
+    let _ = alice_uri;
 }

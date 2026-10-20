@@ -43,6 +43,8 @@ impl AppServices {
             reaction: None,
             file_id: None,
             exported_entity: None,
+            clip_id: None,
+            page_id: None,
         };
         let job = NewJob::new_json(
             JobKind::Notify,

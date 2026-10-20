@@ -107,7 +107,11 @@ public (documented deviation; Misskey `FORBIDDEN` cases do not apply).
   dormant), federated clips + pages (§36: local `clips/*` + `pages/*`
   parity, `export-clips` real + pinetree-only `i/import-clips`, AP
   `OrderedCollection`/`Article` wire + fetch gate; federation switches
-  default OFF).
+  default OFF; §38 Phase 2: page read gate + `pageVisibility`/`visibleUserIds`
+  params, `clips/follow|unfollow|followers` + `isFollowing`,
+  `clipUpdated`/`pageLiked` notification kinds, clip `updated` +
+  `Update`/`Delete(Collection)` + tombstones, Article origin timestamps +
+  outbound `Delete(Article)` + `source` presentation fidelity).
 - `notes/search` `offset`/`channelId`/`rangeStartAt|EndAt`: rejected as
   `UNSUPPORTED_FIELD` (Keystone never sends them).
 

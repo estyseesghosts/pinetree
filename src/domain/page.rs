@@ -20,6 +20,7 @@
 
 use crate::domain::collection::CollectionTier;
 use crate::domain::id::DomainError;
+use crate::domain::note::Visibility;
 
 /// Page title bound (upstream `varchar(256)` column).
 pub const PAGE_TITLE_MAX: usize = 256;
@@ -100,6 +101,20 @@ pub struct Page {
     pub liked_count: i64,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    /// Read gate for the page body (reuses the note [`Visibility`] enum).
+    /// Local creates default `Public` (upstream parity — world-readable).
+    /// `#[serde(default)]` keeps old rows decoding as public.
+    #[serde(default)]
+    pub visibility: Visibility,
+    /// Explicit reader ids when `visibility == Specified`.
+    #[serde(default)]
+    pub visible_user_ids: Vec<String>,
+    /// Origin timestamps for materialized remote `Article`s (Phase 2/3:
+    /// served in place of row times). `None` = pre-field rows / local.
+    #[serde(default)]
+    pub remote_published_ms: Option<i64>,
+    #[serde(default)]
+    pub remote_updated_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -191,6 +206,33 @@ pub struct PageLike {
     pub user_id: String,
     pub page_id: String,
     pub created_at_ms: i64,
+}
+
+/// Read gate for one page row: owner always passes, moderators bypass
+/// (consistent with `pages/delete`), otherwise the note-style visibility
+/// rule applies (Public = all, Followers = follower edge, Specified =
+/// listed ids; Home collapses to Public — pages have no timelines).
+pub fn page_visible_to(
+    page: &Page,
+    viewer_id: Option<&str>,
+    is_moderator: bool,
+    follows_owner: bool,
+) -> bool {
+    if let Some(v) = viewer_id {
+        if v == page.owner_id {
+            return true;
+        }
+    }
+    if is_moderator {
+        return true;
+    }
+    match page.visibility {
+        Visibility::Public | Visibility::Home => true,
+        Visibility::Followers => viewer_id.is_some_and(|_| follows_owner),
+        Visibility::Specified => viewer_id.is_some_and(|v| {
+            page.visible_user_ids.iter().any(|id| id == v)
+        }),
+    }
 }
 
 #[cfg(test)]

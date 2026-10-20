@@ -20,3 +20,12 @@ pub fn format_millis(ms: i64) -> String {
         chrono::DateTime::from_timestamp_millis(ms).unwrap_or_default();
     dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
+
+/// Parse an ISO-8601 UTC string back to epoch millis (`None` when the
+/// string does not parse — remote timestamps are advisory, never trusted
+/// for ordering decisions).
+pub fn parse_millis(s: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.timestamp_millis())
+}

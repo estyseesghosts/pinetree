@@ -18,6 +18,31 @@ impl AppServices {
         reaction: Option<String>,
         key_suffix: &str,
     ) -> Result<NewJob, PortError> {
+        self.notify_job_full(
+            notifiee_id,
+            notifier_id,
+            kind,
+            note_id,
+            reaction,
+            None,
+            None,
+            key_suffix,
+        )
+    }
+
+    /// `notify_job` with clip/page refs (`ClipUpdated` carries `clip_id`,
+    /// `PageLiked` carries `page_id`).
+    pub fn notify_job_full(
+        &self,
+        notifiee_id: &str,
+        notifier_id: &str,
+        kind: NotificationKind,
+        note_id: Option<String>,
+        reaction: Option<String>,
+        clip_id: Option<String>,
+        page_id: Option<String>,
+        key_suffix: &str,
+    ) -> Result<NewJob, PortError> {
         let payload = NotifyJobPayload {
             notifiee_id: notifiee_id.to_string(),
             notifier_id: notifier_id.to_string(),
@@ -26,6 +51,8 @@ impl AppServices {
             reaction,
             file_id: None,
             exported_entity: None,
+            clip_id,
+            page_id,
         };
         NewJob::new_json(
             JobKind::Notify,

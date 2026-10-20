@@ -14,7 +14,7 @@ Each contract file carries a `Status:` line at the top: `Draft` or `Frozen`.
 | ActivityPub collections (outbox, followers, following paging) | Frozen (`docs/activitypub-collections.md`; Phase 2.6 slice 11) | §7 |
 | Visibility policy | Frozen (`docs/visibility-policy.md`) | §4 (`policy.rs`) |
 | Application ports | Frozen (`docs/application-ports.md`) | §4 (`ports.rs`) |
-| Persistence conformance tests | Frozen, redb green (`docs/persistence-conformance.md`; 115/115 green on redb in `tests/conformance.rs` — incl. Group V V1–V4 2026-10-20 + Group W W1–W2 2026-10-20 + Group X X1–X2 + Group Y Y1–Y3 2026-10-20) | §2 |
+| Persistence conformance tests | Frozen, redb green (`docs/persistence-conformance.md`; 118/118 green on redb in `tests/conformance.rs` — incl. Group V V1–V4 2026-10-20 + Group W W1–W2 2026-10-20 + Group X X1–X2 + Group Y Y1–Y4 2026-10-20 + Group Z Z1–Z2 2026-10-20) | §2 |
 | FDB client verification note | Executed 2026-10-14 (`docs/fdb-verification.md`; Q1–Q3 + startup-Q4 answered live) | §9 Phase 0 |
 | Phase 1 plan | Frozen (`docs/phase-1-plan.md`; pinned against Misskey 2026.10.1-alpha.0) | §9 Phase 1 |
 | Phase 1 exit criteria | Tracking checklist — all boxes checked (`docs/phase-1-exit-criteria.md`) | §9 Phase 1 |

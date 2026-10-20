@@ -312,7 +312,7 @@ impl AppServices {
             None => return Err(PortError::NotFound("NO_SUCH_NOTE".to_string())),
             Some(note) => note,
         };
-        if note.author_id != actor_id {
+        if note.author_id != actor_id && !self.viewer_is_moderator(Some(actor_id))? {
             return Err(PortError::Validation("ACCESS_DENIED".to_string()));
         }
         let base = self.public_url.trim_end_matches('/');

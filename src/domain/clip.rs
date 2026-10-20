@@ -49,6 +49,11 @@ pub struct Clip {
     /// Touched on `add-note` only (upstream `lastClippedAt` parity; never
     /// cleared on remove).
     pub last_clipped_at_ms: Option<i64>,
+    /// Last metadata/member change (served as ActivityStreams `updated`;
+    /// compared by `resolve_remote_clip` before full pulls).
+    /// `#[serde(default)]` keeps old rows decoding as never-updated.
+    #[serde(default)]
+    pub updated_at_ms: i64,
 }
 
 impl Clip {
@@ -97,6 +102,7 @@ impl Clip {
             approved_actor_uris: Vec::new(),
             created_at_ms,
             last_clipped_at_ms: None,
+            updated_at_ms: created_at_ms,
         }
     }
 }
@@ -115,6 +121,18 @@ pub struct ClipNote {
 /// `(user, clip)`). The API packs favorited `Clip`s, never this row.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ClipFavorite {
+    pub id: String,
+    pub user_id: String,
+    pub clip_id: String,
+    pub created_at_ms: i64,
+}
+
+/// One clip follow (pinetree-first: Misskey has no clip-follow; follower
+/// set drives `Update`/`Delete(Collection)` fan-out + notifications).
+/// Unique on `(user, clip)`. No cap in v1 (follows are cheap rows, no
+/// fan-out amplification at rest).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ClipFollow {
     pub id: String,
     pub user_id: String,
     pub clip_id: String,

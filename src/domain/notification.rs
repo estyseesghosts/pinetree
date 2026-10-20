@@ -35,6 +35,13 @@ pub enum NotificationKind {
     /// Self-notified through the normal `Notify` path so type filters and
     /// grouped rendering exercise it like any other kind.
     Test,
+    /// A followed clip's metadata changed (pinetree-only wire
+    /// `clipUpdated`, following the `ExportCompleted` precedent for
+    /// pinetree-only wire types; Keystone-only consumers). DIVERGENCE.
+    ClipUpdated,
+    /// A page received a remote `Like` (pinetree-only wire `pageLiked`).
+    /// DIVERGENCE — closes the silent-likes gap.
+    PageLiked,
 }
 
 impl NotificationKind {
@@ -56,6 +63,8 @@ impl NotificationKind {
             NotificationKind::FollowRequestAccepted => "followRequestAccepted",
             NotificationKind::ExportCompleted => "exportCompleted",
             NotificationKind::Test => "test",
+            NotificationKind::ClipUpdated => "clipUpdated",
+            NotificationKind::PageLiked => "pageLiked",
         }
     }
 }
@@ -85,6 +94,14 @@ pub struct Notification {
     /// `#[serde(default)]` keeps older rows decoding as entity-less.
     #[serde(default)]
     pub exported_entity: Option<String>,
+    /// Clip an updated/deleted-clip notification reports on
+    /// (`ClipUpdated`). `None` on every other kind.
+    #[serde(default)]
+    pub clip_id: Option<String>,
+    /// Page a page-like notification reports on (`PageLiked`).
+    /// `None` on every other kind.
+    #[serde(default)]
+    pub page_id: Option<String>,
     pub is_read: bool,
 }
 
@@ -94,7 +111,7 @@ mod tests {
 
     #[test]
     fn notification_roundtrips() {
-        let n = Notification {
+        let n = Notification { clip_id: None, page_id: None,
             id: "nid00000000000001".to_string(),
             notifiee_id: "aid00000000000001".to_string(),
             notifier_id: "aid00000000000002".to_string(),

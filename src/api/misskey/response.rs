@@ -159,6 +159,10 @@ impl RateLimiter {
             .with_limit("fetch-rss", 300, MINUTE_MS, None)
             .with_limit("notifications/test-notification", 10, MINUTE_MS, None)
             .with_limit("notes/versions", 10, 5_000, None)
+            // Batch Q Phase 1: upstream `i/notifications.ts:23-26` and
+            // `i/notifications-grouped.ts:28-31` buckets (30 per 30 s).
+            .with_limit("i/notifications", 30, 30_000, None)
+            .with_limit("i/notifications-grouped", 30, 30_000, None)
             .with_auth_limit("auth/update-email", 10, 30, MINUTE_MS)
     }
 

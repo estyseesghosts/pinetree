@@ -176,6 +176,8 @@ impl AppServices {
             reaction: None,
             file_id: Some(file.id),
             exported_entity: Some(payload.entity.exported_entity().to_string()),
+            clip_id: None,
+            page_id: None,
         };
         Ok(Some(NewJob::new_json(
             JobKind::Notify,

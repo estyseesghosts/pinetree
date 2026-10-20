@@ -8,7 +8,7 @@ use crate::domain::account::{
 use crate::domain::blocking::Blocking;
 use crate::domain::draft::NoteDraft;
 use crate::domain::follow::{Follow, FollowNotify, FollowRequest};
-use crate::domain::instance::{InstanceSettings, InviteCode, RegistrationPolicy};
+use crate::domain::instance::{InstanceSettings, InviteCode, RegistrationPolicy, UgcVisibilityForVisitor};
 use crate::domain::moderation::{AbuseReport, AbuseReportResolution, ModerationAction, ModerationLogEntry};
 use crate::domain::muting::{Muting, RenoteMuting};
 pub use crate::domain::id::{Clock, DomainError, IdGenerator, PortError};
@@ -2282,10 +2282,16 @@ pub trait ClipStore: Send + Sync {
     fn update_clip(
         &self,
         clip: crate::domain::clip::Clip,
+        jobs: Vec<NewJob>,
     ) -> Result<Option<crate::domain::clip::Clip>, PortError>;
-    /// Owner-scoped delete with clip-note + favorite cascade, one
+    /// Owner-scoped delete with clip-note + favorite + follow cascade, one
     /// transaction. Returns true when a row existed.
-    fn delete_clip(&self, owner_id: &str, clip_id: &str) -> Result<bool, PortError>;
+    fn delete_clip(
+        &self,
+        owner_id: &str,
+        clip_id: &str,
+        jobs: Vec<NewJob>,
+    ) -> Result<bool, PortError>;
     fn get_clip(&self, clip_id: &str) -> Result<Option<crate::domain::clip::Clip>, PortError>;
     /// Owner's clips, newest-first (bounded by the per-owner cap).
     fn clips_by_owner(
@@ -2308,6 +2314,7 @@ pub trait ClipStore: Send + Sync {
         &self,
         clip_id: &str,
         note_id: &str,
+        now_ms: i64,
         jobs: Vec<NewJob>,
     ) -> Result<bool, PortError>;
     /// Newest-first note ids of one clip (bounded by the per-clip cap).
@@ -2327,6 +2334,29 @@ pub trait ClipStore: Send + Sync {
         &self,
         user_id: &str,
     ) -> Result<Vec<crate::domain::clip::ClipFavorite>, PortError>;
+    /// Follow one clip (idempotent insert). Returns true when newly added.
+    fn follow_clip(
+        &self,
+        follow: crate::domain::clip::ClipFollow,
+    ) -> Result<bool, PortError>;
+    /// Unfollow (idempotent). Returns true when a row existed.
+    fn unfollow_clip(&self, user_id: &str, clip_id: &str) -> Result<bool, PortError>;
+    fn is_following_clip(&self, user_id: &str, clip_id: &str) -> Result<bool, PortError>;
+    /// Newest-first follower rows of one clip, bounded by `limit`.
+    fn followers_of_clip(
+        &self,
+        clip_id: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::domain::clip::ClipFollow>, PortError>;
+    /// Clips one user follows (for timelines/lookup), newest-first.
+    fn followed_clips_of(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<crate::domain::clip::ClipFollow>, PortError>;
+    /// Record a clip tombstone (`uri → deleted_at_ms`); tiny rows, kept
+    /// forever in v1 (documented). Idempotent.
+    fn record_clip_tombstone(&self, clip_uri: &str, deleted_at_ms: i64) -> Result<(), PortError>;
+    fn clip_tombstone(&self, clip_uri: &str) -> Result<Option<i64>, PortError>;
 }
 
 /// Pages (Misskey `MiPage`/`MiPageLike` parity + pinetree federation
@@ -2353,8 +2383,9 @@ pub trait PageStore: Send + Sync {
         jobs: Vec<NewJob>,
     ) -> Result<Option<crate::domain::page::Page>, PortError>;
     /// Delete by id with like cascade, one transaction. Returns true when
-    /// a row existed.
-    fn delete_page(&self, page_id: &str) -> Result<bool, PortError>;
+    /// a row existed. `jobs` (outbound `Delete(Article)` fan-out) commit
+    /// atomically.
+    fn delete_page(&self, page_id: &str, jobs: Vec<NewJob>) -> Result<bool, PortError>;
     fn get_page(&self, page_id: &str) -> Result<Option<crate::domain::page::Page>, PortError>;
     fn get_page_by_name(
         &self,
@@ -2563,6 +2594,8 @@ pub struct InstanceSettingsPatch {
     pub federate_clips: Option<bool>,
     /// Federated clips + pages handoff: admin `federatePages` switch.
     pub federate_pages: Option<bool>,
+    /// Batch Q Phase 1 item 3 (P5): admin `ugcVisibilityForVisitor` switch.
+    pub ugc_visibility_for_visitor: Option<UgcVisibilityForVisitor>,
 }
 
 pub trait InstanceSettingsStore: Send + Sync {

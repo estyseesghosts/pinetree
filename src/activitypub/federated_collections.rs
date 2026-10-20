@@ -254,16 +254,37 @@ pub fn render_page_article(
     for att in &page.remote_attachments {
         attachments.push(att.clone());
     }
-    // Audience mirrors the tier: only `Listed` pages claim the public
-    // collection (unlisted/approved pages are capability/direct-fetch
-    // only — see `docs/federated-collections.md` §4). The fetch gate, not
-    // this claim, enforces who reads.
-    let (to, cc) = match page.tier {
-        crate::domain::collection::CollectionTier::Listed => (
-            vec![PUBLIC_COLLECTION_URI.to_string()],
-            vec![format!("{actor_uri}/followers")],
-        ),
-        _ => (Vec::new(), Vec::new()),
+    // Audience mirrors tier + visibility (Phase 3 audit): Public ⇒
+    // public collection; Followers ⇒ followers collection; Specified ⇒
+    // addressed actors (local ids resolved to actor URIs; remote ids kept
+    // verbatim); capability tiers carry no public claim. The fetch gate,
+    // not this claim, enforces who reads.
+    let (to, cc) = if page.tier != crate::domain::collection::CollectionTier::Listed {
+        (Vec::new(), Vec::new())
+    } else {
+        match page.visibility {
+            crate::domain::note::Visibility::Public
+            | crate::domain::note::Visibility::Home => (
+                vec![PUBLIC_COLLECTION_URI.to_string()],
+                vec![format!("{actor_uri}/followers")],
+            ),
+            crate::domain::note::Visibility::Followers => (
+                vec![format!("{actor_uri}/followers")],
+                Vec::new(),
+            ),
+            crate::domain::note::Visibility::Specified => {
+                let mut tos = Vec::new();
+                let base = base.to_string();
+                for id in &page.visible_user_ids {
+                    if let Ok(Some(acc)) = services.accounts.find_by_id(id) {
+                        tos.push(acc.actor_url(&base));
+                    } else {
+                        tos.push(id.clone());
+                    }
+                }
+                (tos, Vec::new())
+            }
+        }
     };
     Ok(json!({
         "@context": ap_context(),
@@ -276,13 +297,19 @@ pub fn render_page_article(
         "summary": page.summary,
         "content": render_page_html(services, page),
         "url": uri,
-        "published": format_millis(services.ids.parse_time(&page.id).unwrap_or_else(|_| services.clock.now_ms())),
-        "updated": format_millis(page.updated_at_ms),
+        "published": format_millis(page.remote_published_ms.unwrap_or_else(|| services.ids.parse_time(&page.id).unwrap_or_else(|_| services.clock.now_ms()))),
+        "updated": format_millis(page.remote_updated_ms.unwrap_or(page.updated_at_ms)),
         "attachment": attachments,
         "tag": [],
         "source": {
             "content": page.content,
             "variables": page.variables,
+            "presentation": {
+                "font": page.font.as_str(),
+                "alignCenter": page.align_center,
+                "hideTitleWhenPinned": page.hide_title_when_pinned,
+            },
+            "slug": page.name,
             "mediaType": "application/json",
         },
     }))
@@ -326,6 +353,7 @@ pub fn render_clip_collection(
         items.push(Value::String(note_uri));
     }
     let total = items.len();
+    let updated = crate::activitypub::format_millis(clip.updated_at_ms);
     Ok(json!({
         "@context": ap_context(),
         "id": uri.clone(),
@@ -334,6 +362,7 @@ pub fn render_clip_collection(
         "name": clip.name,
         "summary": clip.description,
         "totalItems": total,
+        "updated": updated,
         "first": format!("{uri}?page=true"),
     }))
 }
@@ -489,24 +518,96 @@ pub fn render_clip_membership_activity(
     })
 }
 
+/// Render `Update(OrderedCollection)` carrying the embedded full
+/// collection document (one round trip, no refetch).
+pub fn render_clip_update_activity(
+    base: &str,
+    activity_id: &str,
+    actor_uri: &str,
+    collection: &Value,
+) -> Value {
+    let base = base.trim_end_matches('/');
+    json!({
+        "@context": ap_context(),
+        "id": format!("{base}/activities/{activity_id}"),
+        "type": "Update",
+        "actor": actor_uri,
+        "object": collection,
+    })
+}
+
+/// Render `Delete(OrderedCollection)` for a clip URI.
+pub fn render_clip_delete_activity(
+    base: &str,
+    activity_id: &str,
+    actor_uri: &str,
+    collection_uri: &str,
+) -> Value {
+    let base = base.trim_end_matches('/');
+    json!({
+        "@context": ap_context(),
+        "id": format!("{base}/activities/{activity_id}"),
+        "type": "Delete",
+        "actor": actor_uri,
+        "object": {
+            "id": collection_uri,
+            "type": "OrderedCollection",
+        },
+    })
+}
+
+/// Render `Delete(Article)` for a page URI (outbound local delete).
+pub fn render_page_delete_activity(
+    base: &str,
+    activity_id: &str,
+    actor_uri: &str,
+    page_uri: &str,
+) -> Value {
+    let base = base.trim_end_matches('/');
+    json!({
+        "@context": ap_context(),
+        "id": format!("{base}/activities/{activity_id}"),
+        "type": "Delete",
+        "actor": actor_uri,
+        "object": {
+            "id": page_uri,
+            "type": "Article",
+        },
+    })
+}
+
+/// Render a clip `Tombstone` (served at deleted URIs).
+pub fn render_clip_tombstone(collection_uri: &str) -> Value {
+    json!({
+        "@context": ap_context(),
+        "id": collection_uri,
+        "type": "Tombstone",
+        "formerType": "OrderedCollection",
+    })
+}
+
 /// Render `Create`/`Update` wrapping a page `Article` for fan-out.
+/// Audience matches the served `Article` (`to`/`cc` taken from the
+/// article doc so Create/Update never over-claim).
 pub fn render_page_activity(
     base: &str,
     activity_id: &str,
     actor_uri: &str,
     article: &Value,
     updated: bool,
-    followers_uri: &str,
+    _followers_uri: &str,
 ) -> Value {
     let base = base.trim_end_matches('/');
+    let to = article.get("to").cloned().unwrap_or(Value::Null);
+    let cc = article.get("cc").cloned().unwrap_or(Value::Null);
     json!({
         "@context": ap_context(),
         "id": format!("{base}/activities/{activity_id}"),
         "type": if updated { "Update" } else { "Create" },
         "actor": actor_uri,
         "published": article.get("published").cloned().unwrap_or(Value::Null),
-        "to": [PUBLIC_COLLECTION_URI],
-        "cc": [followers_uri],
+        "to": to,
+        "cc": cc,
         "object": article,
     })
 }
@@ -571,9 +672,27 @@ pub async fn get_clip_collection(
 ) -> Response {
     let target = original.to_string();
     let clip = match services.clips.get_clip(&id) {
-        Ok(Some(c)) => c,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Ok(Some(c)) => Some(c),
+        Ok(None) => None,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let Some(clip) = clip else {
+        // Tombstone (Phase 2a): a deleted clip URI serves `Tombstone`
+        // (`formerType: OrderedCollection`) so receivers distinguish
+        // "deleted, drop your copy" from 404 — but only while the
+        // instance switch is on (switch off ⇒ zero protocol footprint).
+        if !federation_switch_on(&services, "clips") {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        let base = services.public_url.trim_end_matches('/').to_string();
+        let uri = clip_collection_uri(&base, &id);
+        match services.clips.clip_tombstone(&uri) {
+            Ok(Some(_)) => {
+                return ap_response(StatusCode::GONE, &render_clip_tombstone(&uri));
+            }
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
     };
     // Pre-authenticate cheaply to learn the fetcher before deciding: the
     // callback needs no I/O, so run the gate in two steps (viewer first,
@@ -660,6 +779,57 @@ pub async fn get_page_article(
     if let Err(status) = decide_fetch(&viewer, decision) {
         return status.into_response();
     }
+    // Page-level read gating (Phase 1: gate lands before any non-public
+    // Article becomes a page). Owner always passes; moderators bypass;
+    // followers-only admits a *local* viewer following the owner; remote
+    // viewers of Followers/Specified pages fail closed (same posture as
+    // federated DMs).
+    if page.visibility != crate::domain::note::Visibility::Public
+        && page.visibility != crate::domain::note::Visibility::Home
+    {
+        // Local viewers pass via the same rule as `pages/show`
+        // (`page_visible_to`); remote viewers of a Followers page fail
+        // closed (their follow edge is not checkable — same posture as
+        // federated DMs); Specified admits listed ids (local or cached).
+        let allowed = match &viewer.actor_uri {
+            Some(actor_uri) => {
+                match services.accounts.find_by_uri(actor_uri) {
+                    Ok(Some(acc)) => {
+                        if acc.id == page.owner_id {
+                            true
+                        } else if acc.is_local()
+                            && (acc.is_admin || acc.is_moderator)
+                        {
+                            true
+                        } else {
+                            match page.visibility {
+                                crate::domain::note::Visibility::Followers => {
+                                    acc.is_local()
+                                        && services
+                                            .follows
+                                            .is_following(&acc.id, &page.owner_id)
+                                            .unwrap_or(false)
+                                }
+                                crate::domain::note::Visibility::Specified => {
+                                    page.visible_user_ids.iter().any(|id| id == &acc.id)
+                                }
+                                _ => false,
+                            }
+                        }
+                    }
+                    _ => false,
+                }
+            }
+            None => false,
+        };
+        if !allowed {
+            let status = match viewer.actor_uri {
+                Some(_) => StatusCode::FORBIDDEN,
+                None => StatusCode::NOT_FOUND,
+            };
+            return status.into_response();
+        }
+    }
     match render_page_article(&services, &page) {
         Ok(doc) => ap_response(StatusCode::OK, &doc),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -675,6 +845,9 @@ pub async fn get_page_article(
 struct RemoteClipEntry {
     fetched_at: Instant,
     note_uris: Vec<String>,
+    /// Last-seen ActivityStreams `updated` stamp of the collection doc
+    /// (Phase 2a: revalidation compares it before full pulls).
+    updated: Option<String>,
 }
 
 fn remote_clip_cache() -> &'static Mutex<HashMap<String, RemoteClipEntry>> {
@@ -682,7 +855,7 @@ fn remote_clip_cache() -> &'static Mutex<HashMap<String, RemoteClipEntry>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn remote_clip_cache_insert(uri: &str, note_uris: Vec<String>) {
+fn remote_clip_cache_insert(uri: &str, note_uris: Vec<String>, updated: Option<String>) {
     let Ok(mut cache) = remote_clip_cache().lock() else {
         return;
     };
@@ -702,6 +875,7 @@ fn remote_clip_cache_insert(uri: &str, note_uris: Vec<String>) {
         RemoteClipEntry {
             fetched_at: Instant::now(),
             note_uris,
+            updated,
         },
     );
 }
@@ -754,6 +928,30 @@ pub fn resolve_remote_clip_with_ttl(
             .map_err(|e| PortError::StorageUnavailable(format!("clip doc invalid: {e}")))
     };
     let doc = fetch_doc(clip_uri)?;
+    // `updated` fast-path (Phase 2a): when the served collection carries
+    // an `updated` stamp equal to the cached stamp, reuse the cached
+    // membership without walking `first` — the doc fetch itself is the
+    // revalidation, the item pull is what we skip.
+    if let Some(remote_updated) = doc.get("updated").and_then(Value::as_str) {
+        let hit = remote_clip_cache()
+            .lock()
+            .ok()
+            .and_then(|c| c.get(clip_uri).cloned());
+        if let Some(entry) = hit {
+            if entry.updated.as_deref() == Some(remote_updated) {
+                remote_clip_cache_insert(clip_uri, entry.note_uris.clone(), entry.updated);
+                if let Ok(cache) = remote_clip_cache().lock() {
+                    if let Some(e) = cache.get(clip_uri) {
+                        return Ok(e.note_uris.clone());
+                    }
+                }
+            }
+        }
+    }
+    let served_updated = doc
+        .get("updated")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let mut uris = Vec::new();
     // Full-state: inline `orderedItems` or one `first` page hop (the
     // serving side always fits a full collection on one page).
@@ -778,8 +976,30 @@ pub fn resolve_remote_clip_with_ttl(
             break;
         }
     }
-    remote_clip_cache_insert(clip_uri, uris.clone());
+    remote_clip_cache_insert(clip_uri, uris.clone(), served_updated);
     Ok(uris)
+}
+
+/// Ingest an embedded `OrderedCollection` document into the membership
+/// cache (Phase 2a `Update(Collection)` fast path: one round trip, no
+/// refetch). Extracts string `orderedItems` (capped) + the `updated`
+/// stamp. Idempotent — replays converge.
+pub fn ingest_remote_clip_doc(clip_uri: &str, doc: &Value) {
+    let mut uris = Vec::new();
+    if let Some(items) = doc.get("orderedItems").and_then(Value::as_array) {
+        for item in items {
+            if let Some(uri) = item.as_str() {
+                if uris.len() < CLIP_COLLECTION_PAGE_SIZE && !uris.contains(&uri.to_string()) {
+                    uris.push(uri.to_string());
+                }
+            }
+        }
+    }
+    let updated = doc
+        .get("updated")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    remote_clip_cache_insert(clip_uri, uris, updated);
 }
 
 /// Test hook: forget one cached remote-clip entry.
@@ -798,6 +1018,16 @@ pub fn remote_clip_cached_uris() -> Vec<String> {
         .lock()
         .map(|cache| cache.keys().cloned().collect())
         .unwrap_or_default()
+}
+
+/// Introspection for tests: cached membership URIs for one collection
+/// (`None` = not cached — never fetched or evicted).
+pub fn remote_clip_cached_for(uri: &str) -> Option<Vec<String>> {
+    remote_clip_cache()
+        .lock()
+        .ok()?
+        .get(uri)
+        .map(|e| e.note_uris.clone())
 }
 
 /// Evict one cached remote-clip entry (inbound `Add`/`Remove` promptness;
@@ -856,10 +1086,14 @@ mod tests {
             align_center: true,
             hide_title_when_pinned: false,
             tier: crate::domain::collection::CollectionTier::Listed,
+            visibility: crate::domain::note::Visibility::Public,
+            visible_user_ids: Vec::new(),
             federate: true,
             approved_actor_uris: Vec::new(),
             uri: None,
             remote_attachments: Vec::new(),
+            remote_published_ms: None,
+            remote_updated_ms: None,
             liked_count: 0,
             created_at_ms: 1,
             updated_at_ms: 2,

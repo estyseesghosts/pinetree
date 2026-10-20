@@ -40,7 +40,7 @@ use crate::domain::account::{
     Account, AvatarDecoration, ChatScope, FollowVisibility, MutedWord,
     NotificationRecieveConfig, ProfileField,
 };
-use crate::domain::instance::InviteCode;
+use crate::domain::instance::{InviteCode, UgcVisibilityForVisitor};
 use crate::domain::moderation::{AbuseReportResolution, ModerationAction};
 use crate::domain::note::{
     ReactionAcceptance, Visibility, MAX_CW_API_CHARS, MAX_NOTE_TEXT_CHARS,
@@ -157,6 +157,11 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/signin", post(signin))
         .route("/api/signin", post(signin))
         .route("/api/drive/files/create", post(drive_files_create))
+        // Batch Q Phase 1 (item 9): the route `meta.mediaProxy`
+        // (`{uri}/proxy`) advertises. Upstream shape is `/proxy/:url*`
+        // with a `?url=` override, so both forms route here.
+        .route("/proxy", get(proxy_media))
+        .route("/proxy/{*rest}", get(proxy_media))
         .route("/api/{*endpoint}", post(api_dispatch))
         .route("/streaming", get(streaming_handler))
         // No `DefaultBodyLimit::disable()`: the Misskey JSON dispatcher
@@ -1121,6 +1126,9 @@ fn notification_kind_for(field: &str, name: &str) -> Result<Option<NotificationK
         "exportCompleted" => Ok(Some(NotificationKind::ExportCompleted)),
         // Batch P: test notifications are now emitted locally.
         "test" => Ok(Some(NotificationKind::Test)),
+        // Phase 2c: pinetree-only clip/page notifications.
+        "clipUpdated" => Ok(Some(NotificationKind::ClipUpdated)),
+        "pageLiked" => Ok(Some(NotificationKind::PageLiked)),
         _ if is_unemitted_notification_type(name) => Ok(None),
         _ => Err(ApiError::invalid_param(
             field,
@@ -1131,7 +1139,7 @@ fn notification_kind_for(field: &str, name: &str) -> Result<Option<NotificationK
 
 /// Every [`NotificationKind`] the local store can emit, for the
 /// exclude-everything early return (`i/notifications` Misskey parity).
-const ALL_NOTIFICATION_KINDS: [NotificationKind; 11] = [
+const ALL_NOTIFICATION_KINDS: [NotificationKind; 14] = [
     NotificationKind::Follow,
     NotificationKind::ReceiveFollowRequest,
     NotificationKind::FollowRequestAccepted,
@@ -1143,6 +1151,9 @@ const ALL_NOTIFICATION_KINDS: [NotificationKind; 11] = [
     NotificationKind::ScheduledNotePostFailed,
     NotificationKind::Edited,
     NotificationKind::ExportCompleted,
+    NotificationKind::Test,
+    NotificationKind::ClipUpdated,
+    NotificationKind::PageLiked,
 ];
 
 /// Shared query params of `i/notifications` and `i/notifications-grouped`
@@ -1289,6 +1300,88 @@ async fn serve_file_named(Path((id, _name)): Path<(String, String)>) -> Response
         "",
     )
         .into_response()
+}
+
+/// Batch Q Phase 1 (item 9): `GET /proxy`, the route `meta.mediaProxy`
+/// (`{uri}/proxy`) advertises. Upstream shape is `/proxy/:url*` with a
+/// `?url=` override (`FileServerService.ts:106`,
+/// `FileServerProxyHandler.ts`); the cosmetic path segment is accepted and
+/// ignored, `?url=` wins. No auth: clients embed proxied URLs in `<img>`
+/// tags. The abuse surface is bounded by the SSRF-guarded federation HTTP
+/// client (private/reserved IPs refused), an 8 MiB body cap, and an
+/// inline-safe media allowlist.
+/// DIVERGENCE: no thumbnailing/transcoding and no `emoji`/`avatar`/`static`
+/// variants yet (media pipeline workstream); fetch failure or non-2xx is a
+/// plain 404 (no `dummy.png` fallback asset); SVG and non-media are refused
+/// rather than proxied.
+async fn proxy_media(
+    State(state): State<ApiState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    // Upstream `FileServerProxyHandler.ts` requires a User-Agent and
+    // refuses to proxy another proxy (loop protection).
+    let user_agent = headers
+        .get("user-agent")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    if user_agent.is_empty() {
+        return ApiError::invalid_param("url", "User-Agent is required").into_response();
+    }
+    if user_agent.to_ascii_lowercase().contains("misskey/") {
+        return (
+            StatusCode::FORBIDDEN,
+            "refusing to proxy a request from another proxy",
+        )
+            .into_response();
+    }
+    let url = match params.get("url") {
+        Some(url) => url,
+        None => {
+            return ApiError::invalid_param("url", "url query parameter is required")
+                .into_response();
+        }
+    };
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return ApiError::invalid_param("url", "only http(s) URLs can be proxied").into_response();
+    }
+    let fetched = match state
+        .services
+        .federation_http
+        .send("GET", url, &[], None, 8_388_608)
+    {
+        Ok(resp) => resp,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    if !(200..300).contains(&fetched.status) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let mime = fetched
+        .header("content-type")
+        .unwrap_or("application/octet-stream")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    // Inline-safe media only (same set as served files, so the response
+    // can never become active content in the site origin).
+    if !is_inline_safe_mime(&mime) {
+        return ApiError::invalid_param("url", "only image, audio, and video media can be proxied")
+            .into_response();
+    }
+    let mut response = fetched.body.into_response();
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        mime.parse::<HeaderValue>()
+            .unwrap_or(HeaderValue::from_static("application/octet-stream")),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("cache-control"),
+        HeaderValue::from_static("max-age=31536000, immutable"),
+    );
+    apply_media_security_headers(&mut response, &mime);
+    response
 }
 
 /// Tiny deterministic SVG identicon so avatar URLs always resolve. The
@@ -2826,17 +2919,29 @@ fn api_dispatch_blocking(
 
         "users/show" => {
             check_allowed_fields(&obj, &["userId", "userIds", "username", "host"])?;
+            // Batch Q Phase 1 item 3 (Misskey `users/show.ts` parity):
+            // suspension + ugc gates, with moderator bypass.
+            let viewer_id = caller.as_ref().map(|c| c.account.id.as_str());
             if let Some(Value::Array(ids)) = obj.get("userIds") {
+                if ids.is_empty() {
+                    return Ok(Json(Value::Array(Vec::new())).into_response());
+                }
+                // Upstream batch omits missing AND suspended rows for
+                // non-moderators (moderators see suspended rows).
                 let mut out = Vec::with_capacity(ids.len());
                 for id in ids {
                     let id = id.as_str().ok_or_else(|| {
                         ApiError::invalid_param("userIds", "must be an array of strings")
                     })?;
-                    let account = state
-                        .services
-                        .users_show_by_id(id)
-                        .map_err(ApiError::from_port_error)?;
-                    out.push(pack_account_for(&account, caller.as_ref(), &state.services)?);
+                    match state.services.users_show_by_id_as(id, viewer_id) {
+                        Ok(account) => out.push(pack_account_for(
+                            &account,
+                            caller.as_ref(),
+                            &state.services,
+                        )?),
+                        Err(PortError::NotFound(_)) => {}
+                        Err(err) => return Err(ApiError::from_port_error(err)),
+                    }
                 }
                 return Ok(Json(Value::Array(out)).into_response());
             }
@@ -2846,16 +2951,54 @@ fn api_dispatch_blocking(
                     "must be an array of strings",
                 ));
             }
+            let ugc = state
+                .services
+                .instance_settings
+                .get()
+                .map(|s| s.ugc_visibility_for_visitor)
+                .unwrap_or_default();
             let account = if let Some(user_id) = obj.get("userId").and_then(Value::as_str) {
-                state
-                    .services
-                    .users_show_by_id(user_id)
-                    .map_err(ApiError::from_port_error)?
+                match state.services.users_show_by_id_as(user_id, viewer_id) {
+                    Ok(account) => {
+                        // Upstream `show.ts:178`: anonymous + `local` +
+                        // remote user → `noSuchUser`.
+                        if viewer_id.is_none()
+                            && ugc == UgcVisibilityForVisitor::Local
+                            && account.host.is_some()
+                        {
+                            return Err(ApiError::users_show_no_such_user());
+                        }
+                        account
+                    }
+                    Err(PortError::NotFound(_)) => {
+                        return Err(ApiError::users_show_no_such_user());
+                    }
+                    Err(err) => return Err(ApiError::from_port_error(err)),
+                }
             } else if let Some(username) = obj.get("username").and_then(Value::as_str) {
                 let host = obj.get("host").and_then(Value::as_str);
-                match state.services.users_show_by_username(username, host) {
-                    Ok(account) => account,
-                    Err(original @ PortError::NotFound(_)) => match host {
+                // Upstream `show.ts:158-160`: anonymous + `local` + remote
+                // handle lookup → `noSuchUser` without resolving.
+                if viewer_id.is_none()
+                    && ugc == UgcVisibilityForVisitor::Local
+                    && host.is_some()
+                {
+                    return Err(ApiError::users_show_no_such_user());
+                }
+                match state
+                    .services
+                    .users_show_by_username_as(username, host, viewer_id)
+                {
+                    Ok(account) => {
+                        if viewer_id.is_none()
+                            && ugc == UgcVisibilityForVisitor::Local
+                            && account.host.is_some()
+                        {
+                            return Err(ApiError::users_show_no_such_user());
+                        }
+                        account
+                    }
+                    Err(PortError::NotFound(_)) => match host {
                         Some(remote_host) => {
                             let wf = webfinger_discover_actor_uri(
                                 &state.services.federation_http,
@@ -2881,11 +3024,24 @@ fn api_dispatch_blocking(
                             })
                             .map(|(account, _)| account);
                             match resolved {
-                                Some(account) => account,
-                                None => return Err(ApiError::from_port_error(original)),
+                                Some(account) => {
+                                    // A remotely resolved suspended account
+                                    // stays hidden from non-moderators
+                                    // (upstream re-checks after resolve).
+                                    if account.is_suspended
+                                        && !state
+                                            .services
+                                            .viewer_is_moderator(viewer_id)
+                                            .map_err(ApiError::from_port_error)?
+                                    {
+                                        return Err(ApiError::users_show_no_such_user());
+                                    }
+                                    account
+                                }
+                                None => return Err(ApiError::users_show_no_such_user()),
                             }
                         }
-                        None => return Err(ApiError::from_port_error(original)),
+                        None => return Err(ApiError::users_show_no_such_user()),
                     },
                     Err(err) => return Err(ApiError::from_port_error(err)),
                 }
@@ -3714,6 +3870,74 @@ fn api_dispatch_blocking(
             Ok(Json(Value::Array(out)).into_response())
         }
 
+        // `clips/follow {clipId!}` → 204 (pinetree-first: Misskey has
+        // no clip-follow; idempotent — already-following succeeds).
+        // Permission `write:clip-favorite` (symmetry with clip favorites;
+        // recorded choice). Anyone who can read the clip may follow.
+        "clips/follow" => {
+            check_allowed_fields(&obj, &["clipId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:clip-favorite")?;
+            let clip_id = required_str(&obj, "clipId")?;
+            state
+                .services
+                .follow_clip(&caller.account.id, &clip_id)
+                .map_err(|e| map_clip_error(e, "clips/follow"))?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // `clips/unfollow {clipId!}` → 204 (idempotent).
+        "clips/unfollow" => {
+            check_allowed_fields(&obj, &["clipId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:clip-favorite")?;
+            let clip_id = required_str(&obj, "clipId")?;
+            state
+                .services
+                .unfollow_clip(&caller.account.id, &clip_id)
+                .map_err(|e| map_clip_error(e, "clips/unfollow"))?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // `clips/followers {clipId!}` → 200 packed `UserLite[]`
+        // (pinetree-first, owner-only: following a clip must not advertise
+        // the follower set to others; non-owners get 403 and read
+        // self-status via `clips/show.isFollowing`).
+        "clips/followers" => {
+            check_allowed_fields(&obj, &["clipId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:account")?;
+            let clip_id = required_str(&obj, "clipId")?;
+            let clip = state
+                .services
+                .visible_clip(&clip_id, Some(&caller.account.id))
+                .map_err(|e| map_clip_error(e, "clips/followers"))?;
+            if clip.owner_id != caller.account.id {
+                return Err(ApiError::clip_followers_forbidden());
+            }
+            let follows = state
+                .services
+                .clips
+                .followers_of_clip(&clip_id, 100)
+                .map_err(ApiError::from_port_error)?;
+            let mut out = Vec::with_capacity(follows.len());
+            for f in &follows {
+                if let Some(acc) = state
+                    .services
+                    .accounts
+                    .find_by_id(&f.user_id)
+                    .map_err(ApiError::from_port_error)?
+                {
+                    out.push(crate::api::misskey::packers::pack_user_lite(
+                        &acc,
+                        &state.services.public_url,
+                        state.services.clock.now_ms(),
+                    ));
+                }
+            }
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
         // --- Federated clips + pages handoff: Phase 3 (local pages) ---
         // `pages/create` (full body required, upstream param set; + the
         // same federation extension fields) → 200 packed `Page` (10/hr).
@@ -3732,6 +3956,8 @@ fn api_dispatch_blocking(
                     "alignCenter",
                     "hideTitleWhenPinned",
                     "visibility",
+                    "pageVisibility",
+                    "visibleUserIds",
                     "federate",
                     "approvedActorUris",
                 ],
@@ -3767,6 +3993,8 @@ fn api_dispatch_blocking(
                     "alignCenter",
                     "hideTitleWhenPinned",
                     "visibility",
+                    "pageVisibility",
+                    "visibleUserIds",
                     "federate",
                     "approvedActorUris",
                 ],
@@ -3805,11 +4033,11 @@ fn api_dispatch_blocking(
             let page = match (obj.get("pageId"), obj.get("name"), obj.get("username")) {
                 (Some(Value::String(id)), _, _) if !id.is_empty() => state
                     .services
-                    .show_page_by_id(id)
+                    .show_page_by_id(id, viewer_id)
                     .map_err(|e| map_page_error(e, "pages/show"))?,
                 (_, Some(Value::String(name)), Some(Value::String(username))) => state
                     .services
-                    .show_page_by_name(name, username)
+                    .show_page_by_name(name, username, viewer_id)
                     .map_err(|e| map_page_error(e, "pages/show"))?,
                 _ => {
                     return Err(ApiError::invalid_param(
@@ -3864,6 +4092,22 @@ fn api_dispatch_blocking(
                 .map_err(ApiError::from_port_error)?;
             let mut out = Vec::with_capacity(pages.len());
             for page in &pages {
+                // `pages/featured` stays a pure query but serves public
+                // pages only (Phase 1: gated pages never surface here —
+                // upstream parity is a top-10-by-likedCount query, and the
+                // gate is read-side).
+                if state
+                    .services
+                    .check_page_visible(page, viewer_id)
+                    .is_err()
+                {
+                    continue;
+                }
+                // Double-guard: never feature non-public rows even if the
+                // gate above ever admits Home.
+                if page.visibility != crate::domain::note::Visibility::Public {
+                    continue;
+                }
                 out.push(
                     pack_page(page, viewer_id, &state.services)
                         .map_err(ApiError::from_port_error)?,
@@ -3975,12 +4219,15 @@ fn api_dispatch_blocking(
             let caller = require_caller(caller)?;
             caller.require_permission("write:notes")?;
             state.rate_limiter.check(&rate_key, "notes/create")?;
-            let mut file_ids = str_list(&obj, "fileIds")?;
-            for id in str_list(&obj, "mediaIds")? {
-                if !file_ids.contains(&id) {
-                    file_ids.push(id);
-                }
-            }
+            // Misskey `notes/create.ts:226`: `fileIds ?? mediaIds ?? []`
+            // — when `fileIds` is present it wins outright; `mediaIds`
+            // is only a legacy fallback. (`notes/edit` mirrors the same
+            // precedence.)
+            let file_ids = if obj.contains_key("fileIds") {
+                str_list(&obj, "fileIds")?
+            } else {
+                str_list(&obj, "mediaIds")?
+            };
             let input = CreateNoteInput {
                 author_id: caller.account.id.clone(),
                 text: opt_string(&obj, "text")?,
@@ -4238,12 +4485,15 @@ fn api_dispatch_blocking(
                     )));
                 }
             }
-            let mut file_ids = str_list(&obj, "fileIds")?;
-            for id in str_list(&obj, "mediaIds")? {
-                if !file_ids.contains(&id) {
-                    file_ids.push(id);
-                }
-            }
+            // Misskey `notes/create.ts:226`: `fileIds ?? mediaIds ?? []`
+            // — when `fileIds` is present it wins outright; `mediaIds`
+            // is only a legacy fallback. (`notes/edit` mirrors the same
+            // precedence.)
+            let file_ids = if obj.contains_key("fileIds") {
+                str_list(&obj, "fileIds")?
+            } else {
+                str_list(&obj, "mediaIds")?
+            };
             let input = EditNoteInput {
                 editor_id: caller.account.id.clone(),
                 note_id: edit_id,
@@ -5379,12 +5629,18 @@ fn api_dispatch_blocking(
                     "federatePages".to_string(),
                     serde_json::json!(settings.federate_pages),
                 );
+                // Batch Q Phase 1 item 3: anonymous-visitor UGC visibility
+                // (upstream `admin/meta.ts:590-594`).
+                map.insert(
+                    "ugcVisibilityForVisitor".to_string(),
+                    serde_json::json!(settings.ugc_visibility_for_visitor.as_wire()),
+                );
             }
             Ok(Json(meta).into_response())
         }
 
         "admin/update-meta" => {
-            check_allowed_fields(&obj, &["disableRegistration", "blockedHosts", "federateClips", "federatePages"])?;
+            check_allowed_fields(&obj, &["disableRegistration", "blockedHosts", "federateClips", "federatePages", "ugcVisibilityForVisitor"])?;
             let caller = require_caller(caller)?;
             caller.require_permission("write:admin:meta")?;
             require_admin(&caller)?;
@@ -5430,6 +5686,23 @@ fn api_dispatch_blocking(
                     blocked_hosts,
                     update_bool_field(&obj, "federateClips")?,
                     update_bool_field(&obj, "federatePages")?,
+                    match obj.get("ugcVisibilityForVisitor") {
+                        None | Some(Value::Null) => None,
+                        Some(Value::String(s)) => Some(
+                            UgcVisibilityForVisitor::parse(s).ok_or_else(|| {
+                                ApiError::invalid_param(
+                                    "ugcVisibilityForVisitor",
+                                    "must be one of all, local, none",
+                                )
+                            })?,
+                        ),
+                        Some(_) => {
+                            return Err(ApiError::invalid_param(
+                                "ugcVisibilityForVisitor",
+                                "must be one of all, local, none",
+                            ));
+                        }
+                    },
                     state.services.clock.now_ms(),
                 )
                 .map_err(ApiError::from_port_error)?;
@@ -5555,12 +5828,12 @@ fn api_dispatch_blocking(
             caller.require_permission("write:account")?;
             state.rate_limiter.check(&rate_key, "i/import-following")?;
             let file_id = required_str(&obj, "fileId")?;
-            // DIVERGENCE: upstream `withReplies` is optional with no
-            // default (undefined flows into the relationship job);
-            // pinetree booleans need a default — `true` matches the
-            // `following/create` default. Row-level `withReplies=` still
-            // overrides per row.
-            let with_replies = opt_bool(&obj, "withReplies", true)?;
+            // Misskey `i/import-following.ts:56` declares `withReplies`
+            // with no default; the import processor treats an omitted
+            // value as falsy ("without replies" unless a CSV row
+            // overrides), so the job-level default is false — matching
+            // `following/create` above.
+            let with_replies = opt_bool(&obj, "withReplies", false)?;
             if let Err(err) = state.services.check_import_file(&caller.account.id, &file_id) {
                 return Err(map_import_file_error(err, "i/import-following"));
             }
@@ -5717,7 +5990,11 @@ fn api_dispatch_blocking(
             caller.require_permission("write:following")?;
             state.rate_limiter.check(&rate_key, "following/create")?;
             let user_id = required_str(&obj, "userId")?;
-            let with_replies = opt_bool(&obj, "withReplies", true)?;
+            // Misskey `following/create.ts` declares no `withReplies`
+            // default; the value flows into the relationship row whose
+            // column default is false (`Following.ts:49-52`), so an
+            // omitted `withReplies` means false upstream too.
+            let with_replies = opt_bool(&obj, "withReplies", false)?;
             state
                 .services
                 .follow(&caller.account.id, &user_id, with_replies)
@@ -5797,7 +6074,9 @@ fn api_dispatch_blocking(
         "following/requests/list" => {
             check_allowed_fields(&obj, &["limit", "sinceId", "untilId"])?;
             let caller = require_caller(caller)?;
-            caller.require_permission("read:account")?;
+            // Misskey `following/requests/list.ts:18` kind is
+            // `read:following` (not `read:account`).
+            caller.require_permission("read:following")?;
             let reqs = state
                 .services
                 .follows
@@ -5871,9 +6150,23 @@ fn api_dispatch_blocking(
             let cursor = parse_cursor(&obj)?;
             let with_files = opt_bool(&obj, "withFiles", false)?;
             let with_renotes = opt_bool(&obj, "withRenotes", true)?;
+            // Batch Q Phase 1 item 7: the `include*` trio is honored, not
+            // just accepted (upstream `notes/timeline.ts:48-50` defaults,
+            // all true).
+            let include_my_renotes = opt_bool(&obj, "includeMyRenotes", true)?;
+            let include_renoted_my_notes = opt_bool(&obj, "includeRenotedMyNotes", true)?;
+            let include_local_renotes = opt_bool(&obj, "includeLocalRenotes", true)?;
             let notes = state
                 .services
-                .home_timeline(&caller.account.id, &cursor, with_files, with_renotes)
+                .home_timeline_with_includes(
+                    &caller.account.id,
+                    &cursor,
+                    with_files,
+                    with_renotes,
+                    include_my_renotes,
+                    include_renoted_my_notes,
+                    include_local_renotes,
+                )
                 .map_err(ApiError::from_port_error)?;
             pack_note_list(&state.services, &notes, Some(&caller.account.id))
         }
@@ -5960,14 +6253,23 @@ fn api_dispatch_blocking(
             let with_files = opt_bool(&obj, "withFiles", false)?;
             let with_renotes = opt_bool(&obj, "withRenotes", true)?;
             let with_replies = opt_bool(&obj, "withReplies", false)?;
+            // Batch Q Phase 1 item 7: same `include*` trio as home (flags
+            // apply to the merged home ∪ local-public set, upstream
+            // `hybrid-timeline.ts getFromDb` parity).
+            let include_my_renotes = opt_bool(&obj, "includeMyRenotes", true)?;
+            let include_renoted_my_notes = opt_bool(&obj, "includeRenotedMyNotes", true)?;
+            let include_local_renotes = opt_bool(&obj, "includeLocalRenotes", true)?;
             let notes = state
                 .services
-                .hybrid_timeline(
+                .hybrid_timeline_with_includes(
                     &caller.account.id,
                     &cursor,
                     with_files,
                     with_renotes,
                     with_replies,
+                    include_my_renotes,
+                    include_renoted_my_notes,
+                    include_local_renotes,
                 )
                 .map_err(ApiError::from_port_error)?;
             pack_note_list(&state.services, &notes, Some(&caller.account.id))
@@ -6172,14 +6474,13 @@ fn api_dispatch_blocking(
             let caller = require_caller(caller)?;
             // Misskey kind is `read:notifications` (not `read:account`).
             caller.require_permission("read:notifications")?;
+            // Upstream `i/notifications.ts:23-26` bucket: 30 requests per
+            // 30 s.
+            state.rate_limiter.check(&rate_key, "i/notifications")?;
             let query = parse_notification_query(&obj)?;
             if query.matches_nothing {
-                if query.mark_as_read {
-                    state
-                        .services
-                        .mark_all_notifications_read(&caller.account.id)
-                        .map_err(ApiError::from_port_error)?;
-                }
+                // Misskey `i/notifications.ts:72-79` returns `[]` before
+                // the mark-as-read step: an empty filter never marks.
                 return Ok(Json(Value::Array(Vec::new())).into_response());
             }
             let notifications = state
@@ -6648,6 +6949,18 @@ fn api_dispatch_blocking(
             let limit = get_limit(&obj)?;
             let offset = opt_usize(&obj, "offset")?.unwrap_or(0);
             let viewer_id = caller.as_ref().map(|caller| caller.account.id.as_str());
+            // Upstream `notes/conversation.ts:62`: anonymous + `none` → `[]`.
+            if viewer_id.is_none()
+                && state
+                    .services
+                    .instance_settings
+                    .get()
+                    .map(|s| s.ugc_visibility_for_visitor)
+                    .unwrap_or_default()
+                    == UgcVisibilityForVisitor::None
+            {
+                return Ok(Json(Value::Array(Vec::new())).into_response());
+            }
             let notes = state
                 .services
                 .note_conversation(&note_id, viewer_id, limit, offset)
@@ -8767,14 +9080,15 @@ fn api_dispatch_blocking(
             )?;
             let caller = require_caller(caller)?;
             caller.require_permission("read:notifications")?;
+            // Same 30/30 s bucket as `i/notifications` (upstream
+            // `i/notifications-grouped.ts:28-31`).
+            state
+                .rate_limiter
+                .check(&rate_key, "i/notifications-grouped")?;
             let query = parse_notification_query(&obj)?;
             if query.matches_nothing {
-                if query.mark_as_read {
-                    state
-                        .services
-                        .mark_all_notifications_read(&caller.account.id)
-                        .map_err(ApiError::from_port_error)?;
-                }
+                // Empty filter returns `[]` before mark-as-read, as in
+                // `i/notifications` above.
                 return Ok(Json(Value::Array(Vec::new())).into_response());
             }
             let notifications = state
@@ -9416,6 +9730,16 @@ fn parse_page_body(
         crate::domain::collection::validate_tier_name(v)
             .map_err(|_| ApiError::invalid_param("visibility", "unknown tier"))?;
     }
+    let page_visibility = opt_string(obj, "pageVisibility")?;
+    if let Some(v) = &page_visibility {
+        if !matches!(v.as_str(), "public" | "home" | "followers" | "specified") {
+            return Err(ApiError::invalid_param(
+                "pageVisibility",
+                "must be public|home|followers|specified",
+            ));
+        }
+    }
+    let visible_user_ids = opt_str_array(obj, "visibleUserIds")?;
     Ok(PageBody {
         title,
         name,
@@ -9428,6 +9752,8 @@ fn parse_page_body(
         align_center: update_bool_field(obj, "alignCenter")?,
         hide_title_when_pinned: update_bool_field(obj, "hideTitleWhenPinned")?,
         visibility,
+        page_visibility,
+        visible_user_ids,
         federate: update_bool_field(obj, "federate")?,
         approved_actor_uris: opt_str_array(obj, "approvedActorUris")?,
     })
@@ -13807,7 +14133,7 @@ mod tests {
             state
                 .services
                 .notifications
-                .insert_notification(Notification {
+                .insert_notification(Notification { clip_id: None, page_id: None,
                     id: state.services.ids.generate(),
                     notifiee_id: bob_id.clone(),
                     notifier_id: alice_id.clone(),
@@ -13934,7 +14260,7 @@ mod tests {
         state
             .services
             .notifications
-            .insert_notification(Notification {
+            .insert_notification(Notification { clip_id: None, page_id: None,
                 id: state.services.ids.generate(),
                 notifiee_id: bob_id.clone(),
                 notifier_id: alice_id.clone(),
@@ -14530,7 +14856,7 @@ mod tests {
             state
                 .services
                 .notifications
-                .insert_notification(Notification {
+                .insert_notification(Notification { clip_id: None, page_id: None,
                     id,
                     notifiee_id: bob_id.clone(),
                     notifier_id: notifier.to_string(),
@@ -14711,7 +15037,7 @@ mod tests {
             state
                 .services
                 .notifications
-                .insert_notification(Notification {
+                .insert_notification(Notification { clip_id: None, page_id: None,
                     id: state.services.ids.generate(),
                     notifiee_id: bob_id.clone(),
                     notifier_id: alice_id.clone(),
@@ -17417,7 +17743,7 @@ mod tests {
             .get_follow(&alice_id, &bob_id)
             .unwrap()
             .unwrap();
-        assert!(bob.with_replies, "endpoint default withReplies is true");
+        assert!(!bob.with_replies, "endpoint default withReplies is false (Batch Q item 5)");
         let carol = state
             .services
             .follows
@@ -21220,5 +21546,640 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{lists}");
         assert_eq!(lists.as_array().unwrap().len(), 1, "bad import applied nothing");
+    }
+
+    /// Batch Q Phase 1: mint a third-party token scoped to `permissions`.
+    async fn scoped_token(state: &ApiState, account_id: &str, permissions: Vec<&str>) -> String {
+        let raw = generate_random_token();
+        state
+            .services
+            .auth
+            .store_token(ApiTokenRecord {
+                id: state.services.ids.generate(),
+                token_hash: hash_token(&raw),
+                account_id: account_id.to_string(),
+                permissions: permissions.into_iter().map(str::to_string).collect(),
+                is_first_party: false,
+                name: None,
+                description: None,
+                icon_url: None,
+                created_at_ms: state.services.clock.now_ms(),
+            })
+            .unwrap();
+        raw
+    }
+
+    /// Batch Q Phase 1, item 1: `following/requests/list` requires
+    /// `read:following` (upstream `list.ts:18`), not `read:account`.
+    #[tokio::test]
+    async fn batch_q_requests_list_permission_kind() {
+        let (state, _) = test_state();
+        let (alice_id, _) = signup_user(&state, "alice").await;
+        let following_only = scoped_token(&state, &alice_id, vec!["read:following"]).await;
+        let account_only = scoped_token(&state, &alice_id, vec!["read:account"]).await;
+        let (status, value) = call(
+            &state,
+            "following/requests/list",
+            serde_json::json!({}),
+            Some(&following_only),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let (status, value) = call(
+            &state,
+            "following/requests/list",
+            serde_json::json!({}),
+            Some(&account_only),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{value}");
+        assert_eq!(value["code"], "PERMISSION_DENIED");
+    }
+
+    /// Batch Q Phase 1, item 4: `i/notifications` carries the upstream
+    /// 30/30 s bucket, and an empty filter returns `[]` *before* the
+    /// mark-as-read step (upstream `notifications.ts:72-79` vs `:93-95`).
+    #[tokio::test]
+    async fn batch_q_notifications_bucket_and_empty_filter() {
+        use crate::domain::notification::{Notification, NotificationKind};
+        let (state, _) = test_state();
+        let (alice_id, _) = signup_user(&state, "alice").await;
+        let (bob_id, bob_token) = signup_user(&state, "bob").await;
+        state
+            .services
+            .notifications
+            .insert_notification(Notification { clip_id: None, page_id: None,
+                id: state.services.ids.generate(),
+                notifiee_id: bob_id.clone(),
+                notifier_id: alice_id.clone(),
+                kind: NotificationKind::Follow,
+                note_id: None,
+                reaction: None,
+                draft_id: None,
+                file_id: None,
+                exported_entity: None,
+                is_read: false,
+            })
+            .unwrap();
+        // Empty filter with default markAsRead=true: `[]`, and nothing
+        // is marked read.
+        let (status, value) = call(
+            &state,
+            "i/notifications",
+            serde_json::json!({ "includeTypes": [] }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value.as_array().unwrap().len(), 0);
+        let (status, value) = call(
+            &state,
+            "i/notifications",
+            serde_json::json!({ "markAsRead": false }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value.as_array().unwrap().len(), 1);
+        assert_eq!(value[0]["isRead"], false);
+        // Same for the grouped variant.
+        let (status, value) = call(
+            &state,
+            "i/notifications-grouped",
+            serde_json::json!({ "includeTypes": [] }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value.as_array().unwrap().len(), 0);
+        let (status, value) = call(
+            &state,
+            "i/notifications-grouped",
+            serde_json::json!({ "markAsRead": false }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value[0]["isRead"], false);
+
+        // Bucket: a fresh account gets exactly 30 requests per 30 s.
+        let (_, carol_token) = signup_user(&state, "carol").await;
+        for n in 0..30 {
+            let (status, value) = call(
+                &state,
+                "i/notifications",
+                serde_json::json!({ "markAsRead": false }),
+                Some(&carol_token),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "request {n}: {value}");
+        }
+        let (status, value) = call(
+            &state,
+            "i/notifications",
+            serde_json::json!({ "markAsRead": false }),
+            Some(&carol_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{value}");
+        assert_eq!(value["code"], "RATE_LIMIT_EXCEEDED");
+    }
+
+    /// Batch Q Phase 1, item 5: omitted `withReplies` defaults to false
+    /// (upstream column default `Following.ts:49-52`), on both
+    /// `following/create` and `i/import-following`.
+    #[tokio::test]
+    async fn batch_q_with_replies_default_false() {
+        use crate::application::ports::FollowStore;
+        let (state, _) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (bob_id, _) = signup_user(&state, "bob").await;
+        let (carol_id, carol_token) = signup_user(&state, "carol").await;
+        let (dave_id, _) = signup_user(&state, "dave").await;
+        let (status, value) = call(
+            &state,
+            "following/create",
+            serde_json::json!({ "userId": bob_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let edge = state
+            .services
+            .follows
+            .get_follow(&alice_id, &bob_id)
+            .unwrap()
+            .expect("follow edge");
+        assert!(!edge.with_replies, "omitted withReplies must be false");
+        let (status, value) = call(
+            &state,
+            "following/create",
+            serde_json::json!({ "userId": dave_id, "withReplies": true }),
+            Some(&carol_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let edge = state
+            .services
+            .follows
+            .get_follow(&carol_id, &dave_id)
+            .unwrap()
+            .expect("follow edge");
+        assert!(edge.with_replies, "explicit withReplies=true honored");
+    }
+
+    /// Batch Q Phase 1, item 6: `notes/create` (and `notes/edit`)
+    /// `fileIds ?? mediaIds` — when `fileIds` is present it wins outright.
+    #[tokio::test]
+    async fn batch_q_file_ids_wins_over_media_ids() {
+        let (state, _) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let file_a = state
+            .services
+            .upload_media(&alice_id, "a.txt".to_string(), b"aaa", None, false, true)
+            .unwrap();
+        let file_b = state
+            .services
+            .upload_media(&alice_id, "b.txt".to_string(), b"bbb", None, false, true)
+            .unwrap();
+        // Both keys: only `fileIds` attaches.
+        let (status, value) = call(
+            &state,
+            "notes/create",
+            serde_json::json!({
+                "text": "both keys",
+                "fileIds": [file_a.id],
+                "mediaIds": [file_b.id],
+            }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value["createdNote"]["fileIds"], serde_json::json!([file_a.id]));
+        // `mediaIds` alone still works as the legacy fallback.
+        let (status, value) = call(
+            &state,
+            "notes/create",
+            serde_json::json!({ "text": "legacy key", "mediaIds": [file_b.id] }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value["createdNote"]["fileIds"], serde_json::json!([file_b.id]));
+    }
+
+    /// Batch Q Phase 1, item 9: `GET /proxy` (advertised as
+    /// `meta.mediaProxy`) validation branches. The happy path runs against
+    /// a loopback stub image server (`allow_private_ips: true` in tests).
+    #[tokio::test]
+    async fn batch_q_proxy_route() {
+        use std::collections::HashMap;
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        async fn proxy(
+            state: &ApiState,
+            params: HashMap<String, String>,
+            user_agent: Option<&str>,
+        ) -> (StatusCode, Vec<u8>, HeaderMap) {
+            let mut headers = HeaderMap::new();
+            if let Some(ua) = user_agent {
+                headers.insert("user-agent", ua.parse::<HeaderValue>().unwrap());
+            }
+            let response = proxy_media(State(state.clone()), Query(params), headers).await;
+            let status = response.status();
+            let headers = response.headers().clone();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec();
+            (status, bytes, headers)
+        }
+        fn params(url: &str) -> HashMap<String, String> {
+            HashMap::from([("url".to_string(), url.to_string())])
+        }
+
+        let (state, _) = test_state();
+        // Missing User-Agent → 400.
+        let (status, _, _) = proxy(&state, params("https://example.com/a.png"), None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // Missing url → 400 INVALID_PARAM.
+        let (status, body, _) = proxy(&state, HashMap::new(), Some("test-agent")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["code"], "INVALID_PARAM");
+        // Another proxy in the loop → 403.
+        let (status, _, _) = proxy(
+            &state,
+            params("https://example.com/a.png"),
+            Some("Misskey/2026 (proxy)"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        // Non-http(s) URL → 400.
+        let (status, _, _) = proxy(&state, params("file:///etc/passwd"), Some("test-agent")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // Unreachable host → 404, not a 500.
+        let (status, _, _) = proxy(
+            &state,
+            params("https://proxy-test.invalid/a.png"),
+            Some("test-agent"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Loopback stub: one PNG response, one text response.
+        const PNG_1PX: &[u8] = &[
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9c, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(2) {
+                let mut stream = stream.unwrap();
+                let mut buf = vec![0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]);
+                let (content_type, body): (&str, &[u8]) = if head.contains("GET /pic.png") {
+                    ("image/png", PNG_1PX)
+                } else {
+                    ("text/plain", b"hello")
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+        let (status, body, headers) = proxy(
+            &state,
+            params(&format!("http://{addr}/pic.png")),
+            Some("test-agent"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, PNG_1PX);
+        assert_eq!(headers["content-type"], "image/png");
+        assert_eq!(headers["cache-control"], "max-age=31536000, immutable");
+        // Non-media is refused, never proxied as active content.
+        let (status, _, _) = proxy(
+            &state,
+            params(&format!("http://{addr}/note.txt")),
+            Some("test-agent"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// Batch Q Phase 1, item 3a: `users/show` 404s suspended users for
+    /// non-moderators (upstream `users/show.ts:174` verbatim id + 404),
+    /// moderators still see them, and the `userIds` batch omits hidden rows.
+    #[tokio::test]
+    async fn batch_q_users_show_suspension() {
+        let (state, _) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (bob_id, _) = signup_user(&state, "bob").await;
+        let (_, carol_token) = signup_user(&state, "carol").await;
+        state
+            .services
+            .set_role(None, &alice_id, false, true)
+            .expect("make alice moderator");
+        let (status, _) = call(
+            &state,
+            "admin/suspend-user",
+            serde_json::json!({ "userId": bob_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // Anonymous + non-moderator: 404 with the verbatim upstream id.
+        for token in [None, Some(carol_token.as_str())] {
+            let (status, value) = call(
+                &state,
+                "users/show",
+                serde_json::json!({ "userId": bob_id }),
+                token,
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{value}");
+            assert_eq!(value["code"], "NO_SUCH_USER");
+            assert_eq!(value["error"]["id"], "4362f8dc-731f-4ad8-a694-be5a88922a24");
+        }
+        // Moderator still sees the suspended user.
+        let (status, shown) = call(
+            &state,
+            "users/show",
+            serde_json::json!({ "userId": bob_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{shown}");
+        assert_eq!(shown["id"], bob_id);
+        // Batch omits the hidden row for non-mods, keeps it for mods.
+        let (status, batch) = call(
+            &state,
+            "users/show",
+            serde_json::json!({ "userIds": [alice_id, bob_id] }),
+            Some(&carol_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{batch}");
+        assert_eq!(batch.as_array().unwrap().len(), 1);
+        assert_eq!(batch[0]["id"], alice_id);
+        let (status, batch) = call(
+            &state,
+            "users/show",
+            serde_json::json!({ "userIds": [alice_id, bob_id] }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{batch}");
+        assert_eq!(batch.as_array().unwrap().len(), 2);
+        // Missing users answer the same verbatim 404 on the single path.
+        let (status, value) = call(
+            &state,
+            "users/show",
+            serde_json::json!({ "userId": "aid00000000000099" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_USER");
+        assert_eq!(value["error"]["id"], "4362f8dc-731f-4ad8-a694-be5a88922a24");
+    }
+
+    /// Batch Q Phase 1, item 3b: `notes/show` content gates —
+    /// `CONTENT_RESTRICTED_BY_USER` (author opt-in) and
+    /// `CONTENT_RESTRICTED_BY_SERVER` (`ugcVisibilityForVisitor`), both
+    /// verbatim, both anonymous-only and ordered before visibility.
+    #[tokio::test]
+    async fn batch_q_notes_show_content_restricted() {
+        use crate::application::ports::{AccountStore, CreateAccountInput};
+        let (state, _) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (_bob_id, bob_token) = signup_user(&state, "bob").await;
+        let (_, carol_token) = signup_user(&state, "carol").await;
+        // Bob opts into signin-gated contents.
+        let (status, _) = call(
+            &state,
+            "i/update",
+            serde_json::json!({ "requireSigninToViewContents": true }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let gated = create_note(
+            &state,
+            serde_json::json!({ "text": "gated note" }),
+            &bob_token,
+        )
+        .await;
+        let open = create_note(
+            &state,
+            serde_json::json!({ "text": "open note" }),
+            &alice_token,
+        )
+        .await;
+        // Anonymous: gated → verbatim CONTENT_RESTRICTED_BY_USER.
+        let (status, value) = call(
+            &state,
+            "notes/show",
+            serde_json::json!({ "noteId": gated }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "CONTENT_RESTRICTED_BY_USER");
+        assert_eq!(value["error"]["id"], "fbcc002d-37d9-4944-a6b0-d9e29f2d33ab");
+        // Signed-in viewers and open notes are unaffected.
+        let (status, _) = call(
+            &state,
+            "notes/show",
+            serde_json::json!({ "noteId": gated }),
+            Some(&carol_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(
+            &state,
+            "notes/show",
+            serde_json::json!({ "noteId": open }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Remote-author note under an opted-in `local` policy: anonymous
+        // → CONTENT_RESTRICTED_BY_SERVER. (Pinetree default is `all` —
+        // DIVERGENCE from upstream's `local` default, documented on the
+        // enum — so opt in explicitly. Signup tokens carry every scope,
+        // so Alice's token works for admin endpoints once the role lands.)
+        state
+            .services
+            .set_role(None, &alice_id, true, false)
+            .expect("make alice admin");
+        let (status, value) = call(
+            &state,
+            "admin/update-meta",
+            serde_json::json!({ "ugcVisibilityForVisitor": "local" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{value}");
+        let (status, meta) = call(&state, "admin/meta", serde_json::json!({}), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::OK, "{meta}");
+        assert_eq!(meta["ugcVisibilityForVisitor"], "local");
+        let remote = state
+            .services
+            .accounts
+            .create_account(
+                CreateAccountInput {
+                    handle: "rina".to_string(),
+                    host: Some("remote.example".to_string()),
+                    display_name: None,
+                    description: None,
+                    location: None,
+                    birthday: None,
+                    uri: Some("https://remote.example/users/rina".to_string()),
+                    inbox: Some("https://remote.example/inbox".to_string()),
+                    shared_inbox: None,
+                    is_bot: false,
+                    is_cat: false,
+                    is_locked: false,
+                    preserved_usernames: Vec::new(),
+                },
+                None,
+            )
+            .unwrap();
+        let input = crate::application::ports::CreateNoteInput::simple_public(
+            &remote.id,
+            "remote note",
+        );
+        let remote_note = state.services.create_note(input).unwrap().id;
+        let (status, value) = call(
+            &state,
+            "notes/show",
+            serde_json::json!({ "noteId": remote_note }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "CONTENT_RESTRICTED_BY_SERVER");
+        assert_eq!(value["error"]["id"], "145f88d2-b03d-4087-8143-a78928883c4b");
+        let (status, _) = call(
+            &state,
+            "notes/show",
+            serde_json::json!({ "noteId": remote_note }),
+            Some(&carol_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // `none` restricts even local notes for anonymous visitors.
+        let (status, value) = call(
+            &state,
+            "admin/update-meta",
+            serde_json::json!({ "ugcVisibilityForVisitor": "none" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{value}");
+        let (status, value) = call(
+            &state,
+            "notes/show",
+            serde_json::json!({ "noteId": open }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "CONTENT_RESTRICTED_BY_SERVER");
+        // ...while signed-in readers still pass, and `all` restores anon.
+        let (status, _) = call(
+            &state,
+            "notes/show",
+            serde_json::json!({ "noteId": open }),
+            Some(&carol_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(
+            &state,
+            "admin/update-meta",
+            serde_json::json!({ "ugcVisibilityForVisitor": "all" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = call(
+            &state,
+            "notes/show",
+            serde_json::json!({ "noteId": remote_note }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        // Invalid values are refused, never stored.
+        let (status, value) = call(
+            &state,
+            "admin/update-meta",
+            serde_json::json!({ "ugcVisibilityForVisitor": "everywhere" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "INVALID_PARAM");
+    }
+
+    /// Batch Q Phase 1, item 7: home + hybrid timelines honor the
+    /// `include*` trio through the dispatcher (defaults true).
+    #[tokio::test]
+    async fn batch_q_timeline_include_flags() {
+        let (state, _) = test_state();
+        let (_, alice_token) = signup_user(&state, "alice").await;
+        let (bob_id, bob_token) = signup_user(&state, "bob").await;
+        let (status, _) = call(
+            &state,
+            "following/create",
+            serde_json::json!({ "userId": bob_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let target = create_note(
+            &state,
+            serde_json::json!({ "text": "bob's note" }),
+            &bob_token,
+        )
+        .await;
+        // Alice pure-renotes Bob's note: a bare reshare in her home feed.
+        let (status, _) = call(
+            &state,
+            "notes/create",
+            serde_json::json!({ "renoteId": target }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        for endpoint in ["notes/timeline", "notes/hybrid-timeline"] {
+            let (status, feed) = call(&state, endpoint, serde_json::json!({}), Some(&alice_token)).await;
+            assert_eq!(status, StatusCode::OK, "{endpoint}: {feed}");
+            assert_eq!(note_ids(&feed).len(), 2, "{endpoint} default: {feed}");
+            let (status, feed) = call(
+                &state,
+                endpoint,
+                serde_json::json!({ "includeMyRenotes": false }),
+                Some(&alice_token),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{endpoint}: {feed}");
+            assert_eq!(note_ids(&feed), vec![target.clone()], "{endpoint} flag: {feed}");
+        }
     }
 }

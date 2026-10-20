@@ -118,4 +118,8 @@ pub struct NotifyJobPayload {
     /// payloads written before §13 decodable.
     #[serde(default)]
     pub exported_entity: Option<String>,
+    #[serde(default)]
+    pub clip_id: Option<String>,
+    #[serde(default)]
+    pub page_id: Option<String>,
 }

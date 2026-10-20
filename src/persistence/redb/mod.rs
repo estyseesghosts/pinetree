@@ -137,6 +137,12 @@ const CLIP_NOTES: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new("c
 /// [`ClipFavorite`](crate::domain::clip::ClipFavorite) row.
 const CLIP_FAVORITES: TableDefinition<(&str, &str), &[u8]> =
     TableDefinition::new("clip_favorites");
+/// Clip follows `(clip_id, user_id)` → JSON
+/// [`ClipFollow`](crate::domain::clip::ClipFollow) row.
+const CLIP_FOLLOWS: TableDefinition<(&str, &str), &[u8]> =
+    TableDefinition::new("clip_follows");
+/// Clip tombstones `clip_uri` → deleted_at_ms (u64 le bytes).
+const CLIP_TOMBSTONES: TableDefinition<&str, u64> = TableDefinition::new("clip_tombstones");
 /// Pages by id (federated clips + pages handoff, Phase 3 local). Values are
 /// JSON [`Page`](crate::domain::page::Page) rows.
 const PAGES: TableDefinition<&str, &[u8]> = TableDefinition::new("pages");
@@ -391,6 +397,12 @@ impl RedbStore {
         let _ = write_txn.open_table(CLIP_NOTES).map_err(map_redb_err)?;
         let _ = write_txn
             .open_table(CLIP_FAVORITES)
+            .map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(CLIP_FOLLOWS)
+            .map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(CLIP_TOMBSTONES)
             .map_err(map_redb_err)?;
         let _ = write_txn.open_table(PAGES).map_err(map_redb_err)?;
         let _ = write_txn
@@ -3326,6 +3338,9 @@ impl InstanceSettingsStore for RedbStore {
             if let Some(federate_pages) = patch.federate_pages {
                 settings.federate_pages = federate_pages;
             }
+            if let Some(ugc) = patch.ugc_visibility_for_visitor {
+                settings.ugc_visibility_for_visitor = ugc;
+            }
             settings.validate()?;
             let mut table = write_txn
                 .open_table(INSTANCE_SETTINGS)
@@ -6160,8 +6175,10 @@ impl ClipStore for RedbStore {
     fn update_clip(
         &self,
         clip: crate::domain::clip::Clip,
+        jobs: Vec<NewJob>,
     ) -> Result<Option<crate::domain::clip::Clip>, PortError> {
         let write_txn = self.begin_write()?;
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
         let updated = {
             let mut clips = write_txn.open_table(CLIPS).map_err(map_redb_err)?;
             let existing: Option<crate::domain::clip::Clip> =
@@ -6184,8 +6201,14 @@ impl ClipStore for RedbStore {
         Ok(updated)
     }
 
-    fn delete_clip(&self, owner_id: &str, clip_id: &str) -> Result<bool, PortError> {
+    fn delete_clip(
+        &self,
+        owner_id: &str,
+        clip_id: &str,
+        jobs: Vec<NewJob>,
+    ) -> Result<bool, PortError> {
         let write_txn = self.begin_write()?;
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
         let removed = {
             let mut clips = write_txn.open_table(CLIPS).map_err(map_redb_err)?;
             let existing: Option<crate::domain::clip::Clip> =
@@ -6241,6 +6264,22 @@ impl ClipStore for RedbStore {
                 .collect();
             for (c, u) in stale_favs {
                 favs.remove((c.as_str(), u.as_str()))
+                    .map_err(map_redb_err)?;
+            }
+            drop(favs);
+            let mut fols = write_txn.open_table(CLIP_FOLLOWS).map_err(map_redb_err)?;
+            let stale_fols: Vec<(String, String)> = fols
+                .range((clip_id, "")..=(clip_id, "\u{10ffff}"))
+                .map_err(map_redb_err)?
+                .filter_map(|entry| {
+                    entry.ok().map(|(k, _)| {
+                        let (c, u) = k.value();
+                        (c.to_string(), u.to_string())
+                    })
+                })
+                .collect();
+            for (c, u) in stale_fols {
+                fols.remove((c.as_str(), u.as_str()))
                     .map_err(map_redb_err)?;
             }
             true
@@ -6331,6 +6370,9 @@ impl ClipStore for RedbStore {
             };
             if let Some(mut clip) = prev {
                 clip.last_clipped_at_ms = Some(now_ms);
+                // Phase 2a: membership changes move `updated` (the
+                // collection stamp remote revalidation compares).
+                clip.updated_at_ms = now_ms;
                 let encoded = encode_json(&clip)?;
                 let mut clips = write_txn.open_table(CLIPS).map_err(map_redb_err)?;
                 clips
@@ -6346,6 +6388,7 @@ impl ClipStore for RedbStore {
         &self,
         clip_id: &str,
         note_id: &str,
+        now_ms: i64,
         jobs: Vec<NewJob>,
     ) -> Result<bool, PortError> {
         let write_txn = self.begin_write()?;
@@ -6357,6 +6400,24 @@ impl ClipStore for RedbStore {
                 .map_err(map_redb_err)?
                 .is_some()
         };
+        // Phase 2a: removals move `updated` in the same transaction.
+        if removed {
+            let prev: Option<crate::domain::clip::Clip> = {
+                let clips = write_txn.open_table(CLIPS).map_err(map_redb_err)?;
+                match clips.get(clip_id).map_err(map_redb_err)? {
+                    Some(g) => Some(decode_json(g.value())?),
+                    None => None,
+                }
+            };
+            if let Some(mut clip) = prev {
+                clip.updated_at_ms = now_ms;
+                let encoded = encode_json(&clip)?;
+                let mut clips = write_txn.open_table(CLIPS).map_err(map_redb_err)?;
+                clips
+                    .insert(clip.id.as_str(), encoded.as_slice())
+                    .map_err(map_redb_err)?;
+            }
+        }
         self.commit_write(write_txn)?;
         Ok(removed)
     }
@@ -6477,6 +6538,119 @@ impl ClipStore for RedbStore {
             .collect();
         rows.sort_by(|a, b| b.id.cmp(&a.id));
         Ok(rows)
+    }
+
+    fn follow_clip(
+        &self,
+        follow: crate::domain::clip::ClipFollow,
+    ) -> Result<bool, PortError> {
+        let write_txn = self.begin_write()?;
+        let added = {
+            let mut fols = write_txn
+                .open_table(CLIP_FOLLOWS)
+                .map_err(map_redb_err)?;
+            if fols
+                .get((follow.clip_id.as_str(), follow.user_id.as_str()))
+                .map_err(map_redb_err)?
+                .is_some()
+            {
+                false
+            } else {
+                let encoded = encode_json(&follow)?;
+                fols.insert(
+                    (follow.clip_id.as_str(), follow.user_id.as_str()),
+                    encoded.as_slice(),
+                )
+                .map_err(map_redb_err)?;
+                true
+            }
+        };
+        self.commit_write(write_txn)?;
+        Ok(added)
+    }
+
+    fn unfollow_clip(&self, user_id: &str, clip_id: &str) -> Result<bool, PortError> {
+        let write_txn = self.begin_write()?;
+        let removed = {
+            let mut fols = write_txn
+                .open_table(CLIP_FOLLOWS)
+                .map_err(map_redb_err)?;
+            fols.remove((clip_id, user_id))
+                .map_err(map_redb_err)?
+                .is_some()
+        };
+        self.commit_write(write_txn)?;
+        Ok(removed)
+    }
+
+    fn is_following_clip(&self, user_id: &str, clip_id: &str) -> Result<bool, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(CLIP_FOLLOWS).map_err(map_redb_err)?;
+        Ok(table
+            .get((clip_id, user_id))
+            .map_err(map_redb_err)?
+            .is_some())
+    }
+
+    fn followers_of_clip(
+        &self,
+        clip_id: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::domain::clip::ClipFollow>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(CLIP_FOLLOWS).map_err(map_redb_err)?;
+        let mut rows: Vec<crate::domain::clip::ClipFollow> = table
+            .range((clip_id, "")..=(clip_id, "\u{10ffff}"))
+            .map_err(map_redb_err)?
+            .filter_map(|entry| entry.ok().and_then(|(_, v)| decode_json(v.value()).ok()))
+            .collect();
+        rows.sort_by(|a, b| b.id.cmp(&a.id));
+        rows.truncate(limit);
+        Ok(rows)
+    }
+
+    fn followed_clips_of(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<crate::domain::clip::ClipFollow>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(CLIP_FOLLOWS).map_err(map_redb_err)?;
+        let mut rows: Vec<crate::domain::clip::ClipFollow> = table
+            .iter()
+            .map_err(map_redb_err)?
+            .filter_map(|entry| {
+                entry.ok().and_then(|(k, v)| {
+                    let (_, u) = k.value();
+                    (u == user_id).then(|| decode_json(v.value()).ok())?
+                })
+            })
+            .collect();
+        rows.sort_by(|a, b| b.id.cmp(&a.id));
+        Ok(rows)
+    }
+
+    fn record_clip_tombstone(&self, clip_uri: &str, deleted_at_ms: i64) -> Result<(), PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            let mut t = write_txn
+                .open_table(CLIP_TOMBSTONES)
+                .map_err(map_redb_err)?;
+            t.insert(clip_uri, deleted_at_ms as u64)
+                .map_err(map_redb_err)?;
+        }
+        self.commit_write(write_txn)?;
+        Ok(())
+    }
+
+    fn clip_tombstone(&self, clip_uri: &str) -> Result<Option<i64>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn
+            .open_table(CLIP_TOMBSTONES)
+            .map_err(map_redb_err)?;
+        Ok(table
+            .get(clip_uri)
+            .map_err(map_redb_err)?
+            .map(|g| g.value() as i64))
     }
 }
 
@@ -6607,8 +6781,9 @@ impl PageStore for RedbStore {
         Ok(updated)
     }
 
-    fn delete_page(&self, page_id: &str) -> Result<bool, PortError> {
+    fn delete_page(&self, page_id: &str, jobs: Vec<NewJob>) -> Result<bool, PortError> {
         let write_txn = self.begin_write()?;
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
         let removed = {
             let mut pages = write_txn.open_table(PAGES).map_err(map_redb_err)?;
             let existing: Option<crate::domain::page::Page> =

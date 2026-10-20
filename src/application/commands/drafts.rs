@@ -401,6 +401,8 @@ impl AppServices {
                 draft_id,
                 file_id: None,
                 exported_entity: None,
+                clip_id: None,
+                page_id: None,
                 is_read: false,
             },
         )?;

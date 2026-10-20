@@ -66,6 +66,12 @@ pub const TRANSLATE_NOT_CONFIGURED_ID: &str = "d52ea1f3-7c4e-4b5d-8e9d-4a3b2c1d5
 /// Sharkey `notes/versions.ts` `SIGNIN_REQUIRED` (verbatim;
 /// `NO_SUCH_NOTE` reuses the shared id).
 pub const VERSIONS_SIGNIN_REQUIRED_ID: &str = "8e75455b-738c-471d-9f80-62693f33372e";
+/// Misskey `notes/show.ts:32-42` verbatim errors (Batch Q Phase 1 item 3).
+pub const CONTENT_RESTRICTED_BY_USER_ID: &str = "fbcc002d-37d9-4944-a6b0-d9e29f2d33ab";
+pub const CONTENT_RESTRICTED_BY_SERVER_ID: &str = "145f88d2-b03d-4087-8143-a78928883c4b";
+/// Misskey `users/show.ts:52-57` verbatim `noSuchUser` (Batch Q Phase 1
+/// item 3; per-endpoint UUID + 404, upstream convention).
+pub const USERS_SHOW_NO_SUCH_USER_ID: &str = "4362f8dc-731f-4ad8-a694-be5a88922a24";
 /// Misskey `fetch-rss.ts` verbatim errors.
 pub const FETCH_RSS_INVALID_URL_ID: &str = "89b7ee05-ccfc-4bdd-9b13-61172fd1e06c";
 pub const FETCH_RSS_FAILED_ID: &str = "8db5d3d8-31d7-452f-b0cc-ca3b8925de12";
@@ -186,6 +192,10 @@ pub const CLIP_FAVORITE_NO_SUCH_CLIP_ID: &str = "4c2aaeae-80d8-4250-9606-26cb1fd
 pub const CLIP_ALREADY_FAVORITED_ID: &str = "92658936-c625-4273-8326-2d790129256e";
 pub const CLIP_UNFAVORITE_NO_SUCH_CLIP_ID: &str = "2603966e-b865-426c-94a7-af4a01241dc1";
 pub const CLIP_NOT_FAVORITED_ID: &str = "90c3a9e8-b321-4dae-bf57-2bf79bbcc187";
+/// Pinetree-first `clips/follow|unfollow|followers` idents (DIVERGENCE —
+/// Misskey has no clip-follow; pinetree-fixed UUIDs, documented as such).
+pub const CLIP_FOLLOW_NO_SUCH_CLIP_ID: &str = "ac078150-884c-475f-84d6-22747a204b7a";
+pub const CLIP_FOLLOWERS_FORBIDDEN_ID: &str = "3edf8e54-c859-4654-bad8-39dbacbff7d3";
 /// Misskey `pages/*` idents (verbatim upstream UUIDs; federated clips +
 /// pages handoff, Phase 3 local). One UUID per endpoint per code.
 pub const PAGE_CREATE_NO_SUCH_FILE_ID: &str = "b7b97489-0f66-4b12-a5ff-b21bd63f6e1c";
@@ -703,6 +713,13 @@ impl ApiError {
         Self::client("Signin required.", "SIGNIN_REQUIRED", VERSIONS_SIGNIN_REQUIRED_ID, 401)
     }
 
+    /// Misskey `users/show.ts:52-57` `noSuchUser` (Batch Q Phase 1 item 3):
+    /// verbatim id + 404, covering both missing and suspended users for
+    /// non-moderators.
+    pub fn users_show_no_such_user() -> Self {
+        Self::client("No such user.", "NO_SUCH_USER", USERS_SHOW_NO_SUCH_USER_ID, 404)
+    }
+
     /// Misskey `fetch-rss.ts` `INVALID_URL` (HTTP 400 upstream).
     pub fn fetch_rss_invalid_url() -> Self {
         Self::client("Invalid URL.", "INVALID_URL", FETCH_RSS_INVALID_URL_ID, 400)
@@ -862,6 +879,9 @@ impl ApiError {
             "clips/remove-note" => CLIP_REMOVE_NOTE_NO_SUCH_CLIP_ID,
             "clips/favorite" => CLIP_FAVORITE_NO_SUCH_CLIP_ID,
             "clips/unfavorite" => CLIP_UNFAVORITE_NO_SUCH_CLIP_ID,
+            "clips/follow" => CLIP_FOLLOW_NO_SUCH_CLIP_ID,
+            "clips/unfollow" => CLIP_FOLLOW_NO_SUCH_CLIP_ID,
+            "clips/followers" => CLIP_FOLLOW_NO_SUCH_CLIP_ID,
             _ => CLIP_SHOW_NO_SUCH_CLIP_ID,
         };
         // `clips/create` never emits `NO_SUCH_CLIP` (it emits
@@ -926,6 +946,17 @@ impl ApiError {
             "NOT_FAVORITED",
             CLIP_NOT_FAVORITED_ID,
             400,
+        )
+    }
+
+    /// Pinetree `clips/followers` non-owner read (`Access denied.`,
+    /// pinetree-fixed UUID — follower sets never advertise to non-owners).
+    pub fn clip_followers_forbidden() -> Self {
+        Self::client(
+            "Access denied.",
+            "ACCESS_DENIED",
+            CLIP_FOLLOWERS_FORBIDDEN_ID,
+            403,
         )
     }
 
@@ -1135,6 +1166,8 @@ fn is_known_client_code(code: &str) -> bool {
         code,
         "NO_SUCH_NOTE"
             | "NO_SUCH_USER"
+            | "CONTENT_RESTRICTED_BY_USER"
+            | "CONTENT_RESTRICTED_BY_SERVER"
             | "CANNOT_REPORT_YOURSELF"
             | "CANNOT_REPORT_THE_ADMIN"
             | "NO_SUCH_ABUSE_REPORT"
@@ -1277,6 +1310,20 @@ fn lookup_known_code(code: &str) -> Option<(&'static str, &'static str, u16, &'s
         ),
         "NO_SUCH_NOTE" => ("No such note.", NO_SUCH_NOTE_ID, 400, "client"),
         "NO_SUCH_USER" => ("No such user.", NO_SUCH_USER_ID, 400, "client"),
+        // Batch Q Phase 1 item 3: Misskey `notes/show.ts:32-42` verbatim
+        // (message + id; Misskey default client status 400).
+        "CONTENT_RESTRICTED_BY_USER" => (
+            "Content restricted by user. Please sign in to view.",
+            CONTENT_RESTRICTED_BY_USER_ID,
+            400,
+            "client",
+        ),
+        "CONTENT_RESTRICTED_BY_SERVER" => (
+            "Content restricted by server settings. Please sign in to view.",
+            CONTENT_RESTRICTED_BY_SERVER_ID,
+            400,
+            "client",
+        ),
         "CANNOT_REPORT_YOURSELF" => ("Cannot report yourself.", CANNOT_REPORT_YOURSELF_ID, 400, "client"),
         "CANNOT_REPORT_THE_ADMIN" => ("Cannot report the admin.", CANNOT_REPORT_THE_ADMIN_ID, 400, "client"),
         "NO_SUCH_ABUSE_REPORT" => ("No such abuse report.", NO_SUCH_ABUSE_REPORT_ID, 404, "server"),

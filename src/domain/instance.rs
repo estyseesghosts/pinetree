@@ -50,6 +50,45 @@ impl RegistrationPolicy {
     }
 }
 
+/// Anonymous-visitor UGC visibility (Batch Q Phase 1 item 3, P5; Misskey
+/// `Meta.ugcVisibilityForVisitor`, `admin/update-meta.ts:220-223`):
+/// `'all' | 'local' | 'none'`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UgcVisibilityForVisitor {
+    /// Anonymous visitors see everything visible (pinetree default).
+    #[default]
+    All,
+    /// Upstream Misskey default: anonymous visitors see local users'
+    /// content only. Pinetree defaults to `All` instead (DIVERGENCE — our
+    /// public local/global timelines serve remote notes to visitors today,
+    /// so gating only detail/show while timelines leak the same notes
+    /// would be incoherent; revisit when timeline-level ugc filtering
+    /// lands). Admins can still opt into `local`/`none`.
+    Local,
+    None,
+}
+
+impl UgcVisibilityForVisitor {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "all" => Some(Self::All),
+            "local" => Some(Self::Local),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+
+    /// Misskey `meta.ugcVisibilityForVisitor` wire value.
+    pub fn as_wire(&self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Local => "local",
+            Self::None => "none",
+        }
+    }
+}
+
 /// Instance settings (Batch M §3.3). Only what this batch uses; not a
 /// generic settings bag. Defaults reproduce the pre-batch behavior:
 /// registration open, no blocked hosts, `maxNoteTextLength` 3000.
@@ -71,6 +110,11 @@ pub struct InstanceSettings {
     /// See [`InstanceSettings::federate_clips`].
     #[serde(default)]
     pub federate_pages: bool,
+    /// Batch Q Phase 1 item 3 (P5). `#[serde(default)]` keeps rows written
+    /// before this field existed decoding as the pinetree default (`all`;
+    /// upstream Misskey defaults this column to `local` — see the enum).
+    #[serde(default)]
+    pub ugc_visibility_for_visitor: UgcVisibilityForVisitor,
 }
 
 impl Default for InstanceSettings {
@@ -83,6 +127,7 @@ impl Default for InstanceSettings {
             max_note_text_length: 3000,
             federate_clips: false,
             federate_pages: false,
+            ugc_visibility_for_visitor: UgcVisibilityForVisitor::default(),
         }
     }
 }

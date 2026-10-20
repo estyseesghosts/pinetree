@@ -298,6 +298,21 @@ Backend-agnostic, same cases both adapters (FDB inherits).
 - **Y2 likes + featured**: like/unlike are idempotent and move `liked_count` in the same txn (`ALREADY_LIKED`/`NOT_LIKED` surface at the op layer); likes on remote pages enqueue a `Like` fan-out job in the same txn; `featured_pages` returns only liked pages, highest count first, at most 10. Executed: `y2_page_likes_and_featured` green (redb).
 - **Y3 page URI index**: `get_page_by_uri` round-trip, index follows renames, delete drops the index row. Executed: `y3_page_uri_index_round_trip` green (redb).
 
-Ports: `ClipStore`, `PageStore` (required, no defaults). redb implemented (`clips*`, `pages*` tables).
+Ports: `ClipStore`, `PageStore` (required, no defaults). redb implemented (`clips*` + `clip_follows` + `clip_tombstones`, `pages*` tables).
 
 Execution status (honest): X1–X2 + Y1–Y3 green on redb only; FDB has not run them. Suite total: 115/115 green on redb.
+
+### Group Z — clip follows + clip tombstones (federated clips + pages phase 2; added 2026-10-20; Draft)
+
+Backend-agnostic, same cases both adapters (FDB inherits).
+
+- **Z1 follow converges + cascades**: duplicate follows converge (idempotent bool); unfollow idempotent; followers newest-first bounded; delete cascades follows in the same commit. Executed: `z1_clip_follow_converges_and_cascades` green (redb).
+- **Z2 tombstone round-trip**: record + read; re-record overwrites (replay converge). Executed: `z2_clip_tombstone_round_trip` green (redb).
+
+### Group Y4 — page visibility + origin timestamps (federated clips + pages phase 2; added 2026-10-20; Draft)
+
+- **Y4 columns round-trip**: Followers + Specified (with listed ids) persist; origin timestamps persist; old rows decode as Public via `#[serde(default)]` (covered implicitly by every older fixture). Executed: `y4_page_visibility_columns_round_trip` green (redb).
+
+Ports: `ClipStore.follow_clip/unfollow_clip/is_following_clip/followers_of_clip/followed_clips_of/record_clip_tombstone/clip_tombstone` (required, no defaults).
+
+Execution status (honest): Z1–Z2 + Y4 green on redb only; FDB has not run them. Suite total: 118/118 green on redb.

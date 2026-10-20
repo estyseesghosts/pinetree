@@ -203,10 +203,14 @@ rather than a broken half-implementation:
   through the membership index. Limits enforced + advertised
   (`userListLimit 10`, `userEachUserListsLimit 50`). Remote members queue a
   system-actor Follow. `create-from-public` stays 404.
-- **No clips, channels, pages, drive folders, chat,
+- **No channels, drive folders, chat,
   Reversi, or search-by-hashtag.** No featured timelines,
   no `drive` streaming channel,
   no `signin-flow`, no 2FA/passkeys/webhooks.
+  Local clips + pages ARE supported (11 `clips/*` + 7 `pages/*` endpoints,
+  incl. `clips/follow|unfollow|followers` and gated `pageVisibility`);
+  federation is pinetree-first (`OrderedCollection` clips, `Article` pages)
+  behind default-OFF `federateClips`/`federatePages` switches.
   Antennas, favorites, custom emoji, user lists, mentions timeline,
   notification utilities, discovery, versions, and translate stubs shipped
   (Batch N + O + P).

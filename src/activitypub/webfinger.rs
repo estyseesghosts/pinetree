@@ -1492,10 +1492,11 @@ mod tests {
         fn update_clip(
             &self,
             _clip: crate::domain::clip::Clip,
+            _jobs: Vec<NewJob>,
         ) -> Result<Option<crate::domain::clip::Clip>, PortError> {
             Ok(None)
         }
-        fn delete_clip(&self, _owner_id: &str, _clip_id: &str) -> Result<bool, PortError> {
+        fn delete_clip(&self, _owner_id: &str, _clip_id: &str, _jobs: Vec<NewJob>) -> Result<bool, PortError> {
             Ok(false)
         }
         fn get_clip(&self, _clip_id: &str) -> Result<Option<crate::domain::clip::Clip>, PortError> {
@@ -1519,6 +1520,7 @@ mod tests {
             &self,
             _clip_id: &str,
             _note_id: &str,
+            _now_ms: i64,
             _jobs: Vec<NewJob>,
         ) -> Result<bool, PortError> {
             Ok(false)
@@ -1550,6 +1552,13 @@ mod tests {
         ) -> Result<Vec<crate::domain::clip::ClipFavorite>, PortError> {
             Ok(Vec::new())
         }
+        fn follow_clip(&self, _follow: crate::domain::clip::ClipFollow) -> Result<bool, PortError> { Ok(false) }
+        fn unfollow_clip(&self, _user_id: &str, _clip_id: &str) -> Result<bool, PortError> { Ok(false) }
+        fn is_following_clip(&self, _user_id: &str, _clip_id: &str) -> Result<bool, PortError> { Ok(false) }
+        fn followers_of_clip(&self, _clip_id: &str, _limit: usize) -> Result<Vec<crate::domain::clip::ClipFollow>, PortError> { Ok(Vec::new()) }
+        fn followed_clips_of(&self, _user_id: &str) -> Result<Vec<crate::domain::clip::ClipFollow>, PortError> { Ok(Vec::new()) }
+        fn record_clip_tombstone(&self, _clip_uri: &str, _deleted_at_ms: i64) -> Result<(), PortError> { Ok(()) }
+        fn clip_tombstone(&self, _clip_uri: &str) -> Result<Option<i64>, PortError> { Ok(None) }
     }
 
     impl crate::application::ports::PageStore for Mem {
@@ -1567,7 +1576,7 @@ mod tests {
         ) -> Result<Option<crate::domain::page::Page>, PortError> {
             Ok(None)
         }
-        fn delete_page(&self, _page_id: &str) -> Result<bool, PortError> {
+        fn delete_page(&self, _page_id: &str, _jobs: Vec<NewJob>) -> Result<bool, PortError> {
             Ok(false)
         }
         fn get_page(&self, _page_id: &str) -> Result<Option<crate::domain::page::Page>, PortError> {

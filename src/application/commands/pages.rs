@@ -20,7 +20,8 @@ use crate::application::ports::PortError;
 use crate::domain::collection::CollectionTier;
 use crate::domain::id::DomainError;
 use crate::domain::moderation::{ModerationAction, ModerationLogEntry};
-use crate::domain::page::{Page, PageFont, PageLike};
+use crate::domain::note::Visibility;
+use crate::domain::page::{Page, PageFont, PageLike, page_visible_to};
 
 fn domain_err(e: DomainError) -> PortError {
     match e {
@@ -45,6 +46,14 @@ pub struct PageBody {
     pub align_center: Option<bool>,
     pub hide_title_when_pinned: Option<bool>,
     pub visibility: Option<String>,
+    /// Read-gate visibility (`public|home|followers|specified`; pinetree
+    /// extension `pageVisibility`, DIVERGENCE — upstream has no page
+    /// visibility). Local creates default `Public`. `None` = untouched on
+    /// update.
+    pub page_visibility: Option<String>,
+    /// Explicit reader ids when `pageVisibility == specified`
+    /// (pinetree extension `visibleUserIds`, DIVERGENCE).
+    pub visible_user_ids: Option<Vec<String>>,
     /// Per-page federate flag. `None` (param absent) means **true**:
     /// pages are public by default and federate once the instance
     /// enables `federatePages` (owner decision 2026-10-20; clips stay
@@ -102,7 +111,50 @@ impl AppServices {
         if let Some(v) = &body.visibility {
             crate::domain::collection::validate_tier_name(v).map_err(domain_err)?;
         }
+        if let Some(v) = &body.page_visibility {
+            parse_page_visibility(v).map_err(domain_err)?;
+        }
+        if let Some(ids) = &body.visible_user_ids {
+            if ids.len() > 100 {
+                return Err(PortError::Validation(
+                    "visibleUserIds must have at most 100 entries".to_string(),
+                ));
+            }
+        }
         Ok(())
+    }
+
+    /// Viewer gate for one page row: `NO_SUCH_PAGE`-hiding for unauthorized
+    /// readers (never a distinguishing error). Owner always passes;
+    /// moderators bypass (consistent with `pages/delete`).
+    pub fn check_page_visible(
+        &self,
+        page: &Page,
+        viewer_id: Option<&str>,
+    ) -> Result<(), PortError> {
+        if viewer_id.is_none() && page.visibility != Visibility::Public && page.visibility != Visibility::Home {
+            return Err(PortError::NotFound("NO_SUCH_PAGE".to_string()));
+        }
+        let (is_mod, follows) = match viewer_id {
+            Some(v) => {
+                let is_mod = self
+                    .accounts
+                    .find_by_id(v)?
+                    .is_some_and(|a| a.is_admin || a.is_moderator);
+                let follows = if v == page.owner_id {
+                    true
+                } else {
+                    self.follows.is_following(v, &page.owner_id)?
+                };
+                (is_mod, follows)
+            }
+            None => (false, false),
+        };
+        if page_visible_to(page, viewer_id, is_mod, follows) {
+            Ok(())
+        } else {
+            Err(PortError::NotFound("NO_SUCH_PAGE".to_string()))
+        }
     }
 
     /// `pages/create`: full body required (upstream param set).
@@ -147,10 +199,17 @@ impl AppServices {
                     .map_err(domain_err)?,
                 None => CollectionTier::Listed,
             },
+            visibility: match &body.page_visibility {
+                Some(v) => parse_page_visibility(v)?,
+                None => Visibility::Public,
+            },
+            visible_user_ids: body.visible_user_ids.clone().unwrap_or_default(),
             federate: body.federate.unwrap_or(true),
             approved_actor_uris: body.approved_actor_uris.clone().unwrap_or_default(),
             uri: None,
             remote_attachments: Vec::new(),
+            remote_published_ms: None,
+            remote_updated_ms: None,
             liked_count: 0,
             created_at_ms: now,
             updated_at_ms: now,
@@ -163,14 +222,18 @@ impl AppServices {
     }
 
     /// Whether page create/update federates right now (both switches
-    /// on, per-page flag on, `Listed` tier — capability-tier pages never
-    /// fan out; they serve live by bearer/direct fetch). Pure read; the
-    /// serving gate enforces the same switches on fetch.
+    /// on, per-page flag on, `Listed` tier, visibility Public/Home/Followers
+    /// — Specified pages never fan out; they serve live by bearer/direct
+    /// fetch. Pure read; the serving gate enforces the same switches on
+    /// fetch).
     fn page_federates(&self, page: &Page) -> Result<bool, PortError> {
         if !page.federate {
             return Ok(false);
         }
         if page.tier != CollectionTier::Listed {
+            return Ok(false);
+        }
+        if page.visibility == Visibility::Specified {
             return Ok(false);
         }
         Ok(self
@@ -281,6 +344,8 @@ impl AppServices {
             && body.align_center.is_none()
             && body.hide_title_when_pinned.is_none()
             && body.visibility.is_none()
+            && body.page_visibility.is_none()
+            && body.visible_user_ids.is_none()
             && body.federate.is_none()
             && body.approved_actor_uris.is_none()
         {
@@ -322,6 +387,12 @@ impl AppServices {
             page.tier =
                 crate::domain::collection::validate_tier_name(&v).map_err(domain_err)?;
         }
+        if let Some(v) = body.page_visibility {
+            page.visibility = parse_page_visibility(&v)?;
+        }
+        if let Some(ids) = body.visible_user_ids {
+            page.visible_user_ids = ids;
+        }
         if let Some(federate) = body.federate {
             page.federate = federate;
         }
@@ -358,7 +429,24 @@ impl AppServices {
         if !is_owner && !is_staff {
             return Err(PortError::Validation("ACCESS_DENIED".to_string()));
         }
-        if !self.pages.delete_page(page_id)? {
+        let mut jobs = Vec::new();
+        if self.page_federates(&page)? {
+            let base = self.public_url.trim_end_matches('/').to_string();
+            let page_uri = format!("{base}/pages/{page_id}");
+            jobs.push(
+                crate::federation::outbox::FederateDeliverPayload::PageDeleted {
+                    page_id: page_id.to_string(),
+                    author_id: page.owner_id.clone(),
+                    page_uri,
+                    inbox_override: None,
+                }
+                .into_job(
+                    format!("federate:page:{page_id}:delete"),
+                    self.now_ms(),
+                )?,
+            );
+        }
+        if !self.pages.delete_page(page_id, jobs)? {
             return Err(PortError::NotFound("NO_SUCH_PAGE".to_string()));
         }
         if !is_owner {
@@ -376,23 +464,38 @@ impl AppServices {
     }
 
     /// `pages/show`: by id, or by `(name, username)` for a LOCAL user only
-    /// (upstream `host: IsNull` parity). Any page is readable (upstream has
-    /// no page visibility gate).
-    pub fn show_page_by_id(&self, page_id: &str) -> Result<Page, PortError> {
+    /// (upstream `host: IsNull` parity). Read-gated: unauthorized readers
+    /// hide as `NO_SUCH_PAGE` (never a distinguishing error).
+    pub fn show_page_by_id(
+        &self,
+        page_id: &str,
+        viewer_id: Option<&str>,
+    ) -> Result<Page, PortError> {
         match self.pages.get_page(page_id)? {
-            Some(page) => Ok(page),
+            Some(page) => {
+                self.check_page_visible(&page, viewer_id)?;
+                Ok(page)
+            }
             None => Err(PortError::NotFound("NO_SUCH_PAGE".to_string())),
         }
     }
 
-    pub fn show_page_by_name(&self, name: &str, username: &str) -> Result<Page, PortError> {
+    pub fn show_page_by_name(
+        &self,
+        name: &str,
+        username: &str,
+        viewer_id: Option<&str>,
+    ) -> Result<Page, PortError> {
         let author = self
             .accounts
             .find_by_handle(&username.to_lowercase())?
             .filter(|a| a.is_local())
             .ok_or_else(|| PortError::NotFound("NO_SUCH_PAGE".to_string()))?;
         match self.pages.get_page_by_name(&author.id, name)? {
-            Some(page) => Ok(page),
+            Some(page) => {
+                self.check_page_visible(&page, viewer_id)?;
+                Ok(page)
+            }
             None => Err(PortError::NotFound("NO_SUCH_PAGE".to_string())),
         }
     }
@@ -405,6 +508,7 @@ impl AppServices {
             Some(page) => page,
             None => return Err(PortError::NotFound("NO_SUCH_PAGE".to_string())),
         };
+        self.check_page_visible(&page, Some(user_id))?;
         if page.owner_id == user_id {
             return Err(PortError::Validation("YOUR_PAGE".to_string()));
         }
@@ -477,6 +581,11 @@ impl AppServices {
         }
     }
 
+    /// Parse a `pageVisibility` param (`public|home|followers|specified`).
+    pub fn parse_page_visibility_param(s: &str) -> Result<Visibility, PortError> {
+        parse_page_visibility(s).map_err(|e| PortError::Validation(e.to_string()))
+    }
+
     /// Slugify an `Article` name/title into a page slug (lowercase
     /// alnum/hyphen/underscore; anything else becomes `-`; empty falls
     /// back to `page`). The result always passes `validate_page_name`.
@@ -506,11 +615,12 @@ impl AppServices {
     }
 
     /// Materialize (or refresh) a remote page from an inbound `Article`
-    /// object. Only **public** Articles materialize — anything else keeps
-    /// the note path, which enforces visibility (serving a cached
-    /// restricted Article as a world-readable page would leak it).
-    /// Returns the page, or `None` when the object is not a public
-    /// `Article` (caller falls back to the note pipeline).
+    /// object. Any well-formed `Article` (object, `type == "Article"`,
+    /// non-empty `id`) materializes as a page — the read gate is the
+    /// row's `visibility`, mapped from `to`/`cc` (documented table in
+    /// `docs/federated-collections.md` §4). Only malformed objects keep
+    /// the old note path. Existing Article-derived *notes* stay notes —
+    /// no retro-conversion (recorded DIVERGENCE).
     ///
     /// * Identity: the Article `id` becomes the row's canonical `uri`
     ///   (updates correlate by URI, never by slug).
@@ -522,6 +632,12 @@ impl AppServices {
     ///   owner.
     /// * Attachments: `http(s)` attachment URLs are kept verbatim for
     ///   re-serve; nothing is fetched inline.
+    /// * Audience → visibility: Public-in-`to` ⇒ Public; Public-in-`cc` ⇒
+    ///   Public (pages have no timelines to exclude from — explicit,
+    ///   documented collapse); followers collection in `to`/`cc` ⇒
+    ///   Followers; otherwise Specified with best-effort-resolved user ids
+    ///   (unresolvable recipients dropped, fail-closed, same as note
+    ///   ingest).
     pub fn ingest_remote_article(
         &self,
         author_id: &str,
@@ -546,16 +662,54 @@ impl AppServices {
         else {
             return Ok(None);
         };
-        // Public only (see doc comment).
-        let to = extract_uri_list(map.get("to"));
-        let cc = extract_uri_list(map.get("cc"));
-        if !to.iter().any(|u| is_public_collection_uri(u))
-            && !cc.iter().any(|u| is_public_collection_uri(u))
-        {
-            return Ok(None);
-        }
         self.accounts.get_owner(author_id)?;
         let now = self.now_ms();
+        // Audience → visibility (documented table).
+        let to = extract_uri_list(map.get("to"));
+        let cc = extract_uri_list(map.get("cc"));
+        let public_in_to = to.iter().any(|u| is_public_collection_uri(u));
+        let public_in_cc = cc.iter().any(|u| is_public_collection_uri(u));
+        let base = self.public_url.trim_end_matches('/').to_string();
+        let followers_uri = format!("{base}/users/{author_id}/followers");
+        // Note: remote authors address OUR followers collection by their
+        // own actor URI, not ours — accept any */followers suffix.
+        let followers_in = to
+            .iter()
+            .chain(cc.iter())
+            .any(|u| u.ends_with("/followers"));
+        let _ = followers_uri;
+        let (visibility, visible_user_ids) = if public_in_to || public_in_cc {
+            (Visibility::Public, Vec::new())
+        } else if followers_in {
+            (Visibility::Followers, Vec::new())
+        } else {
+            let mut ids = Vec::new();
+            for u in to.iter().chain(cc.iter()) {
+                if u == &uri {
+                    continue;
+                }
+                if let Some(a) = self.accounts.find_by_uri(u)? {
+                    if !ids.contains(&a.id) {
+                        ids.push(a.id);
+                    }
+                }
+            }
+            (Visibility::Specified, ids)
+        };
+        // Origin timestamps (Phase 3: served in place of row times).
+        let remote_published_ms = map
+            .get("published")
+            .and_then(|v| v.as_str())
+            .and_then(crate::activitypub::parse_millis)
+            .or_else(|| {
+                map.get("published")
+                    .and_then(|v| v.as_i64())
+            });
+        let remote_updated_ms = map
+            .get("updated")
+            .and_then(|v| v.as_str())
+            .and_then(crate::activitypub::parse_millis)
+            .or_else(|| map.get("updated").and_then(|v| v.as_i64()));
         // Title: `name`, else a text snippet, else a fallback.
         let text_fallback = map
             .get("content")
@@ -606,6 +760,30 @@ impl AppServices {
             Some(vars @ serde_json::Value::Array(_)) => vars.clone(),
             _ => serde_json::json!([]),
         };
+        // Presentation fidelity (Phase 3: `source.presentation` + `slug`
+        // round-trip font/align/hide + the author's slug; unknown values
+        // fall back to local defaults, never fail ingest).
+        let source = map.get("source");
+        let presentation = source.and_then(|v| v.get("presentation"));
+        let ing_font = presentation
+            .and_then(|v| v.get("font"))
+            .and_then(|v| v.as_str())
+            .and_then(PageFont::parse)
+            .unwrap_or(PageFont::SansSerif);
+        let ing_align = presentation
+            .and_then(|v| v.get("alignCenter"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let ing_hide = presentation
+            .and_then(|v| v.get("hideTitleWhenPinned"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let ing_slug = source
+            .and_then(|v| v.get("slug"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| crate::domain::page::validate_page_name(v).is_ok())
+            .map(str::to_string);
         // Attachments: keep http(s) URLs verbatim (re-served, never fetched).
         let mut remote_attachments = Vec::new();
         if let Some(items) = map.get("attachment").and_then(|v| v.as_array()) {
@@ -619,21 +797,35 @@ impl AppServices {
                 }
             }
         }
-        // Refresh path: the canonical URI already materialized.
+        // Refresh path: the canonical URI already materialized (the
+        // update path carries visibility forward; serving re-checks per
+        // request, so stale replicas self-heal on refetch).
         if let Some(mut page) = self.pages.get_page_by_uri(&uri)? {
             page.title = title;
             page.summary = summary;
             page.content = content;
             page.variables = variables;
             page.remote_attachments = remote_attachments;
+            page.visibility = visibility;
+            page.visible_user_ids = visible_user_ids;
+            page.font = ing_font;
+            page.align_center = ing_align;
+            page.hide_title_when_pinned = ing_hide;
+            if remote_published_ms.is_some() {
+                page.remote_published_ms = remote_published_ms;
+            }
+            if remote_updated_ms.is_some() {
+                page.remote_updated_ms = remote_updated_ms;
+            }
             page.updated_at_ms = now;
             match self.pages.update_page(page, Vec::new())? {
                 Some(page) => Ok(Some(page)),
                 None => Ok(None),
             }
         } else {
-            // Fresh slug, disambiguated per owner.
-            let slug = Self::slugify_page_name(&title);
+            // Fresh slug (remote `source.slug` when valid, else
+            // derived), disambiguated per owner.
+            let slug = ing_slug.unwrap_or_else(|| Self::slugify_page_name(&title));
             let mut candidate = slug.clone();
             let mut n = 2u32;
             while self.pages.get_page_by_name(author_id, &candidate)?.is_some() {
@@ -654,14 +846,18 @@ impl AppServices {
                 variables,
                 script: String::new(),
                 eye_catching_image_id: None,
-                font: PageFont::SansSerif,
-                align_center: false,
-                hide_title_when_pinned: false,
+                font: ing_font,
+                align_center: ing_align,
+                hide_title_when_pinned: ing_hide,
                 tier: CollectionTier::Listed,
+                visibility,
+                visible_user_ids,
                 federate: false,
                 approved_actor_uris: Vec::new(),
                 uri: Some(uri),
                 remote_attachments,
+                remote_published_ms,
+                remote_updated_ms,
                 liked_count: 0,
                 created_at_ms: now,
                 updated_at_ms: now,
@@ -700,5 +896,18 @@ impl AppServices {
                 _ => FetchDecision::Forbidden,
             },
         }
+    }
+}
+
+/// Parse a page read-gate visibility name.
+fn parse_page_visibility(s: &str) -> Result<Visibility, DomainError> {
+    match s {
+        "public" => Ok(Visibility::Public),
+        "home" => Ok(Visibility::Home),
+        "followers" => Ok(Visibility::Followers),
+        "specified" => Ok(Visibility::Specified),
+        _ => Err(DomainError::Validation(
+            "pageVisibility must be public|home|followers|specified".to_string(),
+        )),
     }
 }

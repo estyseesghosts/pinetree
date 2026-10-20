@@ -5,6 +5,7 @@ use crate::application::events::{MainEventKind, MainMessage};
 use crate::application::ports::{PortError, TimelineCursor};
 use crate::domain::account::{Account, FollowVisibility};
 use crate::domain::follow::Follow;
+use crate::domain::instance::UgcVisibilityForVisitor;
 use crate::domain::note::Note;
 use crate::domain::reaction::Reaction;
 use crate::domain::policy::{
@@ -452,6 +453,50 @@ impl AppServices {
             None => return Err(PortError::NotFound("NO_SUCH_NOTE".to_string())),
             Some(note) => note,
         };
+        // Fail-closed pending withhold first (`visibility.rs`: an
+        // unresolved `reply_parent_uri` reads as missing on every surface).
+        // It precedes the content gates below so a pending note never
+        // leaks existence through a gate error (indistinguishability).
+        if note.reply_parent_uri.is_some() {
+            return Err(PortError::NotFound("NO_SUCH_NOTE".to_string()));
+        }
+        // Batch Q Phase 1 FIX 3b (Misskey `notes/show.ts:69-79` parity):
+        // an anonymous viewer reading an author with
+        // `requireSigninToViewContents` gets `CONTENT_RESTRICTED_BY_USER`
+        // (exact upstream code; the API layer maps it to upstream's
+        // message/id). Checked before visibility, mirroring upstream order
+        // (their gates run before `pack`). The server-wide
+        // `ugcVisibilityForVisitor` gate follows: `none` restricts every
+        // anonymous read; `local` restricts anonymous reads of remote
+        // authors' notes (pinetree default is `all`; admins opt in).
+        if viewer_id.is_none() {
+            let author = self.accounts.find_by_id(&note.author_id)?;
+            if let Some(author) = author {
+                if author.require_signin_to_view_contents {
+                    return Err(PortError::Validation(
+                        "CONTENT_RESTRICTED_BY_USER".to_string(),
+                    ));
+                }
+                let ugc = self
+                    .instance_settings
+                    .get()
+                    .map(|s| s.ugc_visibility_for_visitor)
+                    .unwrap_or_default();
+                match ugc {
+                    UgcVisibilityForVisitor::None => {
+                        return Err(PortError::Validation(
+                            "CONTENT_RESTRICTED_BY_SERVER".to_string(),
+                        ));
+                    }
+                    UgcVisibilityForVisitor::Local if author.host.is_some() => {
+                        return Err(PortError::Validation(
+                            "CONTENT_RESTRICTED_BY_SERVER".to_string(),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
         let viewer = match viewer_id {
             None => ViewerContext::anonymous(),
             Some(viewer) => {
@@ -477,6 +522,50 @@ impl AppServices {
         Ok(note)
     }
 
+    /// `users/show` single-user read with the suspension gate (Batch Q
+    /// Phase 1 FIX 3a; Misskey `users/show.ts:174` parity): a suspended
+    /// account reads as `NO_SUCH_USER` unless the viewer has moderator
+    /// powers (`Account::has_moderator_powers`, admin implied). Anonymous
+    /// (`None`) viewers never bypass. The un-gated `users_show_by_id` /
+    /// `users_show_by_username` below keep their exact behavior for the
+    /// existing internal callers; the `users/show` endpoint should call
+    /// these `_as` variants with the caller's id.
+    pub fn users_show_by_id_as(
+        &self,
+        user_id: &str,
+        viewer_id: Option<&str>,
+    ) -> Result<Account, PortError> {
+        let account = match self.accounts.find_by_id(user_id)? {
+            None => return Err(PortError::NotFound("NO_SUCH_USER".to_string())),
+            Some(account) => account,
+        };
+        if account.is_suspended && !self.viewer_is_moderator(viewer_id)? {
+            return Err(PortError::NotFound("NO_SUCH_USER".to_string()));
+        }
+        Ok(account)
+    }
+
+    /// Username/host sibling of [`AppServices::users_show_by_id_as`]
+    /// (same suspension gate + moderator bypass).
+    pub fn users_show_by_username_as(
+        &self,
+        username: &str,
+        host: Option<&str>,
+        viewer_id: Option<&str>,
+    ) -> Result<Account, PortError> {
+        let account = match self
+            .accounts
+            .find_by_username_and_host(username, host)?
+        {
+            None => return Err(PortError::NotFound("NO_SUCH_USER".to_string())),
+            Some(account) => account,
+        };
+        if account.is_suspended && !self.viewer_is_moderator(viewer_id)? {
+            return Err(PortError::NotFound("NO_SUCH_USER".to_string()));
+        }
+        Ok(account)
+    }
+
     pub fn users_show_by_id(&self, user_id: &str) -> Result<Account, PortError> {
         match self.accounts.find_by_id(user_id)? {
             None => Err(PortError::NotFound("NO_SUCH_USER".to_string())),
@@ -498,12 +587,88 @@ impl AppServices {
         }
     }
 
+    /// Batch Q Phase 1 FIX 7: the `includeMyRenotes` /
+    /// `includeRenotedMyNotes` / `includeLocalRenotes` exclusion shared by
+    /// `home_timeline` and `hybrid_timeline` (Misskey `notes/timeline.ts`
+    /// `getFromDb :220-248` + `notes/hybrid-timeline.ts :257-285` parity,
+    /// same bare-reshare rule as the user-list path above: a renote
+    /// carrying own text/files — or a poll — is content, not a bare
+    /// reshare, and survives every flag). Fail-open like the user-list
+    /// closure (which cannot propagate storage errors): an unreadable
+    /// renote target or account never excludes.
+    fn renote_excluded_by_include_flags(
+        &self,
+        note: &Note,
+        viewer_id: &str,
+        include_my_renotes: bool,
+        include_renoted_my_notes: bool,
+        include_local_renotes: bool,
+    ) -> bool {
+        let Some(target_id) = note.renote_id.as_deref() else {
+            return false;
+        };
+        let has_content = note.text.as_deref().is_some_and(|t| !t.is_empty())
+            || !note.file_ids.is_empty()
+            || self.polls.get_poll(&note.id).ok().flatten().is_some();
+        if has_content {
+            return false;
+        }
+        if !include_my_renotes && note.author_id == viewer_id {
+            return true;
+        }
+        if !include_renoted_my_notes || !include_local_renotes {
+            if let Ok(Some(target)) = self.notes.get_note(target_id) {
+                if !include_renoted_my_notes && target.author_id == viewer_id {
+                    return true;
+                }
+                if !include_local_renotes {
+                    let target_author_host = self
+                        .accounts
+                        .find_by_id(&target.author_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|a| a.host);
+                    if target_author_host.is_none() {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     pub fn home_timeline(
         &self,
         viewer_id: &str,
         cursor: &TimelineCursor,
         with_files: bool,
         with_renotes: bool,
+    ) -> Result<Vec<Note>, PortError> {
+        self.home_timeline_with_includes(
+            viewer_id,
+            cursor,
+            with_files,
+            with_renotes,
+            true,
+            true,
+            true,
+        )
+    }
+
+    /// `home_timeline` with the upstream `includeMyRenotes` /
+    /// `includeRenotedMyNotes` / `includeLocalRenotes` flags (all default
+    /// `true` in the upstream paramDef). The old `home_timeline` delegates
+    /// here so existing callers keep their behavior.
+    #[allow(clippy::too_many_arguments)]
+    pub fn home_timeline_with_includes(
+        &self,
+        viewer_id: &str,
+        cursor: &TimelineCursor,
+        with_files: bool,
+        with_renotes: bool,
+        include_my_renotes: bool,
+        include_renoted_my_notes: bool,
+        include_local_renotes: bool,
     ) -> Result<Vec<Note>, PortError> {
         let following = self.follow_set(viewer_id)?;
         let mut authors = following;
@@ -534,12 +699,26 @@ impl AppServices {
                 if !with_renotes && Self::is_pure_renote(note) {
                     return false;
                 }
+                if self.renote_excluded_by_include_flags(
+                    note,
+                    viewer_id,
+                    include_my_renotes,
+                    include_renoted_my_notes,
+                    include_local_renotes,
+                ) {
+                    return false;
+                }
                 true
             })
             .collect();
         Ok(self.apply_cursor(self.apply_feed_filter(Some(viewer_id), filtered)?, cursor))
     }
 
+    /// `hybrid_timeline` with the upstream `includeMyRenotes` /
+    /// `includeRenotedMyNotes` / `includeLocalRenotes` flags (all default
+    /// `true` in the upstream paramDef). The old `hybrid_timeline`
+    /// delegates here so existing callers keep their behavior.
+    #[allow(clippy::too_many_arguments)]
     pub fn local_timeline(
         &self,
         viewer_id: Option<&str>,
@@ -630,6 +809,34 @@ impl AppServices {
         with_renotes: bool,
         with_replies: bool,
     ) -> Result<Vec<Note>, PortError> {
+        self.hybrid_timeline_with_includes(
+            viewer_id,
+            cursor,
+            with_files,
+            with_renotes,
+            with_replies,
+            true,
+            true,
+            true,
+        )
+    }
+
+    /// `hybrid_timeline` with the upstream `includeMyRenotes` /
+    /// `includeRenotedMyNotes` / `includeLocalRenotes` flags (all default
+    /// `true` in the upstream paramDef). The old `hybrid_timeline`
+    /// delegates here so existing callers keep their behavior.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hybrid_timeline_with_includes(
+        &self,
+        viewer_id: &str,
+        cursor: &TimelineCursor,
+        with_files: bool,
+        with_renotes: bool,
+        with_replies: bool,
+        include_my_renotes: bool,
+        include_renoted_my_notes: bool,
+        include_local_renotes: bool,
+    ) -> Result<Vec<Note>, PortError> {
         // Fetch generous windows from both sources, then merge.
         let wide = TimelineCursor {
             since_id: cursor.since_id.clone(),
@@ -649,6 +856,21 @@ impl AppServices {
             // exception as the local path (Misskey hybrid parity). Pending
             // (unresolved-parent) replies count as replies, never roots.
             if !Self::keeps_reply(&note, with_replies) {
+                continue;
+            }
+            // Batch Q Phase 1 FIX 7: upstream `hybrid-timeline.ts`
+            // `getFromDb :257-285` applies the include flags to the
+            // *combined* (home ∪ local-public) query, so they filter the
+            // merged set here — not just the home arm (a viewer-owned bare
+            // reshare is local-public and would otherwise leak in via the
+            // local side).
+            if self.renote_excluded_by_include_flags(
+                &note,
+                viewer_id,
+                include_my_renotes,
+                include_renoted_my_notes,
+                include_local_renotes,
+            ) {
                 continue;
             }
             if seen.insert(note.id.clone()) {

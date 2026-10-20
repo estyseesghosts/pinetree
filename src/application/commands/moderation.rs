@@ -10,7 +10,7 @@ use crate::application::ports::{
     UnfollowAllPayload, UpdateAccountPatch,
 };
 use crate::domain::account::Account;
-use crate::domain::instance::{InstanceSettings, RegistrationPolicy};
+use crate::domain::instance::{InstanceSettings, RegistrationPolicy, UgcVisibilityForVisitor};
 use crate::domain::moderation::{ModerationAction, ModerationLogEntry};
 use crate::federation::outbox::FederateDeliverPayload;
 
@@ -287,6 +287,7 @@ impl AppServices {
         blocked_hosts: Option<Vec<String>>,
         federate_clips: Option<bool>,
         federate_pages: Option<bool>,
+        ugc_visibility_for_visitor: Option<UgcVisibilityForVisitor>,
         now_ms: i64,
     ) -> Result<InstanceSettings, PortError> {
         let current = self.instance_settings.get()?;
@@ -303,6 +304,9 @@ impl AppServices {
         if let Some(federate_pages) = federate_pages {
             patch.federate_pages = Some(federate_pages);
         }
+        if let Some(ugc) = ugc_visibility_for_visitor {
+            patch.ugc_visibility_for_visitor = Some(ugc);
+        }
         let next_registration = patch.registration.unwrap_or(current.registration);
         let next_blocked_hosts = patch
             .blocked_hosts
@@ -310,6 +314,9 @@ impl AppServices {
             .unwrap_or_else(|| current.blocked_hosts.clone());
         let next_federate_clips = patch.federate_clips.unwrap_or(current.federate_clips);
         let next_federate_pages = patch.federate_pages.unwrap_or(current.federate_pages);
+        let next_ugc = patch
+            .ugc_visibility_for_visitor
+            .unwrap_or(current.ugc_visibility_for_visitor);
         let log = ModerationLogEntry::new(
             self.ids.generate(),
             Some(actor.to_string()),
@@ -321,12 +328,14 @@ impl AppServices {
                     "blockedHosts": current.blocked_hosts,
                     "federateClips": current.federate_clips,
                     "federatePages": current.federate_pages,
+                    "ugcVisibilityForVisitor": current.ugc_visibility_for_visitor.as_wire(),
                 },
                 "after": {
                     "disableRegistration": next_registration.disable_registration(),
                     "blockedHosts": next_blocked_hosts,
                     "federateClips": next_federate_clips,
                     "federatePages": next_federate_pages,
+                    "ugcVisibilityForVisitor": next_ugc.as_wire(),
                 },
             }),
             now_ms,

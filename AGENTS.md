@@ -45,6 +45,10 @@ Phase 3 scope (proposal §9): client compatibility and streaming. Gaps carried i
 - Both storage backends must pass the same persistence contract tests (`docs/` defines them; redb adapter comes in Phase 1, FDB in Phase 4 — Phase 0 needs only the interface + conformance test suite + prototype proof).
 - Compatibility claims require tests against real Misskey/Sharkey checkouts or target client versions, not internal mocks.
 
+## Configuration
+
+- Every new setting must be addressable through the JSON config file (`--config path/to/pinetree.json`): add a serde field whose JSON key matches the field name, keep it optional with a sane default (empty object must parse), cover it in `validate()`, and add a round-trip test in `src/config.rs`. Unknown keys are hard errors (typo safety) — so document every key you add. CLI flags override file values; `validate()` runs once over the merged result. No settings settable only via env vars or CLI flags.
+
 ## Subagent delegation (hard rule)
 
 - Subagents share one worktree: concurrent subagents read and write the same files. The delegating agent must partition work so they cannot collide.

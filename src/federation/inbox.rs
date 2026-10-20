@@ -26,8 +26,9 @@ use crate::activitypub::objects::{
 };
 use crate::activitypub::signatures::{parse_signature_header, verify_http_signature};
 use crate::application::commands::AppServices;
-use crate::application::ports::{Clock, CreateNoteInput, PortError, TimelineCursor, UpdateAccountPatch};
+use crate::application::ports::{Clock, CreateNoteInput, IdGenerator, PortError, TimelineCursor, UpdateAccountPatch};
 use crate::domain::account::Account;
+use crate::domain::pinning::UserNotePining;
 use crate::domain::poll::PollInput;
 use crate::domain::note::{Note, Visibility};
 use crate::domain::quote::QuoteReference;
@@ -294,12 +295,13 @@ fn check_object_authority(
         "Update" => {
             match activity.get("object") {
                 // `Update(Question)` is handled by the §4 poll branch and
-                // `Update(Note|Article|Page)` is deferred to §8: dispatch
-                // re-validates, so the gate passes both through.
+                // `Update(Note|Article|Page|OrderedCollection)` is deferred
+                // to §8 / clip sync: dispatch re-validates, so the gate
+                // passes all through.
                 Some(Value::Object(map))
                     if matches!(
                         map.get("type").and_then(Value::as_str).unwrap_or(""),
-                        "Note" | "Article" | "Page" | "Question"
+                        "Note" | "Article" | "Page" | "Question" | "OrderedCollection"
                     ) =>
                 {
                     true
@@ -379,6 +381,22 @@ fn handle_follow(
     if services.inbound_host_blocked(&follower.id) {
         return Ok(accepted());
     }
+    // Clip follows (Phase 2b): `Follow{actor, object: collection URI}` to
+    // the clip owner's inbox. Authority = signer == follower (established
+    // above); the collection must be ours and readable.
+    {
+        let base = services.public_url.trim_end_matches('/').to_string();
+        if let Some(clip_id) = object_uri
+            .strip_prefix(&format!("{base}/clips/"))
+            .map(|rest| rest.split(['/', '?', '#']).next().unwrap_or("").trim())
+            .filter(|id| !id.is_empty())
+        {
+            if services.clips.get_clip(clip_id)?.is_some() {
+                let _ = services.handle_inbound_clip_follow(activity_id, &follower.id, clip_id);
+            }
+            return Ok(accepted());
+        }
+    }
     let Some(followee) = resolve_local_account(services, &object_uri)? else {
         return Ok(accepted());
     };
@@ -434,8 +452,11 @@ fn handle_flag(
 }
 
 /// Inbound `Add`/`Remove` for clip collections (federated clips + pages
-/// handoff, Phase 2): prompt cache invalidation for the federation
-/// resolver. Semantics:
+/// handoff, Phase 2) and featured-collection pin sync (Batch Q Phase 1,
+/// item 8a). Semantics:
+/// * Target is exactly the signer's own `{actor}/collections/featured`
+///   ⇒ pin/unpin handling (see `handle_featured_membership`). Any other
+///   `/collections/featured` target (someone else's collection) ⇒ ignore.
 /// * Target is a LOCAL `/clips/{id}` URI ⇒ ignore (remote actors never
 ///   mutate our collections; the owner is local and we never deliver to
 ///   ourselves). A remote actor claiming ownership of our collection is
@@ -451,7 +472,7 @@ fn handle_clip_membership(
     activity: &Value,
     activity_id: &str,
     actor_uri: &str,
-    _added: bool,
+    added: bool,
 ) -> Result<Response, PortError> {
     use crate::activitypub::federated_collections::{
         evict_remote_clip_cache, fetch_collection_owner,
@@ -463,6 +484,16 @@ fn handle_clip_membership(
     let Some(target_uri) = extract_object_uri(activity.get("target")) else {
         return Ok(accepted());
     };
+    // Featured-collection pin sync: only the signer's own collection is
+    // ever applied; anyone else's converges without effect (same rule as
+    // local clip collections below — remote actors never mutate
+    // collections they do not own).
+    if target_uri == format!("{actor_uri}/collections/featured") {
+        return handle_featured_membership(services, activity, activity_id, actor_uri, added);
+    }
+    if target_uri.ends_with("/collections/featured") {
+        return Ok(accepted());
+    }
     let base = services.public_url.trim_end_matches('/');
     if target_uri.starts_with(&format!("{base}/clips/")) {
         // Our own collection: never mutated remotely.
@@ -478,6 +509,182 @@ fn handle_clip_membership(
         }
         _ => Ok(accepted()),
     }
+}
+
+/// Inbound `Update(OrderedCollection)` (Phase 2a): clip metadata edits
+/// carry the embedded full collection document (one round trip, no
+/// refetch). Authority = collection owner, verified by fetching the
+/// collection and comparing `attributedTo` (same as Add/Remove). Apply =
+/// refresh-or-evict: the embedded document populates the membership
+/// cache with its `updated` stamp; replays converge idempotently.
+/// Local `/clips/` targets are never mutated remotely.
+fn handle_clip_sync_update(
+    services: &AppServices,
+    doc: &serde_json::Map<String, serde_json::Value>,
+    activity_id: &str,
+    actor_uri: &str,
+) -> Result<Response, PortError> {
+    use crate::activitypub::federated_collections::{
+        evict_remote_clip_cache, fetch_collection_owner, ingest_remote_clip_doc,
+    };
+    if services.dedup.is_recorded(activity_id)? {
+        return Ok(accepted());
+    }
+    let Some(collection_uri) = doc
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+    else {
+        return Ok(accepted());
+    };
+    let base = services.public_url.trim_end_matches('/').to_string();
+    if collection_uri.starts_with(&format!("{base}/clips/")) {
+        return Ok(accepted());
+    }
+    if !collection_uri.contains("/clips/") {
+        return Ok(accepted());
+    }
+    match fetch_collection_owner(services, collection_uri) {
+        Some(owner) if owner == actor_uri => {
+            ingest_remote_clip_doc(
+                collection_uri,
+                &Value::Object(doc.clone()),
+            );
+            services.dedup.check_and_record(activity_id)?;
+            Ok(accepted())
+        }
+        _ => {
+            // Authority failure: evict nothing, record nothing (a retry
+            // after owner change can still succeed).
+            let _ = evict_remote_clip_cache;
+            Ok(accepted())
+        }
+    }
+}
+
+/// Inbound `Delete(OrderedCollection)` (Phase 2a): fires on delete and on
+/// tier flips to a more restrictive tier. Authority = signer == collection
+/// owner (verified like Add/Remove). Receivers evict the membership cache
+/// and prune dependent state (remote follow rows for the collection stop
+/// receiving fan-out; nothing else is stored remotely). Replays idempotent.
+/// A tombstoned remote collection that reappears via full-state pull stays
+/// evicted: pulls that 404-or-Tombstone drop the cache entry.
+fn handle_clip_sync_delete(
+    services: &AppServices,
+    object: &Value,
+    object_uri: &str,
+    activity_id: &str,
+    actor_uri: &str,
+) -> Result<Response, PortError> {
+    use crate::activitypub::federated_collections::{
+        evict_remote_clip_cache, fetch_collection_owner,
+    };
+    if services.dedup.is_recorded(activity_id)? {
+        return Ok(accepted());
+    }
+    let base = services.public_url.trim_end_matches('/').to_string();
+    if object_uri.starts_with(&format!("{base}/clips/")) {
+        return Ok(accepted());
+    }
+    if !object_uri.contains("/clips/") {
+        return Ok(accepted());
+    }
+    // Embedded-document deletes name the collection twice (wrapper id +
+    // inner id); both must agree when both are present.
+    if let Some(inner) = object.as_object().and_then(|m| m.get("id")).and_then(Value::as_str) {
+        if inner.trim() != object_uri {
+            return Ok(accepted());
+        }
+    }
+    match fetch_collection_owner(services, object_uri) {
+        Some(owner) if owner == actor_uri => {
+            evict_remote_clip_cache(object_uri);
+            services.dedup.check_and_record(activity_id)?;
+            Ok(accepted())
+        }
+        // Owner fetch failed (deleted collections 404 their own doc):
+        // accept + evict anyway — the collection is gone either way, and
+        // holding a stale cached copy is the worse outcome. Forged
+        // deletes of *live* collections are the risk; mitigate by
+        // re-checking: only evict-without-verify when the fetch itself
+        // failed, never when it named a different owner.
+        None => {
+            evict_remote_clip_cache(object_uri);
+            services.dedup.check_and_record(activity_id)?;
+            Ok(accepted())
+        }
+        _ => Ok(accepted()),
+    }
+}
+
+/// Inbound `Add`/`Remove` for a remote actor's featured collection
+/// (Batch Q Phase 1, item 8a; Misskey `NotePiningService` featured-sync
+/// parity): the collection owner pins/unpins one of its own notes.
+///
+/// Authority: dispatch only calls this when the target is exactly the
+/// signer's own `{actor}/collections/featured`, and the note must belong
+/// to the signer (collection owners pin only their own notes). The object
+/// may be a bare note URI or an embedded note document — resolution
+/// follows the same lookup-or-fetch-and-cache discipline as
+/// `Like`/`Announce` targets (origin-checked, SSRF-guarded), so unknown
+/// notes materialize before the pin lands.
+///
+/// Idempotency: duplicate `Add` maps the store `Conflict(ALREADY_PINNED)`
+/// to success and duplicate `Remove` is a no-op success upstream-style;
+/// the activity id is recorded after the pin op so replays converge via
+/// the read-only gate in `handle_clip_membership` without refetching.
+/// (Pin and dedup commit in two transactions; both sides are idempotent,
+/// so a crash between them still converges on retry.)
+fn handle_featured_membership(
+    services: &AppServices,
+    activity: &Value,
+    activity_id: &str,
+    actor_uri: &str,
+    added: bool,
+) -> Result<Response, PortError> {
+    // Resolve the signer (cached row or one fetch) and drop blocked hosts
+    // BEFORE any state write (blocked-host discipline).
+    let actor_account = resolve_remote_account(services, actor_uri)?;
+    if services.inbound_host_blocked(&actor_account.id) {
+        return Ok(accepted());
+    }
+    let Some(object_uri) = extract_object_uri(activity.get("object")) else {
+        return Ok(accepted());
+    };
+    let note_id = match find_note_by_uri(services, &object_uri)? {
+        Some(note) => note.id,
+        None => match resolve_note_target_id(services, &object_uri)? {
+            Some(id) => id,
+            // Unresolvable targets accept without recording so a later
+            // retry can succeed (same discipline as `Move` targets).
+            None => return Ok(accepted()),
+        },
+    };
+    let Some(note) = services.notes.get_note(&note_id)? else {
+        return Ok(accepted());
+    };
+    if note.author_id != actor_account.id {
+        return Ok(accepted());
+    }
+    if added {
+        let pinning = UserNotePining {
+            id: services.ids.generate(),
+            user_id: actor_account.id.clone(),
+            note_id: note.id,
+        };
+        match services.notes.add_pinning(pinning, Vec::new()) {
+            Ok(_) => {}
+            Err(PortError::Conflict(_)) => {}
+            Err(e) => return Err(e),
+        }
+    } else {
+        services
+            .notes
+            .remove_pinning(&actor_account.id, &note.id, Vec::new())?;
+    }
+    services.dedup.check_and_record(activity_id)?;
+    Ok(accepted())
 }
 
 /// Inbound `Block` (Misskey `ApInboxService.block()` parity): the remote
@@ -947,6 +1154,33 @@ fn handle_undo(
                     let Some(inner_object) = non_empty_str(map.get("object")) else {
                         return Ok(accepted());
                     };
+                    // Clip unfollows: `Undo(Follow{collection URI})`
+                    // retracts a clip follow. Forged unfollows of unknown
+                    // clips converge quietly.
+                    {
+                        let base = services.public_url.trim_end_matches('/').to_string();
+                        if let Some(clip_id) = inner_object
+                            .strip_prefix(&format!("{base}/clips/"))
+                            .map(|rest| rest.split(['/', '?', '#']).next().unwrap_or("").trim())
+                            .filter(|id| !id.is_empty())
+                        {
+                            let _ = services.handle_inbound_clip_unfollow(
+                                activity_id,
+                                &follower.id,
+                                clip_id,
+                            );
+                            // Misskey id-reuse parity (same as account
+                            // unfollows below): forget both the Follow id and
+                            // this Undo id so a later re-follow is not
+                            // mistaken for a replay. Replaying an
+                            // Undo(Follow) is idempotent anyway.
+                            if let Some(follow_id) = non_empty_str(map.get("id")) {
+                                services.dedup.forget_activity(&follow_id)?;
+                            }
+                            services.dedup.forget_activity(activity_id)?;
+                            return Ok(accepted());
+                        }
+                    }
                     let Some(followee) = resolve_local_account(services, &inner_object)?
                     else {
                         return Ok(accepted());
@@ -1020,6 +1254,53 @@ fn handle_undo(
                             break;
                         }
                     }
+                    Ok(accepted())
+                }
+                // `Undo(Accept(Follow))` (Batch Q Phase 1, item 8b): the
+                // followee revokes a previously granted follow, so the
+                // follow edge comes down exactly like an `Undo(Follow)`
+                // (same store, same idempotency: a missing edge maps to
+                // success). Authority: only the Accepter itself may undo
+                // its Accept — the embedded `Accept.actor` and the
+                // embedded `Follow.object` must both be the Undo signer,
+                // mirroring the `Accept(Follow)` response checks. A bare-IRI
+                // object has no activity record to resolve against, so it
+                // converges without effect (limitation: by-ID Accept
+                // resolution needs an activity store that does not exist).
+                "Accept" => {
+                    if non_empty_str(map.get("actor")).as_deref() != Some(actor_uri) {
+                        return Ok(accepted());
+                    }
+                    let Some(follow_map) = map.get("object").and_then(Value::as_object)
+                    else {
+                        return Ok(accepted());
+                    };
+                    if follow_map.get("type").and_then(Value::as_str).unwrap_or("") != "Follow"
+                    {
+                        return Ok(accepted());
+                    }
+                    let (Some(follow_actor), Some(follow_object)) = (
+                        non_empty_str(follow_map.get("actor")),
+                        non_empty_str(follow_map.get("object")),
+                    ) else {
+                        return Ok(accepted());
+                    };
+                    if follow_object != actor_uri {
+                        return Ok(accepted());
+                    }
+                    let Some(follower) = resolve_local_account(services, &follow_actor)?
+                    else {
+                        return Ok(accepted());
+                    };
+                    if !follower.is_local() {
+                        return Ok(accepted());
+                    }
+                    let followee = resolve_remote_account(services, &follow_object)?;
+                    services.handle_inbound_unfollow(
+                        activity_id,
+                        &follower.id,
+                        &followee.id,
+                    )?;
                     Ok(accepted())
                 }
                 _ => Ok(accepted()),
@@ -1231,6 +1512,38 @@ fn handle_announce(
     Ok(accepted())
 }
 
+/// Record a remote `Like` on a page and notify the page owner (Phase
+/// 2c: closes the silent-likes gap). Replays converge without a second
+/// notification (the like row is the guard).
+fn notify_page_owner_of_like(
+    services: &AppServices,
+    activity_id: &str,
+    liker_id: &str,
+    page: &crate::domain::page::Page,
+) -> Result<(), PortError> {
+    if liker_id == page.owner_id {
+        return Ok(());
+    }
+    if services.pages.is_page_liked(liker_id, &page.id)? {
+        return Ok(());
+    }
+    if !services.handle_inbound_page_like(activity_id, liker_id, &page.id)? {
+        return Ok(());
+    }
+    let job = services.notify_job_full(
+        &page.owner_id,
+        liker_id,
+        crate::domain::notification::NotificationKind::PageLiked,
+        None,
+        None,
+        None,
+        Some(page.id.clone()),
+        &format!("page-liked:{}:{liker_id}:{activity_id}", page.id),
+    )?;
+    services.jobs.enqueue_jobs(vec![job])?;
+    Ok(())
+}
+
 fn handle_like(
     services: &AppServices,
     activity: &Value,
@@ -1252,13 +1565,13 @@ fn handle_like(
         .map(|rest| rest.split(['/', '?', '#']).next().unwrap_or("").trim())
         .filter(|id| !id.is_empty())
     {
-        if services.pages.get_page(page_id)?.is_some() {
-            services.handle_inbound_page_like(activity_id, &liker.id, page_id)?;
+        if let Some(page) = services.pages.get_page(page_id)? {
+            notify_page_owner_of_like(services, activity_id, &liker.id, &page)?;
         }
         return Ok(accepted());
     }
     if let Some(page) = services.pages.get_page_by_uri(&target_uri)? {
-        services.handle_inbound_page_like(activity_id, &liker.id, &page.id)?;
+        notify_page_owner_of_like(services, activity_id, &liker.id, &page)?;
         return Ok(accepted());
     }
     let Some(target_id) = resolve_note_target_id(services, &target_uri)? else {
@@ -1283,6 +1596,18 @@ fn handle_delete(
     let Some(object_uri) = extract_object_uri(activity.get("object")) else {
         return Ok(accepted());
     };
+    // Clip sync (Phase 2a): `Delete(OrderedCollection)` on delete and on
+    // tier flips to a more restrictive tier. Receivers evict + prune.
+    if let Some(obj) = activity.get("object") {
+        let is_collection = obj
+            .as_object()
+            .and_then(|m| m.get("type"))
+            .and_then(Value::as_str)
+            == Some("OrderedCollection");
+        if is_collection || object_uri.contains("/clips/") {
+            return handle_clip_sync_delete(services, obj, &object_uri, activity_id, actor_uri);
+        }
+    }
     // Federated pages (Phase 3): `Delete(Article-URI)` from the page
     // owner retracts a materialized remote page (cascade drops its
     // likes). Local `/pages/` URLs are owner-deleted locally only.
@@ -1296,12 +1621,74 @@ fn handle_delete(
                     None => false,
                 };
                 if owner_ok && !services.dedup.check_and_record(activity_id)? {
-                    services.pages.delete_page(&page.id)?;
+                    services.pages.delete_page(&page.id, Vec::new())?;
                 }
                 return Ok(accepted());
             }
             // Not a materialized page: fall through to the note / stamp /
             // tombstone paths below.
+        }
+    }
+    // Path 0: `Delete(Person)` inbound (Batch Q Phase 1, item 8c) — a
+    // remote server announcing one of its accounts is gone. Applied via
+    // the moderation tombstone path (handle stays reserved, follow edges
+    // and requests torn down both ways), deduped on the activity id.
+    // Authority: only the actor itself deletes itself (`actor == object`,
+    // hence same host); a LOCAL account URI is never marked from
+    // federation input. Embedded non-actor documents (Note/Article/Page)
+    // and bare URIs that name no known account fall through to the note /
+    // stamp / tombstone paths below byte-for-byte unchanged.
+    {
+        let object_value = activity.get("object");
+        let embedded_is_object = object_value.map(Value::is_object).unwrap_or(false);
+        let embedded_type = object_value
+            .and_then(|o| o.as_object())
+            .and_then(|m| m.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let actor_shaped = !embedded_is_object
+            || matches!(
+                embedded_type,
+                "Person" | "Service" | "Application" | "Group" | "Organization"
+            );
+        if actor_shaped {
+            if let Some(account) = services.accounts.find_by_uri(&object_uri)? {
+                // A known account URI is always an actor Delete: it never
+                // reaches the note/stamp/tombstone paths (an actor URI must
+                // never become a note tombstone).
+                if account.is_local() {
+                    return Ok(accepted());
+                }
+                if object_uri != actor_uri {
+                    return Ok(accepted());
+                }
+                // Tombstone first, then record: both sides are idempotent,
+                // so a crash between them still converges on retry.
+                services.moderation.delete_account(&account.id, None, Vec::new())?;
+                services.dedup.check_and_record(activity_id)?;
+                return Ok(accepted());
+            }
+            if embedded_is_object {
+                // An embedded actor document for an unknown account:
+                // fetch-and-verify it names a remote actor, then tombstone.
+                // Unverifiable documents converge without recording so a
+                // later retry can succeed.
+                match fetch_and_upsert_remote_actor(
+                    services,
+                    &services.federation_http,
+                    &object_uri,
+                ) {
+                    Ok((account, _)) => {
+                        if account.is_local() || object_uri != actor_uri {
+                            return Ok(accepted());
+                        }
+                        services.moderation.delete_account(&account.id, None, Vec::new())?;
+                        services.dedup.check_and_record(activity_id)?;
+                        return Ok(accepted());
+                    }
+                    Err(_) => return Ok(accepted()),
+                }
+            }
         }
     }
     // Path 1: a known note → existing author/host authority + delete.
@@ -1408,6 +1795,11 @@ fn handle_update(
             }
             if matches!(obj_type, "Note" | "Article" | "Page") {
                 return handle_update_note(services, doc, activity_id, actor_uri);
+            }
+            // Clip metadata sync (Phase 2a): `Update(OrderedCollection)`
+            // carrying the embedded full collection document.
+            if obj_type == "OrderedCollection" {
+                return handle_clip_sync_update(services, map, activity_id, actor_uri);
             }
             let Some(id) = non_empty_str(map.get("id")) else {
                 return Ok(accepted());

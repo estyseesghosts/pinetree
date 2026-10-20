@@ -91,20 +91,34 @@ def signup(username):
     with urllib.request.urlopen(req, timeout=15) as r:
         return json.loads(r.read().decode())
 
-def wait_for(name, fn, timeout=8):
+def wait_for(name, fn, timeout=8, interval=0.15):
     start = time.time()
     while time.time() - start < timeout:
         v = fn()
         if v:
             check(name, True)
             return v
-        time.sleep(0.15)
+        time.sleep(interval)
     check(name, False, "timed out")
     return None
 
 # meta (Composer.tsx:23, public)
 s, meta = api("meta")
 check("meta public", s == 200 and meta.get("name") == "Pinetree", f"s={s}")
+
+# media proxy: meta advertises /proxy and the route is truthful (Batch Q §37)
+def raw_get(path, headers=None):
+    req = urllib.request.Request(f"{BASE}{path}", headers=headers or {}, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+check("meta advertises mediaProxy", isinstance(meta.get("mediaProxy"), str) and meta["mediaProxy"].endswith("/proxy"), f"s={s}")
+s, _ = raw_get("/proxy", {"User-Agent": "keysweep"})
+check("proxy missing url 400", s == 400, f"s={s}")
+s, _ = raw_get("/proxy?url=https://proxy-test.invalid/a.png", {"User-Agent": "keysweep"})
+check("proxy unreachable 404", s == 404, f"s={s}")
 
 # signin + i (auth.tsx)
 a, b = signup("alice"), signup("bob")
@@ -191,14 +205,14 @@ check("following/delete", s == 200, f"s={s}")
 # notifications + mark-all-as-read (Notifications.tsx)
 s, _ = api("following/create", {"userId": IDB}, TA)
 found = wait_for("i/notifications has follow", lambda: any(
-    n.get("type") == "follow" for n in (api("i/notifications", {"limit": 20}, TB)[1] or [])))
+    n.get("type") == "follow" for n in (api("i/notifications", {"limit": 20}, TB)[1] or [])), interval=1.0)
 # Keystone paginates with untilId (checked again below once two exist).
 s, page1 = api("i/notifications", {"limit": 1}, TB)
 check("i/notifications newest-first", s == 200 and len(page1) == 1, f"s={s}")
 # Second notification (mention) so untilId pagination crosses a page boundary.
 s, _ = api("notes/create", {"text": "ping @bob, two pages"}, TA)
 found = wait_for("mention notification lands", lambda: any(
-    n.get("type") == "mention" for n in (api("i/notifications", {"limit": 20, "markAsRead": False}, TB)[1] or [])))
+    n.get("type") == "mention" for n in (api("i/notifications", {"limit": 20, "markAsRead": False}, TB)[1] or [])), interval=1.0)
 s, p1 = api("i/notifications", {"limit": 1, "markAsRead": False}, TB)
 s, p2 = api("i/notifications", {"limit": 10, "markAsRead": False, "untilId": p1[0]["id"]}, TB)
 check("i/notifications untilId pagination", s == 200 and len(p1) == 1 and len(p2) >= 1 and all(
@@ -254,6 +268,16 @@ s, _ = api("clips/favorite", {"clipId": CID}, TB)
 check("clips/favorite", s == 204, f"s={s}")
 s, favs = api("clips/my-favorites", {}, TB)
 check("clips/my-favorites", s == 200 and len(favs) == 1, f"s={s}")
+s, _ = api("clips/follow", {"clipId": CID}, TB)
+check("clips/follow", s == 204, f"s={s}")
+s, shown2 = api("clips/show", {"clipId": CID}, TB)
+check("clips/show isFollowing", s == 200 and shown2.get("isFollowing") is True, f"s={s}")
+s, followers = api("clips/followers", {"clipId": CID}, TA)
+check("clips/followers owner", s == 200 and len(followers) == 1, f"s={s} body={json.dumps(followers)[:200]}")
+s, _ = api("clips/followers", {"clipId": CID}, TB)
+check("clips/followers non-owner 403", s == 403, f"s={s}")
+s, _ = api("clips/unfollow", {"clipId": CID}, TB)
+check("clips/unfollow", s == 204, f"s={s}")
 s, page = api("pages/create", {"title": "T", "name": "t",
     "content": [{"type": "text", "text": "hi"}], "variables": [], "script": ""}, TA)
 check("pages/create", s == 200 and page.get("name") == "t", f"s={s}")
@@ -262,6 +286,17 @@ s, pshown = api("pages/show", {"pageId": PID})
 check("pages/show anon", s == 200 and pshown.get("title") == "T", f"s={s}")
 s, feat = api("pages/featured", {})
 check("pages/featured empty", s == 200 and feat == [], f"s={s}")
+s, gated = api("pages/create", {"title": "G", "name": "g",
+    "content": [{"type": "text", "text": "gated hello"}], "variables": [], "script": "",
+    "pageVisibility": "followers"}, TA)
+check("pages/create gated", s == 200, f"s={s}")
+GID = gated["id"] if s == 200 else "x"
+s, gshown = api("pages/show", {"pageId": GID}, TB)
+check("pages/show gated stranger hides", s == 400 and "NO_SUCH_PAGE" in json.dumps(gshown), f"s={s}")
+s, _ = api("pages/like", {"pageId": GID}, TB)
+check("pages/like gated stranger hides", s == 400, f"s={s}")
+s, notifs = api("i/notifications", {"includeTypes": ["clipUpdated", "pageLiked"]}, TA)
+check("i/notifications new kinds filter", s == 200 and isinstance(notifs, list), f"s={s}")
 
 # revoke last (kills the token)
 s, second = api("signin", {"username": "bob", "password": "password123"})

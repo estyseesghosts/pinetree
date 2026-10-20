@@ -749,6 +749,10 @@ pub fn pack_clip(
             "isFavorited".to_string(),
             Value::Bool(services.clips.is_clip_favorited(viewer, &clip.id)?),
         );
+        obj.insert(
+            "isFollowing".to_string(),
+            Value::Bool(services.clips.is_following_clip(viewer, &clip.id)?),
+        );
         if viewer == clip.owner_id.as_str() {
             obj.insert(
                 "notesCount".to_string(),
@@ -1857,6 +1861,48 @@ pub fn pack_notification(notification: &Notification, services: &AppServices) ->
                 None => Value::Null,
             };
             map.insert("draft".to_string(), packed_draft);
+        }
+        // Phase 2c: `clipUpdated` carries the clip; `pageLiked`
+        // carries the page (pinetree-only wire types `clipUpdated` /
+        // `pageLiked`, following the `exportCompleted` precedent).
+        if notification.kind == crate::domain::notification::NotificationKind::ClipUpdated
+        {
+            map.insert(
+                "clipId".to_string(),
+                notification
+                    .clip_id
+                    .clone()
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
+            );
+            if let Some(clip_id) = notification.clip_id.as_deref() {
+                if let Ok(Some(clip)) = services.clips.get_clip(clip_id) {
+                    if let Ok(packed) =
+                        pack_clip(&clip, Some(&notification.notifiee_id), services)
+                    {
+                        map.insert("clip".to_string(), packed);
+                    }
+                }
+            }
+        }
+        if notification.kind == crate::domain::notification::NotificationKind::PageLiked {
+            map.insert(
+                "pageId".to_string(),
+                notification
+                    .page_id
+                    .clone()
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
+            );
+            if let Some(page_id) = notification.page_id.as_deref() {
+                if let Ok(Some(page)) = services.pages.get_page(page_id) {
+                    if let Ok(packed) =
+                        pack_page(&page, Some(&notification.notifiee_id), services)
+                    {
+                        map.insert("page".to_string(), packed);
+                    }
+                }
+            }
         }
         // §13: `exportCompleted` carries the exported entity + the drive
         // file it landed in (upstream `exportedEntity`/`fileId` shape,
@@ -3322,10 +3368,11 @@ mod tests {
         fn update_clip(
             &self,
             _clip: crate::domain::clip::Clip,
+            _jobs: Vec<NewJob>,
         ) -> Result<Option<crate::domain::clip::Clip>, PortError> {
             Ok(None)
         }
-        fn delete_clip(&self, _owner_id: &str, _clip_id: &str) -> Result<bool, PortError> {
+        fn delete_clip(&self, _owner_id: &str, _clip_id: &str, _jobs: Vec<NewJob>) -> Result<bool, PortError> {
             Ok(false)
         }
         fn get_clip(&self, _clip_id: &str) -> Result<Option<crate::domain::clip::Clip>, PortError> {
@@ -3349,6 +3396,7 @@ mod tests {
             &self,
             _clip_id: &str,
             _note_id: &str,
+            _now_ms: i64,
             _jobs: Vec<NewJob>,
         ) -> Result<bool, PortError> {
             Ok(false)
@@ -3380,6 +3428,13 @@ mod tests {
         ) -> Result<Vec<crate::domain::clip::ClipFavorite>, PortError> {
             Ok(Vec::new())
         }
+        fn follow_clip(&self, _follow: crate::domain::clip::ClipFollow) -> Result<bool, PortError> { Ok(false) }
+        fn unfollow_clip(&self, _user_id: &str, _clip_id: &str) -> Result<bool, PortError> { Ok(false) }
+        fn is_following_clip(&self, _user_id: &str, _clip_id: &str) -> Result<bool, PortError> { Ok(false) }
+        fn followers_of_clip(&self, _clip_id: &str, _limit: usize) -> Result<Vec<crate::domain::clip::ClipFollow>, PortError> { Ok(Vec::new()) }
+        fn followed_clips_of(&self, _user_id: &str) -> Result<Vec<crate::domain::clip::ClipFollow>, PortError> { Ok(Vec::new()) }
+        fn record_clip_tombstone(&self, _clip_uri: &str, _deleted_at_ms: i64) -> Result<(), PortError> { Ok(()) }
+        fn clip_tombstone(&self, _clip_uri: &str) -> Result<Option<i64>, PortError> { Ok(None) }
     }
 
     impl crate::application::ports::PageStore for Mem {
@@ -3397,7 +3452,7 @@ mod tests {
         ) -> Result<Option<crate::domain::page::Page>, PortError> {
             Ok(None)
         }
-        fn delete_page(&self, _page_id: &str) -> Result<bool, PortError> {
+        fn delete_page(&self, _page_id: &str, _jobs: Vec<NewJob>) -> Result<bool, PortError> {
             Ok(false)
         }
         fn get_page(&self, _page_id: &str) -> Result<Option<crate::domain::page::Page>, PortError> {
