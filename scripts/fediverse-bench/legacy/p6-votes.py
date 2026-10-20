@@ -1,5 +1,7 @@
+import os
+BD = os.environ["BENCH_DIR"]
 import sys, time
-sys.path.insert(0, "/tmp/opencode/bench")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lib import load_nodes
 from concurrent.futures import ThreadPoolExecutor
 nodes = load_nodes()

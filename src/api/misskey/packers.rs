@@ -275,7 +275,16 @@ pub fn pack_user_detailed_not_me(
         .unwrap_or_default();
     obj.insert("url".to_string(), Value::String(actor_url.clone()));
     obj.insert("uri".to_string(), Value::String(actor_url));
-    obj.insert("movedTo".to_string(), Value::Null);
+    // Batch P `i/move`: the destination actor URI (upstream `movedToUri`
+    // parity; null until the account moves).
+    obj.insert(
+        "movedTo".to_string(),
+        account
+            .moved_to_uri
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
     obj.insert(
         "alsoKnownAs".to_string(),
         pack_also_known_as(account, services),
@@ -664,6 +673,28 @@ pub fn emoji_maps_for_viewer(services: &AppServices, show_remote: bool) -> (Valu
     (value.clone(), value)
 }
 
+/// User-list pack (Batch O WP16; upstream `UserListEntityService.pack`
+/// parity): `{id, createdAt, name, userIds, isPublic}`.
+pub fn pack_user_list(
+    list: &crate::domain::user_list::UserList,
+    member_ids: &[String],
+    services: &AppServices,
+) -> Value {
+    let created_at = format_millis(
+        services
+            .ids
+            .parse_time(&list.id)
+            .unwrap_or_else(|_| services.clock.now_ms()),
+    );
+    serde_json::json!({
+        "id": list.id,
+        "createdAt": created_at,
+        "name": list.name,
+        "userIds": member_ids,
+        "isPublic": list.is_public,
+    })
+}
+
 /// Antenna pack (Batch N WS4; upstream `AntennaEntityService.pack`
 /// parity): `{id, createdAt, name, keywords, excludeKeywords, src,
 /// userListId, users, caseSensitive, localOnly, excludeBots, withReplies,
@@ -996,7 +1027,7 @@ fn default_policies(services: &AppServices) -> Value {
         "webhookLimit": 0,
         "clipLimit": 5,
         "noteEachClipsLimit": 200,
-        "userListLimit": 5,
+        "userListLimit": 10,
         "userEachUserListsLimit": 50,
         "rateLimitFactor": 1,
         "avatarDecorationLimit": 5,
@@ -1155,8 +1186,20 @@ pub fn pack_me_detailed(
         Value::Bool(account.show_remote_emojis),
     );
     if include_secrets {
-        obj.insert("email".to_string(), Value::Null);
-        obj.insert("emailVerified".to_string(), Value::Null);
+        // Batch P: the stored address + verification flag (null when unset;
+        // never packed without secrets — see the redaction assert below).
+        obj.insert(
+            "email".to_string(),
+            account
+                .email
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        );
+        obj.insert(
+            "emailVerified".to_string(),
+            Value::Bool(account.email_verified),
+        );
         obj.insert("securityKeysList".to_string(), Value::Array(Vec::new()));
     }
     Ok(Value::Object(obj))
@@ -2932,6 +2975,15 @@ mod tests {
         fn delete_token_by_hash(&self, _token_hash: &str) -> Result<(), PortError> {
             Ok(())
         }
+        fn get_token_by_id(&self, _id: &str) -> Result<Option<ApiTokenRecord>, PortError> {
+            Ok(None)
+        }
+        fn tokens_for_account(&self, _account_id: &str) -> Result<Vec<ApiTokenRecord>, PortError> {
+            Ok(Vec::new())
+        }
+        fn delete_account_first_party_tokens(&self, _account_id: &str) -> Result<u64, PortError> {
+            Ok(0)
+        }
         fn save_miauth_session(&self, _s: MiAuthSessionRecord) -> Result<(), PortError> {
             Ok(())
         }
@@ -2955,6 +3007,132 @@ mod tests {
             _token: &str,
         ) -> Result<Option<LegacyAuthSessionRecord>, PortError> {
             Ok(None)
+        }
+    }
+
+    impl crate::application::ports::UserListStore for Mem {
+        fn create_user_list(&self, list: crate::domain::user_list::UserList) -> Result<crate::domain::user_list::UserList, PortError> {
+            Ok(list)
+        }
+        fn update_user_list(&self, list: crate::domain::user_list::UserList) -> Result<Option<crate::domain::user_list::UserList>, PortError> {
+            Ok(Some(list))
+        }
+        fn delete_user_list(&self, _owner_id: &str, _list_id: &str) -> Result<bool, PortError> {
+            Ok(false)
+        }
+        fn get_user_list(&self, _list_id: &str) -> Result<Option<crate::domain::user_list::UserList>, PortError> {
+            Ok(None)
+        }
+        fn lists_by_owner(&self, _owner_id: &str) -> Result<Vec<crate::domain::user_list::UserList>, PortError> {
+            Ok(Vec::new())
+        }
+        fn public_lists_by_owner(&self, _owner_id: &str) -> Result<Vec<crate::domain::user_list::UserList>, PortError> {
+            Ok(Vec::new())
+        }
+        fn add_list_member(&self, member: crate::domain::user_list::UserListMembership, _jobs: Vec<crate::application::ports::NewJob>) -> Result<crate::domain::user_list::UserListMembership, PortError> {
+            Ok(member)
+        }
+        fn remove_list_member(&self, _list_id: &str, _member_id: &str, _jobs: Vec<crate::application::ports::NewJob>) -> Result<bool, PortError> {
+            Ok(false)
+        }
+        fn update_list_membership(&self, _list_id: &str, _member_id: &str, _with_replies: bool) -> Result<Option<crate::domain::user_list::UserListMembership>, PortError> {
+            Ok(None)
+        }
+        fn get_list_membership(&self, _list_id: &str, _member_id: &str) -> Result<Option<crate::domain::user_list::UserListMembership>, PortError> {
+            Ok(None)
+        }
+        fn members_of_list(&self, _list_id: &str) -> Result<Vec<crate::domain::user_list::UserListMembership>, PortError> {
+            Ok(Vec::new())
+        }
+        fn favorite_list(&self, _owner_id: &str, _list_id: &str) -> Result<bool, PortError> {
+            Ok(true)
+        }
+        fn unfavorite_list(&self, _owner_id: &str, _list_id: &str) -> Result<bool, PortError> {
+            Ok(false)
+        }
+        fn is_list_favorited(&self, _owner_id: &str, _list_id: &str) -> Result<bool, PortError> {
+            Ok(false)
+        }
+        fn list_favorite_count(&self, _list_id: &str) -> Result<u64, PortError> {
+            Ok(0)
+        }
+    }
+
+    impl crate::application::ports::SigninStore for Mem {
+        fn record_signin(&self, _record: crate::application::ports::SigninRecord) -> Result<(), PortError> {
+            Ok(())
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn list_signins(
+            &self,
+            _account_id: &str,
+            _limit: usize,
+            _since_id: Option<&str>,
+            _until_id: Option<&str>,
+            _since_date: Option<i64>,
+            _until_date: Option<i64>,
+        ) -> Result<Vec<crate::application::ports::SigninRecord>, PortError> {
+            Ok(Vec::new())
+        }
+    }
+
+
+    impl crate::application::ports::PasswordResetStore for Mem {
+        fn create_reset_request(
+            &self,
+            _request: crate::application::ports::PasswordResetRequest,
+        ) -> Result<(), PortError> {
+            Ok(())
+        }
+        fn find_reset_request(
+            &self,
+            _token: &str,
+        ) -> Result<Option<crate::application::ports::PasswordResetRequest>, PortError> {
+            Ok(None)
+        }
+        fn delete_reset_request(&self, _id: &str) -> Result<(), PortError> {
+            Ok(())
+        }
+    }
+
+    impl crate::application::ports::RegistryStore for Mem {
+        fn registry_set(
+            &self,
+            _item: crate::application::ports::RegistryItem,
+        ) -> Result<(), PortError> {
+            Ok(())
+        }
+        fn registry_get(
+            &self,
+            _user_id: &str,
+            _domain: Option<&str>,
+            _scope: &[String],
+            _key: &str,
+        ) -> Result<Option<crate::application::ports::RegistryItem>, PortError> {
+            Ok(None)
+        }
+        fn registry_list(
+            &self,
+            _user_id: &str,
+            _domain: Option<&str>,
+            _scope: &[String],
+        ) -> Result<Vec<crate::application::ports::RegistryItem>, PortError> {
+            Ok(Vec::new())
+        }
+        fn registry_remove(
+            &self,
+            _user_id: &str,
+            _domain: Option<&str>,
+            _scope: &[String],
+            _key: &str,
+        ) -> Result<(), PortError> {
+            Ok(())
+        }
+        fn registry_scopes(
+            &self,
+            _user_id: &str,
+        ) -> Result<Vec<(Option<String>, Vec<String>)>, PortError> {
+            Ok(Vec::new())
         }
     }
 
@@ -2993,6 +3171,10 @@ mod tests {
             instance_settings: mem.clone(),
             invites: mem.clone(),
             abuse_reports: mem.clone(),
+            lists: mem.clone(),
+            signin: mem.clone(),
+            password_resets: mem.clone(),
+            registry: mem.clone(),
             federation_http: crate::federation::delivery::SafeHttpClient::new(
                 crate::federation::delivery::SafeHttpConfig {
                     allow_private_ips: true,

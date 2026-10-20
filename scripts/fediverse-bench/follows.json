@@ -1,5 +1,19 @@
 {
- "missing": {},
- "total_follows": 720,
- "errors": 0
+ "total_follows": 9180,
+ "first_pass_failures": 0,
+ "transient_first_pass": 0,
+ "transient_retried": [],
+ "transient_recovered": 0,
+ "transient_still_failing": 0,
+ "deterministic_failures_n": 0,
+ "deterministic_failures_by_status": {},
+ "deterministic_failures": [],
+ "errors": 0,
+ "missing": {
+  "mastodon/u0": [
+   "u0@misskey.test",
+   "u3@catodon.test",
+   "u7@misskey.test"
+  ]
+ }
 }

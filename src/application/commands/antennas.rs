@@ -8,7 +8,7 @@
 //! range scan with read-time visibility/mute/block filtering (`FeedFilter`).
 //! DIVERGENCEs (manifest §29): `home` = own + followed notes (upstream
 //! `home` is a TODO matching everything); no auto-deactivation (instance
-//! cap instead); `src=list` refused (no user lists yet — WP16 pending).
+//! cap instead); `src=list` resolves members through the user-list index (WP16).
 
 use super::AppServices;
 
@@ -20,7 +20,7 @@ use crate::domain::note::Note;
 
 impl AppServices {
     /// `antennas/create`: validate (name/src/keywords, `NO_SUCH_USER_LIST`
-    /// for `src=list` since no lists exist yet, `EMPTY_KEYWORD`,
+    /// for `src=list` naming a missing/foreign list, `EMPTY_KEYWORD`,
     /// `TOO_MANY_ANTENNAS` over the enforced per-owner cap), then insert.
     /// New antennas start active (upstream `isActive: true` parity).
     #[allow(clippy::too_many_arguments)]
@@ -40,11 +40,20 @@ impl AppServices {
         exclude_bots: bool,
     ) -> Result<Antenna, PortError> {
         self.accounts.get_owner(owner_id)?;
-        // WP16 pending: no user-list subsystem exists, so every `src=list`
-        // names a list that cannot exist (upstream `NO_SUCH_USER_LIST`).
-        if src == AntennaSrc::List {
-            return Err(PortError::NotFound("NO_SUCH_USER_LIST".to_string()));
-        }
+        // Upstream `create.ts`: verify the list only when `src=list` names
+        // one (`NO_SUCH_USER_LIST` on miss/foreign); `src=list` without an
+        // id stores null and matches nothing (upstream parity).
+        let verified_list_id = if src == AntennaSrc::List {
+            match user_list_id.as_deref().map(str::trim) {
+                Some(id) if !id.is_empty() => match self.lists.get_user_list(id)? {
+                    Some(list) if list.owner_id == owner_id => Some(list.id),
+                    _ => return Err(PortError::NotFound("NO_SUCH_USER_LIST".to_string())),
+                },
+                _ => None,
+            }
+        } else {
+            None
+        };
         if self.antennas.antennas_by_owner(owner_id)?.len() >= DEFAULT_ANTENNA_LIMIT {
             return Err(PortError::Validation("TOO_MANY_ANTENNAS".to_string()));
         }
@@ -53,7 +62,7 @@ impl AppServices {
             owner_id: owner_id.to_string(),
             name,
             src,
-            user_list_id: None,
+            user_list_id: verified_list_id,
             keywords,
             exclude_keywords,
             users: users
@@ -94,10 +103,8 @@ impl AppServices {
     }
 
     /// `antennas/update`: owner-scoped fetch (`NO_SUCH_ANTENNA` on miss),
-    /// same validation as create (including the `src=list` refusal and the
-    /// cap — an at-cap owner updating keeps their count, so only a *new*
-    /// list source could exceed; still refused). Sets `is_active = true`
-    /// and bumps `last_used_at_ms` (upstream parity).
+    /// same validation as create (including the `src=list` ownership check).
+    /// Sets `is_active = true` and bumps `last_used_at_ms` (upstream parity).
     #[allow(clippy::too_many_arguments)]
     pub fn update_antenna(
         &self,
@@ -122,19 +129,26 @@ impl AppServices {
         if let Some(name) = name {
             antenna.name = name;
         }
-        if let Some(src) = src {
-            if src == AntennaSrc::List {
-                return Err(PortError::NotFound("NO_SUCH_USER_LIST".to_string()));
-            }
-            antenna.src = src;
-            antenna.user_list_id = None;
+        // Upstream `update.ts`: when the new or old source is `list` and a
+        // list id rides the call, it must name an owned list
+        // (`NO_SUCH_USER_LIST`); a present id otherwise stores null, an
+        // absent id leaves the stored value untouched.
+        let old_src = antenna.src;
+        if let Some(s) = src {
+            antenna.src = s;
         }
-        if let Some(user_list_id) = user_list_id {
-            // Clearing back to no list is allowed; setting one is refused.
-            if user_list_id.is_some() {
-                return Err(PortError::NotFound("NO_SUCH_USER_LIST".to_string()));
+        if let Some(id_opt) = user_list_id {
+            match id_opt {
+                Some(id) if antenna.src == AntennaSrc::List || old_src == AntennaSrc::List => {
+                    match self.lists.get_user_list(id.trim())? {
+                        Some(list) if list.owner_id == owner_id => {
+                            antenna.user_list_id = Some(list.id);
+                        }
+                        _ => return Err(PortError::NotFound("NO_SUCH_USER_LIST".to_string())),
+                    }
+                }
+                _ => antenna.user_list_id = None,
             }
-            antenna.user_list_id = None;
         }
         // Upstream `update.ts` checks EMPTY_KEYWORD only when both lists
         // ride the same call (verbatim code on violation).
@@ -279,6 +293,14 @@ impl AppServices {
                     .unwrap_or(false);
             let owner_in_visible_ids =
                 owner_is_author || note.visible_user_ids.iter().any(|id| id == &antenna.owner_id);
+            let author_in_list = match (antenna.src, antenna.user_list_id.as_deref()) {
+                (AntennaSrc::List, Some(list_id)) => self
+                    .lists
+                    .get_list_membership(list_id, &note.author_id)
+                    .map(|m| m.is_some())
+                    .unwrap_or(false),
+                _ => false,
+            };
             let view = AntennaNoteView {
                 note: &note,
                 author_acct: author_acct.clone(),
@@ -287,6 +309,7 @@ impl AppServices {
                 owner_is_author,
                 owner_follows_author,
                 owner_in_visible_ids,
+                author_in_list,
             };
             if antenna_matches(antenna, &view) {
                 self.antenna_notes.append_antenna_note(&antenna.id, &note.id)?;

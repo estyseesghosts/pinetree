@@ -33,9 +33,9 @@ use pinetree::application::ports::{
     EditNoteInput, EmojiStore, FavoriteStore, FollowStore, InsertMediaInput, InstanceSettingsPatch, InstanceSettingsStore,
     InviteStore, JobKind, JobQueue,
     MediaStore, ModerationLogFilter, ModerationLogStore, MuteStore, NewJob,
-    NoopStreamingSink, NoteStore, NotificationStore, PollExpiryPayload, PollStore, PortError,
-    ReactionStore, ReplyParentResolvePayload, ScheduledDraftPayload, StreamingSink, TimelineCursor,
-    UpdateAccountPatch, MAX_JOBS_PER_TXN, MAX_JOB_ATTEMPTS, MAX_JOB_PAYLOAD_BYTES,
+    NoopStreamingSink, NoteStore, NotificationStore, PasswordResetRequest, PasswordResetStore, PollExpiryPayload, PollStore, PortError,
+    ReactionStore, RegistryItem, RegistryStore, ReplyParentResolvePayload, ScheduledDraftPayload, SigninRecord, SigninStore, StreamingSink, TimelineCursor,
+    UpdateAccountPatch, UserListStore, MAX_JOBS_PER_TXN, MAX_JOB_ATTEMPTS, MAX_JOB_PAYLOAD_BYTES, MAX_SIGNIN_ROWS_PER_USER,
 };
 use pinetree::domain::id::{Clock, ManualClock};
 use pinetree::domain::instance::RegistrationPolicy;
@@ -1029,6 +1029,10 @@ fn open_worker_stack(
         instance_settings: store.clone(),
         invites: store.clone(),
             abuse_reports: store.clone(),
+            lists: store.clone(),
+            signin: store.clone(),
+            password_resets: store.clone(),
+            registry: store.clone(),
         streaming: Arc::new(NoopStreamingSink),
         dedup: store.clone() as Arc<dyn ActivityDedup>,
         federation_http: SafeHttpClient::new(SafeHttpConfig {
@@ -4780,7 +4784,7 @@ fn case_s1_draft_crud<S: ConformanceStore>(store: &S) {
 
 #[test]
 fn s1_draft_crud() {
-    let factory = RedbFactory::fresh("s1");
+    let factory = RedbFactory::fresh("v1");
     let store = factory.open(test_clock());
     case_s1_draft_crud(&*store);
 }
@@ -6686,4 +6690,343 @@ fn i4_consume_happy_path() {
     let clock = test_clock();
     let store = factory.open(clock.clone());
     case_i4_consume_happy_path(&*store, &clock);
+}
+
+/// V1 (Batch O WP9): signin history is newest-first, cursor-paged, and
+/// bounded per account (oldest-first trim in the same transaction).
+#[test]
+fn v1_signin_history_bounded_and_paged() {
+    let factory = RedbFactory::fresh("v1");
+    let clock = test_clock();
+    let store = factory.open(clock.clone());
+    let mut ids_made = Vec::new();
+    for i in 0..(MAX_SIGNIN_ROWS_PER_USER + 5) {
+        clock.advance_ms(1);
+        let id = format!("s1row{:06}", i);
+        ids_made.push(id.clone());
+        store
+            .record_signin(SigninRecord {
+                id,
+                account_id: "s1alice".to_string(),
+                ip: "10.0.0.1".to_string(),
+                headers: "{}".to_string(),
+                success: i % 2 == 0,
+                created_at_ms: clock.now_ms(),
+            })
+            .expect("record");
+    }
+    let rows = store
+        .list_signins("s1alice", 200, None, None, None, None)
+        .expect("list");
+    assert_eq!(rows.len(), MAX_SIGNIN_ROWS_PER_USER, "trimmed to the cap");
+    assert_eq!(rows[0].id, ids_made.last().unwrap().as_str(), "newest first");
+    assert!(
+        rows.windows(2).all(|w| w[0].id > w[1].id),
+        "strictly newest-first"
+    );
+    // A foreign account sees nothing.
+    let rows = store
+        .list_signins("s1bob", 100, None, None, None, None)
+        .expect("list");
+    assert!(rows.is_empty());
+    // Cursor paging converges: untilId excludes the head row.
+    let head = store
+        .list_signins("s1alice", 100, None, None, None, None)
+        .expect("list");
+    let page = store
+        .list_signins("s1alice", 1, None, Some(&head[0].id), None, None)
+        .expect("page");
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].id, head[1].id);
+    // Date cursors bound the window.
+    let split = head[50].created_at_ms;
+    let newer = store
+        .list_signins("s1alice", 200, None, None, Some(split), None)
+        .expect("since");
+    assert!(newer.iter().all(|r| r.created_at_ms > split));
+    let older = store
+        .list_signins("s1alice", 200, None, None, None, Some(split))
+        .expect("until");
+    assert!(older.iter().all(|r| r.created_at_ms < split));
+}
+
+// ---------------------------------------------------------------------------
+// Group K — user lists (Batch O WP16)
+// ---------------------------------------------------------------------------
+
+use pinetree::domain::user_list::{UserList, UserListMembership, USER_LIST_LIMIT, USER_LIST_MEMBER_LIMIT};
+
+fn k_list(owner: &str, name: &str) -> UserList {
+    UserList {
+        id: format!("klist-{owner}-{name}"),
+        owner_id: owner.to_string(),
+        name: name.to_string(),
+        is_public: false,
+        created_at_ms: 1,
+    }
+}
+
+fn k_member(list_id: &str, member_id: &str) -> UserListMembership {
+    UserListMembership {
+        id: format!("km-{list_id}-{member_id}"),
+        list_id: list_id.to_string(),
+        member_id: member_id.to_string(),
+        with_replies: false,
+        created_at_ms: 1,
+    }
+}
+
+/// V2: concurrent duplicate pushes converge to exactly one membership
+/// (the rest `ALREADY_ADDED`).
+#[test]
+fn v2_concurrent_duplicate_push_converges() {
+    let factory = RedbFactory::fresh("v2");
+    let clock = test_clock();
+    let factory = RedbFactory::fresh("v2");
+    let clock = test_clock();
+    let store = factory.open(clock);
+    store.create_user_list(k_list("alice", "l")).expect("create");
+    let results: Vec<_> = std::thread::scope(|scope| {
+        (0..8)
+            .map(|_| {
+                let store = store.clone();
+                scope.spawn(move || {
+                    store
+                        .add_list_member(k_member("klist-alice-l", "bob"), Vec::new())
+                        .map(|_| ())
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect()
+    });
+    assert_eq!(
+        results.iter().filter(|r| r.is_ok()).count(),
+        1,
+        "exactly one push wins"
+    );
+    assert!(
+        results.iter().all(|r| r.as_ref().is_ok_and(|_| true)
+            || matches!(r, Err(PortError::Conflict(msg)) if msg == "ALREADY_ADDED")),
+        "losers report ALREADY_ADDED: {results:?}"
+    );
+}
+
+/// V3: cap races — exactly `USER_LIST_LIMIT` lists per owner and exactly
+/// `USER_LIST_MEMBER_LIMIT` members per list; the rest conflict.
+#[test]
+fn v3_cap_races_hold() {
+    let factory = RedbFactory::fresh("v3");
+    let clock = test_clock();
+    let store = factory.open(clock);
+    let list_results: Vec<_> = std::thread::scope(|scope| {
+        (0..(USER_LIST_LIMIT + 4))
+            .map(|i| {
+                let store = store.clone();
+                scope.spawn(move || {
+                    store
+                        .create_user_list(k_list("alice", &format!("l{i}")))
+                        .map(|_| ())
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect()
+    });
+    assert_eq!(
+        list_results.iter().filter(|r| r.is_ok()).count(),
+        USER_LIST_LIMIT,
+        "exactly the cap wins"
+    );
+    assert!(
+        list_results.iter().all(|r| r.is_ok()
+            || matches!(r, Err(PortError::Conflict(msg)) if msg == "TOO_MANY_USERLISTS")),
+        "losers report TOO_MANY_USERLISTS"
+    );
+    store.create_user_list(k_list("bob", "m")).expect("create");
+    let member_results: Vec<_> = std::thread::scope(|scope| {
+        (0..(USER_LIST_MEMBER_LIMIT + 4))
+            .map(|i| {
+                let store = store.clone();
+                scope.spawn(move || {
+                    store
+                        .add_list_member(k_member("klist-bob-m", &format!("u{i:03}")), Vec::new())
+                        .map(|_| ())
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect()
+    });
+    assert_eq!(
+        member_results.iter().filter(|r| r.is_ok()).count(),
+        USER_LIST_MEMBER_LIMIT,
+        "exactly the member cap wins"
+    );
+    assert!(
+        member_results.iter().all(|r| r.is_ok()
+            || matches!(r, Err(PortError::Conflict(msg)) if msg == "TOO_MANY_USERS")),
+        "losers report TOO_MANY_USERS"
+    );
+}
+
+/// V4: delete cascades memberships + favorites in the same commit.
+#[test]
+fn v4_delete_cascades() {
+    let factory = RedbFactory::fresh("v4");
+    let clock = test_clock();
+    let store = factory.open(clock);
+    store.create_user_list(k_list("alice", "l")).expect("create");
+    store
+        .add_list_member(k_member("klist-alice-l", "bob"), Vec::new())
+        .expect("push");
+    assert!(store.favorite_list("alice", "klist-alice-l").expect("fav"));
+    assert!(store.delete_user_list("alice", "klist-alice-l").expect("delete"));
+    assert!(
+        store
+            .members_of_list("klist-alice-l")
+            .expect("members")
+            .is_empty(),
+        "memberships cascaded"
+    );
+    assert!(
+        !store
+            .is_list_favorited("alice", "klist-alice-l")
+            .expect("fav check"),
+        "favorites cascaded"
+    );
+    assert_eq!(
+        store.list_favorite_count("klist-alice-l").expect("count"),
+        0
+    );
+    // Foreign-owner delete is a miss, not a delete.
+    store.create_user_list(k_list("alice", "l2")).expect("create");
+    assert!(!store.delete_user_list("mallory", "klist-alice-l2").expect("foreign"));
+    assert!(store.get_user_list("klist-alice-l2").expect("get").is_some());
+}
+
+/// W1 (Batch P): password-reset rows are single-use and id-indexed.
+/// Create → find by token → delete by id → both lookups miss; deleting a
+/// missing id is a silent success (consume-on-expiry parity).
+fn case_w1_reset_request_lifecycle<S: PasswordResetStore>(store: &S) {
+    assert!(store.find_reset_request("tok-absent").expect("find").is_none());
+    store
+        .create_reset_request(PasswordResetRequest {
+            id: "rid00000000000001".to_string(),
+            user_id: "alice".to_string(),
+            token: "tok-alice-1".to_string(),
+        })
+        .expect("create");
+    let found = store
+        .find_reset_request("tok-alice-1")
+        .expect("find")
+        .expect("row present");
+    assert_eq!(found.user_id, "alice");
+    assert_eq!(found.id, "rid00000000000001");
+    store.delete_reset_request("rid00000000000001").expect("delete");
+    assert!(store.find_reset_request("tok-alice-1").expect("find").is_none());
+    // Idempotent consume: missing ids are not errors.
+    store.delete_reset_request("rid00000000000001").expect("re-delete");
+    store.delete_reset_request("rid-never-existed").expect("missing");
+}
+
+#[test]
+fn w1_reset_request_lifecycle() {
+    let factory = RedbFactory::fresh("w1");
+    let clock = test_clock();
+    let store = factory.open(clock.clone());
+    case_w1_reset_request_lifecycle(&*store);
+}
+
+/// W2 (Batch P): registry upserts, per-(domain, scope) reads, and domain
+/// isolation. Set overwrites in place; remove of a missing key is silent;
+/// null-domain and token-domain rows never see each other; scopes lists
+/// distinct (domain, scope) pairs.
+fn case_w2_registry_store<S: RegistryStore>(store: &S, clock: &ManualClock) {
+    let item = |domain: Option<&str>, scope: &[&str], key: &str, value: serde_json::Value| RegistryItem {
+        id: format!("reg-{key}"),
+        user_id: "alice".to_string(),
+        domain: domain.map(str::to_string),
+        scope: scope.iter().map(|s| s.to_string()).collect(),
+        key: key.to_string(),
+        value,
+        updated_at_ms: clock.now_ms(),
+    };
+    let scope: Vec<String> = vec!["client".to_string()];
+    // Misses first.
+    assert!(store.registry_get("alice", None, &scope, "theme").expect("get").is_none());
+    store
+        .registry_set(item(None, &["client"], "theme", serde_json::json!("dark")))
+        .expect("set");
+    store
+        .registry_set(item(None, &["client"], "font", serde_json::json!(14)))
+        .expect("set");
+    store
+        .registry_set(item(None, &["other"], "theme", serde_json::json!("light")))
+        .expect("set");
+    store
+        .registry_set(item(Some("apptoken1"), &["client"], "theme", serde_json::json!("blue")))
+        .expect("set");
+    // Other users see nothing.
+    assert!(store.registry_get("mallory", None, &scope, "theme").expect("get").is_none());
+    // Domain isolation.
+    let row = store.registry_get("alice", None, &scope, "theme").expect("get").expect("row");
+    assert_eq!(row.value, serde_json::json!("dark"));
+    let row = store
+        .registry_get("alice", Some("apptoken1"), &scope, "theme")
+        .expect("get")
+        .expect("row");
+    assert_eq!(row.value, serde_json::json!("blue"));
+    // Scope listing.
+    let mut keys: Vec<String> = store
+        .registry_list("alice", None, &scope)
+        .expect("list")
+        .into_iter()
+        .map(|item| item.key)
+        .collect();
+    keys.sort();
+    assert_eq!(keys, vec!["font".to_string(), "theme".to_string()]);
+    // Overwrite in place (one row, new value).
+    store
+        .registry_set(item(None, &["client"], "theme", serde_json::json!("darker")))
+        .expect("overwrite");
+    let rows = store.registry_list("alice", None, &scope).expect("list");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows.iter().find(|r| r.key == "theme").expect("theme").value,
+        serde_json::json!("darker")
+    );
+    // Scopes-with-domain pairs.
+    let mut pairs = store.registry_scopes("alice").expect("scopes");
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec![
+            (None, vec!["client".to_string()]),
+            (None, vec!["other".to_string()]),
+            (Some("apptoken1".to_string()), vec!["client".to_string()]),
+        ]
+    );
+    // Remove converges; missing removes are silent.
+    store.registry_remove("alice", None, &scope, "theme").expect("remove");
+    assert!(store.registry_get("alice", None, &scope, "theme").expect("get").is_none());
+    store.registry_remove("alice", None, &scope, "theme").expect("re-remove");
+    store.registry_remove("alice", None, &scope, "never").expect("missing");
+    // Scoped rows of other scopes/domains survive.
+    assert!(store.registry_get("alice", None, &scope, "font").expect("get").is_some());
+    assert!(store
+        .registry_get("alice", Some("apptoken1"), &scope, "theme")
+        .expect("get")
+        .is_some());
+}
+
+#[test]
+fn w2_registry_store_isolation() {
+    let factory = RedbFactory::fresh("w2");
+    let clock = test_clock();
+    let store = factory.open(clock.clone());
+    case_w2_registry_store(&*store, &clock);
 }

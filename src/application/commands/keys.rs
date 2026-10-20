@@ -18,7 +18,11 @@ impl AppServices {
         if let Some(existing) = self.auth.get_actor_keypair(account_id)? {
             return Ok(existing);
         }
-        self.rotate_actor_keypair(account_id)
+        // Several requests can reach here at once for a new actor (every remote server fetching it
+        // for the first time). Generate, then keep whichever keypair was stored first, so every
+        // caller, and every remote cache, ends up with the same key.
+        let record = self.new_actor_keypair_record(account_id)?;
+        self.auth.save_actor_keypair_if_absent(record)
     }
 
     /// Generate and store a fresh RSA-2048 keypair for `account_id` (key
@@ -27,6 +31,13 @@ impl AppServices {
         &self,
         account_id: &str,
     ) -> Result<ActorKeypairRecord, PortError> {
+        let record = self.new_actor_keypair_record(account_id)?;
+        self.auth.save_actor_keypair(record.clone())?;
+        Ok(record)
+    }
+
+    /// A freshly generated RSA-2048 keypair record for a local account (not stored).
+    fn new_actor_keypair_record(&self, account_id: &str) -> Result<ActorKeypairRecord, PortError> {
         let account = self
             .accounts
             .find_by_id(account_id)?
@@ -37,14 +48,12 @@ impl AppServices {
             ));
         }
         let (priv_key, pub_key) = generate_rsa_keypair_2048().map_err(PortError::Validation)?;
-        let record = ActorKeypairRecord {
+        Ok(ActorKeypairRecord {
             account_id: account_id.to_string(),
             public_key_pem: public_key_to_spki_pem(&pub_key),
             private_key_pem: private_key_to_pkcs8_pem(&priv_key),
             created_at_ms: self.now_ms(),
-        };
-        self.auth.save_actor_keypair(record.clone())?;
-        Ok(record)
+        })
     }
 
     /// Ensure the local `system_actor` service account and its RSA-2048 keypair
@@ -55,7 +64,16 @@ impl AppServices {
             None => {
                 let mut input = CreateAccountInput::local("system_actor");
                 input.is_bot = true;
-                self.accounts.create_account(input, None)?
+                match self.accounts.create_account(input, None) {
+                    Ok(acc) => acc,
+                    // A concurrent first call created it between our lookup and our insert (every
+                    // remote server fetching a new actor at once): use the account that won.
+                    Err(PortError::Conflict(_)) => self
+                        .accounts
+                        .find_by_username_and_host("system_actor", None)?
+                        .ok_or_else(|| PortError::NotFound("system_actor".to_string()))?,
+                    Err(e) => return Err(e),
+                }
             }
         };
         let keypair = self.ensure_actor_keypair(&account.id)?;

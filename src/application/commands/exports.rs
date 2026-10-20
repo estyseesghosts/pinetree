@@ -216,12 +216,14 @@ impl AppServices {
                     user.id,
                 );
             }
-            // No user-list subsystem: parse + validate rows, apply zero.
+            // User lists now have a subsystem (Batch O WP16): parse + apply
+            // rows through `apply_user_list_import` (find-or-create by name,
+            // local-only resolution, dup/foreign skips).
             ImportEntity::UserLists => {
                 let text = String::from_utf8_lossy(&bytes);
-                let (valid, invalid) = self.validate_user_list_import(&text);
+                let (applied, skipped) = self.apply_user_list_import(&user.id, &text)?;
                 eprintln!(
-                    "import-user-lists for {}: valid={valid} invalid={invalid} applied=0 (no user-list subsystem)",
+                    "import-user-lists for {}: applied={applied} skipped={skipped}",
                     user.id,
                 );
             }
@@ -356,23 +358,62 @@ impl AppServices {
                     PortError::StorageUnavailable(format!("export notes serialize failed: {e}"))
                 })
             }
-            // No user-list subsystem: valid empty CSV (zero rows is what the
-            // upstream processor writes for a user with no lists).
-            ExportEntity::UserLists => Ok(Vec::new()),
+            // `user-lists-*.csv`: one `listName,acct,withReplies=bool` row
+            // per membership (upstream
+            // `ExportUserListsProcessorService` parity; list-row order,
+            // then member rows). No header row.
+            ExportEntity::UserLists => {
+                let mut out = Vec::new();
+                let lists = self.lists.lists_by_owner(user_id)?;
+                for list in &lists {
+                    let members = self.lists.members_of_list(&list.id)?;
+                    for m in &members {
+                        let Some(member) = self.accounts.find_by_id(&m.member_id)? else {
+                            continue;
+                        };
+                        out.push(format!(
+                            "{},{},withReplies={}\n",
+                            list.name,
+                            format_acct(&member),
+                            m.with_replies
+                        ));
+                    }
+                }
+                Ok(out.concat().into_bytes())
+            }
             // Antenna subsystem now exists (Batch N WS4): the caller's
-            // antennas as JSON (`ExportAntennasProcessorService` shape;
-            // `userListAccts` is always null — no user lists exist).
+            // antennas as JSON (`ExportAntennasProcessorService` shape).
+            // `src=list` antennas carry their members' accts (Batch O WP16;
+            // upstream `antenna.userList?.userIds` parity) so a re-import
+            // on a fresh instance rebuilds the member set.
             ExportEntity::Antennas => {
                 let rows = self.antennas.antennas_by_owner(user_id)?;
                 let mut items = Vec::with_capacity(rows.len());
                 for row in &rows {
+                    let user_list_accts = match (row.src, row.user_list_id.as_deref()) {
+                        (crate::domain::antenna::AntennaSrc::List, Some(list_id)) => {
+                            let accts = self
+                                .lists
+                                .members_of_list(list_id)?
+                                .iter()
+                                .filter_map(|m| {
+                                    self.accounts.find_by_id(&m.member_id).ok().flatten()
+                                })
+                                .map(|a| format_acct(&a))
+                                .collect::<Vec<_>>();
+                            serde_json::Value::Array(
+                                accts.into_iter().map(serde_json::Value::String).collect(),
+                            )
+                        }
+                        _ => serde_json::Value::Null,
+                    };
                     items.push(serde_json::json!({
                         "name": row.name,
                         "src": row.src.as_str(),
                         "keywords": row.keywords,
                         "excludeKeywords": row.exclude_keywords,
                         "users": row.users,
-                        "userListAccts": serde_json::Value::Null,
+                        "userListAccts": user_list_accts,
                         "caseSensitive": row.case_sensitive,
                         "localOnly": row.local_only,
                         "excludeBots": row.exclude_bots,
@@ -387,8 +428,7 @@ impl AppServices {
             }
             // No clip subsystem: valid empty JSON array (upstream writes
             // `[` + `]` for zero clips).
-            ExportEntity::Clips => Ok(b"[]".to_vec()),
-            // Favorites now have a subsystem: JSON array of
+            ExportEntity::Clips => Ok(b"[]".to_vec()),            // Favorites now have a subsystem: JSON array of
             // `{id, createdAt, note: {...}}` (upstream
             // `ExportFavoritesProcessorService.serialize` parity), id-ASC
             // order. Invisible/gone notes are skipped (visibility query
@@ -899,30 +939,123 @@ impl AppServices {
         Ok((applied, skipped))
     }
 
-    /// Parse + validate user-list import rows (`listName,acct[,key=value]`,
-    /// upstream `ImportUserListsProcessorService` shape) without applying
-    /// anything (no user-list subsystem). Returns `(valid, invalid)`;
-    /// `valid` counts rows whose acct parses (resolution is best-effort and
-    /// does not affect the count — the rows are dropped either way).
-    fn validate_user_list_import(&self, text: &str) -> (usize, usize) {
-        let mut valid = 0usize;
-        let mut invalid = 0usize;
+    /// Apply user-list import rows (`listName,acct[,key=value]`, upstream
+    /// `ImportUserListsProcessorService` parity): find-or-create the
+    /// caller's list by name, resolve the acct locally (remote/unresolvable
+    /// rows skip — no remote resolver), skip duplicates, apply
+    /// `withReplies=`. Per-row try/catch parity: only storage faults abort
+    /// (already-applied rows converge on conflicts on replay).
+    fn apply_user_list_import(&self, user_id: &str, text: &str) -> Result<(usize, usize), PortError> {
+        let mut applied = 0usize;
+        let mut skipped = 0usize;
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() {
                 continue;
             }
-            let parts: Vec<&str> = line.split(',').collect();
-            if parts.len() < 2
-                || parts[0].trim().is_empty()
-                || parse_acct_cell(parts[1].trim()).is_none()
-            {
-                invalid += 1;
-            } else {
-                valid += 1;
+            let outcome = self.apply_user_list_row(user_id, line);
+            match outcome {
+                Ok(()) => applied += 1,
+                Err(ImportRowOutcome::Skipped) => skipped += 1,
+                Err(ImportRowOutcome::Abort(err)) => return Err(err),
             }
         }
-        (valid, invalid)
+        Ok((applied, skipped))
+    }
+
+    fn apply_user_list_row(&self, user_id: &str, line: &str) -> Result<(), ImportRowOutcome> {
+        let parts: Vec<&str> = line.split(',').collect();
+        if parts.len() < 2 || parts[0].trim().is_empty() {
+            return Err(ImportRowOutcome::Skipped);
+        }
+        let list_name = parts[0].trim().to_string();
+        let acct = parse_acct_cell(parts[1].trim()).ok_or(ImportRowOutcome::Skipped)?;
+        let mut with_replies = false;
+        for kv in parts.iter().skip(2) {
+            let kv = kv.trim();
+            if let Some(value) = kv.strip_prefix("withReplies=") {
+                with_replies = value.trim() == "true";
+            }
+        }
+        // Find-or-create the caller's list by name (upstream parity; names
+        // are not unique, first match wins).
+        let list = match self
+            .lists
+            .lists_by_owner(user_id)
+            .map_err(skip_as_skipped)?
+            .into_iter()
+            .find(|l| l.name == list_name)
+        {
+            Some(list) => list,
+            None => self
+                .create_user_list(user_id, list_name)
+                .map_err(skip_as_skipped)?,
+        };
+        let target_id = self
+            .resolve_acct(&Some(acct))
+            .map_err(skip_as_skipped)?
+            .ok_or(ImportRowOutcome::Skipped)?;
+        let target = self
+            .accounts
+            .find_by_id(&target_id)
+            .map_err(skip_as_skipped)?
+            .ok_or(ImportRowOutcome::Skipped)?;
+        if target.id != user_id
+            && self
+                .blocks
+                .is_blocking(&target.id, user_id)
+                .map_err(skip_as_skipped)?
+        {
+            return Err(ImportRowOutcome::Skipped);
+        }
+        let member = crate::domain::user_list::UserListMembership {
+            id: self.ids.generate(),
+            list_id: list.id.clone(),
+            member_id: target.id.clone(),
+            with_replies,
+            created_at_ms: self.now_ms(),
+        };
+        let stream_job = self
+            .streaming_job(
+                &crate::application::events::StreamingEvent::UserListMemberAdded {
+                    list_id: list.id.clone(),
+                    member_id: target.id.clone(),
+                },
+                format!("list-import:{}:{}:{}", list.id, target.id, self.ids.generate()),
+            )
+            .map_err(skip_as_skipped)?;
+        // The op's full push (remote Follow + error mapping) is endpoint
+        // shaped; the worker path inserts directly so a remote member's
+        // Follow is still queued below.
+        match self.lists.add_list_member(member, vec![stream_job]) {
+            Ok(_) => {}
+            Err(e @ PortError::StorageUnavailable(_)) => {
+                return Err(ImportRowOutcome::Abort(e));
+            }
+            Err(_) => return Err(ImportRowOutcome::Skipped),
+        }
+        if !target.is_local() {
+            if let Ok((proxy, _)) = self.ensure_system_actor() {
+                if let Some(inbox_url) = crate::federation::outbox::preferred_inbox(&target) {
+                    let follow_id = self.ids.generate();
+                    let job = crate::federation::outbox::FederateDeliverPayload::Follow {
+                        follow_id: follow_id.clone(),
+                        follower_id: proxy.id,
+                        followee_id: target.id.clone(),
+                        inbox_url,
+                    }
+                    .into_job(
+                        format!("federate:list-import-follow:{}:{follow_id}", list.id),
+                        self.now_ms(),
+                    )
+                    .map_err(skip_as_skipped)?;
+                    self.jobs
+                        .enqueue_jobs(vec![job])
+                        .map_err(skip_as_skipped)?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 

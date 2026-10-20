@@ -3,17 +3,25 @@
 
 Features: post, cw, reply, reaction(+undo), renote/boost(+undo), quote,
 poll(+remote vote), media federation, followers-only, delete, mention.
-Records per-check results into /tmp/bench/features.json + prints a matrix.
+Records per-check results into $BENCH_DIR/features.json + prints a matrix.
 """
 import json, sys, time, threading
-sys.path.insert(0, "/tmp/bench")
-from lib import load_nodes, HOSTS, fetch_bytes, sha
+import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from lib import load_nodes, HOSTS, fetch_bytes, sha, BENCH_DIR
 
 nodes = load_nodes()
 nodes = {k: v for k, v in nodes.items() if len(v.users) > 0}
+__import__('lib').run_header('features', nodes)
 PAIRS = [(a, b) for a in nodes for b in nodes if a != b]
 RESULTS = []            # {feature, src, dst, ok, detail, secs}
 LOCK = threading.Lock()
+MEDIA_JOBS = []         # stashed media uploads, verified after all pairs (S4 pattern)
+# Honest window for the deferred media check (same bar as before: attachment
+# present + sha match against the source-side original). Env-overridable like
+# S4's S4_SETTLE_S/S4_DEADLINE_S; the values are printed in every detail.
+MEDIA_SETTLE_S = int(os.environ.get("MEDIA_SETTLE_S", 30))
+MEDIA_DEADLINE_S = int(os.environ.get("MEDIA_DEADLINE_S", 240))
 
 def rec(feature, src, dst, ok, detail="", secs=0.0):
     with LOCK:
@@ -63,7 +71,7 @@ def pair_worker(pi, src, dst):
         A = S.post(su, text=f"FTR|post|{src}|{dst}|{TAG}")
         A_uri = S.uri_of(A, su)
         got = wait_until(lambda: any(FTR_marker(n, f"FTR|post|{src}|{dst}|{TAG}")
-                                     for n in D.home(D.users[(pi+1) % 6], limit=30)),
+                                     for n in D.home(D.users[(pi+1) % len(D.users)], limit=30)),
                          timeout=120)
         rec("post", src, dst, bool(got), f"A={A} uri={A_uri}", time.time() - t0)
         if not got: return
@@ -74,7 +82,7 @@ def pair_worker(pi, src, dst):
         C = S.post(su, text="hidden body", cw=marker)
         C_uri = S.uri_of(C, su)
         def cw_seen():
-            for n in D.home(D.users[(pi+1) % 6], limit=30):
+            for n in D.home(D.users[(pi+1) % len(D.users)], limit=30):
                 if "hidden body" in (text_of(D, n) or "") and marker in (cw_of(D, n) or ""):
                     return True
             return None
@@ -92,11 +100,14 @@ def pair_worker(pi, src, dst):
             def reply_seen():
                 v = S.note_by_uri(R_uri, su)
                 if not v: return None
-                rid = v.get("replyId") or (v.get("reply") or {}).get("id")
-                return rid == A or f"rid={rid},A={A}"
+                # Misskey family: replyId; Mastodon API: in_reply_to_id
+                rid = v.get("replyId") or (v.get("reply") or {}).get("id") or v.get("in_reply_to_id")
+                seen["rid"] = rid
+                return rid == A or None   # only a settled state is truthy (see unreact_seen)
+            seen = {}
             out = wait_until(reply_seen, timeout=120)
             reply_ok = out is True
-            reply_detail = f"R={R} out={out}"
+            reply_detail = f"R={R} out={out if reply_ok else 'rid=%s,A=%s' % (seen.get('rid'), A)}"
         else:
             reply_detail = "could not resolve A on dst"
         rec("reply", src, dst, reply_ok, reply_detail, time.time() - t0)
@@ -146,17 +157,17 @@ def pair_worker(pi, src, dst):
         boost_ok = undo_ok = None
         if A_local_on_d:
             B = D.boost(du, A_local_on_d)
-            out = wait_until(lambda: (S.renote_count(A, su) or 0) > before or
-                             f"count={S.renote_count(A, su)},before={before}", timeout=120)
+            out = wait_until(lambda: (S.renote_count(A, su) or 0) > before or None, timeout=120)
             boost_ok = out is True
-            rec("renote/boost", src, dst, boost_ok, f"B={B} out={out}", time.time() - t0)
+            rec("renote/boost", src, dst, boost_ok,
+                f"B={B} out={out or 'count=%s,before=%s' % (S.renote_count(A, su), before)}", time.time() - t0)
             t0 = time.time()
             # undo via delete of the boost
             D.delete(du, B)
-            out = wait_until(lambda: (S.renote_count(A, su) or 0) <= before or
-                             f"count={S.renote_count(A, su)},before={before}", timeout=120)
+            out = wait_until(lambda: (S.renote_count(A, su) or 0) <= before or None, timeout=120)
             undo_ok = out is True
-            rec("unboost", src, dst, undo_ok, f"out={out}", time.time() - t0)
+            rec("unboost", src, dst, undo_ok,
+                f"out={out or 'count=%s,before=%s' % (S.renote_count(A, su), before)}", time.time() - t0)
         else:
             rec("renote/boost", src, dst, False, "A unresolvable on dst")
 
@@ -221,30 +232,18 @@ def pair_worker(pi, src, dst):
         else:
             rec("poll+vote", src, dst, False, "poll unresolvable on dst", time.time() - t0)
 
-        # 8. media federation
+        # 8. media federation: upload+post inline, verified later by
+        # media_verify_all() (global settle + poll-to-deadline, the S4
+        # pattern: remote media arrives via an async fetch job, so verifying
+        # immediately measures the fetch queue, not federation).
         t0 = time.time()
         data = png_bytes(pi * 31 + len(src) + len(dst))
         fid, furl = S.upload(su, data)
         M = S.post(su, text=f"FTR|media|{src}|{dst}|{TAG}", media=[fid])
         M_uri = S.uri_of(M, su)
-        media_ok = media_detail = None
-        M_local_on_d = remote_note(D, du, M_uri)
-        if M_local_on_d:
-            def files_seen():
-                v = D.note(M_local_on_d, du)
-                fs = (v or {}).get("files") or (v or {}).get("attachments") or []
-                return fs or None   # pinetree fills remote files async after note receipt
-            files = wait_until(files_seen, timeout=90, interval=3)
-            if files:
-                url = files[0].get("url") or files[0].get("remote_url") or files[0].get("textUrl")
-                st, body = fetch_bytes(url, timeout=60)
-                media_ok = st == 200 and sha(body) == sha(data)
-                media_detail = f"url={url} status={st} sha_match={media_ok and True or (st==200 and sha(body))}"
-            else:
-                media_detail = "no attachment on dst copy"
-        else:
-            media_detail = "media note unresolvable on dst"
-        rec("media", src, dst, media_ok, media_detail, time.time() - t0)
+        with LOCK:
+            MEDIA_JOBS.append({"src": src, "dst": dst, "uri": M_uri,
+                               "want": sha(data), "t0": t0})
 
         # 9. followers-only visibility
         t0 = time.time()
@@ -306,12 +305,70 @@ def FTR_marker(n, marker):
     t = n.get("text") or n.get("content") or ""
     return marker in t
 
+def follows_warning():
+    """Feature posts only reach a node whose users follow the author, so a run before the follow
+    graph converges reports setup, not federation. Warn loudly rather than refuse to run."""
+    try:
+        f = json.load(open(os.path.join(BENCH_DIR, "follows.json")))
+    except Exception:
+        return "no follows.json: run phase-follows first"
+    n = sum(len(v) for v in (f.get("missing") or {}).values())
+    return f"follows.json lists {n} missing edges" if n else None
+
+def media_verify_all():
+    """Verify every stashed media upload after a global settle, polling each
+    pair to a deadline (the S4 pattern). A copy that shows up late is lag,
+    not loss; the bar is unchanged (attachment present + sha match)."""
+    print(f"media: {len(MEDIA_JOBS)} posted; settling {MEDIA_SETTLE_S}s for async media fetch", flush=True)
+    time.sleep(MEDIA_SETTLE_S)
+    def verify_once(job):
+        D = nodes[job["dst"]]
+        du = D.users[0]
+        local = D.note_by_uri(job["uri"], du)
+        if not local:
+            return ("unresolvable", None, None)
+        lid = local.get("id") if isinstance(local, dict) else local
+        v = D.note(lid, du)
+        files = (v or {}).get("files") or (v or {}).get("attachments") or (v or {}).get("media_attachments") or []
+        if not files:
+            return ("no-attachment", None, None)
+        url = files[0].get("url") or files[0].get("remote_url") or files[0].get("textUrl")
+        if not url:
+            return ("no-url", None, None)
+        st, body = fetch_bytes(url, timeout=60)
+        if st == 200 and sha(body) == job["want"]:
+            return ("ok", url, st)
+        # mastodon re-encodes served bytes (200 with a different sha): the
+        # comparison is against the source-side original, so that case lands
+        # here as mismatch:200, not as a fetch failure.
+        return (f"mismatch:{st}", url, st)
+    def verify(job):
+        t1 = time.time()
+        while True:
+            cat, url, st = verify_once(job)
+            if cat == "ok":
+                return (job, True, f"url={url} status={st} sha_match=True window=settle{MEDIA_SETTLE_S}+dl{MEDIA_DEADLINE_S}")
+            if time.time() - t1 > MEDIA_DEADLINE_S:
+                return (job, False, f"{cat} url={url} status={st} window=settle{MEDIA_SETTLE_S}+dl{MEDIA_DEADLINE_S}")
+            # A note that never reached the node must not hold a worker for
+            # the whole deadline; give it one minute for plain delivery lag.
+            if cat == "unresolvable" and time.time() - t1 > 60:
+                return (job, False, f"{cat} window=settle{MEDIA_SETTLE_S}+60s")
+            time.sleep(5)
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        for job, ok, detail in ex.map(verify, list(MEDIA_JOBS)):
+            rec("media", job["src"], job["dst"], ok, detail, time.time() - job["t0"])
+
 def main():
+    w = follows_warning()
+    if w: print(f"WARNING: {w}; post/reaction results below may reflect the follow graph, not federation", flush=True)
     print(f"{len(PAIRS)} pairs, tag={TAG}", flush=True)
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=4) as ex:
         list(ex.map(lambda p: pair_worker(PAIRS.index(p), *p), PAIRS))
-    json.dump(RESULTS, open("/tmp/bench/features.json", "w"), indent=1)
+    media_verify_all()
+    json.dump(RESULTS, open(os.path.join(BENCH_DIR, "features.json"), "w"), indent=1)
     # matrix summary
     feats = sorted({r["feature"] for r in RESULTS})
     print("\n=== FEATURE MATRIX (rows=feature, cols=src->dst) ===")
@@ -326,6 +383,7 @@ def main():
     print(f"\n{len(RESULTS)} checks, {len(fails)} failures")
     for r in fails[:40]:
         print(" FAIL", r["feature"], r["src"], "->", r["dst"], r["detail"][:160])
+    if fails: sys.exit(1)
 
 if __name__ == "__main__":
     main()

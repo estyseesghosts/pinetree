@@ -152,6 +152,10 @@ async fn boot_node(tag: &'static str) -> FedNode {
         instance_settings: store.clone(),
         invites: store.clone(),
             abuse_reports: store.clone(),
+            lists: store.clone(),
+            signin: store.clone(),
+            password_resets: store.clone(),
+            registry: store.clone(),
         streaming: Arc::new(NoopStreamingSink),
         dedup: store.clone() as Arc<dyn ActivityDedup>,
         federation_http: SafeHttpClient::new(SafeHttpConfig {
@@ -1372,6 +1376,10 @@ fn federation_remote_media_cache() {
         instance_settings: store.clone(),
         invites: store.clone(),
             abuse_reports: store.clone(),
+            lists: store.clone(),
+            signin: store.clone(),
+            password_resets: store.clone(),
+            registry: store.clone(),
         streaming: Arc::new(NoopStreamingSink),
         dedup: store.clone() as Arc<dyn ActivityDedup>,
         federation_http: SafeHttpClient::new(SafeHttpConfig {
@@ -1443,3 +1451,197 @@ fn federation_remote_media_cache() {
 }
 
 
+
+// ---------------------------------------------------------------------------
+// Batch P gate 4: account move between two live pinetrees.
+// bob@B moves to carol@A; dave@A (bob's follower) refollows carol.
+// Covers: alias handshake, Move delivery, follower migration, replay
+// convergence, forged-Move rejection.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+async fn federation_account_move() {
+    let a = boot_node("move-a").await;
+    let b = boot_node("move-b").await;
+    let client = test_client();
+    let deadline = Duration::from_secs(25);
+
+    let v = api_json(
+        &api_post(
+            &client,
+            &format!("{}/api/signup", a.base_url),
+            None,
+            &json!({"username": "carol", "password": "s3cret-pw"}),
+        ),
+        "A signup carol",
+    );
+    let carol_id = v["id"].as_str().expect("carol id").to_string();
+    let carol_token = v["token"].as_str().expect("carol token").to_string();
+    let v = api_json(
+        &api_post(
+            &client,
+            &format!("{}/api/signup", a.base_url),
+            None,
+            &json!({"username": "dave", "password": "s3cret-pw"}),
+        ),
+        "A signup dave",
+    );
+    let dave_id = v["id"].as_str().expect("dave id").to_string();
+    let dave_token = v["token"].as_str().expect("dave token").to_string();
+    let v = api_json(
+        &api_post(
+            &client,
+            &format!("{}/api/signup", b.base_url),
+            None,
+            &json!({"username": "bob", "password": "s3cret-pw"}),
+        ),
+        "B signup bob",
+    );
+    let bob_id = v["id"].as_str().expect("bob id").to_string();
+    let bob_token = v["token"].as_str().expect("bob token").to_string();
+    let v = api_json(
+        &api_post(
+            &client,
+            &format!("{}/api/signup", b.base_url),
+            None,
+            &json!({"username": "mallory", "password": "s3cret-pw"}),
+        ),
+        "B signup mallory",
+    );
+    let mallory_id = v["id"].as_str().expect("mallory id").to_string();
+
+    let carol_uri = format!("{}/users/{}", a.base_url, carol_id);
+    let bob_uri = format!("{}/users/{}", b.base_url, bob_id);
+    let mallory_uri = format!("{}/users/{}", b.base_url, mallory_id);
+
+    a.services.ensure_actor_keypair(&carol_id).expect("carol key");
+    a.services.ensure_actor_keypair(&dave_id).expect("dave key");
+    b.services.ensure_actor_keypair(&bob_id).expect("bob key");
+    b.services.ensure_actor_keypair(&mallory_id).expect("mallory key");
+
+    // Dave@A resolves + follows bob@B (remote follow handshake).
+    let v = api_json(
+        &api_post(
+            &client,
+            &format!("{}/api/users/show", a.base_url),
+            Some(&dave_token),
+            &json!({"username": "bob", "host": b.host}),
+        ),
+        "A resolves bob",
+    );
+    let bob_on_a = v["id"].as_str().expect("remote bob id").to_string();
+    let r = api_post(
+        &client,
+        &format!("{}/api/following/create", a.base_url),
+        Some(&dave_token),
+        &json!({"userId": bob_on_a}),
+    );
+    assert!((200..300).contains(&r.status), "dave follow bob: {}", r.status);
+    pump_until(&a, &b, "B sees dave as follower", deadline, &mut || {
+        b.services
+            .accounts
+            .find_by_uri(&format!("{}/users/{}", a.base_url, dave_id))
+            .expect("lookup dave")
+            .map(|acc| {
+                b.services
+                    .follows
+                    .is_following(&acc.id, &bob_id)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    })
+    .await;
+
+    // Alias handshake: carol lists bob's URI as alsoKnownAs.
+    let r = api_post(
+        &client,
+        &format!("{}/api/i/update", a.base_url),
+        Some(&carol_token),
+        &json!({"alsoKnownAs": [bob_uri]}),
+    );
+    assert!((200..300).contains(&r.status), "carol alias: {}", r.status);
+
+    // Bob moves to carol@A.
+    let r = api_post(
+        &client,
+        &format!("{}/api/i/move", b.base_url),
+        Some(&bob_token),
+        &json!({"moveToAccount": format!("carol@{}", a.host)}),
+    );
+    assert!((200..300).contains(&r.status), "i/move: {} {}", r.status, String::from_utf8_lossy(&r.body));
+    let moved: Value = serde_json::from_slice(&r.body).expect("move json");
+    assert_eq!(moved["movedTo"], json!(carol_uri), "movedTo packs destination");
+
+    // The Move reaches A: dave unfollows bob and follows carol.
+    pump_until(&a, &b, "dave refollows carol", deadline, &mut || {
+        a.services
+            .follows
+            .is_following(&dave_id, &carol_id)
+            .unwrap_or(false)
+    })
+    .await;
+    assert!(
+        !a.services
+            .follows
+            .is_following(&dave_id, &bob_on_a)
+            .unwrap_or(true),
+        "stale dave→bob edge dropped"
+    );
+    let bob_on_b = b
+        .services
+        .accounts
+        .find_by_id(&bob_id)
+        .expect("bob row")
+        .expect("bob present");
+    assert_eq!(bob_on_b.moved_to_uri.as_deref(), Some(carol_uri.as_str()));
+
+    // Replay convergence: the same Move delivered again changes nothing
+    // (no duplicate edges, still exactly one dave→carol edge).
+    let replay = json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": format!("{}/moves/{}/replay-1", b.base_url, bob_id),
+        "type": "Move",
+        "actor": bob_uri,
+        "object": bob_uri,
+        "target": carol_uri,
+    });
+    let body = serde_json::to_vec(&replay).expect("encode move");
+    let inbox_a = format!("{}/inbox", a.base_url);
+    let r1 = signed_post_to_inbox(&client, &b.services, &bob_id, &inbox_a, &body, None);
+    assert!((200..300).contains(&r1.status), "replay 1: {}", r1.status);
+    let r2 = signed_post_to_inbox(&client, &b.services, &bob_id, &inbox_a, &body, None);
+    assert!((200..300).contains(&r2.status), "replay 2: {}", r2.status);
+    assert!(
+        a.services
+            .follows
+            .is_following(&dave_id, &carol_id)
+            .unwrap_or(false),
+        "replay keeps the migrated edge"
+    );
+
+    // Forgery: mallory signs a Move claiming BOB moved → 401, no state.
+    let forged = json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": format!("{}/moves/{}/forged-1", b.base_url, mallory_id),
+        "type": "Move",
+        "actor": mallory_uri,
+        "object": bob_uri,
+        "target": mallory_uri,
+    });
+    let body = serde_json::to_vec(&forged).expect("encode forged");
+    let r = signed_post_to_inbox(&client, &b.services, &mallory_id, &inbox_a, &body, None);
+    assert_eq!(r.status, 401, "forged move rejected");
+    let bob_on_a_row = a
+        .services
+        .accounts
+        .find_by_id(&bob_on_a)
+        .expect("bob row")
+        .expect("bob present");
+    // The legitimate Move already recorded carol; the forgery must not
+    // overwrite it with mallory.
+    assert_eq!(
+        bob_on_a_row.moved_to_uri.as_deref(),
+        Some(carol_uri.as_str()),
+        "forgery changes nothing on the receiver"
+    );
+}

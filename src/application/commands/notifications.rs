@@ -1,9 +1,57 @@
 use super::AppServices;
 
-use crate::application::ports::PortError;
+use crate::application::events::NotifyJobPayload;
+use crate::application::ports::{JobKind, NewJob, PortError};
 use crate::domain::notification::NotificationKind;
 
 impl AppServices {
+    /// Notifier-less delivery gate (Batch P; generalizes the
+    /// `exportCompleted` gate to `test`): with no `notifierId` only a
+    /// `never` receive-config on that kind drops the notification (Misskey
+    /// `NotificationService.ts:97-104` parity); self-notify and mute checks
+    /// do not apply. A missing notifiee fails open.
+    pub fn system_notification_allowed(
+        &self,
+        notifiee_id: &str,
+        kind: NotificationKind,
+    ) -> Result<bool, PortError> {
+        let Some(notifiee) = self.accounts.find_by_id(notifiee_id)? else {
+            return Ok(true);
+        };
+        let Some(config) = notifiee
+            .notification_recieve_config
+            .get(kind.wire_type())
+        else {
+            return Ok(true);
+        };
+        Ok(config.kind.as_str() != "never")
+    }
+
+    /// Enqueue a `test` notification for `account_id` (Misskey
+    /// `notifications/test-notification.ts`:
+    /// `createNotification(user.id, 'test', {})`). Self-notified through
+    /// the normal `Notify` path so type filters and grouped rendering
+    /// exercise it like any other kind; the worker applies the
+    /// notifier-less gate, so only a `never` test-config drops it.
+    pub fn send_test_notification(&self, account_id: &str) -> Result<(), PortError> {
+        self.accounts.get_owner(account_id)?;
+        let payload = NotifyJobPayload {
+            notifiee_id: account_id.to_string(),
+            notifier_id: account_id.to_string(),
+            kind: NotificationKind::Test,
+            note_id: None,
+            reaction: None,
+            file_id: None,
+            exported_entity: None,
+        };
+        let job = NewJob::new_json(
+            JobKind::Notify,
+            &payload,
+            format!("notify:test:{account_id}:{}", self.ids.generate()),
+            self.clock.now_ms(),
+        )?;
+        self.jobs.enqueue_jobs(vec![job])
+    }
     /// Creation-time receive gate (Misskey `NotificationService`
     /// `#createNotificationInternal` parity, `notificationRecieveConfig`
     /// `UserProfile.ts:252-272` + `types.ts:28-57`).
@@ -22,9 +70,8 @@ impl AppServices {
     ///   notifier; `follower` requires the notifier to follow the notifiee;
     ///   `mutualFollow` requires both; `followingOrFollower` requires
     ///   either; `list(userListId)` requires membership in the notifiee's
-    ///   list — pinetree has no user lists yet, so every `list` config
-    ///   drops (a missing list holds no members upstream either), never
-    ///   errors (TODO: user lists).
+    ///   list (Batch O WP16; dangling/foreign lists deliver nothing, never
+    ///   error — upstream missing-list parity).
     ///
     /// A missing notifiee account fails open (`true`): the row is harmless
     /// and this preserves the pre-§11 behavior for notifier-less and remote
@@ -61,9 +108,19 @@ impl AppServices {
                 self.follows.is_following(notifiee_id, notifier_id)?
                     || self.follows.is_following(notifier_id, notifiee_id)?,
             ),
-            // No user-list store exists yet: no list has members, so `list`
-            // configs drop (upstream missing-list parity). Never errors.
-            "list" => Ok(false),
+            // Batch O WP16: list configs deliver when the notifier is a
+            // member of the referenced list (dangling/foreign lists deliver
+            // nothing, never error — upstream missing-list parity).
+            "list" => match config.user_list_id.as_deref() {
+                Some(list_id) => match self.lists.get_user_list(list_id) {
+                    Ok(Some(list)) if list.owner_id == notifiee_id => Ok(self
+                        .lists
+                        .get_list_membership(list_id, notifier_id)?
+                        .is_some()),
+                    _ => Ok(false),
+                },
+                None => Ok(false),
+            },
             // Stored configs are validated on write; an unknown surviving
             // value fails open rather than dropping notifications silently.
             _ => Ok(true),
@@ -130,6 +187,10 @@ mod tests {
             instance_settings: store.clone(),
             invites: store.clone(),
             abuse_reports: store.clone(),
+            lists: store.clone(),
+            signin: store.clone(),
+            password_resets: store.clone(),
+            registry: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()
@@ -300,16 +361,28 @@ mod tests {
         let (services, _) = notify_services("list-drop");
         let alice = services.create_account("alice", None).unwrap();
         let bob = services.create_account("bob", None).unwrap();
-        // Pinetree has no user lists yet: every `list` config drops (a
-        // missing list holds no members upstream either) without erroring.
+        let carol = services.create_account("carol", None).unwrap();
+        // Dangling list id: delivers nothing, never errors.
         set_receive_config(
             &services,
             &alice.id,
-            "follow",
+            "mention",
             ProfileNotifConfig { kind: "list".to_string(), user_list_id: Some("lst1".to_string()) },
         );
         let services = Arc::new(services);
-        assert_eq!(follow_notifs(&services, &bob.id, &alice.id), 0);
+        assert!(!services.notification_delivery_allowed(&alice.id, NotificationKind::Mention, &bob.id).unwrap());
+        // Member delivers; non-member and foreign lists drop.
+        let list = services.create_user_list(&alice.id, "l".to_string()).unwrap();
+        services.push_list_member(&alice.id, &list.id, &bob.id).unwrap();
+        set_receive_config(
+            &services,
+            &alice.id,
+            "mention",
+            ProfileNotifConfig { kind: "list".to_string(), user_list_id: Some(list.id.clone()) },
+        );
+        assert!(services.notification_delivery_allowed(&alice.id, NotificationKind::Mention, &bob.id).unwrap());
+        assert!(!services.notification_delivery_allowed(&alice.id, NotificationKind::Mention, &carol.id).unwrap());
+        assert!(!services.notification_delivery_allowed(&bob.id, NotificationKind::Mention, &bob.id).unwrap());
     }
 
     #[test]

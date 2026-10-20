@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, WriteTransaction};
 
 use crate::application::ports::{
     AccountStore, ActivityDedup, ActorKeypairRecord, ApiTokenRecord, AuthStore, BlockStore, Clock,
@@ -13,8 +13,9 @@ use crate::application::ports::{
     InviteSort, InviteStore, InviteTypeFilter,
     AbuseReportFilter, Job, JobQueue, LegacyAuthSessionRecord, MediaStore, MiAuthSessionRecord, ModerationLogFilter,
     AbuseReportStore, ModerationLogStore, MuteStore, NewJob,
-    NoteStore, NotificationStore, PollChoiceCount, PollStore, PortError, ReactionStore, FavoriteStore, EmojiStore, AntennaStore, AntennaNoteStore,
-    RemotePublicKeyRecord, TimelineCursor, UpdateAccountPatch, MAX_JOBS_PER_TXN, MAX_JOB_ATTEMPTS,
+    NoteStore, NotificationStore, PasswordResetRequest, PasswordResetStore, PollChoiceCount, PollStore, PortError, ReactionStore, FavoriteStore, EmojiStore, AntennaStore, AntennaNoteStore,
+    RegistryItem, RegistryStore,
+    RemotePublicKeyRecord, TimelineCursor, UpdateAccountPatch, SigninRecord, SigninStore, UserListStore, MAX_JOBS_PER_TXN, MAX_JOB_ATTEMPTS, MAX_SIGNIN_ROWS_PER_USER,
 };
 use crate::domain::account::{validate_local_username, Account};
 use crate::domain::blocking::Blocking;
@@ -111,6 +112,17 @@ const ANTENNAS_BY_OWNER: TableDefinition<(&str, &str), u8> =
 /// in the same transaction as the append.
 const ANTENNA_NOTES: TableDefinition<(&str, &str), u8> =
     TableDefinition::new("antenna_notes");
+/// User lists (Batch O WP16): id → JSON [`UserList`] row.
+const USER_LISTS: TableDefinition<&str, &[u8]> = TableDefinition::new("user_lists");
+/// Owner index `(owner_id, list_id)` (listing + per-owner cap).
+const USER_LISTS_BY_OWNER: TableDefinition<(&str, &str), u8> =
+    TableDefinition::new("user_lists_by_owner");
+/// Memberships `(list_id, member_id)` → JSON [`UserListMembership`] row.
+const USER_LIST_MEMBERSHIPS: TableDefinition<(&str, &str), &[u8]> =
+    TableDefinition::new("user_list_memberships");
+/// List favorites `(owner_id, list_id)` (upstream `MiUserListFavorite`).
+const USER_LIST_FAVORITES: TableDefinition<(&str, &str), u8> =
+    TableDefinition::new("user_list_favorites");
 /// Polls by note id (`docs/misskey-parity-plan.md` §4; Misskey `MiPoll`).
 const POLLS: TableDefinition<&str, &[u8]> = TableDefinition::new("polls");
 /// Poll votes keyed `(user_id, note_id, choice)` (`UNIQUE(user,note,choice)`
@@ -130,8 +142,28 @@ const NOTIFICATIONS_BY_USER: TableDefinition<(&str, &str), &str> =
     TableDefinition::new("notifications_by_user_ordered");
 const CREDENTIALS: TableDefinition<&str, &str> = TableDefinition::new("credentials");
 const API_TOKENS: TableDefinition<&str, &[u8]> = TableDefinition::new("api_tokens");
+/// Token-id index (Batch O WP9): opaque token id → token hash. Rows minted
+/// before ids existed are backfilled at open; every stored row resolves.
+const API_TOKENS_BY_ID: TableDefinition<&str, &str> = TableDefinition::new("api_tokens_by_id");
+/// Signin attempt rows (Batch O WP9; Misskey `MiSignin`), keyed by row id
+/// (aidx, time-ordered → reverse range reads newest-first).
+const SIGNINS: TableDefinition<&str, &[u8]> = TableDefinition::new("signins");
+/// Signin rows by `(account_id, signin_id)` (history read + per-user trim).
+const SIGNINS_BY_USER: TableDefinition<(&str, &str), u8> =
+    TableDefinition::new("signins_by_user");
 const MIAUTH_SESSIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("miauth_sessions");
 const LEGACY_SESSIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("legacy_sessions");
+/// Password-reset request rows (Batch P; Misskey `MiPasswordResetRequest`),
+/// keyed by token (the lookup path) …
+const PASSWORD_RESETS: TableDefinition<&str, &[u8]> = TableDefinition::new("password_resets");
+/// … plus id → token so `delete_reset_request(id)` needs no scan.
+const PASSWORD_RESET_IDS: TableDefinition<&str, &str> =
+    TableDefinition::new("password_reset_ids");
+/// Client registry items (Batch P; Misskey `MiRegistryItem`), keyed by one
+/// encoded composite `user\0domain\0scope\0key` (`\0` cannot appear in user
+/// ids; domains/scopes/keys are caller-validated). Prefix ranges serve the
+/// per-scope reads; `registry_scopes` scans one user's prefix.
+const REGISTRY: TableDefinition<&str, &[u8]> = TableDefinition::new("registry");
 const ACTOR_KEYPAIRS: TableDefinition<&str, &[u8]> = TableDefinition::new("actor_keypairs");
 const REMOTE_PUBLIC_KEYS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("remote_public_keys");
@@ -190,6 +222,9 @@ const INVITE_CODES: TableDefinition<&str, &str> = TableDefinition::new("invite_c
 
 /// META marker: `REACTIONS_BY_NOTE` has been built from `REACTIONS`.
 const REACTIONS_BY_NOTE_DONE_KEY: &str = "migration:reactions_by_note:v1";
+/// META marker: legacy `API_TOKENS` rows (minted before Batch O token ids)
+/// have been assigned ids and indexed in `API_TOKENS_BY_ID`.
+const TOKEN_ID_DONE_KEY: &str = "migration:api_token_ids:v1";
 /// `NOTES_BY_REPLY` backfill version marker: present with value
 /// [`REPLY_INDEX_DONE_VALUE`] once every stored note has been indexed.
 const REPLY_INDEX_DONE_KEY: &str = "migration:notes_by_reply:v1";
@@ -244,6 +279,7 @@ impl RedbStore {
         store.run_uri_index_backfill()?;
         store.run_notification_order_backfill()?;
         store.run_reactions_by_note_backfill()?;
+        store.run_token_id_backfill()?;
         Ok(store)
     }
 
@@ -309,6 +345,16 @@ impl RedbStore {
         let _ = write_txn.open_table(ANTENNAS).map_err(map_redb_err)?;
         let _ = write_txn.open_table(ANTENNAS_BY_OWNER).map_err(map_redb_err)?;
         let _ = write_txn.open_table(ANTENNA_NOTES).map_err(map_redb_err)?;
+        let _ = write_txn.open_table(USER_LISTS).map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(USER_LISTS_BY_OWNER)
+            .map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(USER_LIST_MEMBERSHIPS)
+            .map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(USER_LIST_FAVORITES)
+            .map_err(map_redb_err)?;
         let _ = write_txn.open_table(POLLS).map_err(map_redb_err)?;
         let _ = write_txn.open_table(POLL_VOTES).map_err(map_redb_err)?;
         let _ = write_txn.open_table(JOBS).map_err(map_redb_err)?;
@@ -321,8 +367,18 @@ impl RedbStore {
             .map_err(map_redb_err)?;
         let _ = write_txn.open_table(CREDENTIALS).map_err(map_redb_err)?;
         let _ = write_txn.open_table(API_TOKENS).map_err(map_redb_err)?;
+        let _ = write_txn.open_table(API_TOKENS_BY_ID).map_err(map_redb_err)?;
+        let _ = write_txn.open_table(SIGNINS).map_err(map_redb_err)?;
+        let _ = write_txn.open_table(SIGNINS_BY_USER).map_err(map_redb_err)?;
         let _ = write_txn.open_table(MIAUTH_SESSIONS).map_err(map_redb_err)?;
         let _ = write_txn.open_table(LEGACY_SESSIONS).map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(PASSWORD_RESETS)
+            .map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(PASSWORD_RESET_IDS)
+            .map_err(map_redb_err)?;
+        let _ = write_txn.open_table(REGISTRY).map_err(map_redb_err)?;
         let _ = write_txn.open_table(ACTOR_KEYPAIRS).map_err(map_redb_err)?;
         let _ = write_txn
             .open_table(REMOTE_PUBLIC_KEYS)
@@ -555,6 +611,53 @@ impl RedbStore {
             let mut meta_table = write_txn.open_table(META).map_err(map_redb_err)?;
             meta_table
                 .insert(REACTIONS_BY_NOTE_DONE_KEY, "done")
+                .map_err(map_redb_err)?;
+        }
+        self.commit_write(write_txn)
+    }
+
+    /// Assign ids to `API_TOKENS` rows minted before Batch O (empty `id`)
+    /// and index every row in `API_TOKENS_BY_ID`. Idempotent; the META
+    /// marker makes later opens a no-op.
+    pub fn run_token_id_backfill(&self) -> Result<(), PortError> {
+        if self.meta_get(TOKEN_ID_DONE_KEY)?.as_deref() == Some("done") {
+            return Ok(());
+        }
+        let write_txn = self.begin_write()?;
+        {
+            let mut tokens = write_txn.open_table(API_TOKENS).map_err(map_redb_err)?;
+            let mut by_id = write_txn
+                .open_table(API_TOKENS_BY_ID)
+                .map_err(map_redb_err)?;
+            let mut patched: Vec<(String, ApiTokenRecord)> = Vec::new();
+            for entry in tokens.iter().map_err(map_redb_err)? {
+                let (k, v) = entry.map_err(map_redb_err)?;
+                let mut record: ApiTokenRecord = decode_json(v.value())?;
+                if record.id.is_empty() {
+                    record.id = self.ids.generate();
+                    patched.push((k.value().to_string(), record));
+                } else if by_id
+                    .get(record.id.as_str())
+                    .map_err(map_redb_err)?
+                    .is_none()
+                {
+                    by_id
+                        .insert(record.id.as_str(), record.token_hash.as_str())
+                        .map_err(map_redb_err)?;
+                }
+            }
+            for (key, record) in &patched {
+                let encoded = encode_json(record)?;
+                tokens
+                    .insert(key.as_str(), encoded.as_slice())
+                    .map_err(map_redb_err)?;
+                by_id
+                    .insert(record.id.as_str(), record.token_hash.as_str())
+                    .map_err(map_redb_err)?;
+            }
+            let mut meta_table = write_txn.open_table(META).map_err(map_redb_err)?;
+            meta_table
+                .insert(TOKEN_ID_DONE_KEY, "done")
                 .map_err(map_redb_err)?;
         }
         self.commit_write(write_txn)
@@ -2464,6 +2567,23 @@ impl RedbStore {
             if let Some(v) = patch.moderator_note {
                 acc.moderator_note = v;
             }
+            // Batch P email identity loop (`i/update-email`, `verify-email`).
+            if let Some(v) = patch.email {
+                acc.email = v;
+            }
+            if let Some(v) = patch.email_verified {
+                acc.email_verified = v;
+            }
+            if let Some(v) = patch.email_verify_code {
+                acc.email_verify_code = v;
+            }
+            // Batch P `i/move`: moved marker is set once, never cleared.
+            if let Some(v) = patch.moved_to_uri {
+                acc.moved_to_uri = Some(v);
+            }
+            if let Some(v) = patch.moved_at_ms {
+                acc.moved_at_ms = Some(v);
+            }
             // `update.ts` resets `verifiedLinks` on every profile update;
             // re-verification happens off-request (see `verifyLink`).
             // Only applied when the caller sets the field (profile updates);
@@ -3551,6 +3671,11 @@ impl RedbStore {
             reject_quotes: false,
             default_reaction: None,
             show_remote_emojis: false,
+            email: None,
+            email_verified: false,
+            email_verify_code: None,
+            moved_to_uri: None,
+            moved_at_ms: None,
             moderator_note: None,
         };
         account.validate()?;
@@ -3833,6 +3958,35 @@ impl AccountStore for RedbStore {
         Ok(matches.into_iter().skip(offset).take(limit).collect())
     }
 
+    fn find_by_email_verify_code(&self, code: &str) -> Result<Option<Account>, PortError> {
+        // Codes are single-use and short-lived; the accounts table is small
+        // on a single node, so a bounded cursor walk (same shape as the
+        // export sweeps) is the honest lookup — no secondary index to keep
+        // in sync with the clear-on-verify write.
+        let mut after: Option<String> = None;
+        loop {
+            let (page, next) = self.all_accounts(after.as_deref(), 500)?;
+            if page.is_empty() {
+                return Ok(None);
+            }
+            for acc in page {
+                if acc.email_verify_code.as_deref() == Some(code) {
+                    return Ok(Some(acc));
+                }
+            }
+            let Some(cursor) = next else {
+                return Ok(None);
+            };
+            after = Some(cursor);
+        }
+    }
+
+    fn count_accounts(&self) -> Result<u64, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(ACCOUNTS).map_err(map_redb_err)?;
+        Ok(table.len().map_err(map_redb_err)?)
+    }
+
     fn all_accounts(
         &self,
         after: Option<&str>,
@@ -4054,6 +4208,39 @@ impl NoteStore for RedbStore {
             }
         }
         Ok(out)
+    }
+
+    fn count_notes(&self) -> Result<u64, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let notes_table = read_txn.open_table(NOTES).map_err(map_redb_err)?;
+        Ok(notes_table.len().map_err(map_redb_err)?)
+    }
+
+    fn count_local_notes(&self) -> Result<u64, PortError> {
+        // One accounts pass builds the local-author set; one notes pass
+        // counts live rows by those authors. Both tables are small on a
+        // single node; FDB inherits the same bounded-shape discipline via
+        // its own adapter (this is a read, not a transaction).
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let accounts_table = read_txn.open_table(ACCOUNTS).map_err(map_redb_err)?;
+        let mut local: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for entry in accounts_table.iter().map_err(map_redb_err)? {
+            let (k, v) = entry.map_err(map_redb_err)?;
+            let acc: Account = decode_json(v.value())?;
+            if acc.is_local() {
+                local.insert(k.value().to_string());
+            }
+        }
+        let notes_table = read_txn.open_table(NOTES).map_err(map_redb_err)?;
+        let mut count = 0u64;
+        for entry in notes_table.iter().map_err(map_redb_err)? {
+            let (_, v) = entry.map_err(map_redb_err)?;
+            let note: Note = decode_json(v.value())?;
+            if !note.is_deleted && local.contains(&note.author_id) {
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     fn find_by_uri(&self, uri: &str) -> Result<Option<Note>, PortError> {
@@ -5506,6 +5693,381 @@ impl AntennaNoteStore for RedbStore {
     }
 }
 
+impl UserListStore for RedbStore {
+    fn create_user_list(
+        &self,
+        list: crate::domain::user_list::UserList,
+    ) -> Result<crate::domain::user_list::UserList, PortError> {
+        use crate::domain::user_list::USER_LIST_LIMIT;
+        let write_txn = self.begin_write()?;
+        {
+            let by_owner = write_txn
+                .open_table(USER_LISTS_BY_OWNER)
+                .map_err(map_redb_err)?;
+            let owned = by_owner
+                .range((list.owner_id.as_str(), "")..=(list.owner_id.as_str(), "\u{10ffff}"))
+                .map_err(map_redb_err)?
+                .count();
+            if owned >= USER_LIST_LIMIT {
+                return Err(PortError::Conflict("TOO_MANY_USERLISTS".to_string()));
+            }
+            drop(by_owner);
+            let mut lists = write_txn.open_table(USER_LISTS).map_err(map_redb_err)?;
+            let mut by_owner = write_txn
+                .open_table(USER_LISTS_BY_OWNER)
+                .map_err(map_redb_err)?;
+            let encoded = encode_json(&list)?;
+            lists
+                .insert(list.id.as_str(), encoded.as_slice())
+                .map_err(map_redb_err)?;
+            by_owner
+                .insert((list.owner_id.as_str(), list.id.as_str()), &1u8)
+                .map_err(map_redb_err)?;
+        }
+        self.commit_write(write_txn)?;
+        Ok(list)
+    }
+
+    fn update_user_list(
+        &self,
+        list: crate::domain::user_list::UserList,
+    ) -> Result<Option<crate::domain::user_list::UserList>, PortError> {
+        let write_txn = self.begin_write()?;
+        let updated = {
+            let mut lists = write_txn.open_table(USER_LISTS).map_err(map_redb_err)?;
+            let existing: Option<crate::domain::user_list::UserList> =
+                match lists.get(list.id.as_str()).map_err(map_redb_err)? {
+                    Some(g) => Some(decode_json(g.value())?),
+                    None => None,
+                };
+            match existing {
+                Some(prev) if prev.owner_id == list.owner_id => {
+                    let encoded = encode_json(&list)?;
+                    lists
+                        .insert(list.id.as_str(), encoded.as_slice())
+                        .map_err(map_redb_err)?;
+                    Some(list)
+                }
+                _ => None,
+            }
+        };
+        self.commit_write(write_txn)?;
+        Ok(updated)
+    }
+
+    fn delete_user_list(&self, owner_id: &str, list_id: &str) -> Result<bool, PortError> {
+        let write_txn = self.begin_write()?;
+        let removed = {
+            let mut lists = write_txn.open_table(USER_LISTS).map_err(map_redb_err)?;
+            let existing: Option<crate::domain::user_list::UserList> =
+                match lists.get(list_id).map_err(map_redb_err)? {
+                    Some(g) => Some(decode_json(g.value())?),
+                    None => None,
+                };
+            let Some(prev) = existing else {
+                return Ok(false);
+            };
+            if prev.owner_id != owner_id {
+                return Ok(false);
+            }
+            lists.remove(list_id).map_err(map_redb_err)?;
+            drop(lists);
+            let mut by_owner = write_txn
+                .open_table(USER_LISTS_BY_OWNER)
+                .map_err(map_redb_err)?;
+            by_owner
+                .remove((owner_id, list_id))
+                .map_err(map_redb_err)?;
+            drop(by_owner);
+            let mut memberships = write_txn
+                .open_table(USER_LIST_MEMBERSHIPS)
+                .map_err(map_redb_err)?;
+            let stale: Vec<(String, String)> = memberships
+                .range((list_id, "")..=(list_id, "\u{10ffff}"))
+                .map_err(map_redb_err)?
+                .filter_map(|entry| {
+                    entry.ok().map(|(k, _)| {
+                        let (l, m) = k.value();
+                        (l.to_string(), m.to_string())
+                    })
+                })
+                .collect();
+            for (l, m) in stale {
+                memberships
+                    .remove((l.as_str(), m.as_str()))
+                    .map_err(map_redb_err)?;
+            }
+            drop(memberships);
+            let mut favorites = write_txn
+                .open_table(USER_LIST_FAVORITES)
+                .map_err(map_redb_err)?;
+            let stale_favs: Vec<(String, String)> = favorites
+                .iter()
+                .map_err(map_redb_err)?
+                .filter_map(|entry| {
+                    entry.ok().and_then(|(k, _)| {
+                        let (o, l) = k.value();
+                        (l == list_id).then(|| (o.to_string(), l.to_string()))
+                    })
+                })
+                .collect();
+            for (o, l) in stale_favs {
+                favorites
+                    .remove((o.as_str(), l.as_str()))
+                    .map_err(map_redb_err)?;
+            }
+            true
+        };
+        self.commit_write(write_txn)?;
+        Ok(removed)
+    }
+
+    fn get_user_list(
+        &self,
+        list_id: &str,
+    ) -> Result<Option<crate::domain::user_list::UserList>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(USER_LISTS).map_err(map_redb_err)?;
+        match table.get(list_id).map_err(map_redb_err)? {
+            Some(g) => Ok(Some(decode_json(g.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn lists_by_owner(
+        &self,
+        owner_id: &str,
+    ) -> Result<Vec<crate::domain::user_list::UserList>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let by_owner = read_txn
+            .open_table(USER_LISTS_BY_OWNER)
+            .map_err(map_redb_err)?;
+        let table = read_txn.open_table(USER_LISTS).map_err(map_redb_err)?;
+        let mut ids: Vec<String> = by_owner
+            .range((owner_id, "")..=(owner_id, "\u{10ffff}"))
+            .map_err(map_redb_err)?
+            .filter_map(|entry| {
+                entry.ok().map(|(k, _)| {
+                    let (_, l) = k.value();
+                    l.to_string()
+                })
+            })
+            .collect();
+        ids.sort_by(|a, b| b.cmp(a));
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some(g) = table.get(id.as_str()).map_err(map_redb_err)? {
+                out.push(decode_json(g.value())?);
+            }
+        }
+        Ok(out)
+    }
+
+    fn public_lists_by_owner(
+        &self,
+        owner_id: &str,
+    ) -> Result<Vec<crate::domain::user_list::UserList>, PortError> {
+        Ok(self
+            .lists_by_owner(owner_id)?
+            .into_iter()
+            .filter(|l| l.is_public)
+            .collect())
+    }
+
+    fn add_list_member(
+        &self,
+        member: crate::domain::user_list::UserListMembership,
+        jobs: Vec<NewJob>,
+    ) -> Result<crate::domain::user_list::UserListMembership, PortError> {
+        use crate::domain::user_list::USER_LIST_MEMBER_LIMIT;
+        let write_txn = self.begin_write()?;
+        {
+            let mut memberships = write_txn
+                .open_table(USER_LIST_MEMBERSHIPS)
+                .map_err(map_redb_err)?;
+            if memberships
+                .get((member.list_id.as_str(), member.member_id.as_str()))
+                .map_err(map_redb_err)?
+                .is_some()
+            {
+                return Err(PortError::Conflict("ALREADY_ADDED".to_string()));
+            }
+            let count = memberships
+                .range((member.list_id.as_str(), "")..=(member.list_id.as_str(), "\u{10ffff}"))
+                .map_err(map_redb_err)?
+                .count();
+            if count >= USER_LIST_MEMBER_LIMIT {
+                return Err(PortError::Conflict("TOO_MANY_USERS".to_string()));
+            }
+            let encoded = encode_json(&member)?;
+            memberships
+                .insert(
+                    (member.list_id.as_str(), member.member_id.as_str()),
+                    encoded.as_slice(),
+                )
+                .map_err(map_redb_err)?;
+            drop(memberships);
+            self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        }
+        self.commit_write(write_txn)?;
+        Ok(member)
+    }
+
+    fn remove_list_member(
+        &self,
+        list_id: &str,
+        member_id: &str,
+        jobs: Vec<NewJob>,
+    ) -> Result<bool, PortError> {
+        let write_txn = self.begin_write()?;
+        let removed = {
+            let mut memberships = write_txn
+                .open_table(USER_LIST_MEMBERSHIPS)
+                .map_err(map_redb_err)?;
+            let removed = memberships
+                .remove((list_id, member_id))
+                .map_err(map_redb_err)?
+                .is_some();
+            drop(memberships);
+            self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+            removed
+        };
+        self.commit_write(write_txn)?;
+        Ok(removed)
+    }
+
+    fn update_list_membership(
+        &self,
+        list_id: &str,
+        member_id: &str,
+        with_replies: bool,
+    ) -> Result<Option<crate::domain::user_list::UserListMembership>, PortError> {
+        let write_txn = self.begin_write()?;
+        let updated = {
+            let mut memberships = write_txn
+                .open_table(USER_LIST_MEMBERSHIPS)
+                .map_err(map_redb_err)?;
+            let mut member: crate::domain::user_list::UserListMembership =
+                match memberships
+                    .get((list_id, member_id))
+                    .map_err(map_redb_err)?
+                {
+                    Some(g) => decode_json(g.value())?,
+                    None => return Ok(None),
+                };
+            member.with_replies = with_replies;
+            let encoded = encode_json(&member)?;
+            memberships
+                .insert((list_id, member_id), encoded.as_slice())
+                .map_err(map_redb_err)?;
+            member
+        };
+        self.commit_write(write_txn)?;
+        Ok(Some(updated))
+    }
+
+    fn get_list_membership(
+        &self,
+        list_id: &str,
+        member_id: &str,
+    ) -> Result<Option<crate::domain::user_list::UserListMembership>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn
+            .open_table(USER_LIST_MEMBERSHIPS)
+            .map_err(map_redb_err)?;
+        match table
+            .get((list_id, member_id))
+            .map_err(map_redb_err)?
+        {
+            Some(g) => Ok(Some(decode_json(g.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn members_of_list(
+        &self,
+        list_id: &str,
+    ) -> Result<Vec<crate::domain::user_list::UserListMembership>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn
+            .open_table(USER_LIST_MEMBERSHIPS)
+            .map_err(map_redb_err)?;
+        let mut out = Vec::new();
+        for entry in table
+            .range((list_id, "")..=(list_id, "\u{10ffff}"))
+            .map_err(map_redb_err)?
+        {
+            let (_, v) = entry.map_err(map_redb_err)?;
+            out.push(decode_json(v.value())?);
+        }
+        Ok(out)
+    }
+
+    fn favorite_list(&self, owner_id: &str, list_id: &str) -> Result<bool, PortError> {
+        let write_txn = self.begin_write()?;
+        let added = {
+            let mut favorites = write_txn
+                .open_table(USER_LIST_FAVORITES)
+                .map_err(map_redb_err)?;
+            if favorites
+                .get((owner_id, list_id))
+                .map_err(map_redb_err)?
+                .is_some()
+            {
+                false
+            } else {
+                favorites
+                    .insert((owner_id, list_id), &1u8)
+                    .map_err(map_redb_err)?;
+                true
+            }
+        };
+        self.commit_write(write_txn)?;
+        Ok(added)
+    }
+
+    fn unfavorite_list(&self, owner_id: &str, list_id: &str) -> Result<bool, PortError> {
+        let write_txn = self.begin_write()?;
+        let removed = {
+            let mut favorites = write_txn
+                .open_table(USER_LIST_FAVORITES)
+                .map_err(map_redb_err)?;
+            favorites
+                .remove((owner_id, list_id))
+                .map_err(map_redb_err)?
+                .is_some()
+        };
+        self.commit_write(write_txn)?;
+        Ok(removed)
+    }
+
+    fn is_list_favorited(&self, owner_id: &str, list_id: &str) -> Result<bool, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn
+            .open_table(USER_LIST_FAVORITES)
+            .map_err(map_redb_err)?;
+        Ok(table
+            .get((owner_id, list_id))
+            .map_err(map_redb_err)?
+            .is_some())
+    }
+
+    fn list_favorite_count(&self, list_id: &str) -> Result<u64, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn
+            .open_table(USER_LIST_FAVORITES)
+            .map_err(map_redb_err)?;
+        let mut count = 0u64;
+        for entry in table.iter().map_err(map_redb_err)? {
+            let (k, _) = entry.map_err(map_redb_err)?;
+            if k.value().1 == list_id {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+}
+
 impl JobQueue for RedbStore {
     fn claim_next(&self, lease_duration_ms: i64) -> Result<Option<Job>, PortError> {
         let now = self.clock.now_ms();
@@ -6625,6 +7187,12 @@ impl ReactionStore for RedbStore {
         }
         Ok(out)
     }
+
+    fn count_reactions(&self) -> Result<u64, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(REACTIONS).map_err(map_redb_err)?;
+        Ok(table.len().map_err(map_redb_err)?)
+    }
 }
 
 impl PollStore for RedbStore {
@@ -7583,6 +8151,14 @@ impl AuthStore for RedbStore {
             table
                 .insert(record.token_hash.as_str(), encoded.as_slice())
                 .map_err(map_redb_err)?;
+            if !record.id.is_empty() {
+                let mut by_id = write_txn
+                    .open_table(API_TOKENS_BY_ID)
+                    .map_err(map_redb_err)?;
+                by_id
+                    .insert(record.id.as_str(), record.token_hash.as_str())
+                    .map_err(map_redb_err)?;
+            }
         }
         self.commit_write(write_txn)
     }
@@ -7596,11 +8172,95 @@ impl AuthStore for RedbStore {
         }
     }
 
+    fn get_token_by_id(&self, id: &str) -> Result<Option<ApiTokenRecord>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let by_id = read_txn.open_table(API_TOKENS_BY_ID).map_err(map_redb_err)?;
+        let hash: Option<String> = match by_id.get(id).map_err(map_redb_err)? {
+            Some(g) => Some(g.value().to_string()),
+            None => None,
+        };
+        drop(by_id);
+        match hash {
+            Some(hash) => {
+                let table = read_txn.open_table(API_TOKENS).map_err(map_redb_err)?;
+                match table.get(hash.as_str()).map_err(map_redb_err)? {
+                    Some(g) => Ok(Some(decode_json(g.value())?)),
+                    None => Ok(None),
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn tokens_for_account(&self, account_id: &str) -> Result<Vec<ApiTokenRecord>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(API_TOKENS).map_err(map_redb_err)?;
+        let mut out = Vec::new();
+        for row in table.iter().map_err(map_redb_err)? {
+            let (_, v) = row.map_err(map_redb_err)?;
+            let record: ApiTokenRecord = decode_json(v.value())?;
+            if record.account_id == account_id {
+                out.push(record);
+            }
+        }
+        out.sort_by(|a, b| {
+            a.created_at_ms
+                .cmp(&b.created_at_ms)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(out)
+    }
+
+    fn delete_account_first_party_tokens(&self, account_id: &str) -> Result<u64, PortError> {
+        let write_txn = self.begin_write()?;
+        let removed = {
+            let mut table = write_txn.open_table(API_TOKENS).map_err(map_redb_err)?;
+            let mut by_id = write_txn
+                .open_table(API_TOKENS_BY_ID)
+                .map_err(map_redb_err)?;
+            let mut doomed: Vec<(String, String)> = Vec::new();
+            for row in table.iter().map_err(map_redb_err)? {
+                let (k, v) = row.map_err(map_redb_err)?;
+                let record: ApiTokenRecord = decode_json(v.value())?;
+                if record.account_id == account_id && record.is_first_party {
+                    doomed.push((k.value().to_string(), record.id));
+                }
+            }
+            let count = doomed.len() as u64;
+            for (hash, id) in doomed {
+                table.remove(hash.as_str()).map_err(map_redb_err)?;
+                if !id.is_empty() {
+                    by_id.remove(id.as_str()).map_err(map_redb_err)?;
+                }
+            }
+            count
+        };
+        self.commit_write(write_txn)?;
+        Ok(removed)
+    }
+
     fn delete_token_by_hash(&self, token_hash: &str) -> Result<(), PortError> {
         let write_txn = self.begin_write()?;
         {
             let mut table = write_txn.open_table(API_TOKENS).map_err(map_redb_err)?;
+            let id: Option<String> = match table.get(token_hash).map_err(map_redb_err)? {
+                Some(g) => {
+                    let record: ApiTokenRecord = decode_json(g.value())?;
+                    if record.id.is_empty() {
+                        None
+                    } else {
+                        Some(record.id)
+                    }
+                }
+                None => None,
+            };
             table.remove(token_hash).map_err(map_redb_err)?;
+            if let Some(id) = id {
+                let mut by_id = write_txn
+                    .open_table(API_TOKENS_BY_ID)
+                    .map_err(map_redb_err)?;
+                by_id.remove(id.as_str()).map_err(map_redb_err)?;
+            }
         }
         self.commit_write(write_txn)
     }
@@ -7831,5 +8491,275 @@ impl AuthStore for RedbStore {
                 .map_err(map_redb_err)?;
         }
         self.commit_write(write_txn)
+    }
+}
+
+impl SigninStore for RedbStore {
+    fn record_signin(&self, record: SigninRecord) -> Result<(), PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            let mut signins = write_txn.open_table(SIGNINS).map_err(map_redb_err)?;
+            let mut by_user = write_txn
+                .open_table(SIGNINS_BY_USER)
+                .map_err(map_redb_err)?;
+            let encoded = encode_json(&record)?;
+            signins
+                .insert(record.id.as_str(), encoded.as_slice())
+                .map_err(map_redb_err)?;
+            by_user
+                .insert((record.account_id.as_str(), record.id.as_str()), &1u8)
+                .map_err(map_redb_err)?;
+            // Trim oldest-first to the per-user cap in the same transaction.
+            let owned: Vec<String> = {
+                let mut ids = Vec::new();
+                for entry in by_user
+                    .iter()
+                    .map_err(map_redb_err)?
+                {
+                    let (k, _) = entry.map_err(map_redb_err)?;
+                    let (owner, sid) = k.value();
+                    if owner == record.account_id.as_str() {
+                        ids.push(sid.to_string());
+                    }
+                }
+                ids
+            };
+            if owned.len() > MAX_SIGNIN_ROWS_PER_USER {
+                // aidx ids are time-ordered: ascending = oldest-first.
+                let mut sorted = owned;
+                sorted.sort();
+                for drop_id in sorted
+                    .iter()
+                    .take(sorted.len() - MAX_SIGNIN_ROWS_PER_USER)
+                {
+                    by_user
+                        .remove((record.account_id.as_str(), drop_id.as_str()))
+                        .map_err(map_redb_err)?;
+                    signins.remove(drop_id.as_str()).map_err(map_redb_err)?;
+                }
+            }
+        }
+        self.commit_write(write_txn)
+    }
+
+    fn list_signins(
+        &self,
+        account_id: &str,
+        limit: usize,
+        since_id: Option<&str>,
+        until_id: Option<&str>,
+        since_date: Option<i64>,
+        until_date: Option<i64>,
+    ) -> Result<Vec<SigninRecord>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let signins = read_txn.open_table(SIGNINS).map_err(map_redb_err)?;
+        let by_user = read_txn.open_table(SIGNINS_BY_USER).map_err(map_redb_err)?;
+        let mut rows: Vec<SigninRecord> = Vec::new();
+        for entry in by_user.iter().map_err(map_redb_err)? {
+            let (k, _) = entry.map_err(map_redb_err)?;
+            let (owner, sid) = k.value();
+            if owner != account_id {
+                continue;
+            }
+            if let Some(since) = since_id {
+                if sid <= since {
+                    continue;
+                }
+            }
+            if let Some(until) = until_id {
+                if sid >= until {
+                    continue;
+                }
+            }
+            let Some(g) = signins.get(sid).map_err(map_redb_err)? else {
+                continue;
+            };
+            let record: SigninRecord = decode_json(g.value())?;
+            if let Some(since_ms) = since_date {
+                if record.created_at_ms <= since_ms {
+                    continue;
+                }
+            }
+            if let Some(until_ms) = until_date {
+                if record.created_at_ms >= until_ms {
+                    continue;
+                }
+            }
+            rows.push(record);
+        }
+        // Newest-first (aidx ids descending = creation order).
+        rows.sort_by(|a, b| b.id.cmp(&a.id));
+        rows.truncate(limit);
+        Ok(rows)
+    }
+}
+
+// --- Batch P: password-reset + registry stores ------------------------------
+
+/// Encode one registry composite key. `\0` separates segments; `scope`
+/// segments join on `\x1f` (both rejected from scope segments, keys, and
+/// domains by endpoint validation, so the encoding is unambiguous).
+fn registry_key(user_id: &str, domain: Option<&str>, scope: &[String], key: &str) -> String {
+    format!(
+        "{user_id}\0{}\0{}\0{key}",
+        domain.unwrap_or(""),
+        scope.join("\x1f")
+    )
+}
+
+/// Prefix selecting every row of one (user, domain, scope).
+fn registry_scope_prefix(user_id: &str, domain: Option<&str>, scope: &[String]) -> String {
+    format!(
+        "{user_id}\0{}\0{}\0",
+        domain.unwrap_or(""),
+        scope.join("\x1f")
+    )
+}
+
+/// Prefix selecting every row of one user (for `scopes-with-domain`).
+fn registry_user_prefix(user_id: &str) -> String {
+    format!("{user_id}\0")
+}
+
+impl PasswordResetStore for RedbStore {
+    fn create_reset_request(&self, request: PasswordResetRequest) -> Result<(), PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            let mut by_token = write_txn
+                .open_table(PASSWORD_RESETS)
+                .map_err(map_redb_err)?;
+            let mut by_id = write_txn
+                .open_table(PASSWORD_RESET_IDS)
+                .map_err(map_redb_err)?;
+            let encoded = encode_json(&request)?;
+            by_token
+                .insert(request.token.as_str(), encoded.as_slice())
+                .map_err(map_redb_err)?;
+            by_id
+                .insert(request.id.as_str(), request.token.as_str())
+                .map_err(map_redb_err)?;
+        }
+        self.commit_write(write_txn)
+    }
+
+    fn find_reset_request(&self, token: &str) -> Result<Option<PasswordResetRequest>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let by_token = read_txn.open_table(PASSWORD_RESETS).map_err(map_redb_err)?;
+        let Some(g) = by_token.get(token).map_err(map_redb_err)? else {
+            return Ok(None);
+        };
+        Ok(Some(decode_json(g.value())?))
+    }
+
+    fn delete_reset_request(&self, id: &str) -> Result<(), PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            let mut by_token = write_txn
+                .open_table(PASSWORD_RESETS)
+                .map_err(map_redb_err)?;
+            let mut by_id = write_txn
+                .open_table(PASSWORD_RESET_IDS)
+                .map_err(map_redb_err)?;
+            let token: Option<String> = by_id
+                .get(id)
+                .map_err(map_redb_err)?
+                .map(|g| g.value().to_string());
+            if let Some(token) = token {
+                by_token.remove(token.as_str()).map_err(map_redb_err)?;
+                by_id.remove(id).map_err(map_redb_err)?;
+            }
+        }
+        self.commit_write(write_txn)
+    }
+}
+
+impl RegistryStore for RedbStore {
+    fn registry_set(&self, item: RegistryItem) -> Result<(), PortError> {
+        let key = registry_key(&item.user_id, item.domain.as_deref(), &item.scope, &item.key);
+        let write_txn = self.begin_write()?;
+        {
+            let mut table = write_txn.open_table(REGISTRY).map_err(map_redb_err)?;
+            let encoded = encode_json(&item)?;
+            table
+                .insert(key.as_str(), encoded.as_slice())
+                .map_err(map_redb_err)?;
+        }
+        self.commit_write(write_txn)
+    }
+
+    fn registry_get(
+        &self,
+        user_id: &str,
+        domain: Option<&str>,
+        scope: &[String],
+        key: &str,
+    ) -> Result<Option<RegistryItem>, PortError> {
+        let composite = registry_key(user_id, domain, scope, key);
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(REGISTRY).map_err(map_redb_err)?;
+        let Some(g) = table.get(composite.as_str()).map_err(map_redb_err)? else {
+            return Ok(None);
+        };
+        Ok(Some(decode_json(g.value())?))
+    }
+
+    fn registry_list(
+        &self,
+        user_id: &str,
+        domain: Option<&str>,
+        scope: &[String],
+    ) -> Result<Vec<RegistryItem>, PortError> {
+        let prefix = registry_scope_prefix(user_id, domain, scope);
+        let end = format!("{prefix}\u{10ffff}");
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(REGISTRY).map_err(map_redb_err)?;
+        let mut items = Vec::new();
+        for entry in table
+            .range(prefix.as_str()..end.as_str())
+            .map_err(map_redb_err)?
+        {
+            let (_, v) = entry.map_err(map_redb_err)?;
+            items.push(decode_json(v.value())?);
+        }
+        Ok(items)
+    }
+
+    fn registry_remove(
+        &self,
+        user_id: &str,
+        domain: Option<&str>,
+        scope: &[String],
+        key: &str,
+    ) -> Result<(), PortError> {
+        let composite = registry_key(user_id, domain, scope, key);
+        let write_txn = self.begin_write()?;
+        {
+            let mut table = write_txn.open_table(REGISTRY).map_err(map_redb_err)?;
+            table.remove(composite.as_str()).map_err(map_redb_err)?;
+        }
+        self.commit_write(write_txn)
+    }
+
+    fn registry_scopes(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<(Option<String>, Vec<String>)>, PortError> {
+        let prefix = registry_user_prefix(user_id);
+        let end = format!("{prefix}\u{10ffff}");
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(REGISTRY).map_err(map_redb_err)?;
+        let mut pairs: Vec<(Option<String>, Vec<String>)> = Vec::new();
+        for entry in table
+            .range(prefix.as_str()..end.as_str())
+            .map_err(map_redb_err)?
+        {
+            let (_, v) = entry.map_err(map_redb_err)?;
+            let item: RegistryItem = decode_json(v.value())?;
+            let pair = (item.domain.clone(), item.scope.clone());
+            if !pairs.contains(&pair) {
+                pairs.push(pair);
+            }
+        }
+        Ok(pairs)
     }
 }

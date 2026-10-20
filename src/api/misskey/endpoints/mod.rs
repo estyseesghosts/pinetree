@@ -32,7 +32,7 @@ use crate::application::commands::AppServices;
 use crate::application::ports::{
     AbuseReportFilter, ApiTokenRecord, CreateDraftInput, CreateNoteInput, EditNoteInput, ExportEntity, ImportEntity,
     InviteListFilter, InviteSort, InviteTypeFilter, LegacyAuthSessionRecord, MiAuthSessionRecord,
-    ModerationLogFilter, PortError, TimelineCursor,
+    ModerationLogFilter, PasswordResetRequest, PortError, RegistryItem, SigninRecord, TimelineCursor,
     UpdateAccountPatch, UpdateDraftPatch,
 };
 use crate::domain::account::{
@@ -50,7 +50,7 @@ use crate::federation::delivery::{
 };
 use crate::federation::inbox as fed_inbox;
 use crate::jobs::worker::JobWorker;
-use crate::streaming::hub::Hub;
+use crate::streaming::hub::{Hub, ONLINE_THRESHOLD_MS};
 use crate::streaming::server::streaming_handler;
 
 use super::auth::{
@@ -64,7 +64,8 @@ use super::packers::{
     pack_following, pack_invite_code, pack_me_detailed,
     pack_meta, pack_moderation_log, pack_muting, pack_note, pack_note_draft,
     pack_note_reaction_with_note, pack_scheduled_note,
-    pack_notification, pack_renote_muting, pack_user_detailed_not_me, pack_user_lite,
+    pack_notification, pack_renote_muting, pack_user_detailed_not_me, pack_user_list,
+    pack_user_lite,
     pack_user_relation,
 };
 use super::request::check_allowed_fields;
@@ -272,6 +273,37 @@ fn auth_account_key(username: &str) -> String {
 
 fn auth_ip_key(client_ip: &str) -> String {
     format!("ip:{client_ip}")
+}
+
+/// Batch O WP9: append one `i/signin-history` row. Fire-and-forget like
+/// upstream's `setImmediate` insert: a storage failure is logged, never
+/// surfaced, so a history write can neither block nor fail a login.
+fn record_signin_attempt(
+    services: &AppServices,
+    account_id: &str,
+    ip: &str,
+    headers: &HeaderMap,
+    success: bool,
+) {
+    let user_agent = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    // DIVERGENCE: upstream stores the full request headers jsonb; pinetree
+    // keeps only the user agent (privacy + size; the JSON-RPC dispatch path
+    // is the only other caller and shares this helper).
+    let headers_json = serde_json::json!({ "user-agent": user_agent }).to_string();
+    let record = SigninRecord {
+        id: services.ids.generate(),
+        account_id: account_id.to_string(),
+        ip: ip.to_string(),
+        headers: headers_json,
+        success,
+        created_at_ms: services.clock.now_ms(),
+    };
+    if let Err(e) = services.signin.record_signin(record) {
+        eprintln!("signin history append for {account_id} failed: {e}");
+    }
 }
 
 /// Slice 9 (H3): verify `password` against the stored hash off the async
@@ -916,6 +948,26 @@ fn parse_cursor(obj: &Map<String, Value>) -> Result<TimelineCursor, ApiError> {
     })
 }
 
+/// Map a list-op [`PortError`] to the caller's per-endpoint verbatim
+/// upstream error (Batch O WP16: one UUID per endpoint per code).
+fn map_list_error(err: PortError, endpoint: &str) -> ApiError {
+    match &err {
+        PortError::NotFound(msg) if msg == "NO_SUCH_LIST" => {
+            ApiError::user_list_no_such_list(endpoint)
+        }
+        PortError::NotFound(msg) if msg == "NO_SUCH_USER" => {
+            ApiError::user_list_no_such_user(endpoint)
+        }
+        PortError::Validation(msg) if msg == "YOU_HAVE_BEEN_BLOCKED" => {
+            ApiError::user_list_blocked()
+        }
+        PortError::Conflict(msg) if msg == "ALREADY_ADDED" => ApiError::user_list_already_added(),
+        PortError::Conflict(msg) if msg == "TOO_MANY_USERS" => ApiError::user_list_too_many_users(),
+        PortError::Conflict(msg) if msg == "TOO_MANY_USERLISTS" => ApiError::user_list_too_many(),
+        _ => ApiError::from_port_error(err),
+    }
+}
+
 /// Map an `AppServices::check_import_file` failure to the caller's
 /// per-endpoint verbatim upstream error (`i/import-*.ts` parity: each
 /// endpoint mints its own UUID per code).
@@ -974,9 +1026,12 @@ fn is_unemitted_notification_type(name: &str) -> bool {
             | "login"
             | "createToken"
             | "app"
-            | "test"
     )
 }
+
+/// Misskey `notificationTypes` parity: `test` (Batch P
+/// `notifications/test-notification`) is a real emittable kind, not an
+/// unemitted alias — it was wrongly listed above until Batch P.
 
 /// Misskey obsolete notification types (`types.ts`
 /// `obsoleteNotificationTypes`): accepted for backwards compatibility and
@@ -1008,6 +1063,8 @@ fn notification_kind_for(field: &str, name: &str) -> Result<Option<NotificationK
         "scheduledNotePostFailed" => Ok(Some(NotificationKind::ScheduledNotePostFailed)),
         // §13: export completions are now emitted locally.
         "exportCompleted" => Ok(Some(NotificationKind::ExportCompleted)),
+        // Batch P: test notifications are now emitted locally.
+        "test" => Ok(Some(NotificationKind::Test)),
         _ if is_unemitted_notification_type(name) => Ok(None),
         _ => Err(ApiError::invalid_param(
             field,
@@ -1466,6 +1523,7 @@ async fn miauth_submit(
         .services
         .auth
         .store_token(ApiTokenRecord {
+            id: state.services.ids.generate(),
             token_hash: hash_token(&raw_token),
             account_id: account.id.clone(),
             permissions: permissions.clone(),
@@ -1545,6 +1603,7 @@ async fn miauth_submit(
         .services
         .auth
         .store_token(ApiTokenRecord {
+            id: state.services.ids.generate(),
             token_hash: hash_token(&browser_token),
             account_id: account.id.clone(),
             permissions: Vec::new(),
@@ -1827,6 +1886,7 @@ async fn do_signup(
     state: &ApiState,
     obj: &Map<String, Value>,
     ip: &str,
+    headers: &HeaderMap,
 ) -> Result<(Account, String), SignupError> {
     let username = match obj.get("username").and_then(Value::as_str) {
         Some(username) if !username.is_empty() => username,
@@ -1882,6 +1942,7 @@ async fn do_signup(
         .services
         .auth
         .store_token(ApiTokenRecord {
+            id: state.services.ids.generate(),
             token_hash: hash_token(&raw_token),
             account_id: account.id.clone(),
             permissions: Vec::new(),
@@ -1892,6 +1953,9 @@ async fn do_signup(
             created_at_ms: state.services.clock.now_ms(),
         })
         .map_err(|err| SignupError::Api(ApiError::from_port_error(err)))?;
+    // Batch O WP9: signup counts as a successful signin (upstream funnels
+    // signup through `SigninService.signin`).
+    record_signin_attempt(&state.services, &account.id, ip, headers, true);
     Ok((account, raw_token))
 }
 
@@ -1899,6 +1963,7 @@ async fn do_signin(
     state: &ApiState,
     obj: &Map<String, Value>,
     ip: &str,
+    headers: &HeaderMap,
 ) -> Result<(Account, String), ApiError> {
     let username = match obj.get("username").and_then(Value::as_str) {
         Some(username) if !username.is_empty() => username,
@@ -1947,6 +2012,12 @@ async fn do_signin(
             state
                 .rate_limiter
                 .record_auth_failure("auth/signin", &acct_key, &ip_key);
+            // Batch O WP9: known-account failures append a `success: false`
+            // row (upstream `fail()`); unknown usernames record nothing, so
+            // the history never reveals whether a name exists.
+            if let Some(known) = &found {
+                record_signin_attempt(&state.services, &known.id, ip, headers, false);
+            }
             return Err(ApiError::authentication_failed());
         }
     };
@@ -1966,6 +2037,7 @@ async fn do_signin(
         .services
         .auth
         .store_token(ApiTokenRecord {
+            id: state.services.ids.generate(),
             token_hash: hash_token(&raw_token),
             account_id: account.id.clone(),
             permissions: Vec::new(),
@@ -1976,6 +2048,8 @@ async fn do_signin(
             created_at_ms: state.services.clock.now_ms(),
         })
         .map_err(ApiError::from_port_error)?;
+    // Batch O WP9: successful password signin appends a `success: true` row.
+    record_signin_attempt(&state.services, &account.id, ip, headers, true);
     Ok((account, raw_token))
 }
 
@@ -1997,7 +2071,7 @@ async fn signup(
     let obj = parse_json_body(&body)?;
     check_allowed_fields(&obj, SIGNUP_FIELDS)?;
     let ip = client_ip(peer, &headers, &state.trusted_proxies);
-    let (account, raw_token) = match do_signup(&state, &obj, &ip).await {
+    let (account, raw_token) = match do_signup(&state, &obj, &ip, &headers).await {
         Ok(ok) => ok,
         // Registration-gate rejection: upstream's plain empty 400.
         Err(SignupError::Rejected) => return Ok(StatusCode::BAD_REQUEST.into_response()),
@@ -2025,7 +2099,7 @@ async fn signin(
     let obj = parse_json_body(&body)?;
     check_allowed_fields(&obj, &["username", "password"])?;
     let ip = client_ip(peer, &headers, &state.trusted_proxies);
-    let (account, raw_token) = do_signin(&state, &obj, &ip).await?;
+    let (account, raw_token) = do_signin(&state, &obj, &ip, &headers).await?;
     let user = pack_me_detailed(&account, true, &state.services)
         .map_err(ApiError::from_port_error)?;
     let mut response = Json(serde_json::json!({
@@ -2338,6 +2412,7 @@ fn api_dispatch_blocking(
                 .services
                 .auth
                 .store_token(ApiTokenRecord {
+                    id: state.services.ids.generate(),
                     token_hash: hash_token(&raw_token),
                     account_id: caller.account.id.clone(),
                     permissions: permissions.clone(),
@@ -2463,6 +2538,7 @@ fn api_dispatch_blocking(
                 .services
                 .auth
                 .store_token(ApiTokenRecord {
+                    id: state.services.ids.generate(),
                     token_hash: hash_token(&access_token),
                     account_id: caller.account.id.clone(),
                     permissions: sess.permissions.clone(),
@@ -2531,7 +2607,7 @@ fn api_dispatch_blocking(
         "signup" => {
             check_allowed_fields(&obj, SIGNUP_FIELDS)?;
             let (account, raw_token) = match tokio::runtime::Handle::current()
-                .block_on(do_signup(&state, &obj, &client_ip))
+                .block_on(do_signup(&state, &obj, &client_ip, &headers))
             {
                 Ok(ok) => ok,
                 // Registration-gate rejection: upstream's plain empty 400.
@@ -2572,6 +2648,7 @@ fn api_dispatch_blocking(
                 .services
                 .auth
                 .store_token(ApiTokenRecord {
+                    id: state.services.ids.generate(),
                     token_hash: hash_token(&raw_token),
                     account_id: account.id.clone(),
                     permissions: Vec::new(),
@@ -2593,7 +2670,7 @@ fn api_dispatch_blocking(
         "signin" => {
             check_allowed_fields(&obj, &["username", "password"])?;
             let (account, raw_token) =
-                tokio::runtime::Handle::current().block_on(do_signin(&state, &obj, &client_ip))?;
+                tokio::runtime::Handle::current().block_on(do_signin(&state, &obj, &client_ip, &headers))?;
             let user = pack_me_detailed(&account, true, &state.services)
                 .map_err(ApiError::from_port_error)?;
             Ok(Json(serde_json::json!({
@@ -2770,6 +2847,72 @@ fn api_dispatch_blocking(
             .into_response())
         }
 
+        "users/search-by-username-and-host" => {
+            check_allowed_fields(&obj, &["username", "host", "limit", "detail"])?;
+            let username = obj.get("username").and_then(Value::as_str);
+            let host = obj.get("host").and_then(Value::as_str);
+            if username.is_none_or(|u| u.is_empty()) && host.is_none_or(|h| h.is_empty()) {
+                return Err(ApiError::invalid_param(
+                    "username",
+                    "one of username or host is required",
+                ));
+            }
+            let _limit = get_limit(&obj)?;
+            let detail = opt_bool(&obj, "detail", true)?;
+            // Thin alias over the `users/show` username/host resolution
+            // (upstream `users/search-by-username-and-host.ts` delegates to
+            // `userSearchService.searchByUsernameAndHost`; pinetree resolves
+            // a single account and answers a 1-element array).
+            let mut resolved = None;
+            if let Some(username) = username.filter(|u| !u.is_empty()) {
+                match state.services.users_show_by_username(username, host) {
+                    Ok(account) => resolved = Some(account),
+                    Err(original @ PortError::NotFound(_)) => match host {
+                        Some(remote_host) if !remote_host.is_empty() => {
+                            let account = webfinger_discover_actor_uri(
+                                &state.services.federation_http,
+                                username,
+                                remote_host,
+                                None,
+                            )
+                            .ok()
+                            .and_then(|actor_uri| {
+                                fetch_and_upsert_remote_actor(
+                                    &state.services,
+                                    &state.services.federation_http,
+                                    &actor_uri,
+                                )
+                                .ok()
+                            })
+                            .map(|(account, _)| account);
+                            match account {
+                                Some(account) => resolved = Some(account),
+                                None => return Err(ApiError::from_port_error(original)),
+                            }
+                        }
+                        _ => {}
+                    },
+                    Err(err) => return Err(ApiError::from_port_error(err)),
+                }
+            }
+            let mut out = Vec::new();
+            if let Some(account) = resolved {
+                if detail {
+                    out.push(pack_account_for(&account, caller.as_ref(), &state.services)?);
+                } else {
+                    out.push(
+                        serde_json::to_value(pack_user_lite(
+                            &account,
+                            &state.services.public_url,
+                            state.services.clock.now_ms(),
+                        ))
+                        .map_err(|_| ApiError::internal())?,
+                    );
+                }
+            }
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
         "users/search" => {
             check_allowed_fields(&obj, &["query", "offset", "limit", "origin", "detail"])?;
             let query = obj
@@ -2789,6 +2932,392 @@ fn api_dispatch_blocking(
                 out.push(pack_account_for(account, caller.as_ref(), &state.services)?);
             }
             Ok(Json(Value::Array(out)).into_response())
+        }
+
+        // --- Batch O WP16: user lists -----------------------------------
+        // `users/lists/create {name!}` → 200 packed (verbatim
+        // `TOO_MANY_USERLISTS`).
+        "users/lists/create" => {
+            check_allowed_fields(&obj, &["name"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            let name = required_str(&obj, "name")?;
+            let list = state
+                .services
+                .create_user_list(&caller.account.id, name)
+                .map_err(|e| map_list_error(e, "users/lists/create"))?;
+            Ok(Json(pack_user_list(&list, &[], &state.services)).into_response())
+        }
+
+        // `users/lists/update {listId!, name?, isPublic?}` → 200 packed.
+        "users/lists/update" => {
+            check_allowed_fields(&obj, &["listId", "name", "isPublic"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            let list_id = required_str(&obj, "listId")?;
+            let name = match obj.get("name") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => Some(s.clone()),
+                Some(_) => {
+                    return Err(ApiError::invalid_param("name", "must be a string"));
+                }
+            };
+            let is_public = match obj.get("isPublic") {
+                None | Some(Value::Null) => None,
+                Some(Value::Bool(b)) => Some(*b),
+                Some(_) => {
+                    return Err(ApiError::invalid_param(
+                        "isPublic",
+                        "must be a boolean",
+                    ));
+                }
+            };
+            let list = state
+                .services
+                .update_user_list(&caller.account.id, &list_id, name, is_public)
+                .map_err(|e| map_list_error(e, "users/lists/update"))?;
+            let members = state
+                .services
+                .lists
+                .members_of_list(&list.id)
+                .map_err(ApiError::from_port_error)?;
+            let ids = members.iter().map(|m| m.member_id.clone()).collect::<Vec<_>>();
+            Ok(Json(pack_user_list(&list, &ids, &state.services)).into_response())
+        }
+
+        // `users/lists/delete {listId!}` → 204 (cascade + dependent
+        // antennas in `delete_user_list`).
+        "users/lists/delete" => {
+            check_allowed_fields(&obj, &["listId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            let list_id = required_str(&obj, "listId")?;
+            state
+                .services
+                .delete_user_list(&caller.account.id, &list_id)
+                .map_err(|e| map_list_error(e, "users/lists/delete"))?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // `users/lists/list {userId?}` → 200 packed array. `userId` selects
+        // that user's public lists (remote users refused); without it the
+        // caller's own lists (credential required).
+        "users/lists/list" => {
+            check_allowed_fields(&obj, &["userId"])?;
+            if let Some(c) = &caller {
+                c.require_permission("read:account")?;
+            }
+            let lists = match obj.get("userId").and_then(Value::as_str) {
+                Some(user_id) => {
+                    let user = state
+                        .services
+                        .users_show_by_id(user_id)
+                        .map_err(|e| map_list_error(e, "users/lists/list"))?;
+                    if !user.is_local() {
+                        return Err(ApiError::user_list_remote_not_allowed());
+                    }
+                    state
+                        .services
+                        .lists
+                        .public_lists_by_owner(&user.id)
+                        .map_err(ApiError::from_port_error)?
+                }
+                None => {
+                    let caller = require_caller(caller)?;
+                    state
+                        .services
+                        .lists
+                        .lists_by_owner(&caller.account.id)
+                        .map_err(ApiError::from_port_error)?
+                }
+            };
+            let mut out = Vec::with_capacity(lists.len());
+            for list in &lists {
+                let members = state
+                    .services
+                    .lists
+                    .members_of_list(&list.id)
+                    .map_err(ApiError::from_port_error)?;
+                let ids = members.iter().map(|m| m.member_id.clone()).collect::<Vec<_>>();
+                out.push(pack_user_list(list, &ids, &state.services));
+            }
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        // `users/lists/show {listId!, forPublic?}` → 200 packed (+
+        // `likedCount`/`isLiked` when `forPublic && isPublic`).
+        "users/lists/show" => {
+            check_allowed_fields(&obj, &["listId", "forPublic"])?;
+            if let Some(c) = &caller {
+                c.require_permission("read:account")?;
+            }
+            let list_id = required_str(&obj, "listId")?;
+            let for_public = opt_bool(&obj, "forPublic", false)?;
+            let list = match state.services.lists.get_user_list(&list_id) {
+                Ok(Some(list)) => {
+                    let allowed = if !for_public && caller.is_some() {
+                        list.owner_id == caller.as_ref().unwrap().account.id
+                    } else {
+                        list.is_public
+                    };
+                    if !allowed {
+                        return Err(ApiError::user_list_no_such_list("users/lists/show"));
+                    }
+                    list
+                }
+                Ok(None) => return Err(ApiError::user_list_no_such_list("users/lists/show")),
+                Err(err) => return Err(ApiError::from_port_error(err)),
+            };
+            let members = state
+                .services
+                .lists
+                .members_of_list(&list.id)
+                .map_err(ApiError::from_port_error)?;
+            let ids = members.iter().map(|m| m.member_id.clone()).collect::<Vec<_>>();
+            let mut packed = pack_user_list(&list, &ids, &state.services);
+            if for_public && list.is_public {
+                let liked_count = state
+                    .services
+                    .lists
+                    .list_favorite_count(&list.id)
+                    .map_err(ApiError::from_port_error)?;
+                let is_liked = match &caller {
+                    Some(c) => state
+                        .services
+                        .lists
+                        .is_list_favorited(&c.account.id, &list.id)
+                        .map_err(ApiError::from_port_error)?,
+                    None => false,
+                };
+                if let Some(map) = packed.as_object_mut() {
+                    map.insert("likedCount".to_string(), serde_json::json!(liked_count));
+                    map.insert("isLiked".to_string(), Value::Bool(is_liked));
+                }
+            }
+            Ok(Json(packed).into_response())
+        }
+
+        // `users/lists/push {listId!, userId!}` → 204 (verbatim push
+        // errors; 1h/30 rate bucket like upstream).
+        "users/lists/push" => {
+            check_allowed_fields(&obj, &["listId", "userId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state.rate_limiter.check(&rate_key, "users/lists/push")?;
+            let list_id = required_str(&obj, "listId")?;
+            let user_id = required_str(&obj, "userId")?;
+            state
+                .services
+                .push_list_member(&caller.account.id, &list_id, &user_id)
+                .map_err(|e| map_list_error(e, "users/lists/push"))?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // `users/lists/pull {listId!, userId!}` → 204 (idempotent).
+        "users/lists/pull" => {
+            check_allowed_fields(&obj, &["listId", "userId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            let list_id = required_str(&obj, "listId")?;
+            let user_id = required_str(&obj, "userId")?;
+            state
+                .services
+                .pull_list_member(&caller.account.id, &list_id, &user_id)
+                .map_err(|e| map_list_error(e, "users/lists/pull"))?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // `users/lists/get-memberships {listId!, forPublic?, limit?, ...}`
+        // → 200 `[{id, createdAt, userId, user, withReplies}]`.
+        "users/lists/get-memberships" => {
+            check_allowed_fields(
+                &obj,
+                &[
+                    "listId",
+                    "forPublic",
+                    "limit",
+                    "sinceId",
+                    "untilId",
+                    "sinceDate",
+                    "untilDate",
+                ],
+            )?;
+            if let Some(c) = &caller {
+                c.require_permission("read:account")?;
+            }
+            let list_id = required_str(&obj, "listId")?;
+            let for_public = opt_bool(&obj, "forPublic", false)?;
+            let cursor = parse_list_cursor(&obj)?;
+            let list = match state.services.lists.get_user_list(&list_id) {
+                Ok(Some(list)) => {
+                    let allowed = if !for_public && caller.is_some() {
+                        list.owner_id == caller.as_ref().unwrap().account.id
+                    } else {
+                        list.is_public
+                    };
+                    if !allowed {
+                        return Err(ApiError::user_list_no_such_list(
+                            "users/lists/get-memberships",
+                        ));
+                    }
+                    list
+                }
+                Ok(None) => {
+                    return Err(ApiError::user_list_no_such_list(
+                        "users/lists/get-memberships",
+                    ));
+                }
+                Err(err) => return Err(ApiError::from_port_error(err)),
+            };
+            let mut members = state
+                .services
+                .lists
+                .members_of_list(&list.id)
+                .map_err(ApiError::from_port_error)?;
+            members.sort_by(|a, b| b.member_id.cmp(&a.member_id));
+            let mut out = Vec::new();
+            for m in members {
+                if out.len() >= cursor.limit {
+                    break;
+                }
+                if let Some(since) = cursor.since_id.as_deref() {
+                    if m.member_id.as_str() <= since {
+                        continue;
+                    }
+                }
+                if let Some(until) = cursor.until_id.as_deref() {
+                    if m.member_id.as_str() >= until {
+                        continue;
+                    }
+                }
+                let Some(member) = state
+                    .services
+                    .accounts
+                    .find_by_id(&m.member_id)
+                    .map_err(ApiError::from_port_error)?
+                else {
+                    continue;
+                };
+                let created_at = state
+                    .services
+                    .ids
+                    .parse_time(&m.id)
+                    .map(crate::activitypub::format_millis)
+                    .unwrap_or_else(|_| {
+                        crate::activitypub::format_millis(m.created_at_ms)
+                    });
+                out.push(serde_json::json!({
+                    "id": m.id,
+                    "createdAt": created_at,
+                    "userId": member.id,
+                    "user": pack_account_for(&member, caller.as_ref(), &state.services)?,
+                    "withReplies": m.with_replies,
+                }));
+            }
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        // `users/lists/update-membership {listId!, userId!, withReplies?}`
+        // → 204 (missing membership is a silent no-op, upstream parity).
+        "users/lists/update-membership" => {
+            check_allowed_fields(&obj, &["listId", "userId", "withReplies"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            let list_id = required_str(&obj, "listId")?;
+            let user_id = required_str(&obj, "userId")?;
+            let with_replies = opt_bool(&obj, "withReplies", false)?;
+            state
+                .services
+                .update_list_membership(&caller.account.id, &list_id, &user_id, with_replies)
+                .map_err(|e| map_list_error(e, "users/lists/update-membership"))?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // `users/lists/favorite|unfavorite {listId!}` → 204. Public lists
+        // only; dup/missing map to the verbatim favorite errors (note the
+        // unfavorite-miss quirk: wire code `ALREADY_FAVORITED`).
+        "users/lists/favorite" | "users/lists/unfavorite" => {
+            check_allowed_fields(&obj, &["listId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            let list_id = required_str(&obj, "listId")?;
+            let list = match state.services.lists.get_user_list(&list_id) {
+                Ok(Some(list)) if list.is_public => list,
+                Ok(_) => {
+                    return Err(ApiError::user_list_no_such_user_list(endpoint.as_str()));
+                }
+                Err(err) => return Err(ApiError::from_port_error(err)),
+            };
+            if endpoint.as_str() == "users/lists/favorite" {
+                let added = state
+                    .services
+                    .lists
+                    .favorite_list(&caller.account.id, &list.id)
+                    .map_err(ApiError::from_port_error)?;
+                if !added {
+                    return Err(ApiError::user_list_already_favorited());
+                }
+            } else {
+                let removed = state
+                    .services
+                    .lists
+                    .unfavorite_list(&caller.account.id, &list.id)
+                    .map_err(ApiError::from_port_error)?;
+                if !removed {
+                    return Err(ApiError::user_list_not_favorited());
+                }
+            }
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // `notes/user-list-timeline {listId!, ...}` → 200 packed notes.
+        // Owner-only pull read (verbatim timeline `NO_SUCH_LIST`).
+        "notes/user-list-timeline" => {
+            check_allowed_fields(
+                &obj,
+                &[
+                    "listId",
+                    "limit",
+                    "sinceId",
+                    "untilId",
+                    "sinceDate",
+                    "untilDate",
+                    "allowPartial",
+                    "includeMyRenotes",
+                    "includeRenotedMyNotes",
+                    "includeLocalRenotes",
+                    "withRenotes",
+                    "withFiles",
+                ],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:account")?;
+            let list_id = required_str(&obj, "listId")?;
+            let cursor = parse_cursor(&obj)?;
+            let include_my_renotes = opt_bool(&obj, "includeMyRenotes", true)?;
+            let include_renoted_my_notes = opt_bool(&obj, "includeRenotedMyNotes", true)?;
+            let include_local_renotes = opt_bool(&obj, "includeLocalRenotes", true)?;
+            let with_renotes = opt_bool(&obj, "withRenotes", true)?;
+            let with_files = opt_bool(&obj, "withFiles", false)?;
+            let notes = state
+                .services
+                .user_list_timeline(
+                    &list_id,
+                    &caller.account.id,
+                    &cursor,
+                    include_my_renotes,
+                    include_renoted_my_notes,
+                    include_local_renotes,
+                    with_renotes,
+                    with_files,
+                )
+                .map_err(|e| match e {
+                    PortError::NotFound(msg) if msg == "NO_SUCH_LIST" => {
+                        ApiError::user_list_no_such_list("notes/user-list-timeline")
+                    }
+                    other => ApiError::from_port_error(other),
+                })?;
+            pack_note_list(&state.services, &notes, Some(&caller.account.id))
         }
 
         "username/available" => {
@@ -4594,6 +5123,44 @@ fn api_dispatch_blocking(
             .into_response())
         }
 
+        "following/invalidate" => {
+            check_allowed_fields(&obj, &["userId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:following")?;
+            state.rate_limiter.check(&rate_key, "following/invalidate")?;
+            let follower_id = required_str(&obj, "userId")?;
+            if follower_id == caller.account.id {
+                return Err(ApiError::follower_is_yourself());
+            }
+            // Pinetree ids for unknown users differ from the invalidate
+            // endpoint UUID upstream, so map explicitly.
+            match state.services.users_show_by_id(&follower_id) {
+                Ok(_) => {}
+                Err(PortError::NotFound(_)) => return Err(ApiError::invalidate_no_such_user()),
+                Err(err) => return Err(ApiError::from_port_error(err)),
+            }
+            match state
+                .services
+                .remove_follower(&caller.account.id, &follower_id)
+            {
+                Ok(()) => {}
+                Err(PortError::NotFound(msg)) if msg.starts_with("NOT_FOLLOWING") => {
+                    return Err(ApiError::invalidate_not_following());
+                }
+                Err(err) => return Err(ApiError::from_port_error(err)),
+            }
+            let follower = state
+                .services
+                .users_show_by_id(&follower_id)
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(pack_user_lite(
+                &follower,
+                &state.services.public_url,
+                state.services.clock.now_ms(),
+            ))
+            .into_response())
+        }
+
         "following/requests/list" => {
             check_allowed_fields(&obj, &["limit", "sinceId", "untilId"])?;
             let caller = require_caller(caller)?;
@@ -5016,6 +5583,256 @@ fn api_dispatch_blocking(
             Ok(StatusCode::NO_CONTENT.into_response())
         }
 
+        // --- Batch O WP9: self-service ------------------------------------
+        // `i/change-password` (upstream `i/change-password.ts`): verify the
+        // current password first; untyped upstream failures map to
+        // `AUTHENTICATION_FAILED` (401, like the signin path) rather than
+        // Misskey's generic 500. 2FA (`token`) has no pinetree equivalent
+        // and is accepted-and-ignored. Sessions are NOT revoked (upstream
+        // does not revoke either).
+        "i/change-password" => {
+            check_allowed_fields(&obj, &["currentPassword", "newPassword", "token"])?;
+            let caller = require_caller(caller)?;
+            caller.require_secure()?;
+            state.rate_limiter.check(&rate_key, "i/change-password")?;
+            let current = required_str(&obj, "currentPassword")?;
+            let new = match obj.get("newPassword").and_then(Value::as_str) {
+                Some(new) if !new.is_empty() => new.to_string(),
+                _ => {
+                    return Err(ApiError::invalid_param(
+                        "newPassword",
+                        "must be a non-empty string",
+                    ));
+                }
+            };
+            let acct_key = format!("acctid:{}", caller.account.id);
+            let ip_key = auth_ip_key(&client_ip);
+            state
+                .rate_limiter
+                .check_auth_failures("auth/change-password", &acct_key, &ip_key)?;
+            let stored = state
+                .services
+                .auth
+                .get_password_hash(&caller.account.id)
+                .map_err(ApiError::from_port_error)?;
+            let ok = tokio::runtime::Handle::current()
+                .block_on(verify_and_upgrade_password(
+                    &state,
+                    &caller.account.id,
+                    &current,
+                    stored,
+                ))?;
+            if !ok {
+                state
+                    .rate_limiter
+                    .record_auth_failure("auth/change-password", &acct_key, &ip_key);
+                return Err(ApiError::authentication_failed());
+            }
+            let hash = tokio::runtime::Handle::current().block_on(hash_password_async(new))?;
+            state
+                .services
+                .auth
+                .set_password_hash(&caller.account.id, &hash)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // `i/regenerate-token` (upstream `i/regenerate-token.ts`): verify
+        // the password, then rotate the native token only. Pinetree native
+        // sessions are one row per login, so rotation deletes every
+        // first-party grant of the caller (the caller signs in again for the
+        // fresh token); app grants (`is_first_party: false`) keep working
+        // (owner decision §9.7 default).
+        "i/regenerate-token" => {
+            check_allowed_fields(&obj, &["password"])?;
+            let caller = require_caller(caller)?;
+            caller.require_secure()?;
+            state.rate_limiter.check(&rate_key, "i/regenerate-token")?;
+            let password = required_str(&obj, "password")?;
+            let acct_key = format!("acctid:{}", caller.account.id);
+            let ip_key = auth_ip_key(&client_ip);
+            state
+                .rate_limiter
+                .check_auth_failures("auth/regenerate-token", &acct_key, &ip_key)?;
+            let stored = state
+                .services
+                .auth
+                .get_password_hash(&caller.account.id)
+                .map_err(ApiError::from_port_error)?;
+            let ok = tokio::runtime::Handle::current()
+                .block_on(verify_and_upgrade_password(
+                    &state,
+                    &caller.account.id,
+                    &password,
+                    stored,
+                ))?;
+            if !ok {
+                state
+                    .rate_limiter
+                    .record_auth_failure("auth/regenerate-token", &acct_key, &ip_key);
+                return Err(ApiError::authentication_failed());
+            }
+            state
+                .services
+                .auth
+                .delete_account_first_party_tokens(&caller.account.id)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // `i/apps` (upstream `i/apps.ts`): the caller's token grants
+        // (every access-token row, including ad-hoc grants with no app).
+        // `lastUsedAt` is never tracked (DIVERGENCE: recording a write per
+        // request would double the hot-path store traffic), so the
+        // `lastUsedAt` sorts order by creation time instead.
+        "i/apps" => {
+            check_allowed_fields(&obj, &["sort"])?;
+            let caller = require_caller(caller)?;
+            caller.require_secure()?;
+            state.rate_limiter.check(&rate_key, "i/apps")?;
+            let sort = match obj.get("sort").and_then(Value::as_str) {
+                None => "default",
+                Some("+createdAt") | Some("-createdAt") | Some("+lastUsedAt")
+                | Some("-lastUsedAt") => obj.get("sort").and_then(Value::as_str).unwrap(),
+                Some(_) => {
+                    return Err(ApiError::invalid_param(
+                        "sort",
+                        "must be one of +createdAt, -createdAt, +lastUsedAt, -lastUsedAt",
+                    ));
+                }
+            };
+            let mut grants = state
+                .services
+                .auth
+                .tokens_for_account(&caller.account.id)
+                .map_err(ApiError::from_port_error)?;
+            grants.retain(|g| !g.is_first_party);
+            match sort {
+                "-createdAt" | "+lastUsedAt" => {
+                    grants.sort_by(|a, b| {
+                        b.created_at_ms.cmp(&a.created_at_ms).then_with(|| b.id.cmp(&a.id))
+                    });
+                }
+                _ => {
+                    grants.sort_by(|a, b| {
+                        a.created_at_ms.cmp(&b.created_at_ms).then_with(|| a.id.cmp(&b.id))
+                    });
+                }
+            }
+            let out: Vec<Value> = grants
+                .iter()
+                .map(|g| {
+                    serde_json::json!({
+                        "id": g.id,
+                        "name": g.name,
+                        "createdAt": crate::activitypub::format_millis(g.created_at_ms),
+                        "lastUsedAt": null,
+                        "permission": g.permissions,
+                        "iconUrl": g.icon_url,
+                        "description": g.description,
+                    })
+                })
+                .collect();
+            Ok(Json(out).into_response())
+        }
+
+        // `i/authorized-apps` (upstream `i/authorized-apps.ts`): the apps the
+        // caller authorized. Pinetree has no app registry, so every grant is
+        // ad-hoc and one row is emitted per grant in app shape
+        // (DIVERGENCE; upstream dedupes by registry app).
+        "i/authorized-apps" => {
+            check_allowed_fields(&obj, &["limit", "offset", "sort"])?;
+            let caller = require_caller(caller)?;
+            caller.require_secure()?;
+            state.rate_limiter.check(&rate_key, "i/authorized-apps")?;
+            let limit = match opt_usize(&obj, "limit")? {
+                None => 10,
+                Some(limit) if (1..=100).contains(&limit) => limit,
+                Some(_) => {
+                    return Err(ApiError::invalid_param(
+                        "limit",
+                        "must be an integer between 1 and 100",
+                    ));
+                }
+            };
+            let offset = opt_usize(&obj, "offset")?.unwrap_or(0);
+            let desc = match obj.get("sort").and_then(Value::as_str) {
+                None | Some("desc") => true,
+                Some("asc") => false,
+                Some(_) => {
+                    return Err(ApiError::invalid_param("sort", "must be one of desc, asc"));
+                }
+            };
+            let mut grants = state
+                .services
+                .auth
+                .tokens_for_account(&caller.account.id)
+                .map_err(ApiError::from_port_error)?;
+            grants.retain(|g| !g.is_first_party);
+            grants.sort_by(|a, b| {
+                if desc {
+                    b.created_at_ms.cmp(&a.created_at_ms).then_with(|| b.id.cmp(&a.id))
+                } else {
+                    a.created_at_ms.cmp(&b.created_at_ms).then_with(|| a.id.cmp(&b.id))
+                }
+            });
+            let out: Vec<Value> = grants
+                .iter()
+                .skip(offset)
+                .take(limit)
+                .map(|g| {
+                    serde_json::json!({
+                        "id": g.id,
+                        "name": g.name,
+                        "callbackUrl": null,
+                        "permission": g.permissions,
+                        "isAuthorized": true,
+                    })
+                })
+                .collect();
+            Ok(Json(out).into_response())
+        }
+
+        // `i/signin-history` (upstream `i/signin-history.ts`): cursor-paged
+        // signin attempts for the caller. Rows exist only from deploy
+        // forward (no backfill possible); trimmed to
+        // `MAX_SIGNIN_ROWS_PER_USER` per account.
+        "i/signin-history" => {
+            check_allowed_fields(
+                &obj,
+                &["limit", "sinceId", "untilId", "sinceDate", "untilDate"],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_secure()?;
+            state.rate_limiter.check(&rate_key, "i/signin-history")?;
+            let cursor = parse_cursor(&obj)?;
+            let rows = state
+                .services
+                .signin
+                .list_signins(
+                    &caller.account.id,
+                    cursor.limit,
+                    cursor.since_id.as_deref(),
+                    cursor.until_id.as_deref(),
+                    cursor.since_date,
+                    cursor.until_date,
+                )
+                .map_err(ApiError::from_port_error)?;
+            let out: Vec<Value> = rows
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "id": r.id,
+                        "createdAt": crate::activitypub::format_millis(r.created_at_ms),
+                        "ip": r.ip,
+                        "headers": serde_json::from_str::<Value>(&r.headers).unwrap_or(Value::Null),
+                        "success": r.success,
+                    })
+                })
+                .collect();
+            Ok(Json(out).into_response())
+        }
+
         "i/revoke-token" => {
             check_allowed_fields(&obj, &["token", "tokenId"])?;
             let caller = require_caller(caller)?;
@@ -5023,10 +5840,38 @@ fn api_dispatch_blocking(
             // are restricted to their own token below. No rate limit: token
             // revocation is rare and must never lock a user out.
             if obj.get("tokenId").is_some_and(|v| !v.is_null()) {
-                // Pinetree tokens are hash-addressed and no token ids are
-                // ever issued, so no `tokenId` can resolve: Misskey-parity
-                // no-op success for an unknown target (profile §3 deviation,
-                // logged in the phase-3 endpoints state log).
+                // Named-grant revocation (upstream `revoke-token.ts`
+                // `tokenId` branch): the grant must belong to the caller;
+                // anything else (unknown id, another account's grant) is a
+                // silent no-op success.
+                let token_id = match obj.get("tokenId").and_then(Value::as_str) {
+                    Some(id) if !id.is_empty() => id.to_string(),
+                    _ => {
+                        return Err(ApiError::invalid_param(
+                            "tokenId",
+                            "must be a non-empty string",
+                        ));
+                    }
+                };
+                let target = state
+                    .services
+                    .auth
+                    .get_token_by_id(&token_id)
+                    .map_err(ApiError::from_port_error)?;
+                let Some(target) = target else {
+                    return Ok(StatusCode::NO_CONTENT.into_response());
+                };
+                if target.account_id != caller.account.id {
+                    return Ok(StatusCode::NO_CONTENT.into_response());
+                }
+                if !caller.is_first_party && target.token_hash != hash_token(&caller.raw_token) {
+                    return Err(ApiError::permission_denied());
+                }
+                state
+                    .services
+                    .auth
+                    .delete_token_by_hash(&target.token_hash)
+                    .map_err(ApiError::from_port_error)?;
                 return Ok(StatusCode::NO_CONTENT.into_response());
             }
             let raw = match obj.get("token") {
@@ -5388,6 +6233,909 @@ fn api_dispatch_blocking(
             Ok(Json(pack_drive_file(&meta, &state.services)).into_response())
         }
 
+        // Batch P §1 email identity loop (upstream `i/update-email.ts`,
+        // `request-reset-password.ts`, `reset-password.ts`,
+        // `verify-email.ts`). Owner decision: NO SMTP is configured anywhere
+        // in this repo, so the loop is code-complete and dormant — the
+        // state transitions (store + verify + mint + TTL) are real, the
+        // send paths fail loudly (`EMAIL_NOT_CONFIGURED`) instead of
+        // silently dropping a password reset. Token/code lifecycle:
+        // `emailVerifyCode` 16 chars minted on update-email, cleared on
+        // verify; reset rows single-use with a 30-minute TTL read off the
+        // aidx id timestamp (upstream `reset-password.ts` parity — unknown
+        // or expired tokens answer 500 like upstream's bare throws).
+        "i/update-email" => {
+            check_allowed_fields(&obj, &["password", "email", "token"])?;
+            let caller = require_caller(caller)?;
+            caller.require_secure()?;
+            state.rate_limiter.check(&rate_key, "i/update-email")?;
+            let password = required_str(&obj, "password")?;
+            // 2FA `token`: accepted-and-ignored (no 2FA exists — same
+            // treatment as `i/change-password`).
+            let acct_key = format!("acctid:{}", caller.account.id);
+            let ip_key = auth_ip_key(&client_ip);
+            state
+                .rate_limiter
+                .check_auth_failures("auth/update-email", &acct_key, &ip_key)?;
+            let stored = state
+                .services
+                .auth
+                .get_password_hash(&caller.account.id)
+                .map_err(ApiError::from_port_error)?;
+            let ok = tokio::runtime::Handle::current().block_on(verify_and_upgrade_password(
+                &state,
+                &caller.account.id,
+                &password,
+                stored,
+            ))?;
+            if !ok {
+                state
+                    .rate_limiter
+                    .record_auth_failure("auth/update-email", &acct_key, &ip_key);
+                return Err(ApiError::update_email_incorrect_password());
+            }
+            let email = match obj.get("email") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => Some(s.clone()),
+                Some(_) => {
+                    return Err(ApiError::invalid_param("email", "must be a string"));
+                }
+            };
+            if let Some(addr) = email.as_deref() {
+                if !email_shape_valid(addr)
+                    || !email_available(&state.services, &caller.account.id, addr)?
+                {
+                    return Err(ApiError::update_email_unavailable());
+                }
+            }
+            // `emailRequiredForSignup` is always false here (see
+            // `pack_meta`), so clearing needs no `EMAIL_REQUIRED` branch —
+            // the constructor stays for parity coverage.
+            let code = email.as_deref().map(|_| random_code(16));
+            let updated = state
+                .services
+                .accounts
+                .update_account(
+                    &caller.account.id,
+                    UpdateAccountPatch {
+                        email: Some(email.clone()),
+                        email_verified: Some(false),
+                        email_verify_code: Some(code.clone()),
+                        ..Default::default()
+                    },
+                    Vec::new(),
+                )
+                .map_err(ApiError::from_port_error)?;
+            // Dormant transport: the verification link is minted and stored
+            // (exercisable via `verify-email`), but no mail leaves this
+            // server — the send is a loud no-op, logged, never silent.
+            if email.is_some() {
+                eprintln!(
+                    "email dormant: verification code for {} not sent (no SMTP configured)",
+                    caller.account.id
+                );
+            }
+            Ok(Json(
+                pack_me_detailed(&updated, caller.is_first_party, &state.services)
+                    .map_err(ApiError::from_port_error)?,
+            )
+            .into_response())
+        }
+
+        "request-reset-password" => {
+            check_allowed_fields(&obj, &["username", "email"])?;
+            state
+                .rate_limiter
+                .check(&rate_key, "request-reset-password")?;
+            let username = required_str(&obj, "username")?;
+            let email = required_str(&obj, "email")?;
+            // Information-leak posture (upstream: unknown user, email
+            // mismatch, and unverified address are all silently ignored).
+            // The dormant transport errors UNIFORMLY below, so no oracle
+            // distinguishes the cases (DIVERGENCE: without SMTP the
+            // endpoint cannot operate, so it fails loudly instead of
+            // silently dropping — uniformly, preserving the posture).
+            let candidate = state
+                .services
+                .accounts
+                .find_by_username_and_host(&username.to_lowercase(), None)
+                .map_err(ApiError::from_port_error)?
+                .filter(|acc| acc.is_local());
+            let mailable = candidate.as_ref().is_some_and(|acc| {
+                acc.email.as_deref() == Some(email.as_str()) && acc.email_verified
+            });
+            if mailable {
+                let acc = candidate.expect("filtered Some");
+                let token = random_code(64);
+                state
+                    .services
+                    .password_resets
+                    .create_reset_request(PasswordResetRequest {
+                        id: state.services.ids.generate(),
+                        user_id: acc.id.clone(),
+                        token,
+                    })
+                    .map_err(ApiError::from_port_error)?;
+            }
+            // The row above keeps the loop code-complete and testable
+            // (white-box token read); the user-visible send never happens.
+            Err(ApiError::email_not_configured())
+        }
+
+        "reset-password" => {
+            check_allowed_fields(&obj, &["token", "password"])?;
+            let token = required_str(&obj, "token")?;
+            let password = required_str(&obj, "password")?;
+            // Upstream parity: unknown tokens (`findOneByOrFail`) and
+            // expired rows (bare `throw`, 30-minute TTL) both answer 500.
+            let req = state
+                .services
+                .password_resets
+                .find_reset_request(&token)
+                .map_err(ApiError::from_port_error)?
+                .ok_or_else(ApiError::internal)?;
+            let issued = state
+                .services
+                .ids
+                .parse_time(&req.id)
+                .map_err(|_| ApiError::internal())?;
+            if state.services.clock.now_ms() - issued > 30 * 60 * 1000 {
+                let _ = state.services.password_resets.delete_reset_request(&req.id);
+                return Err(ApiError::internal());
+            }
+            if password.is_empty() {
+                return Err(ApiError::invalid_param(
+                    "password",
+                    "must be a non-empty string",
+                ));
+            }
+            let hash =
+                tokio::runtime::Handle::current().block_on(hash_password_async(password))?;
+            state
+                .services
+                .auth
+                .set_password_hash(&req.user_id, &hash)
+                .map_err(ApiError::from_port_error)?;
+            state
+                .services
+                .password_resets
+                .delete_reset_request(&req.id)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "verify-email" => {
+            check_allowed_fields(&obj, &["code"])?;
+            let code = required_str(&obj, "code")?;
+            let account = state
+                .services
+                .accounts
+                .find_by_email_verify_code(&code)
+                .map_err(ApiError::from_port_error)?
+                .ok_or_else(ApiError::verify_email_no_such_code)?;
+            state
+                .services
+                .accounts
+                .update_account(
+                    &account.id,
+                    UpdateAccountPatch {
+                        email_verified: Some(true),
+                        email_verify_code: Some(None),
+                        ..Default::default()
+                    },
+                    Vec::new(),
+                )
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // Batch P §2 account move (upstream `i/move.ts` +
+        // `AccountMoveService.moveFromLocal` + `postMoveProcess`): the only
+        // workstream here with federation consequences. Outbound `Move` and
+        // `Update(Person)` deliver to old followers via durable jobs
+        // committed in the SAME transaction as `movedToUri`; local
+        // followers unfollow-old + follow-new inline (paged, one txn per
+        // edge — FDB-safe for any follower count).
+        "i/move" => {
+            check_allowed_fields(&obj, &["moveToAccount"])?;
+            let caller = require_caller(caller)?;
+            caller.require_secure()?;
+            state.rate_limiter.check(&rate_key, "i/move")?;
+            let target_acct = required_str(&obj, "moveToAccount")?;
+            if target_acct.trim().is_empty() {
+                return Err(ApiError::move_no_such_user());
+            }
+            // Root refusal: pinetree has no `rootUserId` column — the
+            // instance's initial administrator (lowest account id among
+            // admins, DIVERGENCE) cannot migrate.
+            if caller.account.is_admin && is_oldest_admin(&state.services, &caller.account.id)? {
+                return Err(ApiError::move_root_forbidden());
+            }
+            if caller.account.moved_to_uri.is_some() {
+                return Err(ApiError::move_already_moved());
+            }
+            let (username, host) = parse_acct(&target_acct);
+            if username.is_empty() {
+                return Err(ApiError::move_no_such_user());
+            }
+            // Local-first resolution, then remote WebFinger + fetch
+            // (upstream `remoteUserResolveService.resolveUser` parity).
+            let destination = match state
+                .services
+                .users_show_by_username(&username, host.as_deref())
+            {
+                Ok(account) => account,
+                Err(PortError::NotFound(_)) => match host.as_deref() {
+                    Some(remote_host) if !remote_host.is_empty() => {
+                        webfinger_discover_actor_uri(
+                            &state.services.federation_http,
+                            &username,
+                            remote_host,
+                            None,
+                        )
+                        .ok()
+                        .and_then(|actor_uri| {
+                            fetch_and_upsert_remote_actor(
+                                &state.services,
+                                &state.services.federation_http,
+                                &actor_uri,
+                            )
+                            .ok()
+                        })
+                        .map(|(account, _)| account)
+                        .ok_or_else(ApiError::move_no_such_user)?
+                    }
+                    _ => return Err(ApiError::move_no_such_user()),
+                },
+                Err(err) => return Err(ApiError::from_port_error(err)),
+            };
+            let new_uri = if destination.is_local() {
+                destination.actor_url(&state.services.public_url)
+            } else {
+                destination.uri.clone().filter(|u| !u.is_empty()).ok_or_else(ApiError::move_uri_null)?
+            };
+            // Alias handshake: the destination must list the old account URI
+            // in `alsoKnownAs` (upstream substring `includes` parity), and
+            // must not itself have moved.
+            let from_url =
+                format!("{}/users/{}", state.services.public_url.trim_end_matches('/'), caller.account.id);
+            let allowed = destination
+                .also_known_as
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .any(|known| known.contains(&from_url));
+            if !allowed || destination.moved_to_uri.is_some() {
+                return Err(ApiError::move_destination_forbids());
+            }
+            let now_ms = state.services.clock.now_ms();
+            let mut also_known = caller.account.also_known_as.clone().unwrap_or_default();
+            if !also_known.iter().any(|u| u == &new_uri) {
+                also_known.push(new_uri.clone());
+            }
+            let activity_id = format!(
+                "{}/moves/{}/{}",
+                state.services.public_url.trim_end_matches('/'),
+                caller.account.id,
+                destination.id
+            );
+            let move_job = crate::federation::outbox::FederateDeliverPayload::MoveDelivered {
+                activity_id: activity_id.clone(),
+                account_id: caller.account.id.clone(),
+                new_actor_uri: new_uri.clone(),
+                new_account_id: destination.id.clone(),
+                inbox_override: None,
+            }
+            .into_job(
+                format!("federate:move:{}:{activity_id}", caller.account.id),
+                now_ms,
+            )
+            .map_err(ApiError::from_port_error)?;
+            let update_job = crate::federation::outbox::FederateDeliverPayload::ActorUpdated {
+                update_id: state.services.ids.generate(),
+                account_id: caller.account.id.clone(),
+                inbox_override: None,
+            }
+            .into_job(
+                format!("federate:move-update:{}:{now_ms}", caller.account.id),
+                now_ms,
+            )
+            .map_err(ApiError::from_port_error)?;
+            let updated = state
+                .services
+                .accounts
+                .update_account(
+                    &caller.account.id,
+                    UpdateAccountPatch {
+                        moved_to_uri: Some(new_uri.clone()),
+                        moved_at_ms: Some(now_ms),
+                        also_known_as: Some(Some(also_known)),
+                        ..Default::default()
+                    },
+                    vec![update_job, move_job],
+                )
+                .map_err(ApiError::from_port_error)?;
+            // `postMoveProcess` parity (inline, paged): local followers
+            // unfollow-old + follow-new. Remote followers learn via the
+            // delivered `Move`.
+            migrate_followers_to(&state.services, &caller.account.id, &destination.id)?;
+            Ok(Json(
+                pack_me_detailed(&updated, caller.is_first_party, &state.services)
+                    .map_err(ApiError::from_port_error)?,
+            )
+            .into_response())
+        }
+
+        // Batch P §3 `i/registry` (upstream `i/registry/*.ts` +
+        // `RegistryApiService`): per-user key-value store namespaced by
+        // (domain, scope, key). Domain scoping mirrors upstream exactly: the
+        // caller's access-token id when credentialed via token, else the
+        // explicit `domain` param (or null). Scope segments validate
+        // `^[a-zA-Z0-9_]+$`. Straight key-value — no federation, no jobs.
+        "i/registry/get" => {
+            check_allowed_fields(&obj, &["key", "scope", "domain"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:account")?;
+            let key = required_str(&obj, "key")?;
+            let scope = parse_registry_scope(&obj)?;
+            let domain = registry_domain(&state.services, &caller, &obj)?;
+            let item = state
+                .services
+                .registry
+                .registry_get(&caller.account.id, domain.as_deref(), &scope, &key)
+                .map_err(ApiError::from_port_error)?
+                .ok_or_else(ApiError::registry_no_such_key)?;
+            Ok(Json(item.value).into_response())
+        }
+
+        "i/registry/set" => {
+            check_allowed_fields(&obj, &["key", "value", "scope", "domain"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            let key = required_str(&obj, "key")?;
+            if key.is_empty() {
+                return Err(ApiError::invalid_param("key", "must be a non-empty string"));
+            }
+            let value = obj.get("value").cloned().ok_or_else(|| {
+                ApiError::invalid_param("value", "this field is required")
+            })?;
+            let scope = parse_registry_scope(&obj)?;
+            let domain = registry_domain(&state.services, &caller, &obj)?;
+            state
+                .services
+                .registry
+                .registry_set(RegistryItem {
+                    id: state.services.ids.generate(),
+                    user_id: caller.account.id.clone(),
+                    domain,
+                    scope,
+                    key,
+                    value,
+                    updated_at_ms: state.services.clock.now_ms(),
+                })
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "i/registry/get-all" => {
+            check_allowed_fields(&obj, &["scope", "domain"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:account")?;
+            let scope = parse_registry_scope(&obj)?;
+            let domain = registry_domain(&state.services, &caller, &obj)?;
+            let items = state
+                .services
+                .registry
+                .registry_list(&caller.account.id, domain.as_deref(), &scope)
+                .map_err(ApiError::from_port_error)?;
+            let mut out = Map::new();
+            for item in items {
+                out.insert(item.key, item.value);
+            }
+            Ok(Json(Value::Object(out)).into_response())
+        }
+
+        "i/registry/get-detail" => {
+            check_allowed_fields(&obj, &["key", "scope", "domain"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:account")?;
+            let key = required_str(&obj, "key")?;
+            let scope = parse_registry_scope(&obj)?;
+            let domain = registry_domain(&state.services, &caller, &obj)?;
+            let item = state
+                .services
+                .registry
+                .registry_get(&caller.account.id, domain.as_deref(), &scope, &key)
+                .map_err(ApiError::from_port_error)?
+                .ok_or_else(ApiError::registry_no_such_key)?;
+            Ok(Json(serde_json::json!({
+                "value": item.value,
+                "updatedAt": crate::activitypub::format_millis(item.updated_at_ms),
+            }))
+            .into_response())
+        }
+
+        "i/registry/keys" => {
+            check_allowed_fields(&obj, &["scope", "domain"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:account")?;
+            let scope = parse_registry_scope(&obj)?;
+            let domain = registry_domain(&state.services, &caller, &obj)?;
+            let items = state
+                .services
+                .registry
+                .registry_list(&caller.account.id, domain.as_deref(), &scope)
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(Value::Array(
+                items.into_iter().map(|item| Value::String(item.key)).collect(),
+            ))
+            .into_response())
+        }
+
+        "i/registry/keys-with-type" => {
+            check_allowed_fields(&obj, &["scope", "domain"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:account")?;
+            let scope = parse_registry_scope(&obj)?;
+            let domain = registry_domain(&state.services, &caller, &obj)?;
+            let items = state
+                .services
+                .registry
+                .registry_list(&caller.account.id, domain.as_deref(), &scope)
+                .map_err(ApiError::from_port_error)?;
+            let mut out = Map::new();
+            for item in items {
+                // `typeof value` parity: JSON null/array/object all read
+                // `object`, like upstream `typeof`.
+                let kind = match &item.value {
+                    Value::String(_) => "string",
+                    Value::Number(_) => "number",
+                    Value::Bool(_) => "boolean",
+                    _ => "object",
+                };
+                out.insert(item.key, Value::String(kind.to_string()));
+            }
+            Ok(Json(Value::Object(out)).into_response())
+        }
+
+        "i/registry/remove" => {
+            check_allowed_fields(&obj, &["key", "scope", "domain"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            let key = required_str(&obj, "key")?;
+            let scope = parse_registry_scope(&obj)?;
+            let domain = registry_domain(&state.services, &caller, &obj)?;
+            state
+                .services
+                .registry
+                .registry_remove(&caller.account.id, domain.as_deref(), &scope, &key)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "i/registry/scopes-with-domain" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:account")?;
+            let pairs = state
+                .services
+                .registry
+                .registry_scopes(&caller.account.id)
+                .map_err(ApiError::from_port_error)?;
+            let out: Vec<Value> = pairs
+                .into_iter()
+                .map(|(domain, scopes)| {
+                    serde_json::json!({
+                        "domain": domain,
+                        "scopes": scopes,
+                    })
+                })
+                .collect();
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        // Batch P §4 small reads + §5 mentions + §6 notifications + §7
+        // discovery + §8 versions/translate. Per-endpoint upstream pins in
+        // each arm; DIVERGENCEs recorded in the manifest (§35).
+        "get-online-users-count" => {
+            check_allowed_fields(&obj, &[])?;
+            // "Online" is defined by OUR streaming hub presence (live
+            // authenticated sockets seen within 10 min), not Redis
+            // heartbeats — we have no Redis (DIVERGENCE, hub docs).
+            let count = state
+                .hub
+                .online_count(state.services.clock.now_ms(), ONLINE_THRESHOLD_MS);
+            Ok(Json(serde_json::json!({ "count": count })).into_response())
+        }
+
+        "pinned-users" => {
+            check_allowed_fields(&obj, &[])?;
+            // Upstream reads `meta.pinnedUsers` (admin-set accts). Pinetree
+            // has no admin surface for pinning users, so the configured set
+            // is empty — shape-compatible `[]`, recorded in the manifest.
+            Ok(Json(Value::Array(Vec::new())).into_response())
+        }
+
+        "fetch-external-resources" => {
+            check_allowed_fields(&obj, &["url", "hash"])?;
+            let caller = require_caller(caller)?;
+            caller.require_secure()?;
+            state
+                .rate_limiter
+                .check(&rate_key, "fetch-external-resources")?;
+            let url = required_str(&obj, "url")?;
+            let hash = required_str(&obj, "hash")?;
+            // SSRF-guarded fetch (same client as federation input); 1 MiB
+            // cap. Upstream `getJson` parses any body as JSON.
+            let resp = state
+                .services
+                .federation_http
+                .send("GET", &url, &[], None, 1_048_576)
+                .map_err(|e| ApiError::invalid_param("url", &e.to_string()))?;
+            if !(200..300).contains(&resp.status) {
+                return Err(ApiError::invalid_param(
+                    "url",
+                    &format!("fetch returned HTTP {}", resp.status),
+                ));
+            }
+            let body: Value = serde_json::from_slice(&resp.body)
+                .map_err(|_| ApiError::ext_resource_invalid_schema())?;
+            let (kind, data) = match (&body.get("type"), &body.get("data")) {
+                (Some(Value::String(kind)), Some(Value::String(data))) => {
+                    (kind.clone(), data.clone())
+                }
+                _ => return Err(ApiError::ext_resource_invalid_schema()),
+            };
+            // Upstream parity: sha512 hex of the data with CRLF normalized
+            // to LF must equal `hash`.
+            let normalized = data.replace("\r\n", "\n");
+            let digest = {
+                use sha2::Digest as _;
+                hex::encode(sha2::Sha512::digest(normalized.as_bytes()).as_slice())
+            };
+            if digest != hash.to_lowercase() {
+                return Err(ApiError::ext_resource_hash_mismatch());
+            }
+            Ok(Json(serde_json::json!({ "type": kind, "data": data })).into_response())
+        }
+
+        "fetch-rss" => {
+            check_allowed_fields(&obj, &["url"])?;
+            state.rate_limiter.check(&rate_key, "fetch-rss")?;
+            let url = required_str(&obj, "url")?;
+            if !is_fetchable_http_url(&url) {
+                return Err(ApiError::fetch_rss_invalid_url());
+            }
+            let feed = fetch_rss_feed(&state.services, &url)?;
+            Ok(Json(feed).into_response())
+        }
+
+        "server-info" => {
+            check_allowed_fields(&obj, &[])?;
+            Ok(Json(pack_server_info()).into_response())
+        }
+
+        "stats" => {
+            check_allowed_fields(&obj, &[])?;
+            let (notes, local_notes, users, local_users, reactions, instances, drive_local, drive_remote) =
+                state
+                    .services
+                    .instance_stats()
+                    .map_err(ApiError::from_port_error)?;
+            Ok(Json(serde_json::json!({
+                "notesCount": notes,
+                "originalNotesCount": local_notes,
+                "usersCount": users,
+                "originalUsersCount": local_users,
+                "reactionsCount": reactions,
+                "instances": instances,
+                "driveUsageLocal": drive_local,
+                "driveUsageRemote": drive_remote,
+            }))
+            .into_response())
+        }
+
+        "notes/mentions" => {
+            check_allowed_fields(
+                &obj,
+                &[
+                    "following",
+                    "limit",
+                    "sinceId",
+                    "untilId",
+                    "sinceDate",
+                    "untilDate",
+                    "visibility",
+                ],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:account")?;
+            let following = opt_bool(&obj, "following", false)?;
+            let cursor = parse_cursor(&obj)?;
+            // Upstream `visibility` is a free string equality filter on the
+            // note's visibility (no validation — unknown values match
+            // nothing). Mirror: parse strictly, unknown → empty page.
+            let visibility = match obj.get("visibility") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => match s.as_str() {
+                    "public" => Some(Visibility::Public),
+                    "home" => Some(Visibility::Home),
+                    "followers" => Some(Visibility::Followers),
+                    "specified" => Some(Visibility::Specified),
+                    _ => {
+                        return Ok(Json(Value::Array(Vec::new())).into_response());
+                    }
+                },
+                Some(_) => {
+                    return Err(ApiError::invalid_param(
+                        "visibility",
+                        "must be a string",
+                    ))
+                }
+            };
+            let notes = state
+                .services
+                .mentions_timeline(&caller.account.id, following, visibility, &cursor)
+                .map_err(ApiError::from_port_error)?;
+            pack_note_list(&state.services, &notes, Some(&caller.account.id))
+        }
+
+        // Batch P §6 notification utilities (upstream
+        // `notifications/test-notification.ts` + `flush.ts`).
+        "notifications/test-notification" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:notifications")?;
+            state
+                .rate_limiter
+                .check(&rate_key, "notifications/test-notification")?;
+            // Type `test` through the normal `Notify` path (self-notified;
+            // the worker's notifier-less gate keeps it deliverable, so type
+            // filters + grouped rendering exercise it).
+            state
+                .services
+                .send_test_notification(&caller.account.id)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "notifications/flush" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:notifications")?;
+            // Closest honest equivalent of `flushAllNotifications` (which
+            // drops the Redis timeline + latest-read pointer): our
+            // notifications are durable rows, so flush marks everything read
+            // and emits the upstream `notificationFlushed` main event
+            // (DIVERGENCE, manifest §35).
+            state
+                .services
+                .mark_all_notifications_read(&caller.account.id)
+                .map_err(ApiError::from_port_error)?;
+            state
+                .services
+                .streaming
+                .push_main(crate::application::events::MainMessage {
+                    user_id: caller.account.id.clone(),
+                    kind: crate::application::events::MainEventKind::NotificationFlushed,
+                    body: Value::Null,
+                })
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // Batch P §7 discovery (upstream `users/recommendation.ts` shape +
+        // Sharkey `notes/recommendations.ts` shape, documented-simplified
+        // scoring over the local graph — featured-ranking precedent,
+        // DIVERGENCE, manifest §35).
+        "users/recommendation" => {
+            check_allowed_fields(&obj, &["limit", "offset"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:account")?;
+            let limit = get_limit(&obj)?.clamp(1, 100);
+            let offset = opt_i64(&obj, "offset")?.unwrap_or(0).max(0) as usize;
+            let users = state
+                .services
+                .recommended_users(&caller.account.id, limit, offset)
+                .map_err(ApiError::from_port_error)?;
+            let mut out = Vec::with_capacity(users.len());
+            for account in &users {
+                out.push(
+                    pack_user_detailed_not_me(account, Some(&caller.account.id), &state.services)
+                        .map_err(ApiError::from_port_error)?,
+                );
+            }
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        "notes/recommendations" => {
+            check_allowed_fields(
+                &obj,
+                &["limit", "offset", "refresh", "lang", "withSensitive", "withRenotes"],
+            )?;
+            let viewer_id = caller.as_ref().map(|c| c.account.id.as_str());
+            let limit = get_limit(&obj)?.clamp(1, 30);
+            let offset = opt_i64(&obj, "offset")?.unwrap_or(0).max(0) as usize;
+            // `refresh` (re-rank) and `lang` (language lanes) are
+            // accepted-and-ignored: no algorithmic-feed infrastructure
+            // (non-goal, manifest §35).
+            let with_sensitive = opt_bool(&obj, "withSensitive", false)?;
+            let with_renotes = opt_bool(&obj, "withRenotes", true)?;
+            let notes = state
+                .services
+                .recommended_notes(viewer_id, limit, offset, with_renotes, with_sensitive)
+                .map_err(ApiError::from_port_error)?;
+            pack_note_list(&state.services, &notes, viewer_id)
+        }
+
+        // Batch P §8 versions (Sharkey `notes/versions.ts` SHAPE parity:
+        // `{oldDate, updatedAt, text}[]` newest-first) over our `note_edits`
+        // rows. Read-only; author-or-public visibility.
+        "notes/versions" => {
+            check_allowed_fields(&obj, &["noteId"])?;
+            state.rate_limiter.check(&rate_key, "notes/versions")?;
+            let note_id = required_str(&obj, "noteId")?;
+            let viewer_id = caller.as_ref().map(|c| c.account.id.as_str());
+            let note = state
+                .services
+                .notes
+                .get_note(&note_id)
+                .map_err(ApiError::from_port_error)?
+                .filter(|n| !n.is_deleted)
+                .ok_or_else(|| {
+                    ApiError::from_port_error(PortError::NotFound("NO_SUCH_NOTE".to_string()))
+                })?;
+            // Upstream order: visibility query first (miss → NO_SUCH_NOTE),
+            // then the signin gate.
+            state
+                .services
+                .notes_show(&note_id, viewer_id)
+                .map_err(|_| {
+                    ApiError::from_port_error(PortError::NotFound("NO_SUCH_NOTE".to_string()))
+                })?;
+            if viewer_id.is_none() {
+                let author = state
+                    .services
+                    .accounts
+                    .find_by_id(&note.author_id)
+                    .map_err(ApiError::from_port_error)?;
+                if author.is_some_and(|a| a.require_signin_to_view_contents) {
+                    return Err(ApiError::versions_signin_required());
+                }
+            }
+            let mut edits = state
+                .services
+                .notes
+                .note_edits(&note_id)
+                .map_err(ApiError::from_port_error)?;
+            edits.sort_by(|a, b| b.old_date_ms.cmp(&a.old_date_ms));
+            let out: Vec<Value> = edits
+                .into_iter()
+                .map(|edit| {
+                    serde_json::json!({
+                        "oldDate": crate::activitypub::format_millis(edit.old_date_ms),
+                        "updatedAt": crate::activitypub::format_millis(edit.updated_at_ms),
+                        "text": edit.old_text.or(edit.new_text),
+                    })
+                })
+                .collect();
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        // Batch P §8 translate (upstream `notes/translate.ts` order +
+        // errors; dormant DeepL-compatible transport — config keys reserved,
+        // no backend wired, loud `TRANSLATE_NOT_CONFIGURED` posture).
+        "notes/translate" => {
+            check_allowed_fields(&obj, &["noteId", "targetLang"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:account")?;
+            let note_id = required_str(&obj, "noteId")?;
+            let target_lang = required_str(&obj, "targetLang")?;
+            let note = state
+                .services
+                .notes
+                .get_note(&note_id)
+                .map_err(ApiError::from_port_error)?
+                .filter(|n| !n.is_deleted)
+                .ok_or_else(|| {
+                    ApiError::from_port_error(PortError::NotFound("NO_SUCH_NOTE".to_string()))
+                })?;
+            // Visibility first (miss/invisible →
+            // `CANNOT_TRANSLATE_INVISIBLE_NOTE`, upstream parity).
+            if state
+                .services
+                .notes_show(&note_id, Some(&caller.account.id))
+                .is_err()
+            {
+                return Err(ApiError::translate_invisible_note());
+            }
+            let mut text = note.text.clone().unwrap_or_default();
+            if let Some(cw) = note.cw.as_deref() {
+                text = format!("{cw}\n-----\n{text}");
+            }
+            if text.trim().is_empty() {
+                return Ok(Json(Value::Null).into_response());
+            }
+            // Upstream truncates `targetLang` at `-` (parity, before use).
+            let _target = target_lang.split('-').next().unwrap_or(&target_lang);
+            // No backend configured → loud failure (never proxy arbitrary
+            // fetch — translate path only, dormant until wired).
+            Err(ApiError::translate_not_configured())
+        }
+
+        // Batch O WP13 `drive/files/upload-from-url` (upstream        // `drive/files/upload-from-url.ts` + `DriveService.uploadFromUrl`):
+        // fetch + store synchronously, return the packed file. `folderId`
+        // stays null-only (no folders); `marker` is opaque (accepted,
+        // ignored — no `urlUploadFinished` stream event exists); `force`
+        // follows the local dedup semantics.
+        "drive/files/upload-from-url" => {
+            check_allowed_fields(
+                &obj,
+                &["url", "folderId", "isSensitive", "comment", "marker", "force"],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:drive")?;
+            state
+                .rate_limiter
+                .check(&rate_key, "drive/files/upload-from-url")?;
+            let url = required_str(&obj, "url")?;
+            if let Some(folder) = obj.get("folderId") {
+                if !folder.is_null() {
+                    return Err(ApiError::invalid_param(
+                        "folderId",
+                        "folders are unsupported; folderId must be null",
+                    ));
+                }
+            }
+            let comment = match obj.get("comment") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => {
+                    if s.chars().count() > 512 {
+                        return Err(ApiError::invalid_param(
+                            "comment",
+                            "must be at most 512 chars",
+                        ));
+                    }
+                    Some(s.clone())
+                }
+                Some(_) => {
+                    return Err(ApiError::invalid_param("comment", "must be a string"));
+                }
+            };
+            let is_sensitive = opt_bool(&obj, "isSensitive", false)?;
+            let force = opt_bool(&obj, "force", false)?;
+            let meta = state
+                .services
+                .upload_media_from_url(&caller.account.id, &url, comment, is_sensitive, force)
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(pack_drive_file(&meta, &state.services)).into_response())
+        }
+
+        // Batch O WP13 `drive/files/find-by-hash` (upstream
+        // `drive/files/find-by-hash.ts`): owner-scoped md5 lookup over the
+        // `hash` column pinetree already stores at ingest. Never matched
+        // against SHA-256 blob keys.
+        "drive/files/find-by-hash" => {
+            check_allowed_fields(&obj, &["md5"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:drive")?;
+            state
+                .rate_limiter
+                .check(&rate_key, "drive/files/find-by-hash")?;
+            let md5 = required_str(&obj, "md5")?;
+            let meta = state
+                .services
+                .media
+                .find_by_owner_and_hash(&caller.account.id, &md5)
+                .map_err(ApiError::from_port_error)?;
+            match meta {
+                Some(meta) => Ok(Json(pack_drive_file(&meta, &state.services)).into_response()),
+                None => Err(ApiError::from_port_error(PortError::NotFound(
+                    "NO_SUCH_FILE".to_string(),
+                ))),
+            }
+        }
+
         "drive/files/update" => {
             check_allowed_fields(&obj, &["fileId", "isSensitive", "comment", "name"])?;
             let caller = require_caller(caller)?;
@@ -5516,10 +7264,14 @@ fn api_dispatch_blocking(
             pack_note_list(&state.services, &notes, viewer_id)
         }
 
-        "ap/show" => {
+        "ap/show" | "ap/get" => {
             check_allowed_fields(&obj, &["uri"])?;
             let caller = require_caller(caller)?;
             caller.require_permission("read:account")?;
+            // `ap/get` is the admin-debug alias (upstream `ap/get.ts` is
+            // admin-only 30/h): same packed-output shape as `ap/show`, never
+            // the raw-object return, credential always required.
+            state.rate_limiter.check(&rate_key, endpoint.as_str())?;
             let uri = required_str(&obj, "uri")?;
             let viewer_id = Some(caller.account.id.as_str());
             let base = state.services.public_url.trim_end_matches('/').to_string();
@@ -5662,6 +7414,23 @@ fn api_dispatch_blocking(
                     }
                 }
                 Err(_) => Err(no_such_object()),
+            }
+        }
+
+        // --- Batch O WP12: first-party link preview ------------------------
+        // `url-preview` (Keystone-requested, NOT a Misskey endpoint):
+        // credential required (anonymous preview is an open proxy); SSRF
+        // guard + timeouts + redirect cap + size cap via `federation_http`;
+        // OpenGraph + `<title>` only; process-memory cache (NOT the store).
+        "url-preview" => {
+            check_allowed_fields(&obj, &["url"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:account")?;
+            state.rate_limiter.check(&rate_key, "url-preview")?;
+            let url = required_str(&obj, "url")?;
+            match crate::api::misskey::preview::fetch_preview(&state.services.federation_http, &url) {
+                Ok(value) => Ok(Json(value).into_response()),
+                Err(detail) => Err(ApiError::invalid_param("url", &detail)),
             }
         }
 
@@ -6407,6 +8176,463 @@ fn api_dispatch_blocking(
     }
 }
 
+/// Parse + validate an `i/registry` scope array: default `[]`, every
+/// segment matching upstream `^[a-zA-Z0-9_]+$`.
+fn parse_registry_scope(obj: &Map<String, Value>) -> Result<Vec<String>, ApiError> {
+    match obj.get("scope") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => {
+            let mut scope = Vec::with_capacity(items.len());
+            for item in items {
+                match item.as_str() {
+                    Some(s)
+                        if !s.is_empty()
+                            && s.bytes().all(|b| {
+                                b.is_ascii_alphanumeric() || b == b'_'
+                            }) =>
+                    {
+                        scope.push(s.to_string())
+                    }
+                    _ => {
+                        return Err(ApiError::invalid_param(
+                            "scope",
+                            "segments must match ^[a-zA-Z0-9_]+$",
+                        ))
+                    }
+                }
+            }
+            Ok(scope)
+        }
+        Some(_) => Err(ApiError::invalid_param("scope", "must be an array of strings")),
+    }
+}
+
+/// Resolve a registry call's domain (upstream `RegistryApiService` call
+/// parity): the caller's access-token id when credentialed, else the
+/// explicit `domain` param (or null). Token-id resolution failure falls
+/// back to the explicit param — a missing grant row must not fail the
+/// registry call.
+fn registry_domain(
+    services: &AppServices,
+    caller: &AuthenticatedCaller,
+    obj: &Map<String, Value>,
+) -> Result<Option<String>, ApiError> {
+    let explicit = match obj.get("domain") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => {
+            return Err(ApiError::invalid_param("domain", "must be a string"));
+        }
+    };
+    let token_id = services
+        .auth
+        .get_token_by_hash(&hash_token(&caller.raw_token))
+        .map_err(ApiError::from_port_error)?
+        .map(|record| record.id);
+    Ok(token_id.or(explicit))
+}
+
+/// Batch P helpers (email identity loop + account move + small reads).
+///
+/// Lowercase-alphanumeric random code (`EmailService` `secureRndstr`
+/// parity: `L_CHARS`).
+fn random_code(len: usize) -> String {
+    const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    (0..len)
+        .map(|_| {
+            let i = (rand::random::<u8>() as usize) % CHARS.len();
+            CHARS[i] as char
+        })
+        .collect()
+}
+
+/// Basic email shape check (upstream `validateEmailForAccount` parity on
+/// the shape half: one `@`, non-empty local/domain, dot in domain,
+/// 3..=254 chars).
+fn email_shape_valid(addr: &str) -> bool {
+    if addr.len() < 3 || addr.len() > 254 {
+        return false;
+    }
+    let mut parts = addr.split('@');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(local), Some(domain), None) => {
+            !local.is_empty() && !domain.is_empty() && domain.contains('.')
+        }
+        _ => false,
+    }
+}
+
+/// Email availability (upstream `validateEmailForAccount` parity on the
+/// uniqueness half): no OTHER account holds a VERIFIED copy of this address
+/// (case-insensitive; unverified rows do not block, like upstream).
+fn email_available(
+    services: &AppServices,
+    account_id: &str,
+    addr: &str,
+) -> Result<bool, ApiError> {
+    let needle = addr.to_lowercase();
+    let mut after: Option<String> = None;
+    loop {
+        let (page, next) = services
+            .accounts
+            .all_accounts(after.as_deref(), 500)
+            .map_err(ApiError::from_port_error)?;
+        if page.is_empty() {
+            return Ok(true);
+        }
+        for acc in page {
+            after = Some(acc.id.clone());
+            if acc.id != account_id {
+                if let Some(email) = acc.email.as_deref() {
+                    if acc.email_verified && email.to_lowercase() == needle {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        if next.is_none() {
+            return Ok(true);
+        }
+    }
+}
+
+/// Split `user` / `user@host` (upstream `Acct.parse` parity).
+fn parse_acct(acct: &str) -> (String, Option<String>) {
+    let trimmed = acct.trim().trim_start_matches('@');
+    match trimmed.split_once('@') {
+        Some((user, host)) => (user.to_string(), Some(host.to_string())),
+        None => (trimmed.to_string(), None),
+    }
+}
+
+/// Root check for `i/move` (upstream `meta.rootUserId` parity): pinetree
+/// stores no root id, so root is the instance's initial administrator —
+/// the lowest account id among admins (DIVERGENCE, documented).
+fn is_oldest_admin(services: &AppServices, account_id: &str) -> Result<bool, ApiError> {
+    let mut after: Option<String> = None;
+    loop {
+        let (page, next) = services
+            .accounts
+            .all_accounts(after.as_deref(), 500)
+            .map_err(ApiError::from_port_error)?;
+        if page.is_empty() {
+            return Ok(false);
+        }
+        for acc in page {
+            after = Some(acc.id.clone());
+            if acc.is_admin && acc.id.as_str() < account_id {
+                return Ok(false);
+            }
+        }
+        if next.is_none() {
+            return Ok(true);
+        }
+    }
+}
+
+/// `postMoveProcess` follow migration parity (shared by outbound `i/move`
+/// and inbound `Move`): every LOCAL follower of `old_id` unfollows it and
+/// follows `new_id`. Paged, one transaction per edge; already-migrated
+/// pairs converge (stale old edge dropped, existing new edge kept).
+fn migrate_followers_to(
+    services: &AppServices,
+    old_id: &str,
+    new_id: &str,
+) -> Result<(), ApiError> {
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = services
+            .follows
+            .followers_of(old_id, cursor.as_deref(), 100)
+            .map_err(ApiError::from_port_error)?;
+        if page.is_empty() {
+            break;
+        }
+        for edge in &page {
+            cursor = Some(edge.id.clone());
+            let follower = services
+                .accounts
+                .find_by_id(&edge.follower_id)
+                .map_err(ApiError::from_port_error)?;
+            let Some(follower) = follower else {
+                continue;
+            };
+            if !follower.is_local() || follower.id == *new_id {
+                continue;
+            }
+            if services
+                .follows
+                .is_following(&follower.id, new_id)
+                .map_err(ApiError::from_port_error)?
+            {
+                let _ = services.unfollow(&follower.id, old_id);
+                continue;
+            }
+            let _ = services.unfollow(&follower.id, old_id);
+            let _ = services.follow(&follower.id, new_id, false);
+        }
+        if page.len() < 100 {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// True for absolute `http(s)` URLs (Batch P `fetch-rss`
+/// `INVALID_URL` parity: only http(s) may be fetched, like the SSRF-guarded
+/// federation client).
+fn is_fetchable_http_url(url: &str) -> bool {
+    let lower = url.trim().to_lowercase();
+    (lower.starts_with("http://") || lower.starts_with("https://")) && !url.trim().contains([' ', '\t', '\n'])
+}
+
+/// Minimal RSS 2.0 + Atom fetch-and-parse (Batch P `fetch-rss`; upstream
+/// uses `rss-parser`). Shape-compatible subset: feed `title`/`link`/
+/// `description`/`feedUrl` + per-item `title`/`link`/`guid`/`pubDate`/
+/// `creator`/`summary`/`content`/`isoDate`/`categories`. Omitted (recorded):
+/// `image`, `paginationLinks`, `itunes`, per-item `contentSnippet` and
+/// `enclosure`. SSRF-guarded fetch, 1 MiB cap; failures answer
+/// `FETCH_RSS_FAILED` (422), bad URLs `INVALID_URL` (400).
+fn fetch_rss_feed(services: &AppServices, url: &str) -> Result<Value, ApiError> {
+    let resp = services
+        .federation_http
+        .send("GET", url, &[], None, 1_048_576)
+        .map_err(|_| ApiError::fetch_rss_failed())?;
+    if !(200..300).contains(&resp.status) {
+        return Err(ApiError::fetch_rss_failed());
+    }
+    let text = String::from_utf8(resp.body).map_err(|_| ApiError::fetch_rss_failed())?;
+    parse_rss_feed(&text, url).ok_or_else(ApiError::fetch_rss_failed)
+}
+
+/// Scan one `<tag ...>body</tag>` occurrence (first) out of `xml`.
+/// Attribute-aware open-tag match, CDATA unwrapped, entities decoded.
+fn xml_tag(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let start = xml.find(open.as_str())?;
+    let after_open = xml[start..].find('>')? + start + 1;
+    let end = xml[after_open..].find(close.as_str())? + after_open;
+    Some(xml_unescape(xml_cdata(&xml[after_open..end]).trim()))
+}
+
+/// All `<tag ...>body</tag>` occurrences in order.
+fn xml_tags(xml: &str, tag: &str) -> Vec<String> {
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find(open.as_str()) {
+        let Some(gt) = rest[start..].find('>') else { break };
+        let body_start = start + gt + 1;
+        let Some(end) = rest[body_start..].find(close.as_str()) else { break };
+        out.push(xml_unescape(xml_cdata(&rest[body_start..body_start + end]).trim()));
+        rest = &rest[body_start + end + close.len()..];
+    }
+    out
+}
+
+fn xml_cdata(s: &str) -> String {
+    let trimmed = s.trim();
+    if trimmed.starts_with("<![CDATA[") && trimmed.ends_with("]]>") {
+        trimmed[9..trimmed.len() - 3].to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+fn xml_unescape(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#39;", "'")
+}
+
+/// Attribute value `attr="..."` (or `'...'`) on the first `<tag ...>` open
+/// tag in `xml`.
+fn xml_attr(xml: &str, tag: &str, attr: &str) -> Option<String> {
+    let open = format!("<{tag}");
+    let start = xml.find(open.as_str())?;
+    let gt = xml[start..].find('>')? + start;
+    let head = &xml[start..gt];
+    for quote in ['"', '\''] {
+        let needle = format!("{attr}={quote}");
+        if let Some(pos) = head.find(needle.as_str()) {
+            let value_start = pos + needle.len();
+            if let Some(end) = head[value_start..].find(quote) {
+                return Some(head[value_start..value_start + end].to_string());
+            }
+        }
+    }
+    None
+}
+
+fn parse_rss_feed(text: &str, feed_url: &str) -> Option<Value> {
+    // Atom (`<feed>` + `<entry>`).
+    if text.contains("<feed") {
+        let title = xml_tag(text, "title");
+        let link = xml_attr(text, "link", "href");
+        let items: Vec<Value> = xml_tags(text, "entry")
+            .iter()
+            .map(|entry| {
+                let mut item = serde_json::Map::new();
+                if let Some(title) = xml_tag(entry, "title") {
+                    item.insert("title".to_string(), Value::String(title));
+                }
+                if let Some(href) = xml_attr(entry, "link", "href") {
+                    item.insert("link".to_string(), Value::String(href));
+                } else if let Some(link) = xml_tag(entry, "link") {
+                    item.insert("link".to_string(), Value::String(link));
+                }
+                if let Some(id) = xml_tag(entry, "id") {
+                    item.insert("guid".to_string(), Value::String(id));
+                }
+                if let Some(updated) = xml_tag(entry, "updated") {
+                    item.insert("pubDate".to_string(), Value::String(updated.clone()));
+                    item.insert("isoDate".to_string(), Value::String(updated));
+                }
+                if let Some(author) = xml_tag(entry, "author") {
+                    let name = xml_tag(&author, "name").unwrap_or(author);
+                    item.insert("creator".to_string(), Value::String(name));
+                }
+                if let Some(summary) = xml_tag(entry, "summary") {
+                    item.insert("summary".to_string(), Value::String(summary));
+                }
+                if let Some(content) = xml_tag(entry, "content") {
+                    item.insert("content".to_string(), Value::String(content));
+                }
+                if !xml_tags(entry, "category").is_empty() {
+                    item.insert(
+                        "categories".to_string(),
+                        Value::Array(
+                            xml_tags(entry, "category")
+                                .into_iter()
+                                .map(Value::String)
+                                .collect(),
+                        ),
+                    );
+                }
+                Value::Object(item)
+            })
+            .collect();
+        let mut feed = serde_json::Map::new();
+        if let Some(title) = title {
+            feed.insert("title".to_string(), Value::String(title));
+        }
+        if let Some(link) = link {
+            feed.insert("link".to_string(), Value::String(link));
+        }
+        feed.insert("feedUrl".to_string(), Value::String(feed_url.to_string()));
+        feed.insert("items".to_string(), Value::Array(items));
+        return Some(Value::Object(feed));
+    }
+    // RSS 2.0 (`<channel>` + `<item>`).
+    if text.contains("<channel") || text.contains("<rss") {
+        let channel = xml_tag(text, "channel").unwrap_or_else(|| text.to_string());
+        let mut feed = serde_json::Map::new();
+        if let Some(title) = xml_tag(&channel, "title") {
+            feed.insert("title".to_string(), Value::String(title));
+        }
+        if let Some(link) = xml_tag(&channel, "link") {
+            feed.insert("link".to_string(), Value::String(link));
+        }
+        if let Some(description) = xml_tag(&channel, "description") {
+            feed.insert("description".to_string(), Value::String(description));
+        }
+        feed.insert("feedUrl".to_string(), Value::String(feed_url.to_string()));
+        let items: Vec<Value> = xml_tags(&channel, "item")
+            .iter()
+            .map(|item_xml| {
+                let mut item = serde_json::Map::new();
+                for key in ["title", "link", "guid", "pubDate", "description", "content:encoded"] {
+                    if let Some(value) = xml_tag(item_xml, key) {
+                        let out_key = if key == "description" {
+                            "summary"
+                        } else if key == "content:encoded" {
+                            "content"
+                        } else {
+                            key
+                        };
+                        item.insert(out_key.to_string(), Value::String(value));
+                    }
+                }
+                if let Some(creator) = xml_tag(item_xml, "dc:creator")
+                    .or_else(|| xml_tag(item_xml, "author"))
+                {
+                    item.insert("creator".to_string(), Value::String(creator));
+                }
+                if let Some(pub_date) = item.get("pubDate").cloned() {
+                    item.insert("isoDate".to_string(), pub_date);
+                }
+                if !xml_tags(item_xml, "category").is_empty() {
+                    item.insert(
+                        "categories".to_string(),
+                        Value::Array(
+                            xml_tags(item_xml, "category")
+                                .into_iter()
+                                .map(Value::String)
+                                .collect(),
+                        ),
+                    );
+                }
+                Value::Object(item)
+            })
+            .collect();
+        feed.insert("items".to_string(), Value::Array(items));
+        return Some(Value::Object(feed));
+    }
+    None
+}
+
+/// `server-info` (upstream `server-info.ts` shape): machine/cpu/mem from
+/// what stable Rust + `/proc` can report; `fs` totals are unavailable
+/// without `statvfs` (no libc/sysinfo dep) and answer 0 (DIVERGENCE,
+/// recorded — the drive is local-filesystem single-node).
+fn pack_server_info() -> Value {
+    let machine = format!("{} {}", std::env::consts::OS, std::env::consts::ARCH);
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get() as u64)
+        .unwrap_or(1);
+    let cpu_model = read_cpu_model().unwrap_or_else(|| std::env::consts::ARCH.to_string());
+    let mem_total = read_mem_total().unwrap_or(0);
+    serde_json::json!({
+        "machine": machine,
+        "cpu": { "model": cpu_model, "cores": cores },
+        "mem": { "total": mem_total },
+        "fs": { "total": 0, "used": 0 },
+    })
+}
+
+fn read_cpu_model() -> Option<String> {
+    let text = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+    text.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        if key.trim() == "model name" {
+            Some(value.trim().to_string())
+        } else {
+            None
+        }
+    })
+}
+
+fn read_mem_total() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    text.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        if key.trim() == "MemTotal" {
+            value
+                .trim()
+                .strip_suffix("kB")
+                .and_then(|n| n.trim().parse::<u64>().ok())
+                .map(|kb| kb * 1024)
+        } else {
+            None
+        }
+    })
+}
+
 fn pack_note_list(
     services: &AppServices,
     notes: &[crate::domain::note::Note],
@@ -6522,6 +8748,13 @@ fn parse_profile_patch(obj: &Map<String, Value>) -> Result<UpdateAccountPatch, A
         // DIVERGENCE (Batch N WP8b): plain bool, absent = unchanged.
         show_remote_emojis: update_bool_field(obj, "showRemoteEmojis")?,
         moderator_note: None,
+        // Batch P: email/move are endpoint-owned (`i/update-email`,
+        // `verify-email`, `i/move`) — never through `i/update`.
+        email: None,
+        email_verified: None,
+        email_verify_code: None,
+        moved_to_uri: None,
+        moved_at_ms: None,
     })
 }
 
@@ -6957,6 +9190,10 @@ mod tests {
             instance_settings: store.clone(),
             invites: store.clone(),
             abuse_reports: store.clone(),
+            lists: store.clone(),
+            signin: store.clone(),
+            password_resets: store.clone(),
+            registry: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()
@@ -11846,6 +14083,7 @@ mod tests {
             .services
             .auth
             .store_token(ApiTokenRecord {
+                id: state.services.ids.generate(),
                 token_hash: hash_token(&third_party),
                 account_id: {
                     let (status, me) =
@@ -14437,6 +16675,999 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn batch_o_user_lists_crud_timeline_memberships_and_favorites() {
+        let (state, _) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (bob_id, bob_token) = signup_user(&state, "bob").await;
+        let (carol_id, carol_token) = signup_user(&state, "carol").await;
+
+        // create → 200 packed; bad name → INVALID_PARAM.
+        let (status, value) = call(
+            &state,
+            "users/lists/create",
+            serde_json::json!({ "name": "" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "INVALID_PARAM");
+        let (status, list) = call(
+            &state,
+            "users/lists/create",
+            serde_json::json!({ "name": "friends" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        assert_eq!(list["name"], "friends");
+        assert_eq!(list["isPublic"], false);
+        assert_eq!(list["userIds"].as_array().unwrap().len(), 0);
+        let list_id = list["id"].as_str().unwrap().to_string();
+
+        // push bob + carol; dup → ALREADY_ADDED (verbatim id).
+        for user_id in [&bob_id, &carol_id] {
+            let (status, _) = call(
+                &state,
+                "users/lists/push",
+                serde_json::json!({ "listId": list_id, "userId": user_id }),
+                Some(&alice_token),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+        }
+        let (status, value) = call(
+            &state,
+            "users/lists/push",
+            serde_json::json!({ "listId": list_id, "userId": bob_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "ALREADY_ADDED");
+        assert_eq!(value["error"]["id"], "1de7c884-1595-49e9-857e-61f12f4d4fc5");
+        // Unknown list/user → verbatim ids; foreign list → NO_SUCH_LIST.
+        let (status, value) = call(
+            &state,
+            "users/lists/push",
+            serde_json::json!({ "listId": "aaaaaaaaaaaaaaaa", "userId": bob_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_LIST");
+        assert_eq!(value["error"]["id"], "7f44670e-ab16-43b8-b4c1-ccd2ee89cc02");
+        let (status, value) = call(
+            &state,
+            "users/lists/push",
+            serde_json::json!({ "listId": list_id, "userId": "aaaaaaaaaaaaaaaa" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_USER");
+        assert_eq!(value["error"]["id"], "a89abd3d-f0bc-4cce-beb1-2f446f4f1e6a");
+        let (status, value) = call(
+            &state,
+            "users/lists/push",
+            serde_json::json!({ "listId": list_id, "userId": bob_id }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_LIST");
+
+        // Blocked push: carol blocks alice → alice pushing carol fails.
+        let (status, _) = call(
+            &state,
+            "blocking/create",
+            serde_json::json!({ "userId": alice_id }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, value) = call(
+            &state,
+            "users/lists/push",
+            serde_json::json!({ "listId": list_id, "userId": bob_id }),
+            Some(&alice_token),
+        )
+        .await;
+        // (already a member → ALREADY_ADDED fires before the block check;
+        // pull bob, then the block refusal surfaces.)
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        let (status, _) = call(
+            &state,
+            "users/lists/pull",
+            serde_json::json!({ "listId": list_id, "userId": bob_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, value) = call(
+            &state,
+            "users/lists/push",
+            serde_json::json!({ "listId": list_id, "userId": bob_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "YOU_HAVE_BEEN_BLOCKED");
+        assert_eq!(value["error"]["id"], "990232c5-3f9d-4d83-9f3f-ef27b6332a4b");
+        // Self-push skips the block check.
+        let (status, _) = call(
+            &state,
+            "users/lists/push",
+            serde_json::json!({ "listId": list_id, "userId": alice_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        // Unblock for the rest of the test.
+        let (status, _) = call(
+            &state,
+            "blocking/delete",
+            serde_json::json!({ "userId": alice_id }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(
+            &state,
+            "users/lists/push",
+            serde_json::json!({ "listId": list_id, "userId": bob_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // show: owner reads; strangers denied on private lists.
+        let (status, shown) = call(
+            &state,
+            "users/lists/show",
+            serde_json::json!({ "listId": list_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{shown}");
+        assert_eq!(shown["userIds"].as_array().unwrap().len(), 3);
+        let (status, value) = call(
+            &state,
+            "users/lists/show",
+            serde_json::json!({ "listId": list_id }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_LIST");
+        assert_eq!(value["error"]["id"], "7bc05c21-1d7a-41ae-88f1-66820f4dc686");
+        // list: own lists need a credential; userId selects public lists.
+        let (status, value) = call(
+            &state,
+            "users/lists/list",
+            serde_json::json!({}),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{value}");
+        let (status, lists) = call(
+            &state,
+            "users/lists/list",
+            serde_json::json!({ "userId": alice_id }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{lists}");
+        assert!(lists.as_array().unwrap().is_empty(), "private list hidden");
+        // Make it public; update echoes the pack.
+        let (status, updated) = call(
+            &state,
+            "users/lists/update",
+            serde_json::json!({ "listId": list_id, "isPublic": true }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{updated}");
+        assert_eq!(updated["isPublic"], true);
+        let (status, lists) = call(
+            &state,
+            "users/lists/list",
+            serde_json::json!({ "userId": alice_id }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{lists}");
+        assert_eq!(lists.as_array().unwrap().len(), 1);
+        assert_eq!(lists[0]["userIds"].as_array().unwrap().len(), 3);
+
+        // get-memberships: packed members newest-…; update-membership flips
+        // withReplies (silent no-op on strangers).
+        let (status, members) = call(
+            &state,
+            "users/lists/get-memberships",
+            serde_json::json!({ "listId": list_id, "forPublic": true }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{members}");
+        assert_eq!(members.as_array().unwrap().len(), 3);
+        assert!(members[0].get("user").is_some());
+        let (status, _) = call(
+            &state,
+            "users/lists/update-membership",
+            serde_json::json!({ "listId": list_id, "userId": bob_id, "withReplies": true }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // Timeline: bob posts; carol replies to bob (third-party reply —
+        // hidden while carol's membership has withReplies=false, visible
+        // after the flip). Alice reads the pull timeline.
+        let bob_note = create_note(
+            &state,
+            serde_json::json!({ "text": "bob here" }),
+            &bob_token,
+        )
+        .await;
+        let carol_reply = create_note(
+            &state,
+            serde_json::json!({ "text": "carol replies", "replyId": bob_note }),
+            &carol_token,
+        )
+        .await;
+        let (status, timeline) = call(
+            &state,
+            "notes/user-list-timeline",
+            serde_json::json!({ "listId": list_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{timeline}");
+        let ids: Vec<&str> = timeline
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&bob_note.as_str()), "{ids:?}");
+        assert!(!ids.contains(&carol_reply.as_str()), "third-party reply gated: {ids:?}");
+        // Flip carol's withReplies → the reply backfills (pull, no fanout).
+        let (status, _) = call(
+            &state,
+            "users/lists/update-membership",
+            serde_json::json!({ "listId": list_id, "userId": carol_id, "withReplies": true }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, timeline) = call(
+            &state,
+            "notes/user-list-timeline",
+            serde_json::json!({ "listId": list_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{timeline}");
+        let ids: Vec<&str> = timeline
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&carol_reply.as_str()), "backfilled: {ids:?}");
+        // Strangers cannot read the timeline.
+        let (status, value) = call(
+            &state,
+            "notes/user-list-timeline",
+            serde_json::json!({ "listId": "aaaaaaaaaaaaaaaa" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_LIST");
+        assert_eq!(value["error"]["id"], "8fb1fbd5-e476-4c37-9fb0-43d55b63a2ff");
+
+        // favorites: public lists only; dup + miss map verbatim.
+        let (status, _) = call(
+            &state,
+            "users/lists/favorite",
+            serde_json::json!({ "listId": list_id }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, value) = call(
+            &state,
+            "users/lists/favorite",
+            serde_json::json!({ "listId": list_id }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "ALREADY_FAVORITED");
+        assert_eq!(value["error"]["id"], "6425bba0-985b-461e-af1b-518070e72081");
+        let (status, shown) = call(
+            &state,
+            "users/lists/show",
+            serde_json::json!({ "listId": list_id, "forPublic": true }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{shown}");
+        assert_eq!(shown["likedCount"], 1);
+        assert_eq!(shown["isLiked"], true);
+        let (status, _) = call(
+            &state,
+            "users/lists/unfavorite",
+            serde_json::json!({ "listId": list_id }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, value) = call(
+            &state,
+            "users/lists/unfavorite",
+            serde_json::json!({ "listId": list_id }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "ALREADY_FAVORITED", "unfavorite-miss quirk");
+        assert_eq!(value["error"]["id"], "835c4b27-463d-4cfa-969b-a9058678d465");
+        // Private lists cannot be favorited.
+        let (status, _) = call(
+            &state,
+            "users/lists/update",
+            serde_json::json!({ "listId": list_id, "isPublic": false }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, value) = call(
+            &state,
+            "users/lists/favorite",
+            serde_json::json!({ "listId": list_id }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_USER_LIST");
+        assert_eq!(value["error"]["id"], "7dbaf3cf-7b42-4b8f-b431-b3919e580dbe");
+
+        // delete removes memberships and stops dependent antennas.
+        let (status, antenna) = call(
+            &state,
+            "antennas/create",
+            serde_json::json!({
+                "name": "lst", "src": "list", "userListId": list_id,
+                "keywords": [["x"]], "excludeKeywords": [], "users": [],
+                "caseSensitive": false, "withReplies": true, "withFile": false,
+            }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{antenna}");
+        let (status, _) = call(
+            &state,
+            "users/lists/delete",
+            serde_json::json!({ "listId": list_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, value) = call(
+            &state,
+            "users/lists/show",
+            serde_json::json!({ "listId": list_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_LIST");
+        let (status, value) = call(
+            &state,
+            "antennas/show",
+            serde_json::json!({ "antennaId": antenna["id"] }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_ANTENNA");
+    }
+
+    #[tokio::test]
+    async fn batch_o_drive_extras_and_url_preview() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        // Inline loopback origin: PNG at /pic.png, HTML at /page,
+        // plain text at /txt. `allow_private_ips` is on in test state.
+        static PNG: &[u8] = &[
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x01, 0x02, 0x03,
+        ];
+        static HTML: &[u8] = br#"<html><head>
+<meta property="og:title" content="OG Title">
+<meta name="description" content="Meta Desc">
+<meta property="og:site_name" content="Example">
+<meta property="og:image" content="/img.png">
+<link rel="shortcut icon" href="/favicon.ico">
+<title>Fallback</title>
+</head><body>hi</body></html>"#;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback origin");
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for _ in 0..16 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let (status, ctype, body): (&str, &str, &[u8]) = if req.starts_with("GET /pic.png") {
+                    ("200 OK", "image/png", PNG)
+                } else if req.starts_with("GET /page") {
+                    ("200 OK", "text/html; charset=utf-8", HTML)
+                } else if req.starts_with("GET /txt") {
+                    ("200 OK", "text/plain", b"just text")
+                } else {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnope",
+                    );
+                    continue;
+                };
+                let hdr = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(hdr.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+        let base = format!("http://{addr}");
+
+        let (state, _) = test_state();
+        let (_, alice_token) = signup_user(&state, "alice").await;
+
+        // upload-from-url stores + packs the file.
+        let (status, file) = call(
+            &state,
+            "drive/files/upload-from-url",
+            serde_json::json!({ "url": format!("{base}/pic.png") }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{file}");
+        assert_eq!(file["name"], "pic.png");
+        let file_id = file["id"].as_str().unwrap().to_string();
+        let md5 = file["md5"].as_str().unwrap().to_string();
+
+        // Second fetch without force dedups to the same row.
+        let (status, file2) = call(
+            &state,
+            "drive/files/upload-from-url",
+            serde_json::json!({ "url": format!("{base}/pic.png"), "marker": "opaque-ok" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{file2}");
+        assert_eq!(file2["id"], file_id);
+        // force=true inserts a second row.
+        let (status, file3) = call(
+            &state,
+            "drive/files/upload-from-url",
+            serde_json::json!({ "url": format!("{base}/pic.png"), "force": true }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{file3}");
+        assert_ne!(file3["id"], file_id);
+
+        // find-by-hash resolves md5, never blob keys.
+        let (status, found) = call(
+            &state,
+            "drive/files/find-by-hash",
+            serde_json::json!({ "md5": md5 }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{found}");
+        assert_eq!(found["id"], file_id);
+        let (status, value) = call(
+            &state,
+            "drive/files/find-by-hash",
+            serde_json::json!({ "md5": "0".repeat(32) }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_FILE");
+        // folderId must stay null.
+        let (status, value) = call(
+            &state,
+            "drive/files/upload-from-url",
+            serde_json::json!({ "url": format!("{base}/pic.png"), "folderId": "f1" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "INVALID_PARAM");
+        // 404 origin → 400, not a file row.
+        let (status, value) = call(
+            &state,
+            "drive/files/upload-from-url",
+            serde_json::json!({ "url": format!("{base}/missing") }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+
+        // url-preview: credential required, OG parse, absolutized assets.
+        let (status, _) = call(
+            &state,
+            "url-preview",
+            serde_json::json!({ "url": format!("{base}/page") }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, preview) = call(
+            &state,
+            "url-preview",
+            serde_json::json!({ "url": format!("{base}/page") }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{preview}");
+        assert_eq!(preview["title"], "OG Title");
+        assert_eq!(preview["description"], "Meta Desc");
+        assert_eq!(preview["siteName"], "Example");
+        assert_eq!(preview["image"], format!("{base}/img.png"));
+        assert_eq!(preview["icon"], format!("{base}/favicon.ico"));
+        // Cached second call answers the same.
+        let (status, preview2) = call(
+            &state,
+            "url-preview",
+            serde_json::json!({ "url": format!("{base}/page") }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{preview2}");
+        assert_eq!(preview, preview2);
+        // Non-HTML answers `{}`.
+        let (status, preview) = call(
+            &state,
+            "url-preview",
+            serde_json::json!({ "url": format!("{base}/pic.png") }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{preview}");
+        assert_eq!(preview, serde_json::json!({}));
+        // Non-fetchable scheme is rejected without network.
+        let (status, value) = call(
+            &state,
+            "url-preview",
+            serde_json::json!({ "url": "ftp://example.com/x" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "INVALID_PARAM");
+    }
+
+    #[tokio::test]
+    async fn batch_o_self_service_tokens_and_signin_history() {
+        let (state, clock) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+
+        // i/signin-history: signup recorded one success row.
+        let (status, history) = call(
+            &state,
+            "i/signin-history",
+            serde_json::json!({}),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{history}");
+        assert_eq!(history.as_array().unwrap().len(), 1);
+        assert_eq!(history[0]["success"], true);
+        assert!(history[0].get("ip").is_some());
+
+        // Failed password signin appends success:false; unknown user does not.
+        let (status, _) = call(
+            &state,
+            "signin",
+            serde_json::json!({ "username": "alice", "password": "wrong-pw" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        clock.advance_ms(61_000);
+        let (status, _) = call(
+            &state,
+            "signin",
+            serde_json::json!({ "username": "nobody", "password": "wrong-pw" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        clock.advance_ms(61_000);
+        let (status, history) = call(
+            &state,
+            "i/signin-history",
+            serde_json::json!({}),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{history}");
+        let rows = history.as_array().unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0]["success"], false, "newest first");
+        assert_eq!(rows[1]["success"], true);
+        // Cursor paging.
+        let (status, page) = call(
+            &state,
+            "i/signin-history",
+            serde_json::json!({ "limit": 1, "untilId": rows[0]["id"] }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page.as_array().unwrap().len(), 1);
+        assert_eq!(page[0]["success"], true);
+        // Anonymous → 401.
+        let (status, _) = call(&state, "i/signin-history", serde_json::json!({}), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // change-password: wrong current → 401, token still valid.
+        let (status, _) = call(
+            &state,
+            "i/change-password",
+            serde_json::json!({ "currentPassword": "nope", "newPassword": "n3w-pw" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        clock.advance_ms(61_000);
+        let (status, _) = call(&state, "i", serde_json::json!({}), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::OK);
+        // Empty newPassword → INVALID_PARAM.
+        let (status, value) = call(
+            &state,
+            "i/change-password",
+            serde_json::json!({ "currentPassword": "s3cret-pw", "newPassword": "" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "INVALID_PARAM");
+        clock.advance_ms(61_000);
+        // Rotate the password.
+        let (status, _) = call(
+            &state,
+            "i/change-password",
+            serde_json::json!({ "currentPassword": "s3cret-pw", "newPassword": "n3w-pw" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        // Old password fails, new password signs in; existing sessions stay.
+        let (status, _) = call(
+            &state,
+            "signin",
+            serde_json::json!({ "username": "alice", "password": "s3cret-pw" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        clock.advance_ms(61_000);
+        let (status, _) = call(
+            &state,
+            "signin",
+            serde_json::json!({ "username": "alice", "password": "n3w-pw" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(&state, "i", serde_json::json!({}), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Mint an app grant (white-box): i/apps lists it, authorized-apps
+        // shapes it, tokenId revocation kills it.
+        let grant_token = generate_random_token();
+        state
+            .services
+            .auth
+            .store_token(ApiTokenRecord {
+                id: state.services.ids.generate(),
+                token_hash: hash_token(&grant_token),
+                account_id: alice_id.clone(),
+                permissions: vec!["read:account".to_string()],
+                is_first_party: false,
+                name: Some("third-party".to_string()),
+                description: Some("a grant".to_string()),
+                icon_url: None,
+                created_at_ms: state.services.clock.now_ms(),
+            })
+            .unwrap();
+        let (status, apps) = call(&state, "i/apps", serde_json::json!({}), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::OK, "{apps}");
+        let apps = apps.as_array().unwrap();
+        assert_eq!(apps.len(), 1, "{apps:?}");
+        assert_eq!(apps[0]["name"], "third-party");
+        assert_eq!(apps[0]["permission"], serde_json::json!(["read:account"]));
+        assert_eq!(apps[0]["description"], "a grant");
+        assert!(apps[0].get("createdAt").is_some());
+        let grant_id = apps[0]["id"].as_str().unwrap().to_string();
+        // Bad sort → INVALID_PARAM.
+        let (status, value) = call(
+            &state,
+            "i/apps",
+            serde_json::json!({ "sort": "sideways" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "INVALID_PARAM");
+        let (status, authed) = call(
+            &state,
+            "i/authorized-apps",
+            serde_json::json!({}),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{authed}");
+        let authed = authed.as_array().unwrap();
+        assert_eq!(authed.len(), 1, "{authed:?}");
+        assert_eq!(authed[0]["id"], grant_id);
+        assert_eq!(authed[0]["isAuthorized"], true);
+        // Third-party credentials cannot use self-service (secure:true).
+        let (status, _) = call(&state, "i/apps", serde_json::json!({}), Some(&grant_token)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // tokenId revocation is real now.
+        let (status, _) = call(
+            &state,
+            "i/revoke-token",
+            serde_json::json!({ "tokenId": grant_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, apps) = call(&state, "i/apps", serde_json::json!({}), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::OK, "{apps}");
+        assert!(apps.as_array().unwrap().is_empty());
+        // Unknown tokenId stays a silent no-op.
+        let (status, _) = call(
+            &state,
+            "i/revoke-token",
+            serde_json::json!({ "tokenId": grant_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // regenerate-token: wrong password → 401; correct rotates native
+        // tokens only (caller logged out, fresh signin works).
+        let (status, _) = call(
+            &state,
+            "i/regenerate-token",
+            serde_json::json!({ "password": "wrong" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        clock.advance_ms(61_000);
+        // Re-mint a grant so rotation has something to spare.
+        let grant2 = generate_random_token();
+        state
+            .services
+            .auth
+            .store_token(ApiTokenRecord {
+                id: state.services.ids.generate(),
+                token_hash: hash_token(&grant2),
+                account_id: alice_id.clone(),
+                permissions: vec!["read:account".to_string()],
+                is_first_party: false,
+                name: Some("keeper".to_string()),
+                description: None,
+                icon_url: None,
+                created_at_ms: state.services.clock.now_ms(),
+            })
+            .unwrap();
+        let (status, _) = call(
+            &state,
+            "i/regenerate-token",
+            serde_json::json!({ "password": "n3w-pw" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = call(&state, "i", serde_json::json!({}), Some(&alice_token)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "native token rotated away");
+        let (status, value) = call(
+            &state,
+            "signin",
+            serde_json::json!({ "username": "alice", "password": "n3w-pw" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let fresh = value["token"].as_str().unwrap().to_string();
+        let (status, apps) = call(&state, "i/apps", serde_json::json!({}), Some(&fresh)).await;
+        assert_eq!(status, StatusCode::OK, "{apps}");
+        assert_eq!(apps.as_array().unwrap().len(), 1, "app grant survived");
+        let _ = fresh;
+    }
+
+    #[tokio::test]
+    async fn batch_o_invalidate_search_alias_and_ap_get() {
+        let (state, _) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (bob_id, bob_token) = signup_user(&state, "bob").await;
+
+        // Bob follows Alice; Alice invalidates (removes) him.
+        let (status, _) = call(
+            &state,
+            "following/create",
+            serde_json::json!({ "userId": alice_id }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, follower) = call(
+            &state,
+            "following/invalidate",
+            serde_json::json!({ "userId": bob_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{follower}");
+        assert_eq!(follower["id"], bob_id);
+        // Edge is gone: second invalidate → NOT_FOLLOWING (verbatim id).
+        let (status, value) = call(
+            &state,
+            "following/invalidate",
+            serde_json::json!({ "userId": bob_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NOT_FOLLOWING");
+        assert_eq!(value["error"]["id"], "918faac3-074f-41ae-9c43-ed5d2946770d");
+        // Self → FOLLOWER_IS_YOURSELF (verbatim id).
+        let (status, value) = call(
+            &state,
+            "following/invalidate",
+            serde_json::json!({ "userId": alice_id }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "FOLLOWER_IS_YOURSELF");
+        assert_eq!(value["error"]["id"], "07dc03b9-03da-422d-885b-438313707662");
+        // Unknown → NO_SUCH_USER (invalidate endpoint UUID).
+        let (status, value) = call(
+            &state,
+            "following/invalidate",
+            serde_json::json!({ "userId": "aaaaaaaaaaaaaaaa" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_USER");
+        assert_eq!(value["error"]["id"], "b77e6ae6-a3e5-40da-9cc8-c240115479cc");
+
+        // search-by-username-and-host: single-user alias, 1-element array.
+        let (status, users) = call(
+            &state,
+            "users/search-by-username-and-host",
+            serde_json::json!({ "username": "bob" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{users}");
+        assert_eq!(users.as_array().unwrap().len(), 1);
+        assert_eq!(users[0]["username"], "bob");
+        // Lite form.
+        let (status, users) = call(
+            &state,
+            "users/search-by-username-and-host",
+            serde_json::json!({ "username": "bob", "detail": false }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{users}");
+        assert_eq!(users.as_array().unwrap().len(), 1);
+        // Neither username nor host → INVALID_PARAM.
+        let (status, value) = call(
+            &state,
+            "users/search-by-username-and-host",
+            serde_json::json!({}),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "INVALID_PARAM");
+
+        // ap/get mirrors ap/show's packed shape for a local user URI.
+        let base = state.services.public_url.trim_end_matches('/').to_string();
+        let (status, got) = call(
+            &state,
+            "ap/get",
+            serde_json::json!({ "uri": format!("{base}/users/{alice_id}") }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{got}");
+        assert_eq!(got["type"], "User");
+        assert_eq!(got["object"]["id"], alice_id);
+        // Anonymous → 401 (credential required, no open fetch).
+        let (status, _) = call(
+            &state,
+            "ap/get",
+            serde_json::json!({ "uri": format!("{base}/users/{alice_id}") }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // Remote follower: edge removed, follower packed back. (The
+        // federation direction — Reject authored by the followee, not an
+        // Undo forged as the remote — is covered by the op construction in
+        // `remove_follower`; the job executes through the same outbox path
+        // as the accept/reject request flows.)
+        {
+            use crate::application::ports::{AccountStore, CreateAccountInput, FollowStore};
+            let remote = state
+                .services
+                .accounts
+                .create_account(
+                    CreateAccountInput {
+                        handle: "rina".to_string(),
+                        host: Some("remote.example".to_string()),
+                        display_name: None,
+                        description: None,
+                        location: None,
+                        birthday: None,
+                        uri: Some("https://remote.example/users/rina".to_string()),
+                        inbox: Some("https://remote.example/inbox".to_string()),
+                        shared_inbox: None,
+                        is_bot: false,
+                        is_cat: false,
+                        is_locked: false,
+                        preserved_usernames: Vec::new(),
+                    },
+                    None,
+                )
+                .expect("remote account");
+            state
+                .services
+                .follows
+                .follow(&remote.id, &alice_id, false, None, Vec::new())
+                .unwrap();
+            let (status, follower) = call(
+                &state,
+                "following/invalidate",
+                serde_json::json!({ "userId": remote.id }),
+                Some(&alice_token),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{follower}");
+            assert_eq!(follower["id"], remote.id);
+            assert!(
+                state
+                    .services
+                    .follows
+                    .get_follow(&remote.id, &alice_id)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn batch_n_favorites_crud_state_pack_and_errors() {
         let (state, _) = test_state();
         let (alice_id, alice_token) = signup_user(&state, "alice").await;
@@ -15191,7 +18422,8 @@ mod tests {
         assert_eq!(value["code"], "EMPTY_KEYWORD");
         assert_eq!(value["error"]["id"], "53ee222e-1ddd-4f9a-92e5-9fb82ddb463a");
 
-        // src=list is refused (WP16 pending): NO_SUCH_USER_LIST.
+        // src=list with an unknown list: NO_SUCH_USER_LIST (antennas
+        // endpoint id).
         let (status, value) = call(
             &state,
             "antennas/create",
@@ -15745,5 +18977,779 @@ mod tests {
         assert_eq!(status, StatusCode::NO_CONTENT);
         // No user-list subsystem: validates, applies zero, completes.
         state.worker.drain(100).unwrap();
+    }
+
+    // --- Batch P ----------------------------------------------------------
+
+    #[tokio::test]
+    async fn batch_p_email_identity_loop() {
+        let (state, clock) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+
+        // Wrong password → INCORRECT_PASSWORD (verbatim id).
+        let (status, value) = call(
+            &state,
+            "i/update-email",
+            serde_json::json!({ "password": "wrong-pw", "email": "alice@example.com" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "INCORRECT_PASSWORD");
+        assert_eq!(value["id"], "e54c1d7e-e7d6-4103-86b6-0a95069b4ad3");
+        // Wrong-password attempts arm the progressive auth-failure delay
+        // (change-password convention): step past it.
+        clock.advance_ms(61_000);
+
+        // Malformed address → UNAVAILABLE (shape half).
+        let (status, value) = call(
+            &state,
+            "i/update-email",
+            serde_json::json!({ "password": "s3cret-pw", "email": "not-an-email" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "UNAVAILABLE");
+
+        // Set → MeDetailed, unverified, code minted.
+        let (status, me) = call(
+            &state,
+            "i/update-email",
+            serde_json::json!({ "password": "s3cret-pw", "email": "alice@example.com" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{me}");
+        assert_eq!(me["email"], serde_json::json!("alice@example.com"));
+        assert_eq!(me["emailVerified"], serde_json::json!(false));
+        let stored = state
+            .services
+            .accounts
+            .find_by_id(&alice_id)
+            .expect("lookup")
+            .expect("alice");
+        let code = stored.email_verify_code.clone().expect("code minted");
+        assert_eq!(code.len(), 16);
+
+        // Unknown code → NO_SUCH_CODE.
+        let (status, value) = call(
+            &state,
+            "verify-email",
+            serde_json::json!({ "code": "zzzzzzzzzzzzzzzz" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_CODE");
+
+        // Dormant transport: reset requests fail loudly and UNIFORMLY
+        // (unknown user and valid user answer the same error — no oracle).
+        for body in [
+            serde_json::json!({ "username": "ghost", "email": "ghost@example.com" }),
+            serde_json::json!({ "username": "alice", "email": "alice@example.com" }),
+        ] {
+            let (status, value) =
+                call(&state, "request-reset-password", body, None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+            assert_eq!(value["code"], "EMAIL_NOT_CONFIGURED");
+        }
+
+        // Unknown reset token → 500 (upstream `findOneByOrFail` parity).
+        let (status, _) = call(
+            &state,
+            "reset-password",
+            serde_json::json!({ "token": "tok-never-minted", "password": "new-pw" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+        // Full rotation via a directly-created row (the send half is
+        // dormant; the consume half is real).
+        let reset_id = state.services.ids.generate();
+        state
+            .services
+            .password_resets
+            .create_reset_request(
+                crate::application::ports::PasswordResetRequest {
+                    id: reset_id.clone(),
+                    user_id: alice_id.clone(),
+                    token: "tok-alice-rotate".to_string(),
+                },
+            )
+            .expect("create row");
+        let (status, _) = call(
+            &state,
+            "reset-password",
+            serde_json::json!({ "token": "tok-alice-rotate", "password": "r0tated-pw" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        // Single-use: replay misses → 500.
+        let (status, _) = call(
+            &state,
+            "reset-password",
+            serde_json::json!({ "token": "tok-alice-rotate", "password": "r0tated-pw" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        // Roll past the 3/h `i/update-email` window for the rotation check.
+        clock.advance_ms(61 * 60 * 1000);
+        // The new password verifies (old one does not).
+        let (status, _) = call(
+            &state,
+            "i/update-email",
+            serde_json::json!({ "password": "r0tated-pw", "email": "alice2@example.com" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Expiry: 30-minute TTL read off the aidx id timestamp.
+        let reset_id = state.services.ids.generate();
+        state
+            .services
+            .password_resets
+            .create_reset_request(
+                crate::application::ports::PasswordResetRequest {
+                    id: reset_id,
+                    user_id: alice_id.clone(),
+                    token: "tok-alice-stale".to_string(),
+                },
+            )
+            .expect("create row");
+        clock.advance_ms(31 * 60 * 1000);
+        let (status, _) = call(
+            &state,
+            "reset-password",
+            serde_json::json!({ "token": "tok-alice-stale", "password": "x" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+        // Verify the minted code → verified + cleared.
+        let stored = state
+            .services
+            .accounts
+            .find_by_id(&alice_id)
+            .expect("lookup")
+            .expect("alice");
+        let code = stored.email_verify_code.clone().expect("second code");
+        let (status, _) = call(
+            &state,
+            "verify-email",
+            serde_json::json!({ "code": code }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let stored = state
+            .services
+            .accounts
+            .find_by_id(&alice_id)
+            .expect("lookup")
+            .expect("alice");
+        assert!(stored.email_verified);
+        assert!(stored.email_verify_code.is_none());
+    }
+
+    #[tokio::test]
+    async fn batch_p_move_local_guards_and_migration() {
+        use crate::application::ports::AccountStore as _;
+        let (state, _) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (bob_id, bob_token) = signup_user(&state, "bob").await;
+        let (carol_id, carol_token) = signup_user(&state, "carol").await;
+        let (dave_id, dave_token) = signup_user(&state, "dave").await;
+        let base = "https://example.local";
+        let bob_uri = format!("{base}/users/{bob_id}");
+        let carol_uri = format!("{base}/users/{carol_id}");
+
+        // Root refusal: the oldest admin cannot migrate.
+        state
+            .services
+            .set_role(None, &alice_id, true, false)
+            .expect("make admin");
+        let (status, value) = call(
+            &state,
+            "i/move",
+            serde_json::json!({ "moveToAccount": "bob" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NOT_ROOT_FORBIDDEN");
+
+        // Unknown destination → NO_SUCH_USER.
+        let (status, value) = call(
+            &state,
+            "i/move",
+            serde_json::json!({ "moveToAccount": "ghost" }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_USER");
+
+        // No alias handshake → DESTINATION_ACCOUNT_FORBIDS.
+        let (status, value) = call(
+            &state,
+            "i/move",
+            serde_json::json!({ "moveToAccount": "carol" }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "DESTINATION_ACCOUNT_FORBIDS");
+
+        // Carol lists bob as a known-as alias; dave follows bob.
+        let (status, _) = call(
+            &state,
+            "i/update",
+            serde_json::json!({ "alsoKnownAs": [bob_uri] }),
+            Some(&carol_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(
+            &state,
+            "following/create",
+            serde_json::json!({ "userId": bob_id }),
+            Some(&dave_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Move succeeds: movedTo packs the destination URI.
+        let (status, me) = call(
+            &state,
+            "i/move",
+            serde_json::json!({ "moveToAccount": "carol" }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{me}");
+        assert_eq!(me["movedTo"], serde_json::json!(carol_uri));
+        state.worker.drain(100).expect("drain move jobs");
+
+        // Follower migration: dave unfollowed-old + follows-new.
+        assert!(
+            state
+                .services
+                .follows
+                .is_following(&dave_id, &carol_id)
+                .expect("edge")
+        );
+        assert!(
+            !state
+                .services
+                .follows
+                .is_following(&dave_id, &bob_id)
+                .expect("edge")
+        );
+
+        // Already moved → ALREADY_MOVED.
+        let (status, value) = call(
+            &state,
+            "i/move",
+            serde_json::json!({ "moveToAccount": "carol" }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "ALREADY_MOVED");
+    }
+
+    #[tokio::test]
+    async fn batch_p_registry_round_trip() {
+        let (state, _) = test_state();
+        let (_, token) = signup_user(&state, "alice").await;
+
+        // Bad scope segment → INVALID_PARAM.
+        let (status, _) = call(
+            &state,
+            "i/registry/set",
+            serde_json::json!({ "key": "k", "value": 1, "scope": ["no-dashes"] }),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Set → get → get-all → keys → keys-with-type → get-detail.
+        let (status, _) = call(
+            &state,
+            "i/registry/set",
+            serde_json::json!({ "key": "theme", "value": "dark", "scope": ["client"] }),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, value) = call(
+            &state,
+            "i/registry/get",
+            serde_json::json!({ "key": "theme", "scope": ["client"] }),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value, serde_json::json!("dark"));
+        let (status, value) = call(
+            &state,
+            "i/registry/get-all",
+            serde_json::json!({ "scope": ["client"] }),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value, serde_json::json!({ "theme": "dark" }));
+        let (status, value) = call(
+            &state,
+            "i/registry/keys",
+            serde_json::json!({ "scope": ["client"] }),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value, serde_json::json!(["theme"]));
+        let (status, value) = call(
+            &state,
+            "i/registry/keys-with-type",
+            serde_json::json!({ "scope": ["client"] }),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value, serde_json::json!({ "theme": "string" }));
+        let (status, value) = call(
+            &state,
+            "i/registry/get-detail",
+            serde_json::json!({ "key": "theme", "scope": ["client"] }),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value["value"], serde_json::json!("dark"));
+        assert!(value["updatedAt"].is_string(), "{value}");
+
+        // Domain isolation: explicit-domain rows are invisible by default.
+        let (status, _) = call(
+            &state,
+            "i/registry/set",
+            serde_json::json!({ "key": "theme", "value": "blue", "scope": ["client"], "domain": null }),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        // scopes-with-domain lists the token-domain pair.
+        let (status, value) = call(
+            &state,
+            "i/registry/scopes-with-domain",
+            serde_json::json!({}),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert!(
+            value.as_array().unwrap().iter().any(|row| row["scopes"]
+                == serde_json::json!([["client"]]) || row["scopes"] == serde_json::json!(["client"]))
+        );
+
+        // Remove → NO_SUCH_KEY; re-remove stays silent.
+        let (status, _) = call(
+            &state,
+            "i/registry/remove",
+            serde_json::json!({ "key": "theme", "scope": ["client"] }),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, value) = call(
+            &state,
+            "i/registry/get",
+            serde_json::json!({ "key": "theme", "scope": ["client"] }),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_KEY");
+        let (status, _) = call(
+            &state,
+            "i/registry/remove",
+            serde_json::json!({ "key": "theme", "scope": ["client"] }),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn batch_p_small_reads() {
+        let (state, _) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (_, bob_token) = signup_user(&state, "bob").await;
+        create_note(&state, serde_json::json!({ "text": "hello" }), &alice_token).await;
+
+        // Online count follows hub presence (pruned past the threshold).
+        let now = state.services.clock.now_ms();
+        state.hub.mark_present(&alice_id, now);
+        state.hub.mark_present("stale", now - 11 * 60 * 1000);
+        let (status, value) =
+            call(&state, "get-online-users-count", serde_json::json!({}), None).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value["count"], serde_json::json!(1));
+
+        // Pinned users: shape-compatible empty (no admin surface exists).
+        let (status, value) = call(&state, "pinned-users", serde_json::json!({}), None).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value, serde_json::json!([]));
+
+        // Server info shape.
+        let (status, value) = call(&state, "server-info", serde_json::json!({}), None).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert!(value["machine"].is_string(), "{value}");
+        assert!(value["cpu"]["cores"].as_u64().unwrap_or(0) >= 1, "{value}");
+        assert!(value["cpu"]["model"].is_string(), "{value}");
+        assert!(value["mem"]["total"].is_u64(), "{value}");
+        assert!(value["fs"]["total"].is_u64(), "{value}");
+
+        // Stats count real rows.
+        let (status, value) = call(&state, "stats", serde_json::json!({}), None).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert!(value["usersCount"].as_u64().unwrap_or(0) >= 2, "{value}");
+        assert!(value["originalUsersCount"].as_u64().unwrap_or(0) >= 2, "{value}");
+        assert!(value["notesCount"].as_u64().unwrap_or(0) >= 1, "{value}");
+        assert_eq!(value["instances"], serde_json::json!(0));
+
+        // fetch-rss rejects non-http(s) with the verbatim id.
+        let (status, value) = call(
+            &state,
+            "fetch-rss",
+            serde_json::json!({ "url": "ftp://example.com/feed" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "INVALID_URL");
+        assert_eq!(value["id"], "89b7ee05-ccfc-4bdd-9b13-61172fd1e06c");
+
+        // RSS + Atom subset parsing (unit level).
+        let rss = parse_rss_feed(
+            r#"<?xml version="1.0"?><rss version="2.0"><channel><title>Blog</title><link>https://b.example</link><description>posts</description><item><title><![CDATA[Hi & bye]]></title><link>https://b.example/1</link><guid>1</guid><pubDate>Mon, 01 Jan 2024 00:00:00 GMT</pubDate><category>tech</category></item></channel></rss>"#,
+            "https://b.example/feed",
+        )
+        .expect("rss parses");
+        assert_eq!(rss["title"], serde_json::json!("Blog"));
+        assert_eq!(rss["items"][0]["title"], serde_json::json!("Hi & bye"));
+        assert_eq!(rss["items"][0]["isoDate"], serde_json::json!("Mon, 01 Jan 2024 00:00:00 GMT"));
+        assert_eq!(rss["items"][0]["categories"], serde_json::json!(["tech"]));
+        let atom = parse_rss_feed(
+            r#"<feed xmlns="http://www.w3.org/2005/Atom"><title>Feed</title><link href="https://a.example/"/><entry><title>E1</title><link href="https://a.example/1"/><id>1</id><updated>2024-01-01T00:00:00Z</updated></entry></feed>"#,
+            "https://a.example/feed",
+        )
+        .expect("atom parses");
+        assert_eq!(atom["items"][0]["link"], serde_json::json!("https://a.example/1"));
+        assert!(parse_rss_feed("<html>nope</html>", "https://x.example").is_none());
+        let _ = bob_token;
+    }
+
+    #[tokio::test]
+    async fn batch_p_fetch_external_resources_round_trip() {
+        use std::io::{Read, Write};
+        // Loopback JSON peer (test `SafeHttpClient` allows private IPs).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind json peer");
+        let addr = listener.local_addr().expect("peer addr");
+        let body = serde_json::json!({ "type": "text", "data": "line1\r\nline2" }).to_string();
+        std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(body.as_bytes());
+            }
+        });
+        let (state, _) = test_state();
+        let (_, token) = signup_user(&state, "alice").await;
+        let url = format!("http://{addr}/res.json");
+        // sha512 hex of the CRLF-normalized data.
+        let digest = {
+            use sha2::Digest as _;
+            hex::encode(sha2::Sha512::digest("line1\nline2".as_bytes()).as_slice())
+        };
+        let (status, value) = call(
+            &state,
+            "fetch-external-resources",
+            serde_json::json!({ "url": url, "hash": digest }),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value["type"], serde_json::json!("text"));
+        // Wrong hash → verbatim mismatch error.
+        let (status, value) = call(
+            &state,
+            "fetch-external-resources",
+            serde_json::json!({ "url": url, "hash": "00".repeat(64) }),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "EXT_RESOURCE_HASH_DIDNT_MATCH");
+    }
+
+    #[tokio::test]
+    async fn batch_p_mentions_timeline() {
+        let (state, _) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (bob_id, bob_token) = signup_user(&state, "bob").await;
+        let (carol_id, carol_token) = signup_user(&state, "carol").await;
+
+        let m1 = create_note(
+            &state,
+            serde_json::json!({ "text": "@bob hello there" }),
+            &alice_token,
+        )
+        .await;
+        let m2 = create_note(
+            &state,
+            serde_json::json!({ "text": "@bob self ping" }),
+            &bob_token,
+        )
+        .await;
+        // Followers-only mention invisible to non-follower bob.
+        create_note(
+            &state,
+            serde_json::json!({ "text": "@bob secret", "visibility": "followers" }),
+            &carol_token,
+        )
+        .await;
+
+        // Bob sees both public mentions (alice's + his own).
+        let (status, value) = call(
+            &state,
+            "notes/mentions",
+            serde_json::json!({}),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let ids: Vec<&str> = value.as_array().unwrap().iter().map(|n| n["id"].as_str().unwrap()).collect();
+        assert!(ids.contains(&m1.as_str()), "{ids:?}");
+        assert!(ids.contains(&m2.as_str()), "{ids:?}");
+        // Frozen visibility policy (§3): mentioned viewers see followers
+        // notes, so carol's note is included for bob.
+        assert_eq!(ids.len(), 3, "{ids:?}");
+
+        // following=true keeps only followed authors + self (bob follows
+        // nobody → only his own).
+        let (status, value) = call(
+            &state,
+            "notes/mentions",
+            serde_json::json!({ "following": true }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let ids: Vec<&str> = value.as_array().unwrap().iter().map(|n| n["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec![m2.as_str()]);
+
+        // visibility=followers narrows; unknown values match nothing.
+        let (status, value) = call(
+            &state,
+            "notes/mentions",
+            serde_json::json!({ "visibility": "followers" }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value.as_array().unwrap().len(), 1);
+        let (status, value) = call(
+            &state,
+            "notes/mentions",
+            serde_json::json!({ "visibility": "bogus" }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value.as_array().unwrap().len(), 0);
+        let _ = (alice_id, bob_id, carol_id);
+    }
+
+    #[tokio::test]
+    async fn batch_p_notification_utils() {
+        let (state, _) = test_state();
+        let (_, token) = signup_user(&state, "alice").await;
+
+        // Test notification flows through the Notify path.
+        let (status, _) = call(
+            &state,
+            "notifications/test-notification",
+            serde_json::json!({}),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        state.worker.drain(100).expect("drain notify");
+        let (status, value) = call(
+            &state,
+            "i/notifications",
+            serde_json::json!({ "limit": 20, "markAsRead": false, "includeTypes": ["test"] }),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value.as_array().unwrap().len(), 1, "{value}");
+        assert_eq!(value[0]["type"], serde_json::json!("test"));
+
+        // Flush marks everything read (closest honest equivalent of the
+        // Redis-timeline drop).
+        let (status, _) = call(
+            &state,
+            "notifications/flush",
+            serde_json::json!({}),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, value) = call(
+            &state,
+            "i/notifications",
+            serde_json::json!({ "limit": 20, "markAsRead": false }),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert!(
+            value.as_array().unwrap().iter().all(|n| n["isRead"] == serde_json::json!(true)),
+            "{value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_p_discovery_versions_translate() {
+        let (state, _) = test_state();
+        let (alice_id, alice_token) = signup_user(&state, "alice").await;
+        let (bob_id, bob_token) = signup_user(&state, "bob").await;
+        let (carol_id, carol_token) = signup_user(&state, "carol").await;
+        let (dave_id, dave_token) = signup_user(&state, "dave").await;
+
+        // Follower counts: dave ← {bob, carol} (2), bob ← {alice} (1),
+        // carol ← {} (0). Alice follows bob, so bob is excluded for her.
+        for (token, target) in
+            [(&alice_token, &bob_id), (&bob_token, &dave_id), (&carol_token, &dave_id)]
+        {
+            let (status, _) = call(
+                &state,
+                "following/create",
+                serde_json::json!({ "userId": target }),
+                Some(token),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        // Recommendation: dave (2 followers) before carol (0); self and the
+        // already-followed bob are skipped for alice.
+        let (status, value) = call(
+            &state,
+            "users/recommendation",
+            serde_json::json!({ "limit": 10 }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let ids: Vec<&str> = value.as_array().unwrap().iter().map(|u| u["id"].as_str().unwrap()).collect();
+        assert!(!ids.contains(&alice_id.as_str()), "{ids:?}");
+        assert!(!ids.contains(&bob_id.as_str()), "{ids:?}");
+        assert_eq!(ids.first(), Some(&dave_id.as_str()), "{ids:?}");
+
+        // Notes recommendations: carol's note surfaces for alice.
+        let cn = create_note(
+            &state,
+            serde_json::json!({ "text": "carol post" }),
+            &carol_token,
+        )
+        .await;
+        let (status, value) = call(
+            &state,
+            "notes/recommendations",
+            serde_json::json!({ "limit": 10 }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let ids: Vec<&str> = value.as_array().unwrap().iter().map(|n| n["id"].as_str().unwrap()).collect();
+        assert!(ids.contains(&cn.as_str()), "{ids:?}");
+
+        // Versions: one edit → one history row (Sharkey shape).
+        let (status, value) = call(
+            &state,
+            "notes/edit",
+            serde_json::json!({ "editId": cn, "text": "carol post v2" }),
+            Some(&carol_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let (status, value) = call(
+            &state,
+            "notes/versions",
+            serde_json::json!({ "noteId": cn }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value.as_array().unwrap().len(), 1, "{value}");
+        assert_eq!(value[0]["text"], serde_json::json!("carol post"));
+        assert!(value[0]["oldDate"].is_string(), "{value}");
+        assert!(value[0]["updatedAt"].is_string(), "{value}");
+        // Unknown note → shared NO_SUCH_NOTE (400 by house convention,
+        // like `notes/show`).
+        let (status, value) = call(
+            &state,
+            "notes/versions",
+            serde_json::json!({ "noteId": "oid00000000000000" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "NO_SUCH_NOTE");
+
+        // Translate: invisible note → CANNOT_TRANSLATE_INVISIBLE_NOTE.
+        let secret = create_note(
+            &state,
+            serde_json::json!({ "text": "secret", "visibility": "followers" }),
+            &alice_token,
+        )
+        .await;
+        let (status, value) = call(
+            &state,
+            "notes/translate",
+            serde_json::json!({ "noteId": secret, "targetLang": "en-US" }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "CANNOT_TRANSLATE_INVISIBLE_NOTE");
+        // Visible note → dormant transport loud failure.
+        let (status, value) = call(
+            &state,
+            "notes/translate",
+            serde_json::json!({ "noteId": cn, "targetLang": "en-US" }),
+            Some(&bob_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["code"], "UNAVAILABLE");
+        let _ = (alice_id, bob_id, carol_id);
     }
 }

@@ -25,4 +25,4 @@ From `sns-server-proposal.md` §9 (the proposal wins on any disagreement).
 
 ## Later / explicitly deferred
 
-Newer HTTP message signatures (RFC 9421), OAuth, public-internet federation soak, Mastodon client API (non-goal), user lists, clips/pages/Reversi/chat and other legacy Misskey features (non-goals unless a target client requires them). Antennas, custom emoji, favorites, and polls shipped (Batch N + parity batch); word mutes are server-enforced by owner decision.
+Newer HTTP message signatures (RFC 9421), OAuth, public-internet federation soak, Mastodon client API (non-goal), clips/pages/Reversi/chat and other legacy Misskey features (non-goals unless a target client requires them). Antennas, custom emoji, favorites, polls, user lists, url-preview, self-service auth, follower removal, and drive extras shipped (Batch N + Batch O); email identity, account move, registry, mentions, notification utilities, discovery, versions, and translate shipped (Batch P); word mutes are server-enforced by owner decision.

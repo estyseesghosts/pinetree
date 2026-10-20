@@ -2,7 +2,8 @@ use super::AppServices;
 
 use crate::application::ports::{InsertMediaInput, PortError, TimelineCursor};
 use crate::domain::media::{sniff_mime, MediaMeta, MediaProperties};
-use crate::media::ingest::{md5_hex, sha256_hex};
+use crate::media::ingest::{md5_hex, sanitize_filename, sha256_hex};
+use crate::media::remote_cache::validate_remote_media_url;
 
 /// Misskey `DriveFileEntityService.validateFileName` parity: non-blank,
 /// at most 200 chars, no path separators or parent traversal.
@@ -71,6 +72,69 @@ impl AppServices {
             source_url: None,
             max_file_size: self.max_file_size,
         })
+    }
+
+    /// Fetch `url` and store it as the caller's drive file (Batch O WP13
+    /// `drive/files/upload-from-url`). Reuses the §2-rule-6 fetcher
+    /// (`federation_http`: SSRF guard, timeouts, redirect cap, size cap)
+    /// and the existing `upload_media` dedup path, so `force` keeps its
+    /// exact local meaning. DIVERGENCES from upstream: the fetch runs
+    /// synchronously in-request and the packed file is returned (upstream
+    /// returns void + async `urlUploadFinished`); `content-disposition`
+    /// filenames are ignored, so the name always comes from the URL leaf.
+    pub fn upload_media_from_url(
+        &self,
+        owner_id: &str,
+        url: &str,
+        comment: Option<String>,
+        is_sensitive: bool,
+        force: bool,
+    ) -> Result<MediaMeta, PortError> {
+        self.accounts.get_owner(owner_id)?;
+        validate_remote_media_url(url, &self.federation_http)?;
+        let max_bytes = usize::try_from(self.max_file_size).unwrap_or(16 * 1024 * 1024);
+        let resp = self
+            .federation_http
+            .send("GET", url, &[], None, max_bytes)
+            .map_err(|e| PortError::Validation(e.to_string()))?;
+        if !(200..300).contains(&resp.status) {
+            return Err(PortError::Validation(format!(
+                "upload-from-url GET returned HTTP {}",
+                resp.status
+            )));
+        }
+        if resp.body.is_empty() {
+            return Err(PortError::Validation(
+                "upload-from-url body is empty".to_string(),
+            ));
+        }
+        if resp.body.len() as u64 > self.max_file_size {
+            return Err(PortError::Validation("MAX_FILE_SIZE_EXCEEDED".to_string()));
+        }
+        let mime = sniff_mime(&resp.body);
+        let ext = match mime.as_str() {
+            "image/png" => "png",
+            "image/jpeg" => "jpg",
+            "image/gif" => "gif",
+            "image/webp" => "webp",
+            "image/avif" => "avif",
+            "video/mp4" => "mp4",
+            "video/webm" => "webm",
+            _ => "bin",
+        };
+        let url_leaf = url
+            .split('?')
+            .next()
+            .and_then(|p| p.rsplit('/').next())
+            .filter(|s| !s.is_empty());
+        let name = sanitize_filename(url_leaf, ext);
+        // Upstream `DriveService.uploadFromUrl` nulls the comment when it
+        // equals the derived name.
+        let comment = match comment {
+            Some(c) if c == name => None,
+            other => other,
+        };
+        self.upload_media(owner_id, name, &resp.body, comment, is_sensitive, force)
     }
 
     /// Attach one prepared remote-cache row to `note_id` (Phase 2.6 slice 7,

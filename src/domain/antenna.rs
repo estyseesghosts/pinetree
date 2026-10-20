@@ -87,11 +87,9 @@ impl Antenna {
         if self.id.trim().is_empty() || self.owner_id.trim().is_empty() {
             return Err(invalid("antenna requires id and owner".to_string()));
         }
-        if self.src == AntennaSrc::List
-            && self.user_list_id.as_deref().map(str::trim).unwrap_or("").is_empty()
-        {
-            return Err(invalid("antenna src=list requires user_list_id".to_string()));
-        }
+        // `src=list` without a list id stores null and matches nothing
+        // (upstream `create.ts` parity — the id rides the call only when
+        // `ps.src === 'list' && ps.userListId`).
         if !has_keyword(&self.keywords) && !has_keyword(&self.exclude_keywords) {
             return Err(invalid("EMPTY_KEYWORD".to_string()));
         }
@@ -127,6 +125,9 @@ pub struct AntennaNoteView<'a> {
     /// True when the note author is in `visibleUserIds` (specified notes) —
     /// equivalently, whether the owner may see it via the specified path.
     pub owner_in_visible_ids: bool,
+    /// True when the note author is a member of the antenna's list
+    /// (`src=list` only; resolved per note from the membership index).
+    pub author_in_list: bool,
 }
 
 /// Upstream `checkHitAntenna` order (`AntennaService.ts:116-209`):
@@ -164,8 +165,7 @@ pub fn antenna_matches(antenna: &Antenna, view: &AntennaNoteView) -> bool {
     }
     // (5) source. DIVERGENCE `home`: owner's own notes + notes from
     // followed accounts (upstream `home` is a TODO matching everything).
-    // `list` has no membership index (WP16 pending): matches nothing —
-    // the endpoint refuses `src=list` outright (documented).
+    // `list` checks membership through the user-list index (WP16).
     match antenna.src {
         AntennaSrc::All => {}
         AntennaSrc::Home => {
@@ -183,7 +183,11 @@ pub fn antenna_matches(antenna: &Antenna, view: &AntennaNoteView) -> bool {
                 return false;
             }
         }
-        AntennaSrc::List => return false,
+        AntennaSrc::List => {
+            if !view.author_in_list {
+                return false;
+            }
+        }
     }
     // (6) keywords: OR of AND-groups over `text + "\n" + cw`.
     let haystack = format!(
@@ -300,6 +304,7 @@ mod tests {
             owner_is_author: false,
             owner_follows_author: false,
             owner_in_visible_ids: false,
+            author_in_list: false,
         }
     }
 
@@ -380,9 +385,12 @@ mod tests {
         a.src = AntennaSrc::UsersBlacklist;
         assert!(!antenna_matches(&a, &view(&n, "u1")));
         assert!(antenna_matches(&a, &view(&n, "u2")));
-        // list matches nothing (WP16 pending).
+        // list matches members only (membership index, WP16).
         a.src = AntennaSrc::List;
         assert!(!antenna_matches(&a, &view(&n, "u1")));
+        let mut v = view(&n, "u1");
+        v.author_in_list = true;
+        assert!(antenna_matches(&a, &v));
     }
 
     #[test]
@@ -416,9 +424,9 @@ mod tests {
         a.name = "".to_string();
         assert!(a.validate().is_err());
         a.name = "n".to_string();
+        // `src=list` without an id is allowed (matches nothing).
         a.src = AntennaSrc::List;
-        assert!(a.validate().is_err(), "list needs a list id");
-        a.user_list_id = Some("l1".to_string());
+        a.user_list_id = None;
         assert!(a.validate().is_ok());
     }
 }

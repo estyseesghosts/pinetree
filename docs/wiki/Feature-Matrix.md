@@ -28,7 +28,7 @@ Legend: ✅ supported · 🟡 partial/subset · ❌ not supported (yet) · ⛔ d
 | Streaming (`/streaming`, channels, note capture) | ✅ (6 channels + capture) | ✅ | ✅ |
 | Timelines home / local / hybrid | ✅ | ✅ | ✅ |
 | Global timeline | ✅ | ✅ | ✅ |
-| Other timelines (user lists, hashtag, antenna, role, channel, bubble) | 🟡 (antenna feed + stream; no user lists yet) | ✅ (no bubble) | ✅ (incl. bubble) |
+| Other timelines (user lists, mentions, hashtag, antenna, role, channel, bubble) | ✅ (user lists + pull timelines + `userList` stream; antenna feed + stream; mentions) / ⛔ (hashtag, role, channel, bubble) | ✅ (no bubble) | ✅ (incl. bubble) |
 | Notes: text, CW, visibility, reply, renote, files, localOnly | ✅ | ✅ | ✅ |
 | Quote notes | ✅ (FEP-044f + legacy compat + authorization workflow) | ✅ | ✅ |
 | Branched reply threads | ✅ (indexed children, pending parents fail-closed, durable resolver) | ✅ | ✅ |
@@ -40,7 +40,7 @@ Legend: ✅ supported · 🟡 partial/subset · ❌ not supported (yet) · ⛔ d
 | Follow / unfollow | ✅ | ✅ | ✅ |
 | Follow requests (locked accounts) | ✅ (list/accept/reject/cancel) | ✅ | ✅ |
 | Mute / block / renote-mute | ❌ | ✅ | ✅ |
-| User lists, antennas, clips, pages, flash, gallery, channels | 🟡 (antennas done; rest out) | ✅ | ✅ |
+| User lists, antennas, clips, pages, flash, gallery, channels | ✅ (user lists + antennas; clips/pages/flash/gallery/channels out) | ✅ | ✅ |
 | Drive: upload | ✅ | ✅ | ✅ |
 | Drive: folders, listing, management | 🟡 (listing/show/update/delete; no folders) | ✅ | ✅ |
 | Search (notes/users) | 🟡 (notes + tag + user search, substring) | ✅ | ✅ |
@@ -68,7 +68,7 @@ Legend: ✅ supported · 🟡 partial/subset · ❌ not supported (yet) · ⛔ d
 | Quote (FEP-044f `quote` + e232 Link + stamp, `_misskey_quote` / `quoteUrl`) | ✅ | ✅ | ✅ |
 | Polls (`Question`, `_misskey_votes`) | ❌ (deferred) | ✅ | ✅ |
 | `_misskey_content` | never emitted | legacy | legacy |
-| Move / Block / Flag | ❌ | ✅ | ✅ |
+| Move (`i/move` + inbound, live-tested pinetree↔pinetree) / Block / Flag | ✅ / ✅ / ✅ | ✅ | ✅ |
 | Atomic activity-id dedup | ✅ (same transaction as the state change, including Reject) | job-level | job-level |
 | Durable outbound delivery + backoff | ✅ (outbox in the same transaction as the post; terminal quarantine + retry caps) | ✅ (BullMQ) | ✅ (BullMQ) |
 | SSRF / size / redirect / timeout limits | ✅ | ✅ | ✅ |

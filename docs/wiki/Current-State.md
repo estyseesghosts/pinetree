@@ -61,7 +61,7 @@ Anything else answers 404 `UNKNOWN_API_ENDPOINT`; unknown fields on listed endpo
 ## Known gaps / limits
 
 - Streaming channels: `userList`, `hashtag`, `roleTimeline`, `channel`, `drive`, `chat*`, `reversi*`, `clip`, `admin`, `serverStats`, `queueStats` answer `UNSUPPORTED_CHANNEL` (`antenna` shipped Batch N); connection caps (32/1536) and the 2 min idle reap are implemented but not live-tested.
-- API profile subset only (see above): no clips, channels, pages, drive folders, user lists, featured/mentions/user-list timelines, `notifications/flush`, 2FA, webhooks, OAuth, Mastodon API. `users/followers|following` return Misskey `Following[]` — Keystone's `FollowList` needs a one-line map in its own repo (logged follow-up).
+- API profile subset only (see above): no clips, channels, pages, drive folders, featured timelines, 2FA, webhooks, OAuth, Mastodon API. User lists + pull timelines + `userList` stream, url-preview, self-service auth, follower removal, drive extras (Batch O), and email identity + move + registry + mentions + notification utilities + discovery + versions + translate (Batch P; email/translate transports dormant, `pinned-users` empty, hashtag timeline out — upstream has none). `users/followers|following` return Misskey `Following[]` — Keystone's `FollowList` needs a one-line map in its own repo (logged follow-up).
 - `i/update` supports a subset of profile fields (no profile `fields[]`, decorations, mutes, …).
 - Federation MVP scope: no `_misskey_content` (never emitted), no Move activity handling, no RFC 9421 message signatures or LD signatures, no public-internet validation (interop was loopback-only).
 - Storage is single-node `redb`; FoundationDB adapter and `src/cluster/*` are Phase 4. `--mode=cluster` is refused.

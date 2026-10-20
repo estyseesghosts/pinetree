@@ -196,20 +196,47 @@ rather than a broken half-implementation:
   reactions store verbatim. Outbound reactions to Akkoma/Pleroma-family hosts
   degrade to a plain `Like` (❤ favorite) until an `EmojiReact` emit shape
   passes a live round-trip test.
-- **No clips, channels, pages, drive folders, user lists, chat,
-  Reversi, or search-by-hashtag.** No featured/mentions/user-list timelines,
-  no `drive` streaming channel, no `notes/user-list-timeline`,
-  no `notifications/flush`, no `signin-flow`, no 2FA/passkeys/webhooks.
-  Antennas, favorites, and custom emoji shipped (Batch N); user lists are
-  still out (antenna `src=list` is refused until they land).
+- **User lists shipped (Batch O WP16).** `users/lists/*` (12 endpoints),
+  `notes/user-list-timeline` (owner-only pull read), `userList` streaming
+  channel (`userAdded`/`userRemoved`/notes), list notification
+  receive-configs, CSV export/import, and antenna `src=list` now resolves
+  through the membership index. Limits enforced + advertised
+  (`userListLimit 10`, `userEachUserListsLimit 50`). Remote members queue a
+  system-actor Follow. `create-from-public` stays 404.
+- **No clips, channels, pages, drive folders, chat,
+  Reversi, or search-by-hashtag.** No featured timelines,
+  no `drive` streaming channel,
+  no `signin-flow`, no 2FA/passkeys/webhooks.
+  Antennas, favorites, custom emoji, user lists, mentions timeline,
+  notification utilities, discovery, versions, and translate stubs shipped
+  (Batch N + O + P).
 - **No OAuth.** MiAuth + API tokens only (OAuth lands only if a target client
   requires it).
-- **No thread muting, no Move activity handling, no RFC 9421 or Linked-Data
+- **No thread muting, no RFC 9421 or Linked-Data
   signatures,** no `_misskey_content` (never emitted, by decision), no polls
-  over deleted/expired edge beyond documented errors.
-- **No url-preview, self-service (password/token/apps), follower-removal,
-  or remote lookup yet** (Batch M work packages WP9–WP10 are specified in
-  `docs/implementer-guide-batch-m.md` §§5 but not implemented).
+  over deleted/expired edge beyond documented errors. Account move (`i/move`
+  + inbound `Move`) ships in Batch P — verified live between two pinetrees.
+- **Self-service, follower-removal, remote lookup, drive extras, and
+  url-preview shipped (Batch O WP9/WP10/WP12/WP13).**
+  `i/change-password`, `i/regenerate-token` (native rotation; app grants
+  survive), `i/apps`, `i/authorized-apps`, real `i/revoke-token{tokenId}`,
+  `i/signin-history` (deploy-forward rows, capped at 100/user),
+  `following/invalidate` (followee-authored Reject to remote followers),
+  `users/search-by-username-and-host`, `ap/get` (credentialed safe subset
+  of `ap/show`), `drive/files/upload-from-url`,
+  `drive/files/find-by-hash`, first-party `url-preview`.
+- **Email identity + discovery batch shipped (Batch P).**
+  `i/update-email`, `request-reset-password`, `reset-password`,
+  `verify-email` (code-complete, dormant: no SMTP configured — sends fail
+  loudly, never silently), `i/move` + inbound `Move` (alias handshake,
+  follower migration, replay/forgery covered), `i/registry/*` (8 endpoints),
+  `get-online-users-count` (streaming-presence definition), `pinned-users`
+  (`[]`), `fetch-external-resources`, `fetch-rss` (documented subset),
+  `server-info`, `stats` (real counts), `notes/mentions`,
+  `notifications/test-notification`, `notifications/flush` (mark-read +
+  event), `users/recommendation`, `notes/recommendations` (simplified
+  scoring), `notes/versions` (Sharkey shape), `notes/translate`
+  (dormant: no backend — loud failure).
 - **Abuse reporting is wired up** (`users/report-abuse` + the
   `admin/abuse-user-reports` family with `Flag` forwarding); admins poll the
   list (no mail/webhook notifications).

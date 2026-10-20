@@ -304,10 +304,14 @@ impl JobWorker {
         // so neither the self-notify nor the mute check applies — only a
         // `never` receive-config drops it). Pinetree rows require a
         // notifier (the exporter), so this kind takes the dedicated
-        // notifier-less gate instead.
-        let allowed = if notify.kind == NotificationKind::ExportCompleted {
+        // notifier-less gate instead. Batch P `test` rides the same gate
+        // (upstream `createNotification(user.id, 'test', {})` is equally
+        // notifier-less).
+        let allowed = if notify.kind == NotificationKind::ExportCompleted
+            || notify.kind == NotificationKind::Test
+        {
             self.services
-                .export_completed_allowed(&notify.notifiee_id)?
+                .system_notification_allowed(&notify.notifiee_id, notify.kind)?
         } else if !self.services.notification_delivery_allowed(
             &notify.notifiee_id,
             notify.kind,
@@ -444,7 +448,8 @@ impl JobWorker {
             NotificationKind::FollowRequestAccepted
             | NotificationKind::ScheduledNotePosted
             | NotificationKind::ScheduledNotePostFailed
-            | NotificationKind::ExportCompleted => {}
+            | NotificationKind::ExportCompleted
+            | NotificationKind::Test => {}
         }
         Ok(())
     }

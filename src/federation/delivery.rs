@@ -1314,23 +1314,31 @@ pub fn upsert_remote_actor_from_doc(
             .accounts
             .find_by_username_and_host(&parsed.username, Some(&parsed.host))?)
     {
-        services.accounts.update_account(
-            &existing.id,
-            UpdateAccountPatch {
-                display_name: Some(parsed.display_name.clone()),
-                description: Some(description),
-                location: Some(parsed.location.clone()),
-                birthday: None,
-                avatar_id: None,
-                banner_id: None,
-                is_locked: Some(parsed.manually_approves_followers),
-                is_bot: Some(parsed.is_bot()),
-                is_cat: Some(parsed.is_cat),
-                is_explorable: Some(parsed.discoverable),
-                ..Default::default()
-            },
-            Vec::new(),
-        )?
+        // Batch P: refresh the move-handshake columns from the document
+        // (`updatePerson` parity). `alsoKnownAs` overwrites only when the
+        // document carries the field; `movedTo` is set-only (patch has no
+        // clear — an account never un-moves).
+        let mut patch = UpdateAccountPatch {
+            display_name: Some(parsed.display_name.clone()),
+            description: Some(description),
+            location: Some(parsed.location.clone()),
+            birthday: None,
+            avatar_id: None,
+            banner_id: None,
+            is_locked: Some(parsed.manually_approves_followers),
+            is_bot: Some(parsed.is_bot()),
+            is_cat: Some(parsed.is_cat),
+            is_explorable: Some(parsed.discoverable),
+            ..Default::default()
+        };
+        if parsed.also_known_as.is_some() {
+            patch.also_known_as = Some(parsed.also_known_as.clone());
+        }
+        if let Some(moved) = parsed.moved_to_uri.clone() {
+            patch.moved_to_uri = Some(moved);
+            patch.moved_at_ms = Some(services.clock.now_ms());
+        }
+        services.accounts.update_account(&existing.id, patch, Vec::new())?
     } else {
         services.accounts.create_account(CreateAccountInput {
             handle: parsed.username.clone(),
@@ -1348,6 +1356,24 @@ pub fn upsert_remote_actor_from_doc(
             preserved_usernames: Vec::new(),
         }, None)?
     };
+    // Batch P: seed the move-handshake columns on first sight (same fields
+    // as the refresh path above; one extra txn only when present). Rebind:
+    // callers read the handshake columns off the returned row, and the
+    // pre-seed struct does not have them.
+    let mut account = account;
+    if parsed.also_known_as.is_some() || parsed.moved_to_uri.is_some() {
+        let mut patch = UpdateAccountPatch {
+            ..Default::default()
+        };
+        if parsed.also_known_as.is_some() {
+            patch.also_known_as = Some(parsed.also_known_as.clone());
+        }
+        if let Some(moved) = parsed.moved_to_uri.clone() {
+            patch.moved_to_uri = Some(moved);
+            patch.moved_at_ms = Some(services.clock.now_ms());
+        }
+        account = services.accounts.update_account(&account.id, patch, Vec::new())?;
+    }
 
     // Slice 3 (H5): run domain validation on the upsert path (both the
     // freshly created and the previously stored account) before caching any

@@ -941,6 +941,28 @@ pub fn render_undo_activity(
     doc
 }
 
+/// Render a `Move` activity (Batch P `i/move`; Misskey
+/// `ApRendererService.renderMove` parity: `id =
+/// {url}/moves/{srcId}/{dstId}`, `actor` = old account URI, `object` =
+/// old account URI, `target` = new account URI).
+pub fn render_move_activity(
+    public_url: &str,
+    src_account_id: &str,
+    src_actor_uri: &str,
+    dst_actor_uri: &str,
+    dst_account_id: &str,
+) -> Value {
+    let base = public_url.trim_end_matches('/');
+    json!({
+        "@context": ap_context(),
+        "id": format!("{base}/moves/{src_account_id}/{dst_account_id}"),
+        "type": "Move",
+        "actor": src_actor_uri,
+        "object": src_actor_uri,
+        "target": dst_actor_uri,
+    })
+}
+
 /// Render an `Add`/`Remove` of a note to/from the actor's featured
 /// collection (pinning §7; Misskey `NotePiningService.deliverPinnedChange`
 /// `renderAdd`/`renderRemove` parity: `target =
@@ -1923,6 +1945,10 @@ mod tests {
             instance_settings: store.clone(),
             invites: store.clone(),
             abuse_reports: store.clone(),
+            lists: store.clone(),
+            signin: store.clone(),
+            password_resets: store.clone(),
+            registry: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()
@@ -2139,6 +2165,10 @@ mod quote_render_tests {
             instance_settings: store.clone(),
             invites: store.clone(),
             abuse_reports: store.clone(),
+            lists: store.clone(),
+            signin: store.clone(),
+            password_resets: store.clone(),
+            registry: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()

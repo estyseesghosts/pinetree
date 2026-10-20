@@ -143,6 +143,19 @@ pub enum FederateDeliverPayload {
         account_id: String,
         inbox_override: Option<String>,
     },
+    /// Deliver `Move(old → new)` to the old account's remote follower
+    /// inboxes (Batch P `i/move`; Misskey `moveFromLocal` parity: the
+    /// `Move` goes to old followers; the `Update(Person)` carrying
+    /// `movedTo` is a separate `ActorUpdated` job). `activity_id` is the
+    /// `{url}/moves/{src}/{dst}` id, minted once at enqueue so replays
+    /// re-deliver the SAME id and receivers dedupe.
+    MoveDelivered {
+        activity_id: String,
+        account_id: String,
+        new_actor_uri: String,
+        new_account_id: String,
+        inbox_override: Option<String>,
+    },
     /// Deliver `Update(Note)` after a local `notes/edit` (§8; Sharkey
     /// `postNoteEdited` AP-deliver parity). `note_id` is the edited note
     /// (always known — no `__PENDING__` substitution needed).
@@ -876,12 +889,60 @@ pub fn execute_federate_deliver(
             }
         }
 
+        FederateDeliverPayload::MoveDelivered {
+            activity_id,
+            account_id,
+            new_actor_uri,
+            new_account_id,
+            inbox_override,
+        } => {
+            let account = match services.accounts.find_by_id(&account_id)? {
+                Some(a) => a,
+                None => return Ok(DeliveryOutcome::Delivered),
+            };
+            let activity = crate::activitypub::objects::render_move_activity(
+                base,
+                &account_id,
+                &account.actor_url(base),
+                &new_actor_uri,
+                &new_account_id,
+            );
+            // The rendered id embeds src/dst; stamp the minted activity id
+            // so replays carry the same id receivers dedupe on.
+            let mut activity = activity;
+            activity["id"] = Value::String(activity_id.clone());
+            match inbox_override {
+                Some(inbox) => {
+                    deliver_single(services, client, tracker, &account_id, &inbox, &activity)
+                }
+                None => {
+                    let inboxes =
+                        collect_recipient_inboxes_for_author(services, &account_id, &[], true)?;
+                    fan_out(
+                        services,
+                        client,
+                        tracker,
+                        job_key,
+                        &account_id,
+                        &inboxes,
+                        &activity,
+                        &|inbox: &str| FederateDeliverPayload::MoveDelivered {
+                            activity_id: activity_id.clone(),
+                            account_id: account_id.clone(),
+                            new_actor_uri: new_actor_uri.clone(),
+                            new_account_id: new_account_id.clone(),
+                            inbox_override: Some(inbox.to_string()),
+                        },
+                    )
+                }
+            }
+        }
+
         FederateDeliverPayload::NoteUpdated {
             note_id,
             author_id,
             inbox_override,
-        } => {
-            let author = match services.accounts.find_by_id(&author_id)? {
+        } => {            let author = match services.accounts.find_by_id(&author_id)? {
                 Some(a) if a.is_local() => a,
                 _ => return Ok(DeliveryOutcome::Delivered),
             };

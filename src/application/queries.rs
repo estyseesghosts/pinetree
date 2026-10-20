@@ -882,6 +882,103 @@ impl AppServices {
         })
     }
 
+    /// `notes/user-list-timeline` (Batch O WP16): owner-only pull timeline.
+    /// Merges members' newest notes (bounded: member cap × per-member page)
+    /// and applies the per-membership reply rule plus the caller's include
+    /// flags, then the shared visibility + mute/block page. Mirrors the
+    /// upstream `getFromDb` shape (no write fan-out, DIVERGENCE 3).
+    #[allow(clippy::too_many_arguments)]
+    pub fn user_list_timeline(
+        &self,
+        list_id: &str,
+        viewer_id: &str,
+        cursor: &TimelineCursor,
+        include_my_renotes: bool,
+        include_renoted_my_notes: bool,
+        include_local_renotes: bool,
+        with_renotes: bool,
+        with_files: bool,
+    ) -> Result<Vec<Note>, PortError> {
+        let list = match self.lists.get_user_list(list_id)? {
+            Some(list) if list.owner_id == viewer_id => list,
+            _ => return Err(PortError::NotFound("NO_SUCH_LIST".to_string())),
+        };
+        let memberships = self.lists.members_of_list(&list.id)?;
+        let with_replies: std::collections::HashMap<&str, bool> = memberships
+            .iter()
+            .map(|m| (m.member_id.as_str(), m.with_replies))
+            .collect();
+        // Bounded candidate set: newest page per member.
+        let mut all: Vec<Note> = Vec::new();
+        for member in &memberships {
+            let page = self.notes.notes_by_author(
+                &member.member_id,
+                &TimelineCursor {
+                    limit: 100,
+                    ..Default::default()
+                },
+            )?;
+            for note in page {
+                // Per-membership reply rule (upstream `getFromDb` bracket):
+                // roots, self-replies, and replies to the owner always
+                // pass; other replies need `withReplies`.
+                let reply_ok = match note.reply_id.as_deref() {
+                    None => true,
+                    Some(_) => {
+                        let target = note.reply_user_id.as_deref().unwrap_or("");
+                        target.is_empty()
+                            || target == note.author_id
+                            || target == list.owner_id
+                            || with_replies.get(note.author_id.as_str()).copied().unwrap_or(false)
+                    }
+                };
+                if reply_ok {
+                    all.push(note);
+                }
+            }
+        }
+        // Newest-first merge (authors are unique per note: no duplicates).
+        all.sort_by(|a, b| b.id.cmp(&a.id));
+        let viewer_id_opt = Some(viewer_id);
+        self.visible_page(viewer_id_opt, all, cursor, |note| {
+            if with_files && note.file_ids.is_empty() {
+                return false;
+            }
+            // Upstream brackets: a renote with own text/files (or a poll)
+            // is content, not a bare reshare, and survives every flag.
+            let renote_target = note.renote_id.as_deref();
+            if let Some(target_id) = renote_target {
+                let has_content =
+                    note.text.as_deref().is_some_and(|t| !t.is_empty()) || !note.file_ids.is_empty();
+                if !has_content && self.polls.get_poll(&note.id).ok().flatten().is_none() {
+                    if !with_renotes {
+                        return false;
+                    }
+                    if !include_my_renotes && note.author_id == viewer_id {
+                        return false;
+                    }
+                    if !include_renoted_my_notes || !include_local_renotes {
+                        if let Ok(Some(target)) = self.notes.get_note(target_id) {
+                            let target_author_host = self
+                                .accounts
+                                .find_by_id(&target.author_id)
+                                .ok()
+                                .flatten()
+                                .and_then(|a| a.host);
+                            if !include_renoted_my_notes && target.author_id == viewer_id {
+                                return false;
+                            }
+                            if !include_local_renotes && target_author_host.is_none() {
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+            true
+        })
+    }
+
     /// `notes/replies`: direct replies (`reply_id == note_id`). Like Misskey,
     /// an unknown `note_id` yields `[]` (no existence check).
     ///
@@ -1118,6 +1215,263 @@ impl AppServices {
         self.visible_page(viewer_id, all, cursor, |note| {
             note.tags.iter().any(|t| t.to_lowercase() == needle)
         })
+    }
+
+    // --- Batch P ----------------------------------------------------------
+
+    /// `notes/mentions` (Misskey `notes/mentions.ts` parity): notes
+    /// mentioning the viewer (`mentions`) or directly addressed to them
+    /// (`visibleUserIds`, i.e. specified-visibility notes). `following`
+    /// restricts authors to the viewer's followees + self (upstream
+    /// `following` branch); `visibility` narrows to one visibility value.
+    /// Standard visibility + mute/block/thread filtering applies on top.
+    pub fn mentions_timeline(
+        &self,
+        viewer_id: &str,
+        following_only: bool,
+        visibility: Option<crate::domain::note::Visibility>,
+        cursor: &TimelineCursor,
+    ) -> Result<Vec<Note>, PortError> {
+        let cache = self.follows_cache(Some(viewer_id))?;
+        let authors: Option<std::collections::HashSet<String>> = if following_only {
+            let mut set = self.follow_set(viewer_id)?;
+            set.insert(viewer_id.to_string());
+            Some(set)
+        } else {
+            None
+        };
+        let all = self.all_notes_bounded()?;
+        let mut scoped = Vec::new();
+        for note in all {
+            if !note.mentions.iter().any(|id| id == viewer_id)
+                && !note.visible_user_ids.iter().any(|id| id == viewer_id)
+            {
+                continue;
+            }
+            if let Some(authors) = authors.as_ref() {
+                if !authors.contains(&note.author_id) {
+                    continue;
+                }
+            }
+            if let Some(want) = visibility {
+                if note.visibility != want {
+                    continue;
+                }
+            }
+            let viewer = self.viewer_ctx(Some(viewer_id), &note.author_id, &cache);
+            if !is_visible(&note, &viewer) {
+                continue;
+            }
+            scoped.push(note);
+        }
+        Ok(self.apply_cursor(self.apply_feed_filter(Some(viewer_id), scoped)?, cursor))
+    }
+
+    /// `users/recommendation` (Misskey `users/recommendation.ts`
+    /// documented-simplified scoring, DIVERGENCE noted in the manifest):
+    /// unlocked + explorable LOCAL accounts, excluding self, already-followed,
+    /// muted/blocked (either direction), suspended, and deleted, ordered by
+    /// `followers_count` descending. Upstream additionally requires
+    /// `updatedAt` within 7 days; pinetree stores no per-account activity
+    /// timestamp, so recency is not filtered (documented).
+    pub fn recommended_users(
+        &self,
+        viewer_id: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Account>, PortError> {
+        let following = self.follow_set(viewer_id)?;
+        let muted = self
+            .mutes
+            .muted_ids_for(viewer_id)
+            .unwrap_or_default();
+        let mut out = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let (page, next) = self.accounts.all_accounts(after.as_deref(), 500)?;
+            if page.is_empty() {
+                break;
+            }
+            for acc in page {
+                after = Some(acc.id.clone());
+                if !acc.is_local()
+                    || acc.id == viewer_id
+                    || acc.is_locked
+                    || !acc.is_explorable
+                    || acc.is_suspended
+                    || acc.is_deleted
+                    || following.contains(&acc.id)
+                    || muted.iter().any(|id| id == &acc.id)
+                {
+                    continue;
+                }
+                if self.blocks.is_blocking(viewer_id, &acc.id).unwrap_or(false)
+                    || self.blocks.is_blocking(&acc.id, viewer_id).unwrap_or(false)
+                {
+                    continue;
+                }
+                out.push(acc);
+            }
+            if next.is_none() {
+                break;
+            }
+        }
+        out.sort_by(|a, b| {
+            b.followers_count
+                .cmp(&a.followers_count)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(out.into_iter().skip(offset).take(limit).collect())
+    }
+
+    /// `notes/recommendations` (Batch P; Sharkey `notes/recommendations.ts`
+    /// SHAPE parity — `Note[]`, `limit`/`offset` — over a
+    /// documented-simplified scorer, DIVERGENCE): newest visible notes by
+    /// the [`AppServices::recommended_users`] scorer's top accounts.
+    /// Sharkey's `RecommendationService` (per-user queue, language lanes,
+    /// re-rank) has no pinetree equivalent and is an explicit non-goal;
+    /// `lang`/`refresh` are accepted-and-ignored, `withSensitive` drops
+    /// sensitive/file-flagged notes when false, `withRenotes` drops pure
+    /// renotes when false. Anonymous callers get the same public-only page.
+    pub fn recommended_notes(
+        &self,
+        viewer_id: Option<&str>,
+        limit: usize,
+        offset: usize,
+        with_renotes: bool,
+        with_sensitive: bool,
+    ) -> Result<Vec<crate::domain::note::Note>, PortError> {
+        let suggested: Vec<Account> = match viewer_id {
+            Some(viewer) => self.recommended_users(viewer, 50, 0)?,
+            None => Vec::new(),
+        };
+        let cache = self.follows_cache(viewer_id)?;
+        let all = self.all_notes_bounded()?;
+        let mut scoped = Vec::new();
+        for note in all {
+            // Anonymous (or suggestion-poor) callers fall back to every
+            // visible note; credentialed callers see suggested authors'
+            // notes plus their own recent notes.
+            let in_scope = if suggested.is_empty() {
+                true
+            } else {
+                suggested.iter().any(|a| a.id == note.author_id)
+                    || Some(note.author_id.as_str()) == viewer_id
+            };
+            if !in_scope {
+                continue;
+            }
+            if !with_renotes && Self::is_pure_renote(&note) {
+                continue;
+            }
+            // Sharkey `withSensitive=false` parity (soft): drop notes with
+            // sensitive-flagged attachments (media rows are read per
+            // candidate; missing rows fail open).
+            if !with_sensitive && !note.file_ids.is_empty() {
+                let mut sensitive = false;
+                for file_id in &note.file_ids {
+                    if let Ok(Some(meta)) = self.media.get(file_id) {
+                        if meta.is_sensitive {
+                            sensitive = true;
+                            break;
+                        }
+                    }
+                }
+                if sensitive {
+                    continue;
+                }
+            }
+            let viewer = self.viewer_ctx(viewer_id, &note.author_id, &cache);
+            if !is_visible(&note, &viewer) {
+                continue;
+            }
+            scoped.push(note);
+        }
+        scoped.sort_by(|a, b| b.id.cmp(&a.id));
+        // Offset-then-limit over the ranked page (the feed is a
+        // server-ranked queue, not an id cursor — Sharkey parity on params).
+        let filtered = self.apply_feed_filter(viewer_id, scoped)?;
+        Ok(filtered
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect())
+    }
+
+    /// `stats` (Misskey `stats.ts` parity on shape; values from our stores):
+    /// `(notes, local_notes, users, local_users, reactions, instances,
+    /// drive_local_bytes, drive_remote_bytes)`. `instances` counts distinct
+    /// remote hosts among cached accounts (upstream counts its instances
+    /// table). Drive sums walk media rows once, attributing by owner
+    /// locality (upstream hardcodes both to 0 — pinetree reports real sums,
+    /// DIVERGENCE).
+    #[allow(clippy::type_complexity)]
+    pub fn instance_stats(&self) -> Result<(u64, u64, u64, u64, u64, u64, u64, u64), PortError> {
+        let notes = self.notes.count_notes()?;
+        let local_notes = self.notes.count_local_notes()?;
+        let reactions = self.reactions.count_reactions()?;
+        let mut users = 0u64;
+        let mut local_users = 0u64;
+        let mut hosts = std::collections::HashSet::new();
+        let mut local_ids = std::collections::HashSet::new();
+        let mut after: Option<String> = None;
+        loop {
+            let (page, next) = self.accounts.all_accounts(after.as_deref(), 500)?;
+            if page.is_empty() {
+                break;
+            }
+            for acc in page {
+                after = Some(acc.id.clone());
+                users += 1;
+                if acc.is_local() {
+                    local_users += 1;
+                    local_ids.insert(acc.id.clone());
+                } else if let Some(host) = acc.host.clone() {
+                    hosts.insert(host);
+                }
+            }
+            if next.is_none() {
+                break;
+            }
+        }
+        let mut drive_local = 0u64;
+        let mut drive_remote = 0u64;
+        let mut media_cursor = TimelineCursor {
+            limit: 500,
+            ..Default::default()
+        };
+        loop {
+            let page = self.media.list_all_media(&media_cursor)?;
+            if page.is_empty() {
+                break;
+            }
+            for meta in &page {
+                let is_local = meta
+                    .owner_id
+                    .as_deref()
+                    .map(|owner| local_ids.contains(owner))
+                    .unwrap_or(false);
+                if is_local {
+                    drive_local += meta.size_bytes;
+                } else {
+                    drive_remote += meta.size_bytes;
+                }
+            }
+            if page.len() < 500 {
+                break;
+            }
+            media_cursor.until_id = page.last().map(|m| m.id.clone());
+        }
+        Ok((
+            notes,
+            local_notes,
+            users,
+            local_users,
+            reactions,
+            hosts.len() as u64,
+            drive_local,
+            drive_remote,
+        ))
     }
 
     // --- Phase 3 follow lists ----------------------------------------------
@@ -1476,6 +1830,10 @@ mod timeline_tests {
             instance_settings: store.clone(),
             invites: store.clone(),
             abuse_reports: store.clone(),
+            lists: store.clone(),
+            signin: store.clone(),
+            password_resets: store.clone(),
+            registry: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()

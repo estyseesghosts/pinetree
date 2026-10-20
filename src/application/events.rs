@@ -40,6 +40,11 @@ pub enum StreamingEvent {
     /// One antenna feed gained a note (Batch N WS4): the worker publishes
     /// this post-commit per match; the `antenna` stream channel packs it.
     AntennaNote { antenna_id: String, note_id: String },
+    /// A user-list member was added/removed (Batch O WP16): post-commit
+    /// fan-out to the `userList` stream channel (`userAdded`/`userRemoved`
+    /// with the packed member).
+    UserListMemberAdded { list_id: String, member_id: String },
+    UserListMemberRemoved { list_id: String, member_id: String },
     /// The account was suspended (Batch M WP3): drop its open `/streaming`
     /// connections (upstream publishes `userChangeSuspendedState`; the
     /// pinned upstream only invalidates caches with it, so the socket drop
@@ -72,6 +77,9 @@ pub enum MainEventKind {
     ReceiveFollowRequest,
     MeUpdated,
     ReadAllNotifications,
+    /// Batch P `notifications/flush` parity: upstream `flushAllNotifications`
+    /// emits `notificationFlushed` (distinct from `readAllNotifications`).
+    NotificationFlushed,
 }
 
 impl MainEventKind {
@@ -88,6 +96,7 @@ impl MainEventKind {
             MainEventKind::ReceiveFollowRequest => "receiveFollowRequest",
             MainEventKind::MeUpdated => "meUpdated",
             MainEventKind::ReadAllNotifications => "readAllNotifications",
+            MainEventKind::NotificationFlushed => "notificationFlushed",
         }
     }
 }

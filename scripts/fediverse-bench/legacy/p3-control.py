@@ -1,5 +1,7 @@
+import os
+BD = os.environ["BENCH_DIR"]
 import sys, time, json
-sys.path.insert(0, "/tmp/opencode/bench")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lib import load_nodes
 nodes = load_nodes()
 def total(rs): return sum(len(a) if isinstance(a, list) else int(a or 0) for a in rs.values())

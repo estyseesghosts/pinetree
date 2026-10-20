@@ -87,6 +87,21 @@ impl RateLimiter {
             .with_limit("notes/delete", 300, HOUR_MS, Some(1_000))
             .with_limit("following/create", 100, HOUR_MS, None)
             .with_limit("following/delete", 100, HOUR_MS, None)
+            .with_limit("following/invalidate", 100, HOUR_MS, None)
+            .with_limit("users/search-by-username-and-host", 60, HOUR_MS, None)
+            .with_limit("ap/show", 60, HOUR_MS, None)
+            .with_limit("ap/get", 30, HOUR_MS, None)
+            // Batch O WP9 self-service + WP12 preview + WP13 drive extras.
+            .with_limit("i/change-password", 10, HOUR_MS, None)
+            .with_limit("i/regenerate-token", 10, HOUR_MS, None)
+            .with_limit("i/apps", 60, HOUR_MS, None)
+            .with_limit("i/authorized-apps", 60, HOUR_MS, None)
+            .with_limit("i/signin-history", 60, HOUR_MS, None)
+            .with_limit("url-preview", 60, HOUR_MS, None)
+            .with_limit("drive/files/upload-from-url", 60, HOUR_MS, None)
+            .with_limit("drive/files/find-by-hash", 60, HOUR_MS, None)
+            // Upstream `users/lists/push.ts` 1h/30 rate bucket.
+            .with_limit("users/lists/push", 30, HOUR_MS, None)
             .with_limit("blocking/create", 20, HOUR_MS, None)
             .with_limit("blocking/delete", 100, HOUR_MS, None)
             .with_limit("mute/create", 20, HOUR_MS, None)
@@ -123,6 +138,22 @@ impl RateLimiter {
             // Failed signin attempts: 10 per account and 30 per IP per minute.
             .with_auth_limit("auth/signin", 10, 30, MINUTE_MS)
             .with_auth_limit("auth/miauth", 10, 30, MINUTE_MS)
+            // Batch O WP9: wrong-password on self-service counts like a
+            // failed signin (same 10/account + 30/IP per minute class).
+            .with_auth_limit("auth/change-password", 10, 30, MINUTE_MS)
+            .with_auth_limit("auth/regenerate-token", 10, 30, MINUTE_MS)
+            // Batch P: email/move/translate/notification/discovery buckets
+            // (upstream windows: update-email + request-reset-password 3/h,
+            // i/move 5/day, fetch-external-resources 50/h, fetch-rss
+            // 300/min, test-notification 10/min, notes/versions 10/5s).
+            .with_limit("i/update-email", 3, HOUR_MS, None)
+            .with_limit("request-reset-password", 3, HOUR_MS, None)
+            .with_limit("i/move", 5, 86_400_000, None)
+            .with_limit("fetch-external-resources", 50, HOUR_MS, None)
+            .with_limit("fetch-rss", 300, MINUTE_MS, None)
+            .with_limit("notifications/test-notification", 10, MINUTE_MS, None)
+            .with_limit("notes/versions", 10, 5_000, None)
+            .with_auth_limit("auth/update-email", 10, 30, MINUTE_MS)
     }
 
     /// Failure-counted auth bucket: at most `max_per_account` failures per
@@ -228,6 +259,16 @@ impl RateLimiter {
                 min_interval_ms,
             },
         );
+        self
+    }
+
+    /// Debug-only: multiplies every endpoint bucket's `max_per_window` by
+    /// `factor`. Auth failure throttles and `min_interval_ms` are unchanged.
+    /// Used by `--debug-weak-rate-limits` for load tests; never in production.
+    pub fn with_weakened_limits(mut self, factor: u64) -> Self {
+        for limit in self.limits.values_mut() {
+            limit.max_per_window = limit.max_per_window.saturating_mul(factor);
+        }
         self
     }
 

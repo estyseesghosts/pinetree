@@ -223,6 +223,10 @@ pub struct ParsedSignature {
     pub algorithm: String,
     pub headers: Vec<String>,
     pub signature: Vec<u8>,
+    /// `created` parameter, the value of the `(created)` pseudo-header.
+    pub created: Option<String>,
+    /// `expires` parameter, the value of the `(expires)` pseudo-header.
+    pub expires: Option<String>,
 }
 
 /// Sign an outgoing request the way Misskey/Sharkey `ApRequestService` does:
@@ -278,6 +282,8 @@ pub fn parse_signature_header(header_value: &str) -> Result<ParsedSignature, Str
     let mut algorithm = "rsa-sha256".to_string();
     let mut headers: Option<Vec<String>> = None;
     let mut signature: Option<Vec<u8>> = None;
+    let mut created: Option<String> = None;
+    let mut expires: Option<String> = None;
     for part in split_quoted_commas(v) {
         let part = part.trim();
         if part.is_empty() {
@@ -294,6 +300,8 @@ pub fn parse_signature_header(header_value: &str) -> Result<ParsedSignature, Str
                 headers = Some(val.split_whitespace().map(|s| s.to_string()).collect());
             }
             "signature" => signature = Some(base64_decode(&val)?),
+            "created" => created = Some(val),
+            "expires" => expires = Some(val),
             _ => {}
         }
     }
@@ -305,6 +313,8 @@ pub fn parse_signature_header(header_value: &str) -> Result<ParsedSignature, Str
         algorithm,
         headers: headers.unwrap_or_else(|| vec!["date".to_string()]),
         signature: signature.ok_or("signature missing signature")?,
+        created,
+        expires,
     })
 }
 
@@ -362,6 +372,8 @@ pub fn build_signing_string(
     path_and_query: &str,
     headers: &HeaderMap,
     signed_header_names: &[String],
+    created: Option<&str>,
+    expires: Option<&str>,
 ) -> Result<String, String> {
     let mut lines = Vec::with_capacity(signed_header_names.len());
     for name in signed_header_names {
@@ -371,6 +383,13 @@ pub fn build_signing_string(
                 method.to_lowercase(),
                 path_and_query
             ));
+        } else if name.eq_ignore_ascii_case("(created)") {
+            // Draft HTTP Signatures pseudo-header: the signature's `created` parameter.
+            let created = created.ok_or("signed headers use (created) but the signature has no created parameter")?;
+            lines.push(format!("(created): {created}"));
+        } else if name.eq_ignore_ascii_case("(expires)") {
+            let expires = expires.ok_or("signed headers use (expires) but the signature has no expires parameter")?;
+            lines.push(format!("(expires): {expires}"));
         } else {
             lines.push(format!("{}: {}", name.to_lowercase(), header_value(headers, name)?));
         }
@@ -439,7 +458,14 @@ pub fn verify_http_signature(
             return Err("Date header outside allowed clock skew".to_string());
         }
     }
-    let signing_string = build_signing_string(method, path_and_query, headers, &parsed.headers)?;
+    let signing_string = build_signing_string(
+        method,
+        path_and_query,
+        headers,
+        &parsed.headers,
+        parsed.created.as_deref(),
+        parsed.expires.as_deref(),
+    )?;
     if !rsa_sha256_verify(public_key_pem, signing_string.as_bytes(), &parsed.signature)? {
         return Err("HTTP signature verification failed".to_string());
     }
@@ -750,6 +776,57 @@ mod tests {
             300
         )
         .is_err());
+    }
+
+    /// Birchtree (activitypub_federation) signs a `(created)` pseudo-header, with the
+    /// `created` Signature parameter as its value. Verification must accept it.
+    #[test]
+    fn http_post_created_pseudo_header_verifies() {
+        let (priv_key, pub_key) = test_keypair();
+        let priv_pem = private_key_to_pkcs8_pem(&priv_key);
+        let pub_pem = public_key_to_spki_pem(&pub_key);
+        let (date, now) = date_fixture();
+        let body = br#"{"type":"Follow"}"#;
+        let digest = compute_digest_header(body);
+        let created = (now / 1000).to_string();
+        let names: Vec<String> = ["(request-target)", "(created)", "host", "date", "digest"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let signed_headers = test_headers(&[("date", date), ("host", "example.local"), ("digest", &digest)]);
+        let signing = build_signing_string(
+            "POST",
+            "/users/456/inbox",
+            &signed_headers,
+            &names,
+            Some(&created),
+            None,
+        )
+        .unwrap();
+        assert!(signing.contains(&format!("(created): {created}")));
+        let sig = rsa_sha256_sign_base64(&priv_pem, signing.as_bytes()).unwrap();
+        let sig_header = format!(
+            "keyId=\"https://example.local/users/123#main-key\",algorithm=\"hs2019\",created={created},headers=\"(request-target) (created) host date digest\",signature=\"{sig}\""
+        );
+        let headers = test_headers(&[
+            ("date", date),
+            ("host", "example.local"),
+            ("digest", &digest),
+            ("signature", &sig_header),
+        ]);
+        let parsed = verify_http_signature(
+            "POST",
+            "/users/456/inbox",
+            &headers,
+            Some(body),
+            &pub_pem,
+            Some(now),
+            300,
+        )
+        .unwrap();
+        assert_eq!(parsed.created.as_deref(), Some(created.as_str()));
+        // A (created) header without a created parameter cannot be built.
+        assert!(build_signing_string("POST", "/x", &signed_headers, &names, None, None).is_err());
     }
 
     #[test]

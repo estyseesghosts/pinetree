@@ -61,6 +61,7 @@ enum ChannelKind {
     Main,
     Timeline(TimelineChannel),
     Antenna { antenna_id: String },
+    UserList { list_id: String },
 }
 
 #[derive(Debug, Clone)]
@@ -163,6 +164,14 @@ async fn run_connection(socket: WebSocket, state: ApiState, caller: Option<Calle
     let mut capture_order: VecDeque<String> = VecDeque::new();
     let mut last_activity = Instant::now();
     let mut pings = interval(PING_EVERY);
+    // Batch P presence (`get-online-users-count`): an authenticated socket
+    // marks its account present on connect, refreshes on every inbound
+    // frame, and unmarks on close.
+    if let Some(caller) = caller.as_ref() {
+        state
+            .hub
+            .mark_present(&caller.account_id, state.services.clock.now_ms());
+    }
 
     macro_rules! send {
         ($msg:expr) => {
@@ -179,6 +188,11 @@ async fn run_connection(socket: WebSocket, state: ApiState, caller: Option<Calle
                 let Some(incoming) = incoming else { break };
                 let Ok(msg) = incoming else { break };
                 last_activity = Instant::now();
+                if let Some(caller) = caller.as_ref() {
+                    state
+                        .hub
+                        .mark_present(&caller.account_id, state.services.clock.now_ms());
+                }
                 match msg {
                     Message::Text(text) => {
                         handle_client_message(
@@ -225,6 +239,9 @@ async fn run_connection(socket: WebSocket, state: ApiState, caller: Option<Calle
         }
     }
     let _ = sender.close().await;
+    if let Some(caller) = caller.as_ref() {
+        state.hub.mark_gone(&caller.account_id);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -319,37 +336,48 @@ async fn connect_channel(
     body: Option<&Value>,
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
 ) {
-    // The `antenna` channel needs the owner check up front (credential +
-    // owned `antennaId`); every other channel resolves below.
-    if channel == "antenna" {
+    // The `antenna` and `userList` channels need the owner check up
+    // front (credential + owned id); every other channel resolves below.
+    if channel == "antenna" || channel == "userList" {
         let Some(caller) = caller else {
             return;
         };
-        let antenna_id = body
+        let param_key = if channel == "antenna" { "antennaId" } else { "listId" };
+        let target_id = body
             .and_then(|b| b.get("params"))
-            .and_then(|p| p.get("antennaId"))
+            .and_then(|p| p.get(param_key))
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        if antenna_id.is_empty() {
+        if target_id.is_empty() {
             return;
         }
         let services = state.services.clone();
         let owner = caller.account_id.clone();
-        let antenna_id_query = antenna_id.clone();
+        let target_query = target_id.clone();
+        let is_antenna = channel == "antenna";
         let owned = tokio::task::spawn_blocking(move || {
-            services
-                .antennas
-                .get_antenna(&owner, &antenna_id_query)
-                .map(|row| row.is_some())
-                .unwrap_or(false)
+            if is_antenna {
+                services
+                    .antennas
+                    .get_antenna(&owner, &target_query)
+                    .map(|row| row.is_some())
+                    .unwrap_or(false)
+            } else {
+                services
+                    .lists
+                    .get_user_list(&target_query)
+                    .map(|row| row.is_some_and(|l| l.owner_id == owner))
+                    .unwrap_or(false)
+            }
         })
         .await
         .unwrap_or(false);
         if !owned {
             // Unknown channel on connect answers UNSUPPORTED_CHANNEL, but a
-            // foreign antenna is an auth refusal: silently ignored (Misskey
-            // credential-channel parity — the channel is never added).
+            // foreign antenna/list is an auth refusal: silently ignored
+            // (Misskey credential-channel parity — the channel is never
+            // added).
             return;
         }
         if channels.contains_key(id) {
@@ -361,7 +389,13 @@ async fn connect_channel(
         channels.insert(
             id.to_string(),
             ChannelSub {
-                kind: ChannelKind::Antenna { antenna_id },
+                kind: if is_antenna {
+                    ChannelKind::Antenna {
+                        antenna_id: target_id,
+                    }
+                } else {
+                    ChannelKind::UserList { list_id: target_id }
+                },
                 params: TimelineChannelParams::default(),
             },
         );
@@ -473,16 +507,25 @@ async fn dispatch_hub_message(
                     ChannelKind::Timeline(which) => {
                         Some((id.clone(), ChannelKind::Timeline(*which), sub.params))
                     }
-                    ChannelKind::Main | ChannelKind::Antenna { .. } => None,
+                    ChannelKind::Main | ChannelKind::Antenna { .. } | ChannelKind::UserList { .. } => None,
                 })
                 .collect();
-            if timeline.is_empty() {
+            let lists: Vec<(String, String)> = channels
+                .iter()
+                .filter_map(|(id, sub)| match &sub.kind {
+                    ChannelKind::UserList { list_id } => Some((id.clone(), list_id.clone())),
+                    _ => None,
+                })
+                .collect();
+            if timeline.is_empty() && lists.is_empty() {
                 return;
             }
+            if !timeline.is_empty() {
             let services = state.services.clone();
             let viewer = viewer_id.map(|s| s.to_string());
+            let note_id_timeline = note_id.clone();
             let packed = tokio::task::spawn_blocking(move || {
-                let note = match services.notes.get_note(&note_id) {
+                let note = match services.notes.get_note(&note_id_timeline) {
                     Ok(Some(note)) => note,
                     _ => return None,
                 };
@@ -515,6 +558,77 @@ async fn dispatch_hub_message(
                     let frame = channel_frame(&id, "note", packed.clone());
                     if sender.send(frame).await.is_err() {
                         return;
+                    }
+                }
+            }
+            }
+            // Batch O WP16: fan the note out to this connection's `userList`
+            // channels whose list contains the author. Membership is
+            // re-read per event (no 5s poll); the read-time reply rule,
+            // visibility, and mute/block filters apply (upstream `onNote`
+            // parity, pull-model).
+            if !lists.is_empty() {
+                let services = state.services.clone();
+                let viewer = viewer_id.map(|s| s.to_string());
+                let note_id_owned = note_id.clone();
+                let packed = tokio::task::spawn_blocking(move || {
+                    let note = match services.notes.get_note(&note_id_owned) {
+                        Ok(Some(note)) if !note.is_deleted => note,
+                        _ => return None,
+                    };
+                    let viewer_ref = viewer.as_deref();
+                    let filter = services.feed_filter(viewer_ref).ok()?;
+                    let mut account_cache = std::collections::HashMap::new();
+                    let mut note_cache = std::collections::HashMap::new();
+                    let follows_cache = services.follows_cache(viewer_ref).ok()?;
+                    let viewer_ctx = services.viewer_ctx(viewer_ref, &note.author_id, &follows_cache);
+                    if !crate::domain::policy::is_visible(&note, &viewer_ctx) {
+                        return None;
+                    }
+                    if services
+                        .feed_filter_hides(&filter, &note, &mut account_cache, &mut note_cache)
+                        .unwrap_or(true)
+                    {
+                        return None;
+                    }
+                    let mut ids: Vec<String> = Vec::new();
+                    for (id, list_id) in &lists {
+                        let list = services.lists.get_user_list(list_id).ok()??;
+                        let membership = services
+                            .lists
+                            .get_list_membership(list_id, &note.author_id)
+                            .ok()??;
+                        let reply_ok = match note.reply_id.as_deref() {
+                            None => true,
+                            Some(_) => {
+                                let reply_to_user = note.reply_user_id.as_deref().unwrap_or("");
+                                reply_to_user.is_empty()
+                                    || reply_to_user == note.author_id
+                                    || reply_to_user == list.owner_id
+                                    || membership.with_replies
+                            }
+                        };
+                        if reply_ok {
+                            ids.push(id.clone());
+                        }
+                    }
+                    if ids.is_empty() {
+                        return None;
+                    }
+                    let packed =
+                        crate::api::misskey::packers::pack_note(&note, viewer_ref, &services, 0)
+                            .ok()?;
+                    Some((ids, packed))
+                })
+                .await
+                .ok()
+                .flatten();
+                if let Some((ids, packed)) = packed {
+                    for id in ids {
+                        let frame = channel_frame(&id, "note", packed.clone());
+                        if sender.send(frame).await.is_err() {
+                            return;
+                        }
                     }
                 }
             }
@@ -728,6 +842,50 @@ async fn dispatch_hub_message(
             if let Some(packed) = packed {
                 for id in targets {
                     let frame = channel_frame(&id, "note", packed.clone());
+                    if sender.send(frame).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+        HubMessage::UserListMember {
+            list_id,
+            member_id,
+            added,
+        } => {
+            // Batch O WP16: `userAdded`/`userRemoved` with the packed
+            // member (lite shape — no secrets cross the socket) to this
+            // connection's `userList` channels for that list.
+            let targets: Vec<String> = channels
+                .iter()
+                .filter_map(|(id, sub)| match &sub.kind {
+                    ChannelKind::UserList { list_id: mine } if mine == &list_id => {
+                        Some(id.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            if targets.is_empty() {
+                return;
+            }
+            let services = state.services.clone();
+            let member_id_owned = member_id.clone();
+            let packed = tokio::task::spawn_blocking(move || {
+                let member = services.accounts.find_by_id(&member_id_owned).ok()??;
+                Some(crate::api::misskey::packers::pack_user_lite(
+                    &member,
+                    &services.public_url,
+                    services.clock.now_ms(),
+                ))
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some(packed) = packed {
+                let body = serde_json::to_value(&packed).unwrap_or(Value::Null);
+                let event = if added { "userAdded" } else { "userRemoved" };
+                for id in targets {
+                    let frame = channel_frame(&id, event, body.clone());
                     if sender.send(frame).await.is_err() {
                         return;
                     }

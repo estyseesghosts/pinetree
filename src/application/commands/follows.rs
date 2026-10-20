@@ -264,4 +264,88 @@ impl AppServices {
         }
         self.follows.unfollow(follower_id, followee_id, jobs)
     }
+
+    /// Followee removes one of its followers (Misskey
+    /// `following/invalidate.ts`). Same storage edge removal as `unfollow`,
+    /// but the federation direction is inverted: when the removed follower
+    /// is remote, the followee authors a `Reject(Follow)` (upstream
+    /// `UserFollowingService.unfollow` for the followee-local case) instead
+    /// of forging an `Undo` in the remote follower's name. A local follower
+    /// keeps the `Undo` path (defensive; same shape as `unfollow`).
+    pub fn remove_follower(
+        &self,
+        followee_id: &str,
+        follower_id: &str,
+    ) -> Result<(), PortError> {
+        self.accounts.get_owner(followee_id)?;
+        if self.follows.get_follow(follower_id, followee_id)?.is_none() {
+            return Err(PortError::NotFound("NOT_FOLLOWING".to_string()));
+        }
+        let mut jobs = vec![self.streaming_job(
+            &StreamingEvent::Unfollowed {
+                follower_id: follower_id.to_string(),
+                followee_id: followee_id.to_string(),
+            },
+            format!("invalidate:{followee_id}:{follower_id}:{}", self.ids.generate()),
+        )?];
+        if let (Some(follower), Some(followee)) = (
+            self.accounts.find_by_id(follower_id)?,
+            self.accounts.find_by_id(followee_id)?,
+        ) {
+            if !follower.is_local() {
+                if let Some(inbox_url) = crate::federation::outbox::preferred_inbox(&follower) {
+                    let base = self.public_url.trim_end_matches('/');
+                    let follow_id = self
+                        .follows
+                        .get_follow(follower_id, followee_id)?
+                        .map(|f| f.id)
+                        .unwrap_or_else(|| self.ids.generate());
+                    let response_id = self.ids.generate();
+                    jobs.push(
+                        crate::federation::outbox::FederateDeliverPayload::FollowResponse {
+                            response_id: response_id.clone(),
+                            accept: false,
+                            actor_id: followee_id.to_string(),
+                            inbox_url,
+                            follow_activity: serde_json::json!({
+                                "id": format!("{base}/follows/{follow_id}"),
+                                "type": "Follow",
+                                "actor": follower.actor_url(base),
+                                "object": followee.actor_url(base),
+                            }),
+                        }
+                        .into_job(
+                            format!("federate:reject:{followee_id}:{response_id}"),
+                            self.now_ms(),
+                        )?,
+                    );
+                }
+            } else if !followee.is_local() {
+                // Defensive: local follower, remote followee removed by a
+                // local followee proxy — same Undo shape as `unfollow`.
+                if let Some(inbox_url) = crate::federation::outbox::preferred_inbox(&followee) {
+                    let follow_id = self
+                        .follows
+                        .get_follow(follower_id, followee_id)?
+                        .map(|f| f.id)
+                        .unwrap_or_else(|| self.ids.generate());
+                    let undo_id = self.ids.generate();
+                    jobs.push(
+                        crate::federation::outbox::FederateDeliverPayload::Unfollow {
+                            undo_id: undo_id.clone(),
+                            follow_id,
+                            follower_id: follower_id.to_string(),
+                            followee_id: followee_id.to_string(),
+                            inbox_url,
+                        }
+                        .into_job(
+                            format!("federate:unfollow:{follower_id}:{followee_id}:{undo_id}"),
+                            self.now_ms(),
+                        )?,
+                    );
+                }
+            }
+        }
+        self.follows.unfollow(follower_id, followee_id, jobs)
+    }
 }

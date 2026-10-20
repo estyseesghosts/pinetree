@@ -19,3 +19,4 @@ pub mod antenna;
 pub mod word_mute;
 pub mod moderation;
 pub mod instance;
+pub mod user_list;

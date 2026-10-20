@@ -3,8 +3,10 @@
 
 Nodes: pt-ks (pinetree/keystone), pt-mk (pinetree/misskey), misskey (misskey/keystone),
 catodon (catodon), akkoma (akkoma/pleroma-fe).
-Writes /tmp/opencode/bench/accounts.json with {node: [{user, token}]}.
+Writes $BENCH_DIR/accounts.json with {node: [{user, token}]}.
 """
+import os
+BD = os.environ["BENCH_DIR"]
 import json, subprocess, sys, time, urllib.request, urllib.parse, urllib.error
 
 PASS = "password123"
@@ -106,7 +108,7 @@ if app:
 out["akkoma"] = users
 print(f"akkoma: {len(users)}/{N_USERS} accounts", flush=True)
 
-with open("/tmp/opencode/bench/accounts.json", "w") as f:
+with open(os.path.join(BD, "accounts.json"), "w") as f:
     json.dump(out, f, indent=1)
 
 if errors:

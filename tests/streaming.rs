@@ -87,6 +87,10 @@ impl LiveServer {
             instance_settings: store.clone(),
             invites: store.clone(),
             abuse_reports: store.clone(),
+            lists: store.clone(),
+            signin: store.clone(),
+            password_resets: store.clone(),
+            registry: store.clone(),
             streaming: streaming.clone(),
             dedup: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
@@ -275,6 +279,7 @@ async fn bad_and_scoped_tokens_are_rejected_at_upgrade() {
     srv.services
         .auth
         .store_token(ApiTokenRecord {
+            id: "tok-streaming-test".to_string(),
             token_hash: pinetree::api::misskey::auth::hash_token(scoped),
             account_id: alice_id,
             permissions: vec!["write:notes".to_string()],
@@ -302,12 +307,17 @@ async fn credential_channels_need_auth_and_unknown_channels_error() {
     })).await;
     // Unknown channel → explicit UNSUPPORTED_CHANNEL error frame.
     send(&mut ws, serde_json::json!({
-        "type": "connect", "body": { "channel": "userList", "id": "u" },
+        "type": "connect", "body": { "channel": "nope", "id": "u" },
     })).await;
     let frame = recv(&mut ws).await;
     assert_eq!(frame["type"], "error");
     assert_eq!(frame["body"]["code"], "UNSUPPORTED_CHANNEL");
-    assert_eq!(frame["body"]["channel"], "userList");
+    assert_eq!(frame["body"]["channel"], "nope");
+    // Anonymous `userList`: a credential channel, silently ignored (no frame).
+    send(&mut ws, serde_json::json!({
+        "type": "connect", "body": { "channel": "userList", "id": "l", "params": { "listId": "x" } },
+    })).await;
+    recv_nothing(&mut ws).await;
     // Anonymous `antenna`: a credential channel, silently ignored (no frame).
     send(&mut ws, serde_json::json!({
         "type": "connect", "body": { "channel": "antenna", "id": "a", "params": { "antennaId": "x" } },
@@ -316,8 +326,7 @@ async fn credential_channels_need_auth_and_unknown_channels_error() {
 }
 
 #[tokio::test]
-async fn antenna_channel_streams_matches_to_owner_only() {
-    let srv = LiveServer::start().await;
+async fn antenna_channel_streams_matches_to_owner_only() {    let srv = LiveServer::start().await;
     let (_, alice_token) = srv.signup("alice").await;
     let (_, bob_token) = srv.signup("bob").await;
 
@@ -366,6 +375,78 @@ async fn antenna_channel_streams_matches_to_owner_only() {
     let (id, event, body) = channel_body(&frame);
     assert_eq!((id, event), ("a", "note"));
     assert_eq!(body["id"], note_id);
+    recv_nothing(&mut bob_ws).await;
+}
+
+#[tokio::test]
+async fn userlist_channel_streams_notes_and_membership_to_owner() {
+    let srv = LiveServer::start().await;
+    let (_, alice_token) = srv.signup("alice").await;
+    let (bob_id, bob_token) = srv.signup("bob").await;
+
+    // Alice owns a list; owner connects before any members exist.
+    let (status, list) = srv
+        .api("users/lists/create", serde_json::json!({ "name": "l" }), Some(&alice_token))
+        .await;
+    assert_eq!(status, 200);
+    let list_id = list["id"].as_str().unwrap().to_string();
+    let mut alice_ws = connect(&srv.ws_url(&format!("?i={alice_token}"))).await;
+    send(&mut alice_ws, serde_json::json!({
+        "type": "connect",
+        "body": { "channel": "userList", "id": "l", "params": { "listId": list_id } },
+    })).await;
+    // Stranger's socket on the same list: silently refused.
+    let mut bob_ws = connect(&srv.ws_url(&format!("?i={bob_token}"))).await;
+    send(&mut bob_ws, serde_json::json!({
+        "type": "connect",
+        "body": { "channel": "userList", "id": "b", "params": { "listId": list_id } },
+    })).await;
+
+    // Push bob → owner gets `userAdded` with the packed member.
+    let (status, _) = srv
+        .api(
+            "users/lists/push",
+            serde_json::json!({ "listId": list_id, "userId": bob_id }),
+            Some(&alice_token),
+        )
+        .await;
+    assert_eq!(status, 204);
+    let frame = recv(&mut alice_ws).await;
+    let (id, event, body) = channel_body(&frame);
+    assert_eq!((id, event), ("l", "userAdded"));
+    assert_eq!(body["id"], bob_id);
+    recv_nothing(&mut bob_ws).await;
+
+    // Bob posts → owner's list channel gets the `note` event.
+    let (status, created) = srv
+        .api("notes/create", serde_json::json!({ "text": "list note" }), Some(&bob_token))
+        .await;
+    assert_eq!(status, 200);
+    let note_id = created["createdNote"]["id"].as_str().unwrap().to_string();
+    let frame = recv(&mut alice_ws).await;
+    let (id, event, body) = channel_body(&frame);
+    assert_eq!((id, event), ("l", "note"));
+    assert_eq!(body["id"], note_id);
+    recv_nothing(&mut bob_ws).await;
+
+    // Pull bob → owner gets `userRemoved`; his next note stays silent.
+    let (status, _) = srv
+        .api(
+            "users/lists/pull",
+            serde_json::json!({ "listId": list_id, "userId": bob_id }),
+            Some(&alice_token),
+        )
+        .await;
+    assert_eq!(status, 204);
+    let frame = recv(&mut alice_ws).await;
+    let (id, event, body) = channel_body(&frame);
+    assert_eq!((id, event), ("l", "userRemoved"));
+    assert_eq!(body["id"], bob_id);
+    let (status, _) = srv
+        .api("notes/create", serde_json::json!({ "text": "after pull" }), Some(&bob_token))
+        .await;
+    assert_eq!(status, 200);
+    recv_nothing(&mut alice_ws).await;
     recv_nothing(&mut bob_ws).await;
 }
 

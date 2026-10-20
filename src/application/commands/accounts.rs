@@ -375,6 +375,21 @@ impl AppServices {
     fn resolve_alias_target(&self, line: &str) -> Result<Option<Account>, PortError> {
         let line = line.strip_prefix('@').unwrap_or(line);
         if line.starts_with("http://") || line.starts_with("https://") {
+            // Local-actor-URL form (`{public_url}/users/{id}`): local rows
+            // carry no stored `uri`, so `find_by_uri` never matches them —
+            // resolve the id segment directly (Batch P `i/move` handshake).
+            let base = self.public_url.trim_end_matches('/');
+            let prefix = format!("{base}/users/");
+            if let Some(rest) = line.strip_prefix(&prefix) {
+                let id = rest.split(['/', '?', '#']).next().unwrap_or("").trim();
+                if !id.is_empty() {
+                    if let Some(account) = self.accounts.find_by_id(id)? {
+                        if account.is_local() {
+                            return Ok(Some(account));
+                        }
+                    }
+                }
+            }
             return self.accounts.find_by_uri(line);
         }
         let (username, host) = match line.split_once('@') {

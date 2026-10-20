@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Finish mk2..mk6 + cd2..cd6 after captcha/registration fixes. Merges into accounts.json."""
+import os
+BD = os.environ["BENCH_DIR"]
 import json, sys, time, urllib.request, urllib.error
 
 PASS = "password123"
-ACC = "/tmp/opencode/bench/accounts.json"
+ACC = os.path.join(BD, "accounts.json")
 out = json.load(open(ACC))
 
 def req(base, ep, body, token=None):

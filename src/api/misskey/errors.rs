@@ -39,6 +39,59 @@ pub const NO_SUCH_RENOTE_TARGET_ID: &str = "b5c90186-4ab0-49c8-9bba-a1f76c282ba4
 pub const NO_SUCH_FILE_ID: &str = "b6992544-63e7-67f0-fa7f-32444b1b5306";
 pub const CONTAINS_PROHIBITED_WORDS_ID: &str = "aa6e01d3-a85c-669d-758a-76aab43af334";
 pub const FOLLOWEE_IS_YOURSELF_ID: &str = "26fbe7bb-a331-4857-af17-205b426669a9";
+pub const FOLLOWER_IS_YOURSELF_ID: &str = "07dc03b9-03da-422d-885b-438313707662";
+pub const INVALIDATE_NO_SUCH_USER_ID: &str = "b77e6ae6-a3e5-40da-9cc8-c240115479cc";
+pub const INVALIDATE_NOT_FOLLOWING_ID: &str = "918faac3-074f-41ae-9c43-ed5d2946770d";
+/// Batch P verbatim error UUIDs (`docs/handoff-batch-p.md`): email
+/// identity loop, account move, registry, translate, versions.
+pub const UPDATE_EMAIL_INCORRECT_PASSWORD_ID: &str = "e54c1d7e-e7d6-4103-86b6-0a95069b4ad3";
+pub const UPDATE_EMAIL_UNAVAILABLE_ID: &str = "a2defefb-f220-8849-0af6-17f816099323";
+pub const UPDATE_EMAIL_REQUIRED_ID: &str = "324c7a88-59f2-492f-903f-89134f93e47e";
+pub const VERIFY_EMAIL_NO_SUCH_CODE_ID: &str = "97c1f576-e4b8-4b8a-a6dc-9cb65e7f6f85";
+pub const MOVE_DESTINATION_FORBIDS_ID: &str = "b5c90186-4ab0-49c8-9bba-a1f766282ba4";
+pub const MOVE_ROOT_FORBIDDEN_ID: &str = "4362e8dc-731f-4ad8-a694-be2a88922a24";
+pub const MOVE_URI_NULL_ID: &str = "bf326f31-d430-4f97-9933-5d61e4d48a23";
+pub const MOVE_LOCAL_URI_NULL_ID: &str = "95ba11b9-90e8-43a5-ba16-7acc1ab32e71";
+pub const MOVE_ALREADY_MOVED_ID: &str = "b234a14e-9ebe-4581-8000-074b3c215962";
+pub const REGISTRY_NO_SUCH_KEY_ID: &str = "ac3ed68a-62f0-422b-a7bc-d5e09e8f6a6a";
+pub const EXT_RESOURCE_INVALID_SCHEMA_ID: &str = "bb774091-7a15-4a70-9dc5-6ac8cf125856";
+pub const EXT_RESOURCE_HASH_MISMATCH_ID: &str = "693ba8ba-b486-40df-a174-72f8279b56a4";
+pub const TRANSLATE_UNAVAILABLE_ID: &str = "50a70314-2d8a-431b-b433-efa5cc56444c";
+pub const TRANSLATE_INVISIBLE_NOTE_ID: &str = "ea29f2ca-c368-43b3-aaf1-5ac3e74bbe5d";
+/// First-party loud-failure UUIDs (dormant transports — no SMTP / no
+/// translation backend configured; Batch P owner decision: fail loudly,
+/// never silently drop).
+pub const EMAIL_NOT_CONFIGURED_ID: &str = "c41d9a2e-6b3f-4e5a-9d8c-3f2a1b0c4d01";
+pub const TRANSLATE_NOT_CONFIGURED_ID: &str = "d52ea1f3-7c4e-4b5d-8e9d-4a3b2c1d5e02";
+/// Sharkey `notes/versions.ts` `SIGNIN_REQUIRED` (verbatim;
+/// `NO_SUCH_NOTE` reuses the shared id).
+pub const VERSIONS_SIGNIN_REQUIRED_ID: &str = "8e75455b-738c-471d-9f80-62693f33372e";
+/// Misskey `fetch-rss.ts` verbatim errors.
+pub const FETCH_RSS_INVALID_URL_ID: &str = "89b7ee05-ccfc-4bdd-9b13-61172fd1e06c";
+pub const FETCH_RSS_FAILED_ID: &str = "8db5d3d8-31d7-452f-b0cc-ca3b8925de12";
+pub const FETCH_RSS_UNAVAILABLE_ID: &str = "91e6ff44-c63f-4725-9ad0-b7a40d7f7655";
+/// Misskey `users/lists/*` + `notes/user-list-timeline` verbatim errors
+/// (Batch O WP16; one UUID per endpoint per code, upstream convention).
+/// `NO_SUCH_LIST` is a different code from pinetree's `NO_SUCH_USER_LIST`;
+/// both exist here.
+pub const LIST_NO_SUCH_LIST_UPDATE_ID: &str = "796666fe-3dff-4d39-becb-8a5932c1d5b7";
+pub const LIST_NO_SUCH_LIST_DELETE_ID: &str = "78436795-db79-42f5-b1e2-55ea2cf19166";
+pub const LIST_NO_SUCH_LIST_SHOW_ID: &str = "7bc05c21-1d7a-41ae-88f1-66820f4dc686";
+pub const LIST_NO_SUCH_LIST_MEMBER_ID: &str = "7f44670e-ab16-43b8-b4c1-ccd2ee89cc02";
+pub const LIST_TIMELINE_NO_SUCH_LIST_ID: &str = "8fb1fbd5-e476-4c37-9fb0-43d55b63a2ff";
+pub const LIST_NO_SUCH_USER_LIST_FAVORITE_ID: &str = "7dbaf3cf-7b42-4b8f-b431-b3919e580dbe";
+pub const LIST_NO_SUCH_USER_LIST_UNFAVORITE_ID: &str = "baedb33e-76b8-4b0c-86a8-9375c0a7b94b";
+pub const LIST_NO_SUCH_USER_LIST_QUERY_ID: &str = "a8af4a82-0980-4cc4-a6af-8b0ffd54465e";
+pub const LIST_NO_SUCH_USER_PUSH_ID: &str = "a89abd3d-f0bc-4cce-beb1-2f446f4f1e6a";
+pub const LIST_NO_SUCH_USER_PULL_ID: &str = "588e7f72-c744-4a61-b180-d354e912bda2";
+pub const LIST_TOO_MANY_USERLISTS_ID: &str = "0cf21a28-7715-4f39-a20d-777bfdb8d138";
+pub const LIST_ALREADY_ADDED_ID: &str = "1de7c884-1595-49e9-857e-61f12f4d4fc5";
+pub const LIST_YOU_HAVE_BEEN_BLOCKED_ID: &str = "990232c5-3f9d-4d83-9f3f-ef27b6332a4b";
+pub const LIST_TOO_MANY_USERS_ID: &str = "2dd9752e-a338-413d-8eec-41814430989b";
+pub const LIST_ALREADY_FAVORITED_ID: &str = "6425bba0-985b-461e-af1b-518070e72081";
+pub const LIST_NOT_FAVORITED_ID: &str = "835c4b27-463d-4cfa-969b-a9058678d465";
+pub const LIST_REMOTE_USER_NOT_ALLOWED_ID: &str = "53858f1b-3315-4a01-81b7-db9b48d4b79a";
+pub const LIST_QUERY_INVALID_PARAM_ID: &str = "ab36de0e-29e9-48cb-9732-d82f1281620d";
 pub const ALREADY_FOLLOWING_ID: &str = "35387507-38c7-4cb9-9197-300b93783fa0";pub const NO_FOLLOW_REQUEST_ID: &str = "bcde4f8b-0913-4614-8736-2e2d5fa29d5b";
 pub const NOT_FOLLOWING_ID: &str = "7f6e1c2d-9f9b-4c1a-9e2a-9b9b9b9b9b01";
 pub const BLOCKEE_IS_YOURSELF_ID: &str = "88b19138-f28d-42c0-8499-6a31bbd0fdc6";
@@ -418,6 +471,335 @@ impl ApiError {
         Self::permission("Permission denied.", "PERMISSION_DENIED", SCHEDULE_PERMISSION_DENIED_ID, 403)
     }
 
+    /// Misskey `following/invalidate.ts` verbatim errors (per-endpoint
+    /// UUIDs, upstream `29-45`). Pinetree's shared `NO_SUCH_USER` /
+    /// `NOT_FOLLOWING` UUIDs differ, so invalidate mints its own.
+    pub fn invalidate_no_such_user() -> Self {
+        Self::client("No such user.", "NO_SUCH_USER", INVALIDATE_NO_SUCH_USER_ID, 400)
+    }
+
+    /// Misskey `following/invalidate.ts` `FOLLOWER_IS_YOURSELF`.
+    pub fn follower_is_yourself() -> Self {
+        Self::client(
+            "Follower is yourself.",
+            "FOLLOWER_IS_YOURSELF",
+            FOLLOWER_IS_YOURSELF_ID,
+            400,
+        )
+    }
+
+/// Misskey `following/invalidate.ts` `NOT_FOLLOWING`.
+    pub fn invalidate_not_following() -> Self {
+        Self::client(
+            "You are not following that user.",
+            "NOT_FOLLOWING",
+            INVALIDATE_NOT_FOLLOWING_ID,
+            400,
+        )
+    }
+
+    /// Batch P email/move/registry/translate verbatim errors (upstream
+    /// `code` + UUID per endpoint file).
+    /// Misskey `i/update-email.ts` `INCORRECT_PASSWORD`.
+    pub fn update_email_incorrect_password() -> Self {
+        Self::client(
+            "Incorrect password.",
+            "INCORRECT_PASSWORD",
+            UPDATE_EMAIL_INCORRECT_PASSWORD_ID,
+            400,
+        )
+    }
+
+    /// Misskey `i/update-email.ts` `UNAVAILABLE`.
+    pub fn update_email_unavailable() -> Self {
+        Self::client(
+            "Unavailable email address.",
+            "UNAVAILABLE",
+            UPDATE_EMAIL_UNAVAILABLE_ID,
+            400,
+        )
+    }
+
+    /// Misskey `i/update-email.ts` `EMAIL_REQUIRED`.
+    pub fn update_email_required() -> Self {
+        Self::client(
+            "Email address is required.",
+            "EMAIL_REQUIRED",
+            UPDATE_EMAIL_REQUIRED_ID,
+            400,
+        )
+    }
+
+    /// Misskey `verify-email.ts` `NO_SUCH_CODE`.
+    pub fn verify_email_no_such_code() -> Self {
+        Self::client("No such code.", "NO_SUCH_CODE", VERIFY_EMAIL_NO_SUCH_CODE_ID, 404)
+    }
+
+    /// Misskey `i/move.ts` `DESTINATION_ACCOUNT_FORBIDS`.
+    pub fn move_destination_forbids() -> Self {
+        Self::client(
+            "Destination account doesn't have proper 'Known As' alias, or has already moved.",
+            "DESTINATION_ACCOUNT_FORBIDS",
+            MOVE_DESTINATION_FORBIDS_ID,
+            400,
+        )
+    }
+
+    /// Misskey `i/move.ts` `NOT_ROOT_FORBIDDEN` (upstream message/code:
+    /// "The root can't migrate." / `NOT_ROOT_FORBIDDEN`).
+    pub fn move_root_forbidden() -> Self {
+        Self::client(
+            "The root can't migrate.",
+            "NOT_ROOT_FORBIDDEN",
+            MOVE_ROOT_FORBIDDEN_ID,
+            400,
+        )
+    }
+
+    /// Misskey `i/move.ts` `NO_SUCH_USER` (shared `NO_SUCH_USER` UUID).
+    pub fn move_no_such_user() -> Self {
+        Self::client("No such user.", "NO_SUCH_USER", NO_SUCH_USER_ID, 404)
+    }
+
+    /// Misskey `i/move.ts` `URI_NULL`.
+    pub fn move_uri_null() -> Self {
+        Self::client(
+            "User ActivityPup URI is null.",
+            "URI_NULL",
+            MOVE_URI_NULL_ID,
+            400,
+        )
+    }
+
+    /// Misskey `i/move.ts` `ALREADY_MOVED`.
+    pub fn move_already_moved() -> Self {
+        Self::client(
+            "Account was already moved to another account.",
+            "ALREADY_MOVED",
+            MOVE_ALREADY_MOVED_ID,
+            400,
+        )
+    }
+
+    /// Misskey `i/registry/get|get-detail.ts` `NO_SUCH_KEY`.
+    pub fn registry_no_such_key() -> Self {
+        Self::client("No such key.", "NO_SUCH_KEY", REGISTRY_NO_SUCH_KEY_ID, 404)
+    }
+
+    /// Misskey `fetch-external-resources.ts`
+    /// `EXT_RESOURCE_RETURNED_INVALID_SCHEMA`.
+    pub fn ext_resource_invalid_schema() -> Self {
+        Self::client(
+            "External resource returned invalid schema.",
+            "EXT_RESOURCE_RETURNED_INVALID_SCHEMA",
+            EXT_RESOURCE_INVALID_SCHEMA_ID,
+            400,
+        )
+    }
+
+    /// Misskey `fetch-external-resources.ts`
+    /// `EXT_RESOURCE_HASH_DIDNT_MATCH`.
+    pub fn ext_resource_hash_mismatch() -> Self {
+        Self::client(
+            "Hash did not match.",
+            "EXT_RESOURCE_HASH_DIDNT_MATCH",
+            EXT_RESOURCE_HASH_MISMATCH_ID,
+            400,
+        )
+    }
+
+    /// Misskey `notes/translate.ts` `UNAVAILABLE` (no backend / no
+    /// permission). The dormant-transport posture reuses this code with a
+    /// first-party UUID (`TRANSLATE_NOT_CONFIGURED_ID`).
+    pub fn translate_unavailable() -> Self {
+        Self::client(
+            "Translate of notes unavailable.",
+            "UNAVAILABLE",
+            TRANSLATE_UNAVAILABLE_ID,
+            400,
+        )
+    }
+
+    /// Batch P dormant-transport posture: no translation backend is
+    /// configured, so the send path fails loudly (never silently drops).
+    /// Same `UNAVAILABLE` code as upstream, first-party UUID.
+    pub fn translate_not_configured() -> Self {
+        Self::client(
+            "Translate of notes unavailable.",
+            "UNAVAILABLE",
+            TRANSLATE_NOT_CONFIGURED_ID,
+            400,
+        )
+    }
+
+    /// Misskey `notes/translate.ts` `CANNOT_TRANSLATE_INVISIBLE_NOTE`.
+    pub fn translate_invisible_note() -> Self {
+        Self::client(
+            "Cannot translate invisible note.",
+            "CANNOT_TRANSLATE_INVISIBLE_NOTE",
+            TRANSLATE_INVISIBLE_NOTE_ID,
+            400,
+        )
+    }
+
+    /// Batch P dormant-transport posture for the email loop: no SMTP is
+    /// configured, so send paths fail loudly (never silently drop a
+    /// password reset). First-party UUID.
+    pub fn email_not_configured() -> Self {
+        Self::client(
+            "Email sending is not configured on this server.",
+            "EMAIL_NOT_CONFIGURED",
+            EMAIL_NOT_CONFIGURED_ID,
+            400,
+        )
+    }
+
+    /// Sharkey `notes/versions.ts` `SIGNIN_REQUIRED` (private-note history
+    /// without a viewer).
+    pub fn versions_signin_required() -> Self {
+        Self::client("Signin required.", "SIGNIN_REQUIRED", VERSIONS_SIGNIN_REQUIRED_ID, 401)
+    }
+
+    /// Misskey `fetch-rss.ts` `INVALID_URL` (HTTP 400 upstream).
+    pub fn fetch_rss_invalid_url() -> Self {
+        Self::client("Invalid URL.", "INVALID_URL", FETCH_RSS_INVALID_URL_ID, 400)
+    }
+
+    /// Misskey `fetch-rss.ts` `FETCH_RSS_FAILED` (HTTP 422 upstream).
+    pub fn fetch_rss_failed() -> Self {
+        Self::client(
+            "Failed to fetch RSS.",
+            "FETCH_RSS_FAILED",
+            FETCH_RSS_FAILED_ID,
+            422,
+        )
+    }
+
+    /// Misskey `fetch-rss.ts` `FETCH_RSS_UNAVAILABLE` (HTTP 503 upstream).
+    pub fn fetch_rss_unavailable() -> Self {
+        Self::client(
+            "RSS fetching is temporarily unavailable.",
+            "FETCH_RSS_UNAVAILABLE",
+            FETCH_RSS_UNAVAILABLE_ID,
+            503,
+        )
+    }
+
+    /// Misskey `users/lists/*` `NO_SUCH_LIST` (`No such list.`, verbatim
+    /// per-endpoint UUID): `endpoint` is the Misskey endpoint name
+    /// (`users/lists/update|delete|show|get-memberships|pull|
+    /// update-membership`, `notes/user-list-timeline`).
+    pub fn user_list_no_such_list(endpoint: &str) -> Self {
+        let id = match endpoint {
+            "users/lists/update" => LIST_NO_SUCH_LIST_UPDATE_ID,
+            "users/lists/delete" => LIST_NO_SUCH_LIST_DELETE_ID,
+            "users/lists/show" | "users/lists/get-memberships" => LIST_NO_SUCH_LIST_SHOW_ID,
+            "users/lists/pull" | "users/lists/update-membership" | "users/lists/push" => {
+                LIST_NO_SUCH_LIST_MEMBER_ID
+            }
+            "notes/user-list-timeline" => LIST_TIMELINE_NO_SUCH_LIST_ID,
+            _ => LIST_NO_SUCH_LIST_SHOW_ID,
+        };
+        Self::client("No such list.", "NO_SUCH_LIST", id, 400)
+    }
+
+    /// Misskey `users/lists/*` `NO_SUCH_USER` (verbatim per-endpoint UUID).
+    pub fn user_list_no_such_user(endpoint: &str) -> Self {
+        let id = match endpoint {
+            "users/lists/list" => LIST_NO_SUCH_USER_LIST_QUERY_ID,
+            "users/lists/push" => LIST_NO_SUCH_USER_PUSH_ID,
+            _ => LIST_NO_SUCH_USER_PULL_ID,
+        };
+        Self::client("No such user.", "NO_SUCH_USER", id, 400)
+    }
+
+    /// Misskey `users/lists/list` `REMOTE_USER_NOT_ALLOWED`.
+    pub fn user_list_remote_not_allowed() -> Self {
+        Self::client(
+            "Not allowed to load the remote user's list",
+            "REMOTE_USER_NOT_ALLOWED",
+            LIST_REMOTE_USER_NOT_ALLOWED_ID,
+            400,
+        )
+    }
+
+    /// Misskey `users/lists/list` `INVALID_PARAM` (anonymous without
+    /// `userId`; verbatim id).
+    pub fn user_list_query_invalid_param() -> Self {
+        Self::client("Invalid param.", "INVALID_PARAM", LIST_QUERY_INVALID_PARAM_ID, 400)
+    }
+
+    /// Misskey `users/lists/create` `TOO_MANY_USERLISTS`.
+    pub fn user_list_too_many() -> Self {
+        Self::client(
+            "You cannot create user list any more.",
+            "TOO_MANY_USERLISTS",
+            LIST_TOO_MANY_USERLISTS_ID,
+            400,
+        )
+    }
+
+    /// Misskey `users/lists/push` `ALREADY_ADDED`.
+    pub fn user_list_already_added() -> Self {
+        Self::client(
+            "That user has already been added to that list.",
+            "ALREADY_ADDED",
+            LIST_ALREADY_ADDED_ID,
+            400,
+        )
+    }
+
+    /// Misskey `users/lists/push` `YOU_HAVE_BEEN_BLOCKED`.
+    pub fn user_list_blocked() -> Self {
+        Self::client(
+            "You cannot push this user because you have been blocked by this user.",
+            "YOU_HAVE_BEEN_BLOCKED",
+            LIST_YOU_HAVE_BEEN_BLOCKED_ID,
+            400,
+        )
+    }
+
+    /// Misskey `users/lists/push` `TOO_MANY_USERS`.
+    pub fn user_list_too_many_users() -> Self {
+        Self::client(
+            "You can not push users any more.",
+            "TOO_MANY_USERS",
+            LIST_TOO_MANY_USERS_ID,
+            400,
+        )
+    }
+
+    /// Misskey `users/lists/favorite|unfavorite` `NO_SUCH_USER_LIST`
+    /// (verbatim per-endpoint UUID).
+    pub fn user_list_no_such_user_list(endpoint: &str) -> Self {
+        let id = match endpoint {
+            "users/lists/favorite" => LIST_NO_SUCH_USER_LIST_FAVORITE_ID,
+            _ => LIST_NO_SUCH_USER_LIST_UNFAVORITE_ID,
+        };
+        Self::client("No such user list.", "NO_SUCH_USER_LIST", id, 400)
+    }
+
+    /// Misskey `users/lists/favorite` `ALREADY_FAVORITED`.
+    pub fn user_list_already_favorited() -> Self {
+        Self::client(
+            "The list has already been favorited.",
+            "ALREADY_FAVORITED",
+            LIST_ALREADY_FAVORITED_ID,
+            400,
+        )
+    }
+
+    /// Misskey `users/lists/unfavorite` `notFavorited` quirk: the wire code
+    /// stays `ALREADY_FAVORITED` with its own UUID (verbatim).
+    pub fn user_list_not_favorited() -> Self {
+        Self::client(
+            "You have not favorited the list.",
+            "ALREADY_FAVORITED",
+            LIST_NOT_FAVORITED_ID,
+            400,
+        )
+    }
+
     /// Misskey `admin/drive/show-file.ts` `NO_SUCH_FILE` (`No such file.`,
     /// verbatim UUID `caf3ca38-…`).
     pub fn drive_show_file_no_such_file() -> Self {
@@ -560,6 +942,7 @@ fn is_known_client_code(code: &str) -> bool {
             | "CONTAINS_PROHIBITED_WORDS"
             | "CONTAINS_TOO_MANY_MENTIONS"
             | "FOLLOWEE_IS_YOURSELF"
+            | "FOLLOWER_IS_YOURSELF"
             | "ALREADY_FOLLOWING"
             | "BLOCKEE_IS_YOURSELF"
             | "ALREADY_BLOCKING"
@@ -621,6 +1004,11 @@ fn is_known_client_code(code: &str) -> bool {
             | "EMPTY_KEYWORD"
             | "TOO_MANY_ANTENNAS"
             | "NO_SUCH_USER_LIST"
+            | "NO_SUCH_LIST"
+            | "TOO_MANY_USERLISTS"
+            | "TOO_MANY_USERS"
+            | "ALREADY_ADDED"
+            | "REMOTE_USER_NOT_ALLOWED"
             | "SCHEDULE_NOTE_MAX"
             | "CANNOT_CREATE_ALREADY_EXPIRED_SCHEDULE"
             | "FILE_REQUIRED"
@@ -786,6 +1174,12 @@ fn lookup_known_code(code: &str) -> Option<(&'static str, &'static str, u16, &'s
         "FOLLOWEE_IS_YOURSELF" => (
             "Followee is yourself.",
             FOLLOWEE_IS_YOURSELF_ID,
+            400,
+            "client",
+        ),
+        "FOLLOWER_IS_YOURSELF" => (
+            "Follower is yourself.",
+            FOLLOWER_IS_YOURSELF_ID,
             400,
             "client",
         ),
@@ -1035,6 +1429,36 @@ fn lookup_known_code(code: &str) -> Option<(&'static str, &'static str, u16, &'s
         "NO_SUCH_USER_LIST" => (
             "No such user list.",
             NO_SUCH_USER_LIST_ID,
+            400,
+            "client",
+        ),
+        "NO_SUCH_LIST" => (
+            "No such list.",
+            LIST_NO_SUCH_LIST_SHOW_ID,
+            400,
+            "client",
+        ),
+        "TOO_MANY_USERLISTS" => (
+            "You cannot create user list any more.",
+            LIST_TOO_MANY_USERLISTS_ID,
+            400,
+            "client",
+        ),
+        "TOO_MANY_USERS" => (
+            "You can not push users any more.",
+            LIST_TOO_MANY_USERS_ID,
+            400,
+            "client",
+        ),
+        "ALREADY_ADDED" => (
+            "That user has already been added to that list.",
+            LIST_ALREADY_ADDED_ID,
+            400,
+            "client",
+        ),
+        "REMOTE_USER_NOT_ALLOWED" => (
+            "Not allowed to load the remote user's list",
+            LIST_REMOTE_USER_NOT_ALLOWED_ID,
             400,
             "client",
         ),

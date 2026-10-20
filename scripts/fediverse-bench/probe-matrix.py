@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """Reachability + per-post federation proof.
 
-R1: 30 probe posts (one per account). R2: every ordered instance pair (A,B):
+R1: one probe post per node (user 0 of each). R2: every ordered instance pair (A,B):
 resolve A's probes on B via AP deref (note_by_uri forces a federated fetch).
 R3: home-timeline census on every node: markers per source instance.
 """
 import json, sys, time
 from concurrent.futures import ThreadPoolExecutor
-sys.path.insert(0, "/tmp/bench")
-from lib import load_nodes
+import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from lib import load_nodes, BENCH_DIR
 
 nodes = load_nodes()
 # Filter to nodes that have accounts (reference impls may not have tokens)
@@ -91,5 +92,5 @@ with ThreadPoolExecutor(max_workers=5) as ex:
         print(f"{dst:9} items={total:4}  " + "  ".join(f"{k}:{v}" for k, v in sorted(per.items())))
 
 json.dump({"probe_fails": fails, "pair_results": results},
-          open("/tmp/bench/probes.json", "w"), indent=1)
+          open(os.path.join(BENCH_DIR, "probes.json"), "w"), indent=1)
 print("\nPROBES_DONE" if not fails else f"\nPROBES_DONE_WITH_FAILURES={len(fails)}")

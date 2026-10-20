@@ -210,6 +210,27 @@ pub struct Account {
     /// on `i` / `i/update`.
     #[serde(default)]
     pub show_remote_emojis: bool,
+    // --- Batch P: email identity loop + account move ------------------------
+    /// `MiUserProfile.email` (default null). Stored so the reset/verify
+    /// loop can compare without a separate profile table; secrets never
+    /// pack (see `packers.rs` me-detailed secrets redaction).
+    #[serde(default)]
+    pub email: Option<String>,
+    /// `MiUserProfile.emailVerified` (default false).
+    #[serde(default)]
+    pub email_verified: bool,
+    /// `MiUserProfile.emailVerifyCode` (default null; 16-char code minted
+    /// on `i/update-email`, cleared on `verify-email`).
+    #[serde(default)]
+    pub email_verify_code: Option<String>,
+    /// `MiUser.movedToUri` (default null; set once by `i/move`, never
+    /// cleared — `prohibitMoved` refuses further moves).
+    #[serde(default)]
+    pub moved_to_uri: Option<String>,
+    /// `MiUser.movedAt` as unix millis (default null; set with
+    /// `moved_to_uri`).
+    #[serde(default)]
+    pub moved_at_ms: Option<i64>,
 }
 
 fn default_true() -> bool {
@@ -454,6 +475,11 @@ impl Account {
             reject_quotes: false,
             default_reaction: None,
             show_remote_emojis: false,
+            email: None,
+            email_verified: false,
+            email_verify_code: None,
+            moved_to_uri: None,
+            moved_at_ms: None,
         })
     }
 
@@ -670,6 +696,11 @@ mod tests {
             reject_quotes: false,
             default_reaction: None,
             show_remote_emojis: false,
+            email: None,
+            email_verified: false,
+            email_verify_code: None,
+            moved_to_uri: None,
+            moved_at_ms: None,
         }
     }
 

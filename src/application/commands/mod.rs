@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::application::ports::{
     AbuseReportStore, AccountStore, ActivityDedup, AntennaNoteStore, AntennaStore, AuthStore, BlobStore, BlockStore, Clock, EmojiStore, FavoriteStore, FollowStore, HostCapsStore,
     IdGenerator, InstanceSettingsStore, InviteStore, JobQueue, MediaStore, ModerationLogStore,
-    MuteStore, NoteStore, NotificationStore, PollStore, ReactionStore, StreamingSink,
+    MuteStore, NoteStore, NotificationStore, PasswordResetStore, PollStore, ReactionStore, RegistryStore, SigninStore, StreamingSink, UserListStore,
 };
 use crate::federation::delivery::SafeHttpClient;
 
@@ -26,6 +26,7 @@ pub mod notifications;
 pub mod notes;
 pub mod pins;
 pub mod polls;
+pub mod user_lists;
 #[cfg(test)]
 pub(crate) mod tests;
 
@@ -65,6 +66,14 @@ pub struct AppServices {
     pub invites: Arc<dyn InviteStore>,
     /// Abuse reports (Batch M WP4).
     pub abuse_reports: Arc<dyn AbuseReportStore>,
+    /// User lists (Batch O WP16).
+    pub lists: Arc<dyn UserListStore>,
+    /// Signin attempt history (Batch O WP9; `i/signin-history`).
+    pub signin: Arc<dyn SigninStore>,
+    /// Password-reset request rows (Batch P; `request-reset-password`).
+    pub password_resets: Arc<dyn PasswordResetStore>,
+    /// Client key-value registry (Batch P; `i/registry/*`).
+    pub registry: Arc<dyn RegistryStore>,
     pub federation_http: SafeHttpClient,
     pub public_url: String,
     pub max_file_size: u64,

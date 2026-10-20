@@ -30,6 +30,11 @@ pub enum NotificationKind {
     /// `Notify` worker treats this kind as notifier-less (only a `never`
     /// receive-config drops it, like upstream).
     ExportCompleted,
+    /// Test notification (`notifications/test-notification`: Misskey
+    /// `NotificationService.createNotification(userId, 'test', {})`).
+    /// Self-notified through the normal `Notify` path so type filters and
+    /// grouped rendering exercise it like any other kind.
+    Test,
 }
 
 impl NotificationKind {
@@ -50,6 +55,7 @@ impl NotificationKind {
             NotificationKind::Edited => "edited",
             NotificationKind::FollowRequestAccepted => "followRequestAccepted",
             NotificationKind::ExportCompleted => "exportCompleted",
+            NotificationKind::Test => "test",
         }
     }
 }

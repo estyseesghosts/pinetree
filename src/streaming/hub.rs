@@ -46,6 +46,9 @@ pub enum HubMessage {
     NoteUpdated { note_id: String },
     /// An antenna feed gained a note (Batch N WS4).
     AntennaNote { antenna_id: String, note_id: String },
+    /// A user-list member was added/removed (Batch O WP16): the `userList`
+    /// channel emits `userAdded`/`userRemoved` with the packed member.
+    UserListMember { list_id: String, member_id: String, added: bool },
     /// A note was deleted.
     NoteDeleted { note_id: String },
     /// A `main`-channel event for one user.
@@ -58,15 +61,30 @@ pub enum HubMessage {
 /// Process-wide broadcast hub. `send` is synchronous and never blocks a
 /// job worker: with no receivers, or when every receiver lagged, the
 /// message is dropped (live hints are at-most-once by design).
+///
+/// Batch P: the hub also carries streaming presence (`account_id → last
+/// seen ms`) behind [`ONLINE_THRESHOLD_MS`], backing
+/// `get-online-users-count`. Upstream counts `lastActiveDate` heartbeats
+/// (any API activity); pinetree has no such column, so "online" is defined
+/// honestly as *a live authenticated streaming connection seen within the
+/// threshold* (DIVERGENCE, documented in the manifest).
 #[derive(Debug, Clone)]
 pub struct Hub {
     tx: broadcast::Sender<HubMessage>,
+    presence: Arc<std::sync::Mutex<std::collections::HashMap<String, i64>>>,
 }
+
+/// Online threshold for [`Hub::online_count`]: Misskey
+/// `USER_ONLINE_THRESHOLD` parity (10 minutes).
+pub const ONLINE_THRESHOLD_MS: i64 = 10 * 60 * 1000;
 
 impl Hub {
     pub fn new(capacity: usize) -> Self {
         let (tx, _) = broadcast::channel(capacity);
-        Self { tx }
+        Self {
+            tx,
+            presence: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<HubMessage> {
@@ -79,6 +97,33 @@ impl Hub {
 
     pub fn send(&self, msg: HubMessage) {
         let _ = self.tx.send(msg);
+    }
+
+    /// Record a live authenticated streaming connection for `account_id`
+    /// at `now_ms` (called on connect and on every inbound socket message).
+    pub fn mark_present(&self, account_id: &str, now_ms: i64) {
+        if let Ok(mut presence) = self.presence.lock() {
+            presence.insert(account_id.to_string(), now_ms);
+        }
+    }
+
+    /// Forget one account's presence (called when its socket closes).
+    /// Entries are also lazily pruned by [`Hub::online_count`], so a missed
+    /// close only over-counts until the threshold lapses.
+    pub fn mark_gone(&self, account_id: &str) {
+        if let Ok(mut presence) = self.presence.lock() {
+            presence.remove(account_id);
+        }
+    }
+
+    /// Distinct accounts with a live streaming connection seen within
+    /// `threshold_ms` of `now_ms`; stale entries are pruned.
+    pub fn online_count(&self, now_ms: i64, threshold_ms: i64) -> usize {
+        let Ok(mut presence) = self.presence.lock() else {
+            return 0;
+        };
+        presence.retain(|_, seen| now_ms.saturating_sub(*seen) < threshold_ms);
+        presence.len()
     }
 }
 
@@ -146,6 +191,22 @@ impl StreamingSink for BroadcastStreamingSink {
             // post-commit by the match worker, one per match).
             StreamingEvent::AntennaNote { antenna_id, note_id } => {
                 self.hub.send(HubMessage::AntennaNote { antenna_id, note_id });
+            }
+            // Batch O WP16: list membership changes fan out to the
+            // `userList` channel post-commit (`userAdded`/`userRemoved`).
+            StreamingEvent::UserListMemberAdded { list_id, member_id } => {
+                self.hub.send(HubMessage::UserListMember {
+                    list_id,
+                    member_id,
+                    added: true,
+                });
+            }
+            StreamingEvent::UserListMemberRemoved { list_id, member_id } => {
+                self.hub.send(HubMessage::UserListMember {
+                    list_id,
+                    member_id,
+                    added: false,
+                });
             }
             // The bare `MeUpdated` marker wakes `main` channels, which pack
             // `MeDetailed` on receipt (per-connection token scoping).

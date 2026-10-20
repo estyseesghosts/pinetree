@@ -44,3 +44,10 @@ Phase 3 scope (proposal §9): client compatibility and streaming. Gaps carried i
 - Verify by execution: run tests/prototypes and paste or reference real output in the state log. Do not mark work done on reasoning alone. The full gate is `bash scripts/smoke-all.sh` (see `docs/testing.md`); use it before claiming phase-level completion.
 - Both storage backends must pass the same persistence contract tests (`docs/` defines them; redb adapter comes in Phase 1, FDB in Phase 4 — Phase 0 needs only the interface + conformance test suite + prototype proof).
 - Compatibility claims require tests against real Misskey/Sharkey checkouts or target client versions, not internal mocks.
+
+## Subagent delegation (hard rule)
+
+- Subagents share one worktree: concurrent subagents read and write the same files. The delegating agent must partition work so they cannot collide.
+- Assign disjoint file sets; shared files (`docs/*` contracts, schema/migrations, router/ports, shared test files) are owned by the parent for merging — subagents propose patch snippets, they do not edit shared files directly.
+- Subagents use uniquely-named test files, leave changes uncommitted, and never `git commit`, `git stash`, `git reset`, or `git checkout --` anything.
+- Check `git status --short` before starting; respect uncommitted work by others; stage/commit only your own files when explicitly told to.

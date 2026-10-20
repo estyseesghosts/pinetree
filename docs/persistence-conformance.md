@@ -260,3 +260,25 @@ Ports: `AbuseReportStore`. redb implemented; K1–K4 storage paths present (K2/K
 - **L3 read-path filtering** (notes from blocked host + subdomain hidden; restored on unblock) — exercised by `suspended_or_host_blocked` + `host_is_blocked` tests and feed_filter_hides tests.
 
 Ports: `InstanceSettingsStore` (required, no defaults). redb implemented.
+
+### Group V — user lists + signin history (Batch O; added 2026-10-20; Draft)
+
+Backend-agnostic, same cases both adapters (FDB inherits).
+
+- **V1 signin bound + page**: over-cap inserts trim oldest-first in the same txn (`MAX_SIGNIN_ROWS_PER_USER`); list is newest-first, foreign accounts see nothing, `untilId` paging converges, date cursors bound. Executed: `v1_signin_history_bounded_and_paged` green (redb).
+- **V2 duplicate-push converge**: 8 concurrent `add_list_member` of the same pair → exactly one membership, the rest `Conflict(ALREADY_ADDED)`. Executed: `v2_concurrent_duplicate_push_converges` green (redb).
+- **V3 cap races**: concurrent creates at the owner cap → exactly `USER_LIST_LIMIT` succeed (`TOO_MANY_USERLISTS` else); concurrent adds at the member cap → exactly `USER_LIST_MEMBER_LIMIT` succeed (`TOO_MANY_USERS` else). Executed: `v3_cap_races_hold` green (redb).
+- **V4 delete cascade**: `delete_user_list` removes memberships + favorites in the same commit; foreign-owner delete is a miss. Executed: `v4_delete_cascades` green (redb).
+
+Execution status (honest): V1–V4 are green on redb only (`tests/conformance.rs`); the FDB adapter is still a stub and has not run them.
+
+### Group W — password-reset + registry stores (Batch P; added 2026-10-20; Draft)
+
+Backend-agnostic, same cases both adapters (FDB inherits).
+
+- **W1 reset lifecycle**: create → find-by-token → delete-by-id → both lookups miss; re-delete and missing-id deletes are silent successes (consume-on-expiry parity). Executed: `w1_reset_request_lifecycle` green (redb).
+- **W2 registry isolation**: upsert/get/list per (user, domain, scope, key); null-domain vs token-domain rows never see each other; foreign users see nothing; overwrite replaces in place; `scopes-with-domain` lists distinct pairs; remove converges and missing removes are silent; other scopes/domains survive. Executed: `w2_registry_store_isolation` green (redb).
+
+Ports: `PasswordResetStore`, `RegistryStore` (required, no defaults). redb implemented (`password_resets*`, `registry` tables).
+
+Execution status (honest): W1–W2 green on redb only; FDB has not run them. Suite total: 110/110 green on redb.

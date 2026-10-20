@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """Stress fix-up round: S2 (bigger window), S3 (patient vote resolution),
 S4b (patient media verification), S6-res (deleted-note residue inspection)."""
+import os
+BD = os.environ["BENCH_DIR"]
 import json, sys, time
 from concurrent.futures import ThreadPoolExecutor
-sys.path.insert(0, "/tmp/opencode/bench")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lib import load_nodes, fetch_bytes, sha
 
 nodes = load_nodes()
-TAG = open("/tmp/opencode/bench/stress.tag").read().strip()
-R = json.load(open("/tmp/opencode/bench/stress.json")) if __import__("os").path.exists("/tmp/opencode/bench/stress.json") else {}
+TAG = open(os.path.join(BD, "stress.tag")).read().strip()
+_SJ = os.path.join(BD, "stress.json")
+R = json.load(open(_SJ)) if os.path.exists(_SJ) else {}
 out = {}
 
 def note_text(node, n):
@@ -232,5 +235,5 @@ out["S4b_media"] = {"uploads": len(ups), "ok": len(okc),
     "max_link_s": max(lat) if lat else None, "wall_s": round(time.time() - t0, 1)}
 print("S4b:", json.dumps(out["S4b_media"]), flush=True)
 
-json.dump(out, open("/tmp/opencode/bench/stress-fixup.json", "w"), indent=1)
+json.dump(out, open(os.path.join(BD, "stress-fixup.json"), "w"), indent=1)
 print("FIXUP_DONE")

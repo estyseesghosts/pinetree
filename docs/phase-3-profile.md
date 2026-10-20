@@ -81,18 +81,30 @@ public (documented deviation; Misskey `FORBIDDEN` cases do not apply).
 
 ## 5. Explicitly OUT of the profile (non-goals)
 
-- `antennas/*` (Keystone renders honest 404 states), polls +
-  `notes/polls/vote` (no votable polls can exist; Keystone poll UI is
-  hidden on the pinetree target), `drive/folders/*` + non-null `folderId`
-  (no folder model; `drive/files/create` ignores `folderId`, documented),
-  `clips`, `channels/*`, `chat*`, `pages`, Reversi, `user-list(s)`,
-  `hashtag`, `roleTimeline`, `serverStats`, `queueStats`, `admin`,
-  `drive` streaming channel, `i/notifications-grouped`,
-  `notes/featured`, `users/featured-notes`, `notes/mentions`,
-  `notes/user-list-timeline`, `notes/reactions` (list),
-  `notifications/flush|test-notification`, `signin-flow`
-  (Misskey-family-only; pinetree target uses `signin`), OAuth, RFC 9421
-  signatures, Mastodon API.
+- `drive/folders/*` + non-null `folderId` (no folder model;
+  `drive/files*` requires null, documented), `clips`, `channels/*`,
+  `chat*`, `pages`, Reversi, `hashtag`, `roleTimeline`, `serverStats`,
+  `queueStats`, `drive` streaming channel, `i/notifications-grouped`,
+  `notes/featured`, `users/featured-notes`,
+  `notes/reactions` (list),
+  `signin-flow` (Misskey-family-only; pinetree target uses `signin`),
+  OAuth, RFC 9421 signatures, Mastodon API, `i/update-email` (needs the
+  §9.2 email decision), `users/lists/create-from-public` (deferred,
+  guide §8), `admin/*` beyond the shipped moderation/user/drive/meta
+  surface (manifest §§21–26, 30).
+- Shipped since this profile froze (superseding note 2026-10-17 →
+  2026-10-20): polls (§15), favorites + note state (§27), custom emoji
+  (§28), antennas + `antenna` stream (§29), abuse-report routes (§24),
+  admin moderation/user/drive/meta surface (§§21–26, 30), word mutes
+  (§31), Sharkey scheduling shim (§32), MiAuth hardening (§33),
+  `url-preview` (§34 WP12), self-service (§34 WP9), follower removal +
+  remote lookup (§34 WP10), drive extras (§34 WP13), user lists +
+  `notes/user-list-timeline` + `userList` stream (§34 WP16), email identity
+  loop + account move + `i/registry` + small reads + `notes/mentions` +
+  notification utilities + discovery + versions + translate (§35 Batch P;
+  `pinned-users` answers `[]`, hashtag timeline stays out — upstream has
+  none — `fetch-rss` is a documented subset, email/translate transports
+  dormant).
 - `notes/search` `offset`/`channelId`/`rangeStartAt|EndAt`: rejected as
   `UNSUPPORTED_FIELD` (Keystone never sends them).
 

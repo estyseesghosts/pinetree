@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::domain::account::{
     Account, AvatarDecoration, ChatScope, FollowVisibility, MutedWord,
@@ -119,6 +120,19 @@ pub struct UpdateAccountPatch {
     /// Batch M WP6 `admin/update-user-note`: moderator-only note text.
     /// `Some(Some(text))` sets, `Some(None)` clears, `None` leaves unchanged.
     pub moderator_note: Option<Option<String>>,
+    /// Batch P email identity loop (`i/update-email`, `verify-email`):
+    /// `Some(Some(addr))` sets + un-verifies, `Some(None)` clears,
+    /// `None` leaves unchanged.
+    pub email: Option<Option<String>>,
+    /// Batch P: `Some(v)` sets verified flag (verify-email), else unchanged.
+    pub email_verified: Option<bool>,
+    /// Batch P: `Some(Some(code))` mints, `Some(None)` clears, else unchanged.
+    pub email_verify_code: Option<Option<String>>,
+    /// Batch P `i/move`: `Some(uri)` marks moved (+ `moved_at_ms`);
+    /// never cleared (already-moved refusal guards it).
+    pub moved_to_uri: Option<String>,
+    /// Batch P `i/move`: unix millis of the move, set with `moved_to_uri`.
+    pub moved_at_ms: Option<i64>,
 }
 
 impl UpdateAccountPatch {
@@ -159,6 +173,21 @@ pub trait AccountStore: Send + Sync {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<Account>, PortError>;
+    /// Look up a local account by its pending email-verification code
+    /// (Batch P `verify-email`; Misskey queries `UserProfile` by
+    /// `emailVerifyCode`). Default body keeps in-memory test doubles
+    /// compiling; the redb adapter scans the accounts table.
+    fn find_by_email_verify_code(&self, _code: &str) -> Result<Option<Account>, PortError> {
+        Err(PortError::StorageUnavailable(
+            "AccountStore::find_by_email_verify_code not implemented".to_string(),
+        ))
+    }
+    /// Total stored account rows, local and remote (Batch P `stats`).
+    fn count_accounts(&self) -> Result<u64, PortError> {
+        Err(PortError::StorageUnavailable(
+            "AccountStore::count_accounts not implemented".to_string(),
+        ))
+    }
 
     /// Batch M WP6: bounded enumeration of ALL accounts (including
     /// suspended and tombstoned) for admin read paths. Pages by id cursor.
@@ -500,6 +529,19 @@ pub trait NoteStore: Send + Sync {
         ))
     }
     fn list_all_notes(&self, cursor: &TimelineCursor) -> Result<Vec<Note>, PortError>;
+    /// Total stored note rows, local and remote (Batch P `stats`).
+    fn count_notes(&self) -> Result<u64, PortError> {
+        Err(PortError::StorageUnavailable(
+            "NoteStore::count_notes not implemented".to_string(),
+        ))
+    }
+    /// Stored note rows by local authors (Batch P `stats`
+    /// `originalNotesCount`).
+    fn count_local_notes(&self) -> Result<u64, PortError> {
+        Err(PortError::StorageUnavailable(
+            "NoteStore::count_local_notes not implemented".to_string(),
+        ))
+    }
     fn find_by_uri(&self, uri: &str) -> Result<Option<Note>, PortError> {
         let _ = uri;
         Ok(None)
@@ -1206,6 +1248,12 @@ pub trait ReactionStore: Send + Sync {
             "ReactionStore::reactions_for_note not implemented".to_string(),
         ))
     }
+    /// Total stored reaction rows (Batch P `stats`).
+    fn count_reactions(&self) -> Result<u64, PortError> {
+        Err(PortError::StorageUnavailable(
+            "ReactionStore::count_reactions not implemented".to_string(),
+        ))
+    }
 }
 
 /// Note favorites (`notes/favorites/*`, `i/favorites`, `notes/state`;
@@ -1886,6 +1934,11 @@ pub trait NotificationStore: Send + Sync {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiTokenRecord {
+    /// Opaque token id (Misskey `MiAccessToken.id`, aidx). Assigned at mint;
+    /// rows written before Batch O backfill it at open. Addressed by
+    /// `i/revoke-token {tokenId}` and listed by `i/apps`.
+    #[serde(default)]
+    pub id: String,
     pub token_hash: String,
     pub account_id: String,
     pub permissions: Vec<String>,
@@ -1956,6 +2009,19 @@ pub trait AuthStore: Send + Sync {
     /// Delete the token row addressed by `token_hash` (Phase 3
     /// `i/revoke-token`). A missing row is a no-op success.
     fn delete_token_by_hash(&self, token_hash: &str) -> Result<(), PortError>;
+    /// Fetch one grant by its opaque id (Batch O `i/revoke-token`
+    /// `{tokenId}`, `i/apps`). Rows minted before ids existed are backfilled
+    /// at open, so every stored row resolves.
+    fn get_token_by_id(&self, id: &str) -> Result<Option<ApiTokenRecord>, PortError>;
+    /// All grants ever minted for `account_id`, oldest-first (Batch O
+    /// `i/apps`, `i/regenerate-token`). No pagination: callers bound the
+    /// account's live grants by construction (signin mints one row per
+    /// login; see `MAX_SIGNIN_ROWS_PER_USER` for the analogous cap).
+    fn tokens_for_account(&self, account_id: &str) -> Result<Vec<ApiTokenRecord>, PortError>;
+    /// Delete every first-party (native) grant of `account_id` (Batch O
+    /// `i/regenerate-token`: the single native token rotation). App grants
+    /// (`is_first_party: false`) keep working. Returns rows removed.
+    fn delete_account_first_party_tokens(&self, account_id: &str) -> Result<u64, PortError>;
     fn save_miauth_session(&self, session: MiAuthSessionRecord) -> Result<(), PortError>;
     fn get_miauth_session(&self, session_id: &str) -> Result<Option<MiAuthSessionRecord>, PortError>;
     fn consume_miauth_session(
@@ -2003,6 +2069,197 @@ pub trait AuthStore: Send + Sync {
         let _ = record;
         Ok(())
     }
+}
+
+/// One signin attempt row (Batch O WP9; Misskey `MiSignin`: `id`, `userId`,
+/// `ip varchar(128)`, `headers jsonb`, `success bool`, cascade-delete on
+/// user). Written for password-signin success/failure (known account only,
+/// like upstream `fail()`) and signup success. MiAuth and legacy-session
+/// approvals are not signins upstream and write no row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SigninRecord {
+    pub id: String,
+    pub account_id: String,
+    pub ip: String,
+    pub headers: String,
+    pub success: bool,
+    pub created_at_ms: i64,
+}
+
+/// Bound on stored signin rows per account (Batch O WP9). Upstream keeps
+/// every row; pinetree trims oldest-first in the same transaction so the
+/// read path stays bounded (no FDB impact: the write is one row + bounded
+/// deletes). No backfill possible — rows exist only from deploy forward.
+pub const MAX_SIGNIN_ROWS_PER_USER: usize = 100;
+
+pub trait SigninStore: Send + Sync {
+    /// Insert one attempt row and trim the account's history to
+    /// [`MAX_SIGNIN_ROWS_PER_USER`] oldest-first, atomically.
+    fn record_signin(&self, record: SigninRecord) -> Result<(), PortError>;
+    /// Newest-first page for `i/signin-history`. `limit` is clamped by the
+    /// caller (1..=100, default 10). Cursor pairs mirror upstream
+    /// (`sinceId`/`untilId` aidx ids, `sinceDate`/`untilDate` ms).
+    #[allow(clippy::too_many_arguments)]
+    fn list_signins(
+        &self,
+        account_id: &str,
+        limit: usize,
+        since_id: Option<&str>,
+        until_id: Option<&str>,
+        since_date: Option<i64>,
+        until_date: Option<i64>,
+    ) -> Result<Vec<SigninRecord>, PortError>;
+}
+
+/// One password-reset request row (Batch P; Misskey
+/// `MiPasswordResetRequest`: `id` (aid, carries the 30-minute TTL —
+/// `reset-password` rejects tokens older than 30 min by id timestamp),
+/// `userId`, `token` (64-char). No expiry sweeper: rows are single-use
+/// (deleted on consume) and unreadable rows fail closed (`NO_SUCH_CODE`
+/// posture like `verify-email`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PasswordResetRequest {
+    pub id: String,
+    pub user_id: String,
+    pub token: String,
+}
+
+/// One client registry item (Batch P; Misskey `MiRegistryItem`: `id`,
+/// `userId`, `domain` (nullable; an access-token id when written with a
+/// token-scoped call, else the explicit `domain` param or null), `scope`
+/// (string array), `key`, `value` (arbitrary JSON), `updatedAt`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistryItem {
+    pub id: String,
+    pub user_id: String,
+    pub domain: Option<String>,
+    pub scope: Vec<String>,
+    pub key: String,
+    pub value: Value,
+    pub updated_at_ms: i64,
+}
+
+/// Password-reset tokens (Batch P; `request-reset-password` /
+/// `reset-password`). Single-use rows keyed by token.
+pub trait PasswordResetStore: Send + Sync {
+    /// Insert one request row (caller mints id + 64-char token).
+    fn create_reset_request(&self, request: PasswordResetRequest) -> Result<(), PortError>;
+    /// Look up by token (`None` when unknown or already consumed).
+    fn find_reset_request(&self, token: &str) -> Result<Option<PasswordResetRequest>, PortError>;
+    /// Delete one row by id (consume on successful reset; best-effort on
+    /// expiry — missing rows are not an error).
+    fn delete_reset_request(&self, id: &str) -> Result<(), PortError>;
+}
+
+/// Client key-value registry (Batch P; `i/registry/*`). Upstream
+/// `RegistryApiService` semantics: one row per
+/// (user, domain, scope, key); `set` upserts; reads with a non-null
+/// domain are token/app-scoped, null-domain rows are shared. Scope
+/// segments are validated by the caller (`^[a-zA-Z0-9_]+$`).
+pub trait RegistryStore: Send + Sync {
+    /// Upsert one item (insert or replace value + `updated_at_ms`).
+    fn registry_set(&self, item: RegistryItem) -> Result<(), PortError>;
+    /// Fetch one item by (user, domain, scope, key).
+    fn registry_get(
+        &self,
+        user_id: &str,
+        domain: Option<&str>,
+        scope: &[String],
+        key: &str,
+    ) -> Result<Option<RegistryItem>, PortError>;
+    /// All items of one (user, domain, scope).
+    fn registry_list(
+        &self,
+        user_id: &str,
+        domain: Option<&str>,
+        scope: &[String],
+    ) -> Result<Vec<RegistryItem>, PortError>;
+    /// Delete one item (missing rows are not an error, like upstream
+    /// `remove`).
+    fn registry_remove(
+        &self,
+        user_id: &str,
+        domain: Option<&str>,
+        scope: &[String],
+        key: &str,
+    ) -> Result<(), PortError>;
+    /// Distinct (domain, scope) pairs holding at least one item for the
+    /// user (`scopes-with-domain`).
+    fn registry_scopes(&self, user_id: &str) -> Result<Vec<(Option<String>, Vec<String>)>, PortError>;
+}
+
+/// User lists (Batch O WP16; pull timelines, remote members, favorites).
+pub trait UserListStore: Send + Sync {
+    /// Insert one list; `Conflict(TOO_MANY_USERLISTS)` when the owner
+    /// already holds [`crate::domain::user_list::USER_LIST_LIMIT`] lists.
+    /// Count check + insert commit atomically (conformance K2).
+    fn create_user_list(
+        &self,
+        list: crate::domain::user_list::UserList,
+    ) -> Result<crate::domain::user_list::UserList, PortError>;
+    /// Owner-scoped rewrite (name / visibility). `None` on miss.
+    fn update_user_list(
+        &self,
+        list: crate::domain::user_list::UserList,
+    ) -> Result<Option<crate::domain::user_list::UserList>, PortError>;
+    /// Owner-scoped delete with membership + favorite cascade, one
+    /// transaction (conformance K3). Returns true when a row existed.
+    fn delete_user_list(&self, owner_id: &str, list_id: &str) -> Result<bool, PortError>;
+    fn get_user_list(
+        &self,
+        list_id: &str,
+    ) -> Result<Option<crate::domain::user_list::UserList>, PortError>;
+    /// Owner's lists, newest-first.
+    fn lists_by_owner(
+        &self,
+        owner_id: &str,
+    ) -> Result<Vec<crate::domain::user_list::UserList>, PortError>;
+    /// Owner's public lists, newest-first (`users/lists/list{userId}`).
+    fn public_lists_by_owner(
+        &self,
+        owner_id: &str,
+    ) -> Result<Vec<crate::domain::user_list::UserList>, PortError>;
+    /// Add one member; `Conflict(ALREADY_ADDED)` on duplicate,
+    /// `Conflict(TOO_MANY_USERS)` past
+    /// [`crate::domain::user_list::USER_LIST_MEMBER_LIMIT`] members.
+    /// Cap check + insert + `jobs` commit atomically (conformance K2).
+    fn add_list_member(
+        &self,
+        member: crate::domain::user_list::UserListMembership,
+        jobs: Vec<NewJob>,
+    ) -> Result<crate::domain::user_list::UserListMembership, PortError>;
+    /// Remove one member (idempotent) with `jobs`, one transaction.
+    /// Returns true when a row existed.
+    fn remove_list_member(
+        &self,
+        list_id: &str,
+        member_id: &str,
+        jobs: Vec<NewJob>,
+    ) -> Result<bool, PortError>;
+    /// Flip `with_replies`. `None` on miss.
+    fn update_list_membership(
+        &self,
+        list_id: &str,
+        member_id: &str,
+        with_replies: bool,
+    ) -> Result<Option<crate::domain::user_list::UserListMembership>, PortError>;
+    fn get_list_membership(
+        &self,
+        list_id: &str,
+        member_id: &str,
+    ) -> Result<Option<crate::domain::user_list::UserListMembership>, PortError>;
+    /// Every membership of one list (bounded by the member cap).
+    fn members_of_list(
+        &self,
+        list_id: &str,
+    ) -> Result<Vec<crate::domain::user_list::UserListMembership>, PortError>;
+    /// Favorite one public list (idempotent insert). Returns true when the
+    /// row was newly added.
+    fn favorite_list(&self, owner_id: &str, list_id: &str) -> Result<bool, PortError>;
+    /// Unfavorite (idempotent). Returns true when a row existed.
+    fn unfavorite_list(&self, owner_id: &str, list_id: &str) -> Result<bool, PortError>;
+    fn is_list_favorited(&self, owner_id: &str, list_id: &str) -> Result<bool, PortError>;
+    fn list_favorite_count(&self, list_id: &str) -> Result<u64, PortError>;
 }
 
 pub trait StreamingSink: Send + Sync {

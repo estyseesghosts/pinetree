@@ -58,6 +58,11 @@ pub struct ParsedRemoteActor {
     /// Pre-parsed AP `Emoji` tags (`(shortcode, icon_url)`), capped at 32.
     /// WP8b ingest source for actor documents (metadata only).
     pub emojis: Vec<(String, String)>,
+    /// Batch P: `alsoKnownAs` actor URIs (capped at 10, Misskey
+    /// `ApPersonService` parity — drives the `i/move` alias handshake).
+    pub also_known_as: Option<Vec<String>>,
+    /// Batch P: `movedTo` actor URI (Misskey `movedToUri` parity).
+    pub moved_to_uri: Option<String>,
 }
 
 impl ParsedRemoteActor {
@@ -299,6 +304,38 @@ pub fn parse_remote_actor(doc: &Value) -> Result<ParsedRemoteActor, String> {
         .and_then(Value::as_bool)
         .unwrap_or(true);
     let is_cat = obj.get("isCat").and_then(Value::as_bool).unwrap_or(false);
+    // Batch P `i/move` handshake inputs (untrusted: trimmed, capped at 10
+    // entries × 512 chars, non-URI strings kept verbatim — the handshake
+    // compares substrings, like upstream `includes`).
+    let also_known_as = match obj.get("alsoKnownAs") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() || trimmed.chars().count() > 512 {
+                None
+            } else {
+                Some(vec![trimmed.to_string()])
+            }
+        }
+        Some(Value::Array(arr)) => {
+            let mut uris = Vec::new();
+            for entry in arr.iter().take(10) {
+                if let Some(s) = entry.as_str().map(str::trim).filter(|s| {
+                    !s.is_empty() && s.chars().count() <= 512
+                }) {
+                    uris.push(s.to_string());
+                }
+            }
+            if uris.is_empty() { None } else { Some(uris) }
+        }
+        Some(_) => None,
+    };
+    let moved_to_uri = obj
+        .get("movedTo")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && s.chars().count() <= 512)
+        .map(ToOwned::to_owned);
     let birthday = obj
         .get("vcard:bday")
         .and_then(Value::as_str)
@@ -379,6 +416,8 @@ pub fn parse_remote_actor(doc: &Value) -> Result<ParsedRemoteActor, String> {
         icon_url,
         image_url,
         emojis,
+        also_known_as,
+        moved_to_uri,
     })
 }
 
@@ -502,6 +541,21 @@ pub fn render_actor_document(
         "vcard:bday": account.birthday,
         "vcard:Address": account.location,
     });
+
+    // Batch P `i/move` handshake outputs (upstream `renderPerson`
+    // `alsoKnownAs`/`movedTo` parity): omitted when unset, so old
+    // documents keep their shape.
+    if let Some(map) = doc.as_object_mut() {
+        if let Some(uris) = account.also_known_as.as_deref().filter(|uris| !uris.is_empty()) {
+            map.insert(
+                "alsoKnownAs".to_string(),
+                Value::Array(uris.iter().map(|u| Value::String(u.clone())).collect()),
+            );
+        }
+        if let Some(moved) = account.moved_to_uri.as_deref() {
+            map.insert("movedTo".to_string(), Value::String(moved.to_string()));
+        }
+    }
 
     if image.is_null() {
         if let Some(map) = doc.as_object_mut() {
@@ -1058,6 +1112,10 @@ mod tests {
             instance_settings: store.clone(),
             invites: store.clone(),
             abuse_reports: store.clone(),
+            lists: store.clone(),
+            signin: store.clone(),
+            password_resets: store.clone(),
+            registry: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()
@@ -1071,6 +1129,31 @@ mod tests {
             scheduled_note_limit: crate::domain::draft::DEFAULT_SCHEDULED_NOTE_LIMIT,
             pin_limit: crate::domain::pinning::DEFAULT_PIN_LIMIT,
         }
+    }
+
+    #[test]
+    fn batch_p_alias_and_moved_round_trip() {
+        let doc = actor_doc(
+            "https://remote.example/users/1",
+            "bob",
+            "https://remote.example/users/1/inbox",
+            None,
+        );
+        let mut doc = doc;
+        doc["alsoKnownAs"] = json!(["https://local.example/users/9", "https://x.example/u"]);
+        doc["movedTo"] = json!("https://remote.example/users/2");
+        let parsed = parse_remote_actor(&doc).expect("parses");
+        assert_eq!(
+            parsed.also_known_as,
+            Some(vec![
+                "https://local.example/users/9".to_string(),
+                "https://x.example/u".to_string()
+            ])
+        );
+        assert_eq!(
+            parsed.moved_to_uri,
+            Some("https://remote.example/users/2".to_string())
+        );
     }
 
     // Slice 3 (H5): a sharedInbox on another host is dropped (None) so
