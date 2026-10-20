@@ -22,6 +22,13 @@ landed during the session:
    Non-public Articles keep the note pipeline (visibility enforcement).
    Updates/deletes/likes correlate by URI. Page likes on remote pages
    federate back to the origin as `Like`.
+5. **Pages federate by default; clips stay private** (owner decision
+   2026-10-20). `PageBody.federate` absent ⇒ true (explicit `false`
+   opts out); clips unchanged (`isPublic` false, per-clip flag false).
+   The admin switches still gate everything (default OFF), so there is
+   no protocol footprint until the instance opts in. Documented in the
+   handoff §Phase 3, manifest §36, `federated-collections.md` §2, and
+   pinned by a store-read assertion in `pages_crud_likes_and_featured`.
 4. **Test harness: per-node Tokio runtimes.** A clips gate test hung
    deterministically on the shared test runtime (B stopped accepting
    while all workers idled, timers dead, EAGAIN on reads). Giving each
@@ -67,8 +74,9 @@ re-verified verbatim by script afterwards).
 
 ## Executed evidence (the gate)
 
-- `cargo test --offline`: 483 lib + 115 conformance (Groups X+Y) + 34
-  integration (1+1+2+5+2+1+1+5+16) = **632/632 green**.
+- `cargo test --offline`: 489 lib (incl. 6 new config-schema tests) +
+  115 conformance (Groups X+Y, incl. Y3 URI index) + 34 integration
+  (1+1+2+5+2+1+1+5+16) = **638/638 green**.
 - `bash scripts/smoke-all.sh` → `SMOKE_ALL_OK` (phase2 SKIP — no Node 22
   in this environment, same environmental note as Batches O/P).
 - `bash scripts/keystone-sweep.sh` → `KEYSWEEP_OK`, **48 passed / 0

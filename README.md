@@ -340,6 +340,35 @@ target/release/pinetree \
 - `--listen` is the address the HTTP server binds to. Use `127.0.0.1:3000` to
   keep it local-only, or `0.0.0.0:3000` to expose it on your network.
 
+Every one of these has a JSON-file equivalent. Point `--config` at a file
+and it becomes the base configuration; CLI flags override the file, and
+`validate()` runs once over the merged result. Every key is optional —
+absent keys take the compiled defaults — and unknown keys are rejected
+(typo safety):
+
+```json
+{
+  "public_url": "https://social.example.com",
+  "data_dir": "./data",
+  "listen": "127.0.0.1:3000",
+  "max_file_size": 262144000,
+  "trusted_proxies": ["10.0.0.1"],
+  "note_draft_limit": 10,
+  "scheduled_note_limit": 1,
+  "pin_limit": 5
+}
+```
+
+```bash
+target/release/pinetree --config=/etc/pinetree.json --listen=0.0.0.0:3000
+```
+
+The remaining flags (`--mode`, `--trusted-proxies`, `--max-file-size`,
+`--preserved-usernames`, `--prohibited-words`, `--sensitive-words`,
+`--note-draft-limit`, `--scheduled-note-limit`, `--pin-limit`,
+`--debug-federation`, `--debug-weak-rate-limits`,
+`--federation-extra-ca`) override the same keys.
+
 If you're just trying it out locally, this works too:
 
 ```bash

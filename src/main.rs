@@ -192,7 +192,11 @@ fn run_set_role(args: &[String], cfg: &Config) -> ! {
 async fn main() {
     pinetree::observability::init();
 
-    let mut cfg = Config::default();
+    // Base configuration: the `--config=PATH` JSON file over the compiled
+    // defaults (unknown keys, unreadable files and malformed JSON are hard
+    // errors naming the path). Every key below is optional in the file;
+    // absent keys take the defaults. This loop's flags override the file.
+    let mut cfg = config_base();
     let mut positional: Vec<String> = Vec::new();
     let mut debug_federation_flag = false;
     let mut debug_weak_rate_limits_flag = false;
@@ -204,6 +208,10 @@ async fn main() {
         } else if let Some(path) = arg.strip_prefix("--federation-extra-ca=") {
             pinetree::federation::delivery::set_extra_ca(path.into());
             eprintln!("federation extra CA in force (--federation-extra-ca={path}): not for production");
+        } else if arg.starts_with("--config=") {
+            // Consumed by `config_base()` (sets the base this loop
+            // overrides); ignored here so it never falls through to
+            // `positional`.
         } else if let Some(mode) = arg.strip_prefix("--mode=") {
             cfg.mode = match mode {
                 "single" => DeploymentMode::Single,
@@ -218,7 +226,10 @@ async fn main() {
         } else if let Some(dir) = arg.strip_prefix("--data-dir=") {
             cfg.data_dir = dir.into();
         } else if let Some(listen) = arg.strip_prefix("--listen=") {
-            cfg.listen = listen.parse().expect("valid --listen addr");
+            cfg.listen = listen.parse().unwrap_or_else(|_| {
+                eprintln!("invalid --listen address: {listen}");
+                std::process::exit(1);
+            });
         } else if let Some(list) = arg.strip_prefix("--trusted-proxies=") {
             cfg.trusted_proxies = match parse_trusted_proxies(list) {
                 Ok(proxies) => proxies,
@@ -227,6 +238,32 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
+        } else if let Some(bytes) = arg.strip_prefix("--max-file-size=") {
+            cfg.max_file_size = bytes.parse().ok().filter(|n| *n > 0).unwrap_or_else(|| {
+                eprintln!("invalid --max-file-size (want an integer > 0): {bytes}");
+                std::process::exit(2);
+            });
+        } else if let Some(list) = arg.strip_prefix("--preserved-usernames=") {
+            cfg.preserved_usernames = parse_csv_list(list);
+        } else if let Some(list) = arg.strip_prefix("--prohibited-words=") {
+            cfg.prohibited_words = parse_csv_list(list);
+        } else if let Some(list) = arg.strip_prefix("--sensitive-words=") {
+            cfg.sensitive_words = parse_csv_list(list);
+        } else if let Some(limit) = arg.strip_prefix("--note-draft-limit=") {
+            cfg.note_draft_limit = limit.parse().ok().filter(|n| *n > 0).unwrap_or_else(|| {
+                eprintln!("invalid --note-draft-limit (want an integer > 0): {limit}");
+                std::process::exit(2);
+            });
+        } else if let Some(limit) = arg.strip_prefix("--scheduled-note-limit=") {
+            cfg.scheduled_note_limit = limit.parse().ok().filter(|n| *n > 0).unwrap_or_else(|| {
+                eprintln!("invalid --scheduled-note-limit (want an integer > 0): {limit}");
+                std::process::exit(2);
+            });
+        } else if let Some(limit) = arg.strip_prefix("--pin-limit=") {
+            cfg.pin_limit = limit.parse().ok().filter(|n| *n > 0).unwrap_or_else(|| {
+                eprintln!("invalid --pin-limit (want an integer > 0): {limit}");
+                std::process::exit(2);
+            });
         } else {
             positional.push(arg);
         }
@@ -338,4 +375,32 @@ fn parse_trusted_proxies(list: &str) -> Result<Vec<IpAddr>, String> {
                 .map_err(|err| format!("invalid --trusted-proxies address {part}: {err}"))
         })
         .collect()
+}
+
+/// Comma-separated string lists (`--preserved-usernames`,
+/// `--prohibited-words`, `--sensitive-words`). Empty items are dropped;
+/// pass an empty value to clear the file/default list.
+fn parse_csv_list(list: &str) -> Vec<String> {
+    list.split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Base configuration: the `--config=PATH` JSON file over the compiled
+/// defaults (unknown keys, unreadable files and malformed JSON are hard
+/// errors naming the path). Every other CLI flag overrides the file.
+fn config_base() -> Config {
+    let path = std::env::args()
+        .skip(1)
+        .filter_map(|arg| arg.strip_prefix("--config=").map(str::to_string))
+        .next();
+    match path {
+        None => Config::default(),
+        Some(path) => Config::load_from_file(std::path::Path::new(&path)).unwrap_or_else(|err| {
+            eprintln!("configuration error: {err}");
+            std::process::exit(1);
+        }),
+    }
 }

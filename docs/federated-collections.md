@@ -63,10 +63,15 @@ server-to-server pulls.
 `RemoteApproved` (signed fetch, listed approver actors only).
 
 Upstream `isPublic` maps onto the model (`true` ⇒ listed-global, `false`
-⇒ self-only); the per-object `federate` flag defaults OFF. Either the
-admin switch (`federateClips`/`federatePages`, default OFF,
-`admin/update-meta`) or the per-object flag off ⇒ local-only behavior,
-zero protocol footprint (routes 404, actor `clips` reference omitted).
+⇒ self-only). Clips stay private by default: `isPublic` defaults false
+and the per-clip `federate` flag defaults OFF. Pages are public by
+default: no visibility gate (upstream parity) and the per-page
+`federate` flag defaults ON (an absent `federate` param means true;
+explicit `false` opts out). Either the admin switch
+(`federateClips`/`federatePages`, default OFF, `admin/update-meta`) or
+the per-object flag off ⇒ local-only behavior, zero protocol footprint
+(routes 404, actor `clips` reference omitted) — so pages federate only
+once the instance opts in.
 
 Remote-approved carries the standing trust caveat: we control who can
 fetch, not what the remote server does next (same as federated DMs).

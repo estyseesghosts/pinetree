@@ -45,6 +45,10 @@ pub struct PageBody {
     pub align_center: Option<bool>,
     pub hide_title_when_pinned: Option<bool>,
     pub visibility: Option<String>,
+    /// Per-page federate flag. `None` (param absent) means **true**:
+    /// pages are public by default and federate once the instance
+    /// enables `federatePages` (owner decision 2026-10-20; clips stay
+    /// opt-in). Explicit `false` opts a page out.
     pub federate: Option<bool>,
     pub approved_actor_uris: Option<Vec<String>>,
 }
@@ -143,7 +147,7 @@ impl AppServices {
                     .map_err(domain_err)?,
                 None => CollectionTier::Listed,
             },
-            federate: body.federate.unwrap_or(false),
+            federate: body.federate.unwrap_or(true),
             approved_actor_uris: body.approved_actor_uris.clone().unwrap_or_default(),
             uri: None,
             remote_attachments: Vec::new(),

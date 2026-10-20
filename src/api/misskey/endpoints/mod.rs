@@ -20902,6 +20902,13 @@ mod tests {
         assert!(page.get("isLiked").is_some());
         assert_eq!(page["script"], "let x = 1");
         let page_id = page["id"].as_str().unwrap().to_string();
+        // Pages federate by default (owner decision 2026-10-20): absent
+        // `federate` param means true (clips stay opt-in). The flag is
+        // internal-only, so read it back through the store.
+        assert!(
+            state.services.pages.get_page(&page_id).unwrap().unwrap().federate,
+            "pages default to federate=true"
+        );
         // Duplicate slug → NAME_ALREADY_EXISTS (verbatim create UUID).
         let (status, value) = call(&state, "pages/create", body("Other", "hello"), Some(&alice_token)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
