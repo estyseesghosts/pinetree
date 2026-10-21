@@ -31,18 +31,21 @@ fn build_services(cfg: &Config) -> Result<(Arc<AppServices>, pinetree::streaming
         .map_err(|err| format!("init cache cap: {err}"))?;
     // Storage overhaul: durable local uploads live in `blobs_durable/`
     // (never evicted), remote fetches in `blobs_cache/` (LRU+TTL, capped).
+    // Both roots are config-overridable (`durable_dir` / `cache_dir`) and
+    // must be distinct (enforced by `Config::validate`).
     // A pre-overhaul `blobs/` directory is migrated once via rename.
     let legacy_blobs = cfg.data_dir.join("blobs");
-    let durable_dir = cfg.data_dir.join("blobs_durable");
+    let durable_dir = cfg.durable_pool_dir();
     if !durable_dir.exists() && legacy_blobs.exists() {
         std::fs::rename(&legacy_blobs, &durable_dir)
-            .map_err(|err| format!("migrate blobs/ to blobs_durable/: {err}"))?;
+            .map_err(|err| format!("migrate blobs/ to {}: {err}", durable_dir.display()))?;
     }
+    let cache_dir = cfg.cache_pool_dir();
     let blobs: Arc<dyn BlobStore> = Arc::new(
         FsBlobStore::new(&durable_dir).map_err(|err| format!("init blob store: {err}"))?,
     );
     let cache_blobs: Arc<dyn BlobStore> = Arc::new(
-        FsBlobStore::new(cfg.data_dir.join("blobs_cache"))
+        FsBlobStore::new(&cache_dir)
             .map_err(|err| format!("init cache blob store: {err}"))?,
     );
     let streaming: Arc<dyn StreamingSink>;
@@ -221,8 +224,27 @@ fn run_set_role(args: &[String], cfg: &Config) -> ! {
     }
 }
 
-#[tokio::main]
-async fn main() {
+#[allow(clippy::too_many_lines)]
+fn main() {
+    // Storage-overhaul fallout (2026-10-21): the sync `/api` dispatch
+    // match needs just over 2 MiB of stack in dev builds, overflowing
+    // tokio's default 2 MiB worker/blocking threads on EVERY `/api` call
+    // (`meta`, `username/available`, … — `healthz` was unaffected).
+    // Diagnosed via `RUST_MIN_STACK` gradient (2 MiB aborts, 4 MiB serves)
+    // after `drive/cache/stats` + quota work tipped the match over.
+    // 8 MiB leaves 2x headroom; `dispatch_fits_bounded_stack` guards the
+    // 4 MiB half. This covers both pools: the blocking pool inherits the
+    // same builder stack size.
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 << 20)
+        .build()
+        .expect("build tokio runtime")
+        .block_on(async_main());
+}
+
+#[allow(clippy::too_many_lines)]
+async fn async_main() {
     pinetree::observability::init();
 
     // Base configuration: the `--config=PATH` JSON file over the compiled
@@ -362,6 +384,10 @@ async fn main() {
                     std::process::exit(2);
                 }
             };
+        } else if let Some(dir) = arg.strip_prefix("--durable-dir=") {
+            cfg.durable_dir = Some(dir.into());
+        } else if let Some(dir) = arg.strip_prefix("--cache-dir=") {
+            cfg.cache_dir = Some(dir.into());
         } else {
             positional.push(arg);
         }

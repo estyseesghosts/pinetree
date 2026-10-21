@@ -68,13 +68,24 @@ pub struct ReconcileReport {
 /// Run one bounded reconciliation scan. Idempotent: re-running converges
 /// (every mutation moves state toward accounted, indexed, present bytes).
 pub fn reconcile_media(services: &AppServices) -> Result<ReconcileReport, PortError> {
+    reconcile_media_with_cap(services, RECONCILE_SCAN_CAP)
+}
+
+/// [`reconcile_media`] with an explicit scan cap (storage job payload).
+/// Caps above [`RECONCILE_SCAN_CAP`] are clamped — one run never exceeds
+/// the bound the reconciler was designed around.
+pub fn reconcile_media_with_cap(
+    services: &AppServices,
+    scan_cap: usize,
+) -> Result<ReconcileReport, PortError> {
+    let cap = scan_cap.clamp(1, RECONCILE_SCAN_CAP);
     let mut report = ReconcileReport::default();
     let rows = services
         .media
-        .list_all_media(&TimelineCursor::with_limit(RECONCILE_SCAN_CAP))?;
+        .list_all_media(&TimelineCursor::with_limit(cap))?;
     report.examined = rows.len() as u64;
 
-    let report_truncated = rows.len() >= RECONCILE_SCAN_CAP;
+    let report_truncated = rows.len() >= cap;
 
     // Expected state recomputed from the scan: per-key reference counts
     // and per-owner durable sums, compared against the stored counters.
@@ -148,7 +159,7 @@ pub fn reconcile_media(services: &AppServices) -> Result<ReconcileReport, PortEr
     let mut accounted_blobs: HashSet<String> = HashSet::new();
     let candidates = services
         .media
-        .remote_cache_evict_candidates(RECONCILE_SCAN_CAP)?;
+        .remote_cache_evict_candidates(cap)?;
     for rec in &candidates {
         if services.media.get(&rec.media_id)?.is_some() {
             continue;
@@ -308,6 +319,75 @@ pub fn sweep_orphan_blobs(
 /// legacy: flagged, never purged.
 fn is_legacy_md5_row(blob_key: &str) -> bool {
     blob_key.len() != 64 || !blob_key.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Rows per page for [`backfill_durable_accounting`]. Every page is one
+/// bounded `list_all_media` read (FDB-safe); the in-memory sums stay
+/// small (one entry per owner/blob key).
+pub const BACKFILL_PAGE_SIZE: usize = 500;
+
+/// Outcome of one [`backfill_durable_accounting`] run.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BackfillReport {
+    /// Media rows scanned.
+    pub media_scanned: u64,
+    /// Owner byte-counter rows overwritten.
+    pub owners_updated: u64,
+    /// Blob-refcount rows overwritten.
+    pub refcounts_updated: u64,
+}
+
+/// Recompute `DURABLE_BYTES_BY_OWNER` (and `BLOB_REFCOUNT`) from the
+/// metadata rows and overwrite the stored counters. Idempotent: a re-run
+/// over unchanged rows writes the same sums. `after_media_id` sets the
+/// start cursor (`None` = newest); `page_size` is clamped to
+/// `1..=BACKFILL_PAGE_SIZE`. The scan pages to the newest-to-oldest end
+/// (one bounded `list_all_media` read per page) and persists the sums
+/// once; the returned cursor is always `None` (done). Partial pages are
+/// never written: sums accumulate in memory (one entry per owner/blob
+/// key) and are persisted only after the final page, so an interrupted
+/// run simply re-runs from the start and converges to the same counters.
+pub fn backfill_durable_accounting(
+    services: &AppServices,
+    after_media_id: Option<String>,
+    page_size: usize,
+) -> Result<(BackfillReport, Option<String>), PortError> {
+    let page = page_size.clamp(1, BACKFILL_PAGE_SIZE);
+    let mut cursor_after = after_media_id;
+    let mut durable_sums: HashMap<String, u64> = HashMap::new();
+    let mut ref_sums: HashMap<String, u64> = HashMap::new();
+    let mut scanned: u64 = 0;
+    loop {
+        let mut cursor = TimelineCursor::with_limit(page);
+        cursor.until_id = cursor_after.clone();
+        let rows = services.media.list_all_media(&cursor)?;
+        if rows.is_empty() {
+            break;
+        }
+        for meta in &rows {
+            *ref_sums.entry(meta.blob_key.clone()).or_insert(0) += 1;
+            if let Some(owner) = meta.owner_id.as_deref() {
+                let entry = durable_sums.entry(owner.to_string()).or_insert(0);
+                *entry = entry.saturating_add(meta.size_bytes);
+            }
+        }
+        scanned += rows.len() as u64;
+        if rows.len() < page {
+            break;
+        }
+        cursor_after = rows.last().map(|m| m.id.clone());
+    }
+    let mut report = BackfillReport::default();
+    report.media_scanned = scanned;
+    for (owner, sum) in &durable_sums {
+        services.media.set_durable_bytes(owner, *sum)?;
+        report.owners_updated += 1;
+    }
+    for (key, count) in &ref_sums {
+        services.media.set_blob_refcount(key, *count)?;
+        report.refcounts_updated += 1;
+    }
+    Ok((report, None))
 }
 
 #[cfg(test)]

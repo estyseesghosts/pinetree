@@ -9192,6 +9192,34 @@ impl MediaStore for RedbStore {
             .unwrap_or(0))
     }
 
+    fn set_blob_refcount(&self, blob_key: &str, count: u64) -> Result<(), PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            let mut table = write_txn.open_table(BLOB_REFCOUNT).map_err(map_redb_err)?;
+            if count == 0 {
+                table.remove(blob_key).map_err(map_redb_err)?;
+            } else {
+                table.insert(blob_key, count).map_err(map_redb_err)?;
+            }
+        }
+        self.commit_write(write_txn)
+    }
+
+    fn set_durable_bytes(&self, owner_id: &str, bytes: u64) -> Result<(), PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            let mut table = write_txn
+                .open_table(DURABLE_BYTES_BY_OWNER)
+                .map_err(map_redb_err)?;
+            if bytes == 0 {
+                table.remove(owner_id).map_err(map_redb_err)?;
+            } else {
+                table.insert(owner_id, bytes).map_err(map_redb_err)?;
+            }
+        }
+        self.commit_write(write_txn)
+    }
+
     fn delete_media_record(
         &self,
         id: &str,

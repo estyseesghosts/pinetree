@@ -7,8 +7,9 @@ use crate::api::misskey::packers::{
 use crate::application::commands::AppServices;
 use crate::application::events::{EmojiBroadcastOp, MainEventKind, MainMessage, NotifyJobPayload, StreamingEvent};
 use crate::application::ports::{
-    Clock, IdGenerator, Job, JobKind, JobQueue, NewJob, NotificationStore, PortError,
-    RemoteMediaFetchPayload, StreamingSink, MAX_JOBS_PER_TXN, MAX_JOB_ATTEMPTS,
+    BackfillDurablePayload, CacheEvictPayload, Clock, IdGenerator, Job, JobKind, JobQueue,
+    NewJob, NotificationStore, PortError, ReconcileStoragePayload, RemoteMediaFetchPayload,
+    StreamingSink, MAX_JOBS_PER_TXN, MAX_JOB_ATTEMPTS,
 };
 use crate::domain::notification::{Notification, NotificationKind};
 use crate::federation::retry::{DeliveryOutcome, DestinationTracker};
@@ -295,6 +296,78 @@ impl JobWorker {
                         Ok(Disposition::Quarantine(format!("bad-payload: {reason}")))
                     }
                     Err(_) => Ok(Disposition::Retry { retry_after_ms: None }),
+                }
+            }
+            // Storage overhaul: free cache bytes under pressure (bytes only,
+            // LRU+TTL-first, metadata stays for re-fetch). Bad payloads
+            // quarantine; only storage faults retry.
+            JobKind::CacheEvict => {
+                match serde_json::from_slice::<CacheEvictPayload>(&job.payload) {
+                    Err(e) => Ok(Disposition::Quarantine(format!(
+                        "bad-payload: cache-evict invalid: {e}"
+                    ))),
+                    Ok(payload) => {
+                        match crate::media::remote_cache::ensure_cache_budget(
+                            &self.services,
+                            payload.need_bytes,
+                            payload.class,
+                        ) {
+                            Ok(()) => Ok(Disposition::Done),
+                            Err(PortError::Validation(reason)) => {
+                                Ok(Disposition::Quarantine(format!("bad-payload: {reason}")))
+                            }
+                            Err(_) => Ok(Disposition::Retry { retry_after_ms: None }),
+                        }
+                    }
+                }
+            }
+            // Storage overhaul: one bounded reconciler scan (orphan sweep,
+            // missing-bytes heal, accounting-drift detect, legacy flag,
+            // sidecar heal). Bad payloads quarantine; storage faults retry.
+            JobKind::ReconcileStorage => {
+                match serde_json::from_slice::<ReconcileStoragePayload>(&job.payload) {
+                    Err(e) => Ok(Disposition::Quarantine(format!(
+                        "bad-payload: reconcile-storage invalid: {e}"
+                    ))),
+                    Ok(payload) => {
+                        match crate::media::reconciler::reconcile_media_with_cap(
+                            &self.services,
+                            payload.scan_cap.unwrap_or(
+                                crate::media::reconciler::RECONCILE_SCAN_CAP,
+                            ),
+                        ) {
+                            Ok(_) => Ok(Disposition::Done),
+                            Err(PortError::Validation(reason)) => {
+                                Ok(Disposition::Quarantine(format!("bad-payload: {reason}")))
+                            }
+                            Err(_) => Ok(Disposition::Retry { retry_after_ms: None }),
+                        }
+                    }
+                }
+            }
+            // Storage overhaul: recompute durable owner bytes + blob
+            // refcounts from a bounded metadata scan (post-upgrade
+            // backfill). Bad payloads quarantine; storage faults retry.
+            JobKind::BackfillDurableAccounting => {
+                match serde_json::from_slice::<BackfillDurablePayload>(&job.payload) {
+                    Err(e) => Ok(Disposition::Quarantine(format!(
+                        "bad-payload: backfill-durable invalid: {e}"
+                    ))),
+                    Ok(payload) => {
+                        match crate::media::reconciler::backfill_durable_accounting(
+                            &self.services,
+                            payload.after,
+                            payload.batch_size.unwrap_or(
+                                crate::media::reconciler::BACKFILL_PAGE_SIZE,
+                            ),
+                        ) {
+                            Ok(_) => Ok(Disposition::Done),
+                            Err(PortError::Validation(reason)) => {
+                                Ok(Disposition::Quarantine(format!("bad-payload: {reason}")))
+                            }
+                            Err(_) => Ok(Disposition::Retry { retry_after_ms: None }),
+                        }
+                    }
                 }
             }
         }

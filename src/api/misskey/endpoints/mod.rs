@@ -11205,6 +11205,44 @@ mod tests {
         assert!(lite.get("features").is_none());
     }
 
+    #[test]
+    fn dispatch_fits_bounded_stack() {
+        // Guardrail for the 2026-10-21 stack overflow: the sync `/api`
+        // dispatch match needs just over 2 MiB in dev builds, which
+        // aborted every `/api` call on tokio's default 2 MiB threads
+        // (production now runs 8 MiB; see `main.rs`). This test pins the
+        // need below 4 MiB: representative dispatches must complete on a
+        // 4 MiB thread under a 4 MiB-stack runtime. If it fails, the match
+        // grew again — split it instead of raising the runtime further.
+        std::thread::Builder::new()
+            .stack_size(4 << 20)
+            .spawn(|| {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .thread_stack_size(4 << 20)
+                    .enable_all()
+                    .build()
+                    .expect("bounded test runtime");
+                rt.block_on(async {
+                    let (state, _) = test_state();
+                    let (status, _) =
+                        call(&state, "meta", serde_json::json!({}), None).await;
+                    assert_eq!(status, StatusCode::OK);
+                    let (status, _) = call(
+                        &state,
+                        "username/available",
+                        serde_json::json!({ "username": "alice" }),
+                        None,
+                    )
+                    .await;
+                    assert_eq!(status, StatusCode::OK);
+                });
+            })
+            .expect("spawn bounded-stack thread")
+            .join()
+            .expect("bounded-stack dispatch completes");
+    }
+
     #[tokio::test]
     async fn signup_signin_and_i_roundtrip() {
         let (state, _) = test_state();

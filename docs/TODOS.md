@@ -21,11 +21,20 @@ Conventions: `- [ ]` = open, `- [x]` = done (move to log, don't delete the line)
 ## P1 — media lifecycle + storage safety (single-node, broken/risky)
 
 > WIP 2026-10-21 (storage overhaul, `docs/remote-media-cache-plan.md` addendum 2026-10-21): S1 shared contracts landed (config keys, ports, redb tables, dual pools, `drive/cache/stats`). Subagents building domain/storage/fetch_stream, commands/reconciler/remote-cache, and `tests/storage_*.rs` suites in parallel. Boxes below stay open until `cargo test --offline` + `bash scripts/smoke-all.sh` (incl. cap-never-exceeded, local-survives-eviction, cross-owner delete, crash-heal) are green.
+>
+> S3 2026-10-21 (finish pass) — DONE, gate green (`SMOKE_ALL_OK` 2026-10-21;
+> log `state/logs/2026-10-21-storage-overhaul-s3.md`): `JobKind::CacheEvict|
+> ReconcileStorage|BackfillDurableAccounting` + worker arms + `backfill_durable_accounting`
+> + `set_blob_refcount`/`set_durable_bytes` + `durable_dir`/`cache_dir` overrides +
+> reserved-sum guard + `tests/storage_two_pools|storage_cache_evict|storage_reconcile.rs`
+> (10/10). Stack-overflow fix: explicit 8 MiB runtime threads + guardrail test
+> (`thread_stack_size` in `main.rs`, `dispatch_fits_bounded_stack`). Live steps ran
+> under WSL against `./misskey` → `../kissme/kissme-fe`.
 
 
-- [ ] Remote-media GC/quotas/eviction/reconciler (unbounded disk growth; per-note 64 MiB is per-job-run, not a total) — plan `docs/remote-media-cache-plan.md:35-39,102-138`.
-- [ ] Shared-blob refcount: `delete_media` drops row+bytes non-atomically (`application/commands/media.rs:211-216`) — fix before eviction.
-- [ ] Stream-to-disk under byte cap (local upload + remote fetch hold full bodies in RAM: `media/remote_cache.rs:174,232-254`).
+- [x] Remote-media GC/quotas/eviction/reconciler — LANDED 2026-10-21 (S1+S2+S3): per-user durable quota (`DRIVE_CAPACITY_EXCEEDED`), refcounted shared blobs, global+class caps, LRU+TTL eviction (bytes-only), on-demand fetch with in-flight reservation, idempotent reconciler, 3 storage job kinds + worker arms, 22 storage tests green, gate `SMOKE_ALL_OK` (phase2 SKIP).
+- [x] Shared-blob refcount: `delete_media` drops row+bytes non-atomically (`application/commands/media.rs:211-216`) — fix before eviction. — LANDED 2026-10-21: `delete_media_record` decrements in-txn, bytes deleted only at refcount 0 outside txn, reconciler sweeps the rest.
+- [x] Stream-to-disk under byte cap (local upload + remote fetch hold full bodies in RAM: `media/remote_cache.rs:174,232-254`). — LANDED 2026-10-21: `fetch_stream.rs` stages to disk under cap with mid-stream abort + `import_file`; transport (`SafeHttpClient`) buffering is a documented follow-up, not a cap hole.
 - [ ] Backup/snapshot/restore for `pinetree.redb` + `blobs/` (crash-between-row-and-blob orphans; plan `:44-46`).
 - [ ] `drive/files/find|move-bulk|check-existence|attached-notes|attached-chat-messages` — missing (`→404`).
 - [ ] Thumbnails/transcoding/variants/`Range`/avatar-emoji static variants (declared-out; `thumbnail_url` always `None`).

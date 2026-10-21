@@ -865,6 +865,21 @@ pub enum JobKind {
     /// converges quietly; replays re-match harmlessly (rows are keyed
     /// `(antenna, note)`). Only storage faults retry.
     AntennaMatch,
+    /// Storage overhaul (`docs/database.md`): evict cache bytes under
+    /// pressure. The payload is [`CacheEvictPayload`]. Idempotent: the
+    /// handler re-reads accounting and evicts LRU+TTL-first until the need
+    /// fits or candidates run out; bytes only, metadata stays.
+    CacheEvict,
+    /// Storage overhaul: bounded idempotent storage reconciliation sweep.
+    /// The payload is [`ReconcileStoragePayload`]. Converges quietly on
+    /// re-run (orphan bytes removed, accounting adjusted, legacy rows
+    /// flagged, sidecars healed).
+    ReconcileStorage,
+    /// Storage overhaul: recompute `DURABLE_BYTES_BY_OWNER` from a bounded
+    /// metadata scan after the quota upgrade. The payload is
+    /// [`BackfillDurablePayload`]. Idempotent: setters overwrite with the
+    /// recomputed sums; a full batch returns a continuation cursor.
+    BackfillDurableAccounting,
 }
 
 /// Maximum `fail()` retries before a job is auto-quarantined as
@@ -1762,6 +1777,37 @@ pub struct AntennaMatchPayload {
     pub note_id: String,
 }
 
+/// Payload of a `JobKind::CacheEvict` job (storage overhaul): free at
+/// least `need_bytes` for `class` (byte-weighted LRU + TTL, bytes only).
+/// Small by construction (well under [`MAX_JOB_PAYLOAD_BYTES`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheEvictPayload {
+    pub need_bytes: u64,
+    pub class: MediaClass,
+}
+
+/// Payload of a `JobKind::ReconcileStorage` job (storage overhaul): one
+/// bounded reconciler scan. `scan_cap` is clamped to `RECONCILE_SCAN_MAX`
+/// by the handler; the scan converges over repeated runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReconcileStoragePayload {
+    #[serde(default)]
+    pub scan_cap: Option<usize>,
+}
+
+/// Payload of a `JobKind::BackfillDurableAccounting` job (storage
+/// overhaul): recompute durable owner bytes (and blob refcounts) in
+/// bounded pages of at most 500 rows. `after` is the start cursor
+/// (`None` = newest); the handler scans to the end and persists the sums
+/// once, so re-runs converge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackfillDurablePayload {
+    #[serde(default)]
+    pub after: Option<String>,
+    #[serde(default)]
+    pub batch_size: Option<usize>,
+}
+
 /// Payload of a `JobKind::PostScheduledDraft` job: the draft to post.
 /// `scheduled_at_ms` is the `scheduled_at` the job was armed for — the
 /// handler converges quietly when the stored draft no longer matches
@@ -1993,6 +2039,16 @@ pub trait MediaStore: Send + Sync {
     /// Test-double default: unreferenced.
     fn blob_refcount(&self, _blob_key: &str) -> Result<u64, PortError> {
         Ok(0)
+    }
+    /// Overwrite the stored `BLOB_REFCOUNT` row (backfill/reconciler).
+    /// Default no-op for test doubles; durable backends must override.
+    fn set_blob_refcount(&self, _blob_key: &str, _count: u64) -> Result<(), PortError> {
+        Ok(())
+    }
+    /// Overwrite the stored `DURABLE_BYTES_BY_OWNER` row
+    /// (backfill/reconciler). Default no-op; durable backends override.
+    fn set_durable_bytes(&self, _owner_id: &str, _bytes: u64) -> Result<(), PortError> {
+        Ok(())
     }
     /// Atomic durable insert: quota check + metadata write + refcount inc +
     /// owner-bytes adjust in one transaction. Breach ⇒

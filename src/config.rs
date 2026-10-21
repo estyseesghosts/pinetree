@@ -95,6 +95,14 @@ pub struct Config {
     pub remote_cache_full_ttl_days: u64,
     /// Opt-in background warming (relay-excluded). Off by default.
     pub remote_cache_warming_enabled: bool,
+    /// Durable pool root override (`docs/database.md`): local uploads live
+    /// here and are never evicted. `None` (default) resolves to
+    /// `<data_dir>/blobs_durable`.
+    pub durable_dir: Option<PathBuf>,
+    /// Cache pool root override: remote fetches live here under the
+    /// global + per-class caps. `None` (default) resolves to
+    /// `<data_dir>/blobs_cache`. Must resolve distinct from `durable_dir`.
+    pub cache_dir: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -128,6 +136,8 @@ impl Default for Config {
             remote_cache_preview_ttl_days: 7,
             remote_cache_full_ttl_days: 3,
             remote_cache_warming_enabled: false,
+            durable_dir: None,
+            cache_dir: None,
         }
     }
 }
@@ -194,6 +204,23 @@ impl Config {
                 return Err(format!("{name} must be > 0"));
             }
         }
+        // Reserved class budgets live inside the global cap — individually
+        // (above) and as a sum, so the classes can never over-subscribe it.
+        let reserved = self
+            .remote_cache_avatar_bytes
+            .saturating_add(self.remote_cache_preview_bytes)
+            .saturating_add(self.remote_cache_full_bytes);
+        if reserved > self.remote_cache_max_bytes {
+            return Err(format!(
+                "reserved class budgets ({reserved}) must fit in remote_cache_max_bytes ({})",
+                self.remote_cache_max_bytes
+            ));
+        }
+        // The two byte pools must be distinct directories: sharing one root
+        // would let cache eviction eat durable uploads.
+        if self.durable_pool_dir() == self.cache_pool_dir() {
+            return Err("durable_dir and cache_dir must be distinct".to_string());
+        }
         Ok(())
     }
 
@@ -209,6 +236,20 @@ impl Config {
 
     pub fn normalized_public_url(&self) -> String {
         self.public_url.trim_end_matches('/').to_string()
+    }
+
+    /// Durable pool root: explicit `durable_dir` or `<data_dir>/blobs_durable`.
+    pub fn durable_pool_dir(&self) -> PathBuf {
+        self.durable_dir
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("blobs_durable"))
+    }
+
+    /// Cache pool root: explicit `cache_dir` or `<data_dir>/blobs_cache`.
+    pub fn cache_pool_dir(&self) -> PathBuf {
+        self.cache_dir
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("blobs_cache"))
     }
 
     pub fn public_host(&self) -> String {
@@ -365,6 +406,39 @@ mod tests {
             serde_json::from_str(r#"{"remote_cache_mode": "on_demand"}"#).unwrap();
         assert_eq!(cfg.remote_cache_mode, RemoteCacheMode::OnDemand);
         assert!(serde_json::from_str::<Config>(r#"{"remote_cache_mode": "eager"}"#).is_err());
+    }
+
+    #[test]
+    fn storage_pool_dirs_default_distinct_and_sum_guard() {
+        let cfg = Config::default();
+        assert_eq!(cfg.durable_pool_dir(), cfg.data_dir.join("blobs_durable"));
+        assert_eq!(cfg.cache_pool_dir(), cfg.data_dir.join("blobs_cache"));
+        assert!(cfg.validate().is_ok());
+        // Sum of reserved class budgets over the global cap is rejected,
+        // even when each class fits individually.
+        let over = Config {
+            remote_cache_max_bytes: 512 << 20,
+            remote_cache_avatar_bytes: 256 << 20,
+            remote_cache_preview_bytes: 256 << 20,
+            remote_cache_full_bytes: 256 << 20,
+            ..Config::default()
+        };
+        assert!(over.validate().is_err());
+        // Explicit pool dirs must resolve distinct.
+        let same = Config {
+            durable_dir: Some(PathBuf::from("/tmp/pool")),
+            cache_dir: Some(PathBuf::from("/tmp/pool")),
+            ..Config::default()
+        };
+        assert!(same.validate().is_err());
+        let split = Config {
+            durable_dir: Some(PathBuf::from("/tmp/durable")),
+            cache_dir: Some(PathBuf::from("/tmp/cache")),
+            ..Config::default()
+        };
+        assert!(split.validate().is_ok());
+        assert_eq!(split.durable_pool_dir(), PathBuf::from("/tmp/durable"));
+        assert_eq!(split.cache_pool_dir(), PathBuf::from("/tmp/cache"));
     }
 
     #[test]
