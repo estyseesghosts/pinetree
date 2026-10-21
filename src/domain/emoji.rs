@@ -66,8 +66,47 @@ impl CustomEmoji {
                 return Err(invalid("emoji license must be <= 1024 chars".to_string()));
             }
         }
+        validate_role_ids(&self.role_ids)?;
         Ok(())
     }
+}
+
+/// `role_ids` enforcement (WP6): an empty list means unrestricted (upstream
+/// default — every row written before roles existed stays usable); a
+/// non-empty list restricts use to holders of at least one listed role.
+/// Moderators bypass the gate (they can always inspect/apply any emoji for
+/// moderation display). Both the reaction resolver and the MFM renderer
+/// call this, so neither adapter invents its own gate.
+pub fn emoji_usable_by(
+    emoji: &CustomEmoji,
+    user_role_ids: &[String],
+    is_moderator: bool,
+) -> bool {
+    if is_moderator {
+        return true;
+    }
+    if emoji.role_ids.is_empty() {
+        return true;
+    }
+    emoji
+        .role_ids
+        .iter()
+        .any(|role| user_role_ids.iter().any(|user| user == role))
+}
+
+/// Role id list shape: at most 64 entries, each 1..=64 chars (bounds keep
+/// the federated `Update(Person)` patch and job payloads small).
+pub fn validate_role_ids(role_ids: &[String]) -> Result<(), DomainError> {
+    if role_ids.len() > 64 {
+        return Err(invalid("role_ids exceeds 64 entries".to_string()));
+    }
+    for role in role_ids {
+        let n = role.chars().count();
+        if n == 0 || n > 64 {
+            return Err(invalid("role_ids entries must be 1..=64 chars".to_string()));
+        }
+    }
+    Ok(())
 }
 
 /// One remote custom-emoji metadata row (WP8b opt-in).
@@ -187,5 +226,37 @@ mod tests {
         assert_eq!(r.host, "r.example");
         assert_eq!(r.shortcode, "blobcat");
         assert!(RemoteEmoji::new("r.example", "x", "ftp://r.example/x", 1).is_err());
+    }
+
+    #[test]
+    fn role_ids_gate_unrestricted_and_restricted() {
+        fn emoji_with_roles(roles: &[&str]) -> CustomEmoji {
+            CustomEmoji {
+                id: "e1".to_string(),
+                shortcode: "x".to_string(),
+                category: None,
+                media_id: None,
+                aliases: Vec::new(),
+                license: None,
+                is_sensitive: false,
+                local_only: false,
+                role_ids: roles.iter().map(|s| s.to_string()).collect(),
+                created_at_ms: 0,
+            }
+        }
+        let open = emoji_with_roles(&[]);
+        assert!(super::emoji_usable_by(&open, &[], false));
+        let gated = emoji_with_roles(&["r1", "r2"]);
+        assert!(super::emoji_usable_by(&gated, &["r2".to_string()], false));
+        assert!(!super::emoji_usable_by(&gated, &["r9".to_string()], false));
+        assert!(!super::emoji_usable_by(&gated, &[], false));
+        // Moderators bypass for display/moderation.
+        assert!(super::emoji_usable_by(&gated, &[], true));
+        // Shape bounds ride `validate`.
+        let mut bad = emoji_with_roles(&["ok"]);
+        bad.role_ids = vec!["x".repeat(65)];
+        assert!(bad.validate().is_err());
+        bad.role_ids = vec!["r".to_string(); 65];
+        assert!(bad.validate().is_err());
     }
 }

@@ -301,6 +301,199 @@ impl NoteEdit {
     }
 }
 
+/// Edit permission (WP6 domain layering: Misskey `notes/edit` parity).
+/// Only the author may edit, and only a live note. Deleted notes and
+/// foreign editors are rejected before any storage write.
+pub fn can_edit_note(note: &Note, editor_id: &str) -> Result<(), DomainError> {
+    if note.is_deleted {
+        return Err(invalid("NO_SUCH_NOTE".to_string()));
+    }
+    if note.author_id.as_str() != editor_id {
+        return Err(invalid("YOU_ARE_NOT_THE_AUTHOR".to_string()));
+    }
+    Ok(())
+}
+
+/// Delete permission (WP6): the author may always delete a live note;
+/// moderators (admin-implied) may delete anyone's live note. Deleted notes
+/// are `NotFound(NO_SUCH_NOTE)` so deletes stay idempotent-safe at the op
+/// layer (the op maps repeat deletes to success after this check).
+pub fn can_delete_note(
+    note: &Note,
+    requester_id: &str,
+    requester_is_moderator: bool,
+) -> Result<(), DomainError> {
+    if note.is_deleted {
+        return Err(DomainError::NotFound("NO_SUCH_NOTE".to_string()));
+    }
+    if note.author_id.as_str() == requester_id || requester_is_moderator {
+        Ok(())
+    } else {
+        Err(invalid("YOU_ARE_NOT_THE_AUTHOR".to_string()))
+    }
+}
+
+/// Tombstone transition (WP6): a live note may tombstone; an already-deleted
+/// note may not transition again (the op treats the `NotFound` as a
+/// converged no-op for idempotent replays).
+pub fn tombstone_transition(note: &Note) -> Result<(), DomainError> {
+    if note.is_deleted {
+        return Err(DomainError::NotFound("NO_SUCH_NOTE".to_string()));
+    }
+    Ok(())
+}
+
+/// MFM sanitize policy (WP6 domain layering: domain decides,
+/// `activitypub/objects.rs` only renders). Strips the dangerous subset of
+/// Misskey MFM/HTML that must never reach federation output or stored HTML:
+/// `<script…>…</script>` blocks, inline event-handler attributes
+/// (`on*=…`), and `javascript:`/`data:text/html` URL schemes. Plain MFM
+/// (`**bold**`, `@mentions`, `#tags`, `:emoji:`, links) passes through
+/// unchanged. Idempotent: sanitizing twice converges.
+pub fn sanitize_mfm(input: &str) -> String {
+    // Strip <script ...>...</script> (case-insensitive, spanning lines).
+    let mut out = strip_script_blocks(input);
+    // Strip inline event handlers: ` onxxx=` / ` ONXXX =`.
+    out = strip_event_handlers(&out);
+    // Neutralize dangerous URL schemes (case-insensitive).
+    out = neutralize_scheme_case_insensitive(&out, "javascript");
+    out = neutralize_scheme_case_insensitive(&out, "data:text/html");
+    // Null bytes never survive (AP JSON + HTML parsers disagree on them).
+    out = out.replace('\0', "");
+    out
+}
+
+fn strip_script_blocks(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    loop {
+        let lower = rest.to_lowercase();
+        let Some(start) = lower.find("<script") else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..start]);
+        let after_open = &rest[start..];
+        let lower_after = after_open.to_lowercase();
+        if let Some(end) = lower_after.find("</script>") {
+            rest = &after_open[end + "</script>".len()..];
+        } else {
+            // Unterminated <script: drop to end (fail-closed).
+            break;
+        }
+    }
+    out
+}
+
+fn strip_event_handlers(s: &str) -> String {
+    // Remove ` on<name> = "..." | '...' | bare` occurrences. Operates on the
+    // raw string so both HTML and MFM `$[x ...]` shapes are covered.
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        if bytes[i] == b' ' || bytes[i] == b'\t' || bytes[i] == b'\n' {
+            let mut j = i + 1;
+            if j + 2 <= s.len() && (s[j..].starts_with("on") || s[j..].starts_with("ON")) {
+                // `on` must be followed by a handler name char.
+                let mut k = j + 2;
+                while k < s.len() && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_') {
+                    k += 1;
+                }
+                if k > j + 2 {
+                    let mut m = k;
+                    while m < s.len() && (bytes[m] == b' ' || bytes[m] == b'\t') {
+                        m += 1;
+                    }
+                    if m < s.len() && bytes[m] == b'=' {
+                        m += 1;
+                        while m < s.len() && (bytes[m] == b' ' || bytes[m] == b'\t') {
+                            m += 1;
+                        }
+                        if m < s.len() && (bytes[m] == b'"' || bytes[m] == b'\'') {
+                            let q = bytes[m];
+                            m += 1;
+                            while m < s.len() && bytes[m] != q {
+                                m += 1;
+                            }
+                            if m < s.len() {
+                                m += 1;
+                            }
+                        } else {
+                            while m < s.len()
+                                && !bytes[m].is_ascii_whitespace()
+                                && bytes[m] != b'>'
+                            {
+                                m += 1;
+                            }
+                        }
+                        i = m;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(s[i..].chars().next().unwrap());
+        i += s[i..].chars().next().unwrap().len_utf8();
+    }
+    out
+}
+
+fn neutralize_scheme_case_insensitive(s: &str, scheme: &str) -> String {
+    // Replace every case-variant of `{scheme}:` with `blocked:`.
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    loop {
+        let lower = rest.to_lowercase();
+        let Some(pos) = lower.find(&format!("{scheme}:")) else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..pos]);
+        out.push_str("blocked:");
+        rest = &rest[pos + scheme.len() + 1..];
+    }
+    out
+}
+
+/// Hashtag-trend backing (WP6): count tag occurrences across a batch of
+/// notes (each note contributes at most one per distinct tag, deleted notes
+/// excluded). Adapters share this so local trends and federation-tag
+/// ingestion rank identically.
+pub fn aggregate_hashtag_counts<'a>(
+    notes: impl IntoIterator<Item = &'a Note>,
+) -> std::collections::BTreeMap<String, u64> {
+    let mut counts = std::collections::BTreeMap::new();
+    for note in notes {
+        if note.is_deleted {
+            continue;
+        }
+        let mut seen = std::collections::HashSet::new();
+        for tag in &note.tags {
+            let normalized = tag.to_lowercase();
+            if seen.insert(normalized.clone()) {
+                *counts.entry(normalized).or_insert(0) += 1;
+            }
+        }
+    }
+    counts
+}
+
+/// Rank trends: count-descending, name-ascending tiebreak, truncated to
+/// `limit`. `limit == 0` means no truncation.
+pub fn rank_hashtag_trends(
+    counts: &std::collections::BTreeMap<String, u64>,
+    limit: usize,
+) -> Vec<(String, u64)> {
+    let mut ranked: Vec<(String, u64)> =
+        counts.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    if limit > 0 && ranked.len() > limit {
+        ranked.truncate(limit);
+    }
+    ranked
+}
+
 /// Extracts `@username` local usernames from text.
 pub fn extract_mentions(text: &str) -> Vec<String> {
     extract_prefixed(text, '@', true)
@@ -602,6 +795,75 @@ mod tests {
         assert_eq!(
             extract_hashtags(&format!("#ok #{}", "t".repeat(129))),
             vec!["ok".to_string()]
+        );
+    }
+
+    #[test]
+    fn edit_requires_live_owner_note() {
+        let mut n = valid_note();
+        assert!(can_edit_note(&n, "aid00000000000001").is_ok());
+        assert!(can_edit_note(&n, "aid00000000000009").is_err());
+        n.is_deleted = true;
+        assert!(can_edit_note(&n, "aid00000000000001").is_err());
+    }
+
+    #[test]
+    fn delete_allows_owner_or_moderator_on_live_notes() {
+        let mut n = valid_note();
+        assert!(can_delete_note(&n, "aid00000000000001", false).is_ok());
+        assert!(can_delete_note(&n, "aid00000000000009", true).is_ok());
+        assert!(can_delete_note(&n, "aid00000000000009", false).is_err());
+        n.is_deleted = true;
+        assert!(can_delete_note(&n, "aid00000000000001", false).is_err());
+        assert!(tombstone_transition(&valid_note()).is_ok());
+        assert!(tombstone_transition(&n).is_err());
+    }
+
+    #[test]
+    fn sanitize_mfm_strips_dangerous_subset_only() {
+        // Plain MFM passes through.
+        let plain = "**bold** @alice #tag :emoji: https://example.local/x";
+        assert_eq!(sanitize_mfm(plain), plain);
+        // Script blocks drop (fail-closed on unterminated).
+        assert_eq!(sanitize_mfm("a<script>alert(1)</script>b"), "ab");
+        assert_eq!(sanitize_mfm("a<SCRIPT SRC=x>evil</SCRIPT>b"), "ab");
+        assert_eq!(sanitize_mfm("a<script>alert(1)"), "a");
+        // Event handlers drop; other attributes stay.
+        assert_eq!(
+            sanitize_mfm("<b title=\"hi\" onclick=\"evil()\">x</b>"),
+            "<b title=\"hi\">x</b>"
+        );
+        // Dangerous schemes neutralize (any case).
+        assert_eq!(
+            sanitize_mfm("[x](JAVASCRIPT:alert(1))"),
+            "[x](blocked:alert(1))"
+        );
+        assert_eq!(sanitize_mfm("![x](data:text/html,evil)"), "![x](blocked:,evil)");
+        // Null bytes never survive; sanitize is idempotent.
+        let once = sanitize_mfm("a\0<script>x</script>b");
+        assert!(!once.contains('\0'));
+        assert_eq!(sanitize_mfm(&once), once);
+    }
+
+    #[test]
+    fn hashtag_trend_counts_and_ranks() {
+        let mut a = valid_note();
+        a.tags = vec!["Rust".to_string(), "rust".to_string(), "async".to_string()];
+        let mut b = valid_note();
+        b.tags = vec!["rust".to_string()];
+        let mut deleted = valid_note();
+        deleted.is_deleted = true;
+        deleted.tags = vec!["rust".to_string()];
+        let counts = aggregate_hashtag_counts([&a, &b, &deleted]);
+        // Per-note dedup: `a` contributes one `rust` despite two spellings.
+        assert_eq!(counts.get("rust"), Some(&2));
+        assert_eq!(counts.get("async"), Some(&1));
+        let ranked = rank_hashtag_trends(&counts, 1);
+        assert_eq!(ranked, vec![("rust".to_string(), 2)]);
+        let ranked_all = rank_hashtag_trends(&counts, 0);
+        assert_eq!(
+            ranked_all,
+            vec![("rust".to_string(), 2), ("async".to_string(), 1)]
         );
     }
 }

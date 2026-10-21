@@ -1006,3 +1006,7 @@ parity),
 cap 429, both with the upstream id; window expiry restores login),
 `signin_with_passkey_is_400_unsupported`,
 `preflight_answers_204_with_cors_headers`.
+
+### 42.6 Addendum 2026-10-21 (gaps WP6): domain-owned antenna rules
+
+Domain owns `should_auto_deactivate` / `deactivate_stale_antenna` (7 days, upstream `CleanProcessorService` parity) and `antenna_matches_with_sensitivity` (`exclude_sensitive` gate). The §29 "no 7-day auto-deactivation" divergence is retired as a rule; the stored `exclude_sensitive` column + endpoint param + packer field are still pending (no backfill needed — default false == legacy). The read-path reactivation sweep stays application-owned. Recorded in `state/logs/2026-10-21-gaps-wp6.md`.

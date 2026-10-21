@@ -627,6 +627,113 @@ impl Account {
     }
 }
 
+/// Rename rule (WP6 domain layering: rename/move state machine lives here
+/// so the API endpoint and the inbound `Update(Person)`/`Move` handler
+/// share it). Local renames validate the new handle and require it to be
+/// free (`handle_taken` comes from the store lookup); remote renames only
+/// validate shape (authority was already checked at the federation
+/// boundary). Suspended/deleted accounts cannot rename.
+pub fn validate_rename(
+    account: &Account,
+    new_handle: &str,
+    handle_taken: bool,
+) -> Result<(), DomainError> {
+    if account.is_suspended || account.is_deleted {
+        return Err(invalid("ACCOUNT_UNAVAILABLE".to_string()));
+    }
+    if account.is_local() {
+        validate_local_username(new_handle)?;
+    } else {
+        validate_remote_username(new_handle)?;
+    }
+    if handle_taken {
+        return Err(DomainError::Conflict("USERNAME_TAKEN".to_string()));
+    }
+    Ok(())
+}
+
+/// Move rule (WP6; Misskey `i/move` parity: `movedToUri` is set once and
+/// never cleared — `prohibitMoved` refuses further moves). Returns the
+/// `(moved_to_uri, moved_at_ms)` to persist; the store commits it with the
+/// delivery jobs in one transaction.
+pub fn validate_move(
+    account: &Account,
+    target_uri: &str,
+    now_ms: i64,
+) -> Result<(String, i64), DomainError> {
+    if !account.is_local() {
+        return Err(invalid("MOVE_REMOTE_FORBIDDEN".to_string()));
+    }
+    if account.moved_to_uri.is_some() {
+        return Err(invalid("ALREADY_MOVED".to_string()));
+    }
+    let uri = target_uri.trim();
+    if !(uri.starts_with("https://") || uri.starts_with("http://")) {
+        return Err(invalid("move target must be an http(s) URI".to_string()));
+    }
+    if uri.chars().count() > 512 {
+        return Err(invalid("move target exceeds 512 chars".to_string()));
+    }
+    Ok((uri.to_string(), now_ms))
+}
+
+/// `pinned_page_id` update rule (WP6): `None` clears unconditionally;
+/// `Some(id)` requires a non-empty id (existence is checked by the
+/// application op against the page store — domain only enforces shape so
+/// the API and federation paths cannot diverge).
+pub fn validate_pinned_page_update(pinned_page_id: Option<&str>) -> Result<(), DomainError> {
+    if let Some(id) = pinned_page_id {
+        if id.trim().is_empty() {
+            return Err(invalid("pinned_page_id must be non-empty".to_string()));
+        }
+    }
+    Ok(())
+}
+
+/// `verifiedLinks` re-verify loop (WP6; Misskey `update.ts` `verifyLink`
+/// parity): every profile update resets `verified_links` to `[]`, and
+/// re-verification happens off-request. This constructor is the ONLY way
+/// the application op clears the list, so no adapter can forget the reset.
+pub fn reset_verified_links_for_reverify() -> Vec<String> {
+    Vec::new()
+}
+
+/// True when the profile changed after the last link verification, i.e. a
+/// re-verify job must be (re-)armed. `last_verified_at_ms == None` means
+/// never verified.
+pub fn needs_link_reverify(
+    last_verified_at_ms: Option<i64>,
+    profile_updated_at_ms: i64,
+) -> bool {
+    match last_verified_at_ms {
+        None => true,
+        Some(verified_at) => verified_at < profile_updated_at_ms,
+    }
+}
+
+/// Signin input shape (WP6: credential check lives in the application op,
+/// out of the API adapter — domain only enforces input shape so both the
+/// password-signin endpoint and any future SSO bridge share it).
+pub fn validate_signin_input(username_or_handle: &str, password: &str) -> Result<(), DomainError> {
+    if username_or_handle.trim().is_empty() {
+        return Err(invalid("username is required".to_string()));
+    }
+    if password.is_empty() || password.chars().count() > 512 {
+        return Err(invalid("password must be 1..=512 chars".to_string()));
+    }
+    Ok(())
+}
+
+/// Password policy for signup / password set (Misskey `signup.ts` parity:
+/// at least 8 chars; upper bound keeps the hash input bounded).
+pub fn password_meets_policy(password: &str) -> Result<(), DomainError> {
+    let n = password.chars().count();
+    if n < 8 || n > 128 {
+        return Err(invalid("password must be 8..=128 chars".to_string()));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -979,5 +1086,66 @@ mod tests {
         a.is_admin = true;
         assert!(a.has_moderator_powers());
         assert!(a.validate().is_ok());
+    }
+
+    #[test]
+    fn rename_validates_shape_availability_and_liveness() {
+        let a = local_account();
+        assert!(super::validate_rename(&a, "bob_2", false).is_ok());
+        assert!(super::validate_rename(&a, "has space", false).is_err());
+        assert_eq!(
+            super::validate_rename(&a, "bob_2", true),
+            Err(crate::domain::id::DomainError::Conflict(
+                "USERNAME_TAKEN".to_string()
+            ))
+        );
+        let mut gone = local_account();
+        gone.is_suspended = true;
+        assert!(super::validate_rename(&gone, "bob_2", false).is_err());
+        gone.is_suspended = false;
+        gone.is_deleted = true;
+        assert!(super::validate_rename(&gone, "bob_2", false).is_err());
+    }
+
+    #[test]
+    fn move_sets_once_and_never_clears() {
+        let a = local_account();
+        let (uri, at) =
+            super::validate_move(&a, "https://new.example/users/alice", 123).unwrap();
+        assert_eq!(uri, "https://new.example/users/alice");
+        assert_eq!(at, 123);
+        assert!(super::validate_move(&a, "gopher://x", 123).is_err());
+        let mut moved = local_account();
+        moved.moved_to_uri = Some("https://new.example/users/alice".to_string());
+        moved.moved_at_ms = Some(123);
+        // `prohibitMoved`: a second move is refused even to a new target.
+        assert!(super::validate_move(&moved, "https://other.example/u", 456).is_err());
+        let mut remote = remote_account();
+        remote.moved_to_uri = None;
+        assert!(super::validate_move(&remote, "https://other.example/u", 1).is_err());
+    }
+
+    #[test]
+    fn pinned_page_and_verified_links_loop() {
+        assert!(super::validate_pinned_page_update(None).is_ok());
+        assert!(super::validate_pinned_page_update(Some("page1")).is_ok());
+        assert!(super::validate_pinned_page_update(Some("  ")).is_err());
+        // Every profile update resets to empty; re-verify is armed until a
+        // verification timestamp covers the update.
+        assert!(super::reset_verified_links_for_reverify().is_empty());
+        assert!(super::needs_link_reverify(None, 100));
+        assert!(super::needs_link_reverify(Some(50), 100));
+        assert!(!super::needs_link_reverify(Some(100), 100));
+        assert!(!super::needs_link_reverify(Some(150), 100));
+    }
+
+    #[test]
+    fn signin_input_and_password_policy() {
+        assert!(super::validate_signin_input("alice", "s3cret!!").is_ok());
+        assert!(super::validate_signin_input("  ", "s3cret!!").is_err());
+        assert!(super::validate_signin_input("alice", "").is_err());
+        assert!(super::password_meets_policy("s3cret!!").is_ok());
+        assert!(super::password_meets_policy("short").is_err());
+        assert!(super::password_meets_policy(&"x".repeat(129)).is_err());
     }
 }

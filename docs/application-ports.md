@@ -267,3 +267,11 @@ The "no `Err`/`unimplemented!()` defaults" rule (section status at line 181, gui
 Redb implements every one of them (no `unimplemented!` in `src/persistence/redb/mod.rs`), so the current tests cannot see the gap. An FDB adapter that forgets any method would compile and then panic at runtime. This is the same risk as the FDB adapter gap in `docs/TODOS.md` P0.
 
 Decision needed (tracked as a TODOS P2 item): either make these methods required (remove the default bodies) or change each default body to return `PortError::StorageUnavailable`. Either change is a superseding decision and needs a state log entry. Until then, the Status line at `:181` should be read as "redb-only; defaults still panic".
+
+---
+
+## Addendum 2026-10-21 (gaps WP6): zero `unimplemented!()` in `ports.rs`
+
+Status: ADDENDUM only. Frozen text above is not rewritten. Verified: `grep -c 'unimplemented!' src/application/ports.rs` returns `0`.
+
+All 20 default bodies (`FollowStore` 3 + `ActivityDedup` 17) now return `Err(PortError::StorageUnavailable("<method> not implemented"))`, matching the existing convention in this file (e.g. `find_by_email_verify_code`). `StorageUnavailable` was chosen over required methods so the 4+ in-memory test doubles (`packers.rs`, `webfinger.rs`, `actor.rs` fakes) keep compiling; redb already implements all 20 for real, so production behavior is unchanged. Recorded in `state/logs/2026-10-21-gaps-wp6.md`.

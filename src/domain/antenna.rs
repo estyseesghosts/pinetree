@@ -4,8 +4,15 @@
 //! match order below copies `AntennaService.checkHitAntenna` (`:116-209`)
 //! with two documented divergences (manifest §29): `home` matches the
 //! owner's own notes + notes from followed accounts (upstream `home` is a
-//! TODO matching everything), and there is no 7-day auto-deactivation
-//! (instance cap instead).
+//! TODO matching everything), and the 7-day auto-deactivation rule lives in
+//! [`should_auto_deactivate`]/[`deactivate_stale_antenna`] here while the
+//! read-path reactivation sweep stays application-owned.
+//!
+//! `exclude_sensitive` is decided here
+//! ([`antenna_matches_with_sensitivity`]) but the flag is not a stored
+//! column yet: rows predate it, so callers pass the requested flag and the
+//! resolved sensitivity explicitly until the parent-owned endpoint +
+//! persistence + packer change lands (proposal in the WP6 report).
 
 use crate::domain::id::DomainError;
 use crate::domain::note::Visibility;
@@ -110,6 +117,34 @@ pub const DEFAULT_ANTENNA_LIMIT: usize = 5;
 /// Feed cap per antenna (newest 200 entries; upstream `push` parity).
 pub const ANTENNA_NOTES_CAP: usize = 200;
 
+/// Auto-deactivation budget (WP6): an antenna untouched for 7 full days is
+/// deactivated (upstream `AntennaService` 7-day rule — the previous
+/// "instance cap instead" divergence is retired; see the manifest addendum
+/// proposal in the WP6 report).
+pub const ANTENNA_AUTO_DEACTIVATE_AFTER_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+/// True when `last_used_at_ms` is at least 7 days before `now_ms`
+/// (deactivation threshold reached). A future `last_used_at_ms` (clock
+/// skew) never deactivates.
+pub fn should_auto_deactivate(last_used_at_ms: i64, now_ms: i64) -> bool {
+    now_ms.saturating_sub(last_used_at_ms) >= ANTENNA_AUTO_DEACTIVATE_AFTER_MS
+}
+
+/// Apply the 7-day rule to one antenna row: flips `is_active` off when
+/// stale. Returns true when the row changed (the caller persists it).
+/// Already-inactive rows never change.
+pub fn deactivate_stale_antenna(antenna: &mut Antenna, now_ms: i64) -> bool {
+    if !antenna.is_active {
+        return false;
+    }
+    if should_auto_deactivate(antenna.last_used_at_ms, now_ms) {
+        antenna.is_active = false;
+        true
+    } else {
+        false
+    }
+}
+
 /// Resolved note view the matcher runs on (application layer assembles it:
 /// author record + owner relationship lookups stay out of the domain).
 pub struct AntennaNoteView<'a> {
@@ -134,12 +169,38 @@ pub struct AntennaNoteView<'a> {
 /// sensitive-channel/bots → localOnly → withReplies → visibility →
 /// src → keywords → excludeKeywords → withFile. `case_sensitive` toggles
 /// case handling; empty strings are stripped; null text+cw never matches.
+/// Use [`antenna_matches_with_sensitivity`] when the caller resolves the
+/// note's sensitivity (CW or sensitive files) and the antenna's
+/// `exclude_sensitive` flag; this shape stays back-compatible with rows
+/// written before the flag exists.
 pub fn antenna_matches(antenna: &Antenna, view: &AntennaNoteView) -> bool {
+    antenna_matches_with_sensitivity(antenna, view, false, false)
+}
+
+/// Sensitivity-aware matcher (WP6): `exclude_sensitive` drops notes with
+/// sensitive content (CW set or at least one sensitive file, resolved by
+/// the application layer from the media rows into `note_is_sensitive`).
+/// Runs right after the bots gate (upstream `AntennaService` parity). When
+/// the flag is off, this is exactly [`antenna_matches`].
+pub fn antenna_matches_with_sensitivity(
+    antenna: &Antenna,
+    view: &AntennaNoteView,
+    note_is_sensitive: bool,
+    exclude_sensitive: bool,
+) -> bool {
+    if exclude_sensitive && note_is_sensitive {
+        return false;
+    }
+    antenna_matches_inner(antenna, view)
+}
+
+fn antenna_matches_inner(antenna: &Antenna, view: &AntennaNoteView) -> bool {
     let note = view.note;
     // (1) bots / sensitive channels (no channels exist: second half no-op).
     if antenna.exclude_bots && view.author_is_bot {
         return false;
     }
+    // (1b) sensitive channels (no channels exist: no-op).
     // (2) localOnly drops remote authors.
     if antenna.local_only && !view.author_is_local {
         return false;
@@ -413,6 +474,31 @@ mod tests {
         v.author_is_bot = true;
         a.exclude_bots = true;
         assert!(!antenna_matches(&a, &v));
+        // exclude_sensitive drops sensitive notes only when armed.
+        // (Flag + sensitivity resolve outside the stored row until the
+        // parent-owned endpoint/persistence/store change lands.)
+        assert!(antenna_matches_with_sensitivity(&a, &view(&n, "u1"), false, false));
+        assert!(antenna_matches_with_sensitivity(&a, &view(&n, "u1"), true, false));
+        assert!(!antenna_matches_with_sensitivity(&a, &view(&n, "u1"), true, true));
+        assert!(antenna_matches_with_sensitivity(&a, &view(&n, "u1"), false, true));
+    }
+
+    #[test]
+    fn stale_antennas_auto_deactivate_after_seven_days() {
+        let day_ms: i64 = 24 * 60 * 60 * 1000;
+        assert!(!should_auto_deactivate(0, 7 * day_ms - 1));
+        assert!(should_auto_deactivate(0, 7 * day_ms));
+        assert!(should_auto_deactivate(0, 30 * day_ms));
+        // Future timestamps (clock skew) never deactivate.
+        assert!(!should_auto_deactivate(1000, 999));
+        let mut a = antenna();
+        a.last_used_at_ms = 0;
+        assert!(!deactivate_stale_antenna(&mut a, 6 * day_ms));
+        assert!(a.is_active);
+        assert!(deactivate_stale_antenna(&mut a, 8 * day_ms));
+        assert!(!a.is_active);
+        // Already-inactive rows never change.
+        assert!(!deactivate_stale_antenna(&mut a, 30 * day_ms));
     }
 
     #[test]

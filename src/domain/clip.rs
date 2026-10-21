@@ -139,6 +139,22 @@ pub struct ClipFollow {
     pub created_at_ms: i64,
 }
 
+/// `notesCount` derivation (WP6): clips carry no stored counter (upstream
+/// packs `notesCount` from the `clip_notes` index at read time — pinetree
+/// keeps the same discipline so add/remove never disagree). Counts the
+/// DISTINCT note ids in `note_ids` (defensive: the pair is unique in
+/// storage, but callers pass raw index rows).
+pub fn count_clip_notes(note_ids: &[String]) -> u64 {
+    let mut seen = std::collections::HashSet::new();
+    let mut count = 0u64;
+    for id in note_ids {
+        if seen.insert(id.as_str()) {
+            count += 1;
+        }
+    }
+    count
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,5 +192,19 @@ mod tests {
             0,
         );
         assert_eq!(private.tier, CollectionTier::Private);
+    }
+
+    #[test]
+    fn notes_count_derives_distinct_members() {
+        assert_eq!(count_clip_notes(&[]), 0);
+        assert_eq!(
+            count_clip_notes(&["n1".to_string(), "n2".to_string()]),
+            2
+        );
+        // Duplicate index rows count once (defensive dedup).
+        assert_eq!(
+            count_clip_notes(&["n1".to_string(), "n1".to_string(), "n2".to_string()]),
+            2
+        );
     }
 }

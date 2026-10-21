@@ -131,6 +131,41 @@ pub fn coerce_reaction(
     }
 }
 
+/// React outcome (WP6 idempotency rule, shared by local `notes/reactions`
+/// and inbound `EmojiReact`/`Like` so adapters never diverge):
+/// - `Created`: no prior row — insert.
+/// - `Idempotent`: same normalized reaction already stored — no-op success.
+/// - `Replaced`: a different reaction is stored — overwrite in place
+///   (Misskey `create` updates the existing row, never duplicates).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReactOutcome {
+    Created,
+    Idempotent,
+    Replaced,
+}
+
+/// Decide the react path from the existing row's normalized reaction (if
+/// any) and the incoming normalized reaction. Both sides must already be
+/// `normalize_reaction` outputs so legacy/emoji-shape differences cannot
+/// fork the decision per adapter.
+pub fn decide_react(existing: Option<&str>, incoming_normalized: &str) -> ReactOutcome {
+    match existing {
+        None => ReactOutcome::Created,
+        Some(current) if current == incoming_normalized => ReactOutcome::Idempotent,
+        Some(_) => ReactOutcome::Replaced,
+    }
+}
+
+/// Unreact permission (WP6): a reaction row must exist.
+/// Errors `NotFound(NOT_REACTED)` when `existing` is `None` so missing
+/// unreacts converge without a storage write.
+pub fn can_unreact(existing: Option<&Reaction>) -> Result<(), DomainError> {
+    match existing {
+        Some(_) => Ok(()),
+        None => Err(DomainError::NotFound("NOT_REACTED".to_string())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,6 +263,33 @@ mod tests {
         assert_eq!(
             normalize_reaction(Some(":custom_emoji@.:")),
             ":custom_emoji@.:"
+        );
+    }
+
+    #[test]
+    fn react_idempotency_and_replace() {
+        assert_eq!(decide_react(None, "👍"), ReactOutcome::Created);
+        assert_eq!(
+            decide_react(Some("👍"), "👍"),
+            ReactOutcome::Idempotent
+        );
+        assert_eq!(decide_react(Some("❤"), "👍"), ReactOutcome::Replaced);
+    }
+
+    #[test]
+    fn unreact_requires_existing_row() {
+        let row = Reaction {
+            id: "rid00000000000001".to_string(),
+            user_id: "aid00000000000001".to_string(),
+            note_id: "nid00000000000001".to_string(),
+            reaction: "👍".to_string(),
+        };
+        assert!(can_unreact(Some(&row)).is_ok());
+        assert_eq!(
+            can_unreact(None),
+            Err(crate::domain::id::DomainError::NotFound(
+                "NOT_REACTED".to_string()
+            ))
         );
     }
 }

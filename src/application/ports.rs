@@ -1068,7 +1068,9 @@ pub trait FollowStore: Send + Sync {
         jobs: Vec<NewJob>,
     ) -> Result<FollowRequest, PortError> {
         let _ = (follower_id, followee_id, with_replies, notify, jobs);
-        unimplemented!("FollowStore::request_follow not implemented")
+        Err(PortError::StorageUnavailable(
+            "FollowStore::request_follow not implemented".to_string(),
+        ))
     }
     fn get_follow_request(
         &self,
@@ -1098,7 +1100,9 @@ pub trait FollowStore: Send + Sync {
         jobs: Vec<NewJob>,
     ) -> Result<Follow, PortError> {
         let _ = (follower_id, followee_id, jobs);
-        unimplemented!("FollowStore::accept_follow_request not implemented")
+        Err(PortError::StorageUnavailable(
+            "FollowStore::accept_follow_request not implemented".to_string(),
+        ))
     }
     /// Atomically delete the request (reject or cancel) and enqueue `jobs`.
     /// `NotFound(NO_FOLLOW_REQUEST)` if there is no request.
@@ -1109,7 +1113,9 @@ pub trait FollowStore: Send + Sync {
         jobs: Vec<NewJob>,
     ) -> Result<(), PortError> {
         let _ = (follower_id, followee_id, jobs);
-        unimplemented!("FollowStore::remove_follow_request not implemented")
+        Err(PortError::StorageUnavailable(
+            "FollowStore::remove_follow_request not implemented".to_string(),
+        ))
     }
 }
 
@@ -1437,7 +1443,9 @@ pub trait ActivityDedup: Send + Sync {
     /// `/follows/{follower}/{followee}`). No silent default: backends and
     /// test doubles must implement this explicitly.
     fn forget_activity(&self, _activity_id: &str) -> Result<(), PortError> {
-        unimplemented!("ActivityDedup::forget_activity not implemented")
+        Err(PortError::StorageUnavailable(
+            "ActivityDedup::forget_activity not implemented".to_string(),
+        ))
     }
     fn record_note_activity(
         &self,
@@ -1452,7 +1460,9 @@ pub trait ActivityDedup: Send + Sync {
         jobs: Vec<NewJob>,
     ) -> Result<bool, PortError> {
         let _ = (activity_id, note_id, jobs);
-        unimplemented!("ActivityDedup::record_delete_note_activity not implemented")
+        Err(PortError::StorageUnavailable(
+            "ActivityDedup::record_delete_note_activity not implemented".to_string(),
+        ))
     }
     /// Inbound `Delete` addressed by object URI (bench S6, 2026-10-17): the
     /// deleter may reach the store before the note's `Create`. Atomically
@@ -1468,7 +1478,9 @@ pub trait ActivityDedup: Send + Sync {
         jobs: Vec<NewJob>,
     ) -> Result<bool, PortError> {
         let _ = (activity_id, object_uri, jobs);
-        unimplemented!("ActivityDedup::record_delete_uri_activity not implemented")
+        Err(PortError::StorageUnavailable(
+            "ActivityDedup::record_delete_uri_activity not implemented".to_string(),
+        ))
     }
     fn record_follow_activity(
         &self,
@@ -1487,7 +1499,9 @@ pub trait ActivityDedup: Send + Sync {
             notify,
             jobs,
         );
-        unimplemented!("ActivityDedup::record_follow_activity not implemented")
+        Err(PortError::StorageUnavailable(
+            "ActivityDedup::record_follow_activity not implemented".to_string(),
+        ))
     }
     /// Dedup + record a pending request from an inbound Follow to a locked
     /// account. `Ok(None)` when the activity id was already seen.
@@ -1508,7 +1522,9 @@ pub trait ActivityDedup: Send + Sync {
             notify,
             jobs,
         );
-        unimplemented!("ActivityDedup::record_follow_request_activity not implemented")
+        Err(PortError::StorageUnavailable(
+            "ActivityDedup::record_follow_request_activity not implemented".to_string(),
+        ))
     }
     fn record_unfollow_activity(
         &self,
@@ -1518,7 +1534,9 @@ pub trait ActivityDedup: Send + Sync {
         jobs: Vec<NewJob>,
     ) -> Result<bool, PortError> {
         let _ = (activity_id, follower_id, followee_id, jobs);
-        unimplemented!("ActivityDedup::record_unfollow_activity not implemented")
+        Err(PortError::StorageUnavailable(
+            "ActivityDedup::record_unfollow_activity not implemented".to_string(),
+        ))
     }
     fn record_reject_follow_activity(
         &self,
@@ -1541,7 +1559,9 @@ pub trait ActivityDedup: Send + Sync {
         jobs: Vec<NewJob>,
     ) -> Result<Option<Blocking>, PortError> {
         let _ = (activity_id, blocker_id, blockee_id, jobs);
-        unimplemented!("ActivityDedup::record_block_activity not implemented")
+        Err(PortError::StorageUnavailable(
+            "ActivityDedup::record_block_activity not implemented".to_string(),
+        ))
     }
     /// Dedup + remove the block for an inbound `Undo(Block)`.
     /// `Ok(false)` on replay or when no block row exists (Misskey `unblock`
@@ -1554,7 +1574,9 @@ pub trait ActivityDedup: Send + Sync {
         jobs: Vec<NewJob>,
     ) -> Result<bool, PortError> {
         let _ = (activity_id, blocker_id, blockee_id, jobs);
-        unimplemented!("ActivityDedup::record_unblock_activity not implemented")
+        Err(PortError::StorageUnavailable(
+            "ActivityDedup::record_unblock_activity not implemented".to_string(),
+        ))
     }
     fn record_react_activity(
         &self,
@@ -1566,7 +1588,9 @@ pub trait ActivityDedup: Send + Sync {
         jobs: Vec<NewJob>,
     ) -> Result<Option<Reaction>, PortError> {
         let _ = (activity_id, user_id, note_id, reaction, upsert, jobs);
-        unimplemented!("ActivityDedup::record_react_activity not implemented")
+        Err(PortError::StorageUnavailable(
+            "ActivityDedup::record_react_activity not implemented".to_string(),
+        ))
     }
     fn record_unreact_activity(
         &self,
@@ -1576,7 +1600,9 @@ pub trait ActivityDedup: Send + Sync {
         jobs: Vec<NewJob>,
     ) -> Result<bool, PortError> {
         let _ = (activity_id, user_id, note_id, jobs);
-        unimplemented!("ActivityDedup::record_unreact_activity not implemented")
+        Err(PortError::StorageUnavailable(
+            "ActivityDedup::record_unreact_activity not implemented".to_string(),
+        ))
     }
     fn record_update_account_activity(
         &self,
@@ -1586,7 +1612,9 @@ pub trait ActivityDedup: Send + Sync {
         jobs: Vec<NewJob>,
     ) -> Result<Option<Account>, PortError> {
         let _ = (activity_id, account_id, patch, jobs);
-        unimplemented!("ActivityDedup::record_update_account_activity not implemented")
+        Err(PortError::StorageUnavailable(
+            "ActivityDedup::record_update_account_activity not implemented".to_string(),
+        ))
     }
     /// Dedup + persist a locally authored `QuoteAuthorization` stamp and its
     /// `Accept` delivery job. `Ok(None)` when the activity id was already
@@ -1598,7 +1626,9 @@ pub trait ActivityDedup: Send + Sync {
         jobs: Vec<NewJob>,
     ) -> Result<Option<QuoteStamp>, PortError> {
         let _ = (activity_id, stamp, jobs);
-        unimplemented!("ActivityDedup::record_quote_request_accept not implemented")
+        Err(PortError::StorageUnavailable(
+            "ActivityDedup::record_quote_request_accept not implemented".to_string(),
+        ))
     }
     /// Dedup + enqueue a `Reject(QuoteRequest)` delivery job (no stamp is
     /// created). `Ok(false)` on replay.
@@ -1608,7 +1638,9 @@ pub trait ActivityDedup: Send + Sync {
         jobs: Vec<NewJob>,
     ) -> Result<bool, PortError> {
         let _ = (activity_id, jobs);
-        unimplemented!("ActivityDedup::record_quote_request_reject not implemented")
+        Err(PortError::StorageUnavailable(
+            "ActivityDedup::record_quote_request_reject not implemented".to_string(),
+        ))
     }
     /// Dedup + move our pending quote to `Approved` with its verified stamp
     /// (inbound `Accept`). `Ok(None)` on replay.
@@ -1621,7 +1653,9 @@ pub trait ActivityDedup: Send + Sync {
         jobs: Vec<NewJob>,
     ) -> Result<Option<Note>, PortError> {
         let _ = (activity_id, note_id, stamp_uri, verified_at_ms, jobs);
-        unimplemented!("ActivityDedup::record_quote_decision_accept not implemented")
+        Err(PortError::StorageUnavailable(
+            "ActivityDedup::record_quote_decision_accept not implemented".to_string(),
+        ))
     }
     /// Dedup + move our pending quote to `Rejected` (inbound `Reject`).
     /// The relation and API projection are retained. `Ok(None)` on replay.
@@ -1632,7 +1666,9 @@ pub trait ActivityDedup: Send + Sync {
         jobs: Vec<NewJob>,
     ) -> Result<Option<Note>, PortError> {
         let _ = (activity_id, note_id, jobs);
-        unimplemented!("ActivityDedup::record_quote_decision_reject not implemented")
+        Err(PortError::StorageUnavailable(
+            "ActivityDedup::record_quote_decision_reject not implemented".to_string(),
+        ))
     }
     /// Dedup + move our approved quote to `Revoked` (valid `Delete` of the
     /// stamp) and enqueue revocation-forwarding jobs. `Ok(None)` on replay.
@@ -1643,7 +1679,9 @@ pub trait ActivityDedup: Send + Sync {
         jobs: Vec<NewJob>,
     ) -> Result<Option<Note>, PortError> {
         let _ = (activity_id, note_id, jobs);
-        unimplemented!("ActivityDedup::record_quote_stamp_delete not implemented")
+        Err(PortError::StorageUnavailable(
+            "ActivityDedup::record_quote_stamp_delete not implemented".to_string(),
+        ))
     }
     /// Dedup + apply a federated note edit (inbound `Update(Note)`, §8):
     /// the same [`NoteStore::apply_note_edit`] storage path (no-change
@@ -1657,7 +1695,9 @@ pub trait ActivityDedup: Send + Sync {
         jobs: Vec<NewJob>,
     ) -> Result<Option<Note>, PortError> {
         let _ = (activity_id, edit, jobs);
-        unimplemented!("ActivityDedup::record_note_edit_activity not implemented")
+        Err(PortError::StorageUnavailable(
+            "ActivityDedup::record_note_edit_activity not implemented".to_string(),
+        ))
     }
 }
 
