@@ -27,7 +27,7 @@ use crate::activitypub::objects::{
 };
 use crate::activitypub::signatures::{parse_signature_header, verify_http_signature};
 use crate::application::commands::AppServices;
-use crate::application::ports::{Clock, CreateNoteInput, IdGenerator, PortError, TimelineCursor, UpdateAccountPatch};
+use crate::application::ports::{CreateNoteInput, PortError, TimelineCursor, UpdateAccountPatch};
 use crate::domain::account::Account;
 use crate::domain::fed_policy;
 use crate::domain::pinning::UserNotePining;

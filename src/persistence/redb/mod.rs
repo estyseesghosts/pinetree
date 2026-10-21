@@ -16,6 +16,7 @@ use crate::application::ports::{
     NoteStore, NotificationStore, PasswordResetRequest, PasswordResetStore, PollChoiceCount, PollStore, PortError, ReactionStore, FavoriteStore, EmojiStore, AntennaStore, AntennaNoteStore,
     RegistryItem, RegistryStore, ClipStore, PageStore,
     RemotePublicKeyRecord, TimelineCursor, UpdateAccountPatch, SigninRecord, SigninStore, UserListStore, MAX_JOBS_PER_TXN, MAX_JOB_ATTEMPTS, MAX_SIGNIN_ROWS_PER_USER,
+    DriveFolderStore, SystemWebhookStore, UserWebhookStore, AbuseReportRecipientStore,
 };
 use crate::domain::account::{validate_local_username, Account};
 use crate::domain::blocking::Blocking;
@@ -38,7 +39,9 @@ use crate::domain::poll::{Poll, PollVote};
 use crate::domain::reaction::Reaction;
 use crate::domain::favorite::NoteFavorite;
 use crate::domain::antenna::Antenna;
+use crate::domain::drive_folder::DriveFolder;
 use crate::domain::emoji::{CustomEmoji, RemoteEmoji};
+use crate::domain::webhook::{AbuseReportRecipient, SystemWebhook, UserWebhook};
 
 const ACCOUNTS: TableDefinition<&str, &[u8]> = TableDefinition::new("accounts");
 const HANDLE_INDEX: TableDefinition<&str, &str> = TableDefinition::new("handle_index");
@@ -267,6 +270,79 @@ const INVITES: TableDefinition<&str, &[u8]> = TableDefinition::new("invites");
 /// column): code → ticket id. A row present here means the code is
 /// unconsumed; `consume_and_create_account` removes it atomically.
 const INVITE_CODES: TableDefinition<&str, &str> = TableDefinition::new("invite_codes");
+/// Drive folders by id (WP2 part A; Misskey `MiDriveFolder` parity).
+/// Values are JSON [`DriveFolder`] rows.
+const DRIVE_FOLDERS: TableDefinition<&str, &[u8]> = TableDefinition::new("drive_folders");
+/// Owner placement index `(owner_id, parent_key, folder_id)` (WP2 part A),
+/// where `parent_key` is the parent folder id or `""` for the drive root
+/// (aidx ids are never empty, so `""` never collides). Prefix ranges serve
+/// `child_folders`; every mutation commits row + indexes + jobs in one txn.
+const DRIVE_FOLDERS_BY_OWNER_PARENT: TableDefinition<(&str, &str, &str), u8> =
+    TableDefinition::new("drive_folders_by_owner_parent");
+/// Owner name index `(owner_id, parent_key, name)` → JSON sorted folder-id
+/// list (WP2 part A; `drive/folders/find` parity). One row per name bucket
+/// (arbitrary names, no charset games); the id list stays id-ordered.
+const DRIVE_FOLDERS_BY_NAME: TableDefinition<(&str, &str, &str), &[u8]> =
+    TableDefinition::new("drive_folders_by_name");
+/// File-to-folder placement `file_id` → folder id (WP2 part A; upstream
+/// nullable `folderId` column parity). Absent row = drive root; a row always
+/// names a live folder (the op empties folders before delete).
+const DRIVE_FILE_FOLDERS: TableDefinition<&str, &str> =
+    TableDefinition::new("drive_file_folders");
+/// Reverse placement index `(folder_id, file_id)` (WP2 part A) backing
+/// `count_files_in_folder`. Only non-root placements are indexed.
+const DRIVE_FILES_IN_FOLDER: TableDefinition<(&str, &str), u8> =
+    TableDefinition::new("drive_files_in_folder");
+/// System webhooks by id (WP3; `system-webhook/*` parity). Values are JSON
+/// [`SystemWebhook`] rows.
+const SYSTEM_WEBHOOKS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("system_webhooks");
+/// System-webhook trigger index `(trigger, webhook_id)` (WP3) backing
+/// `active_system_webhooks_for`.
+const SYSTEM_WEBHOOKS_BY_TRIGGER: TableDefinition<(&str, &str), u8> =
+    TableDefinition::new("system_webhooks_by_trigger");
+/// User webhooks by id (WP3; `webhooks/*` parity). Values are JSON
+/// [`UserWebhook`] rows.
+const USER_WEBHOOKS: TableDefinition<&str, &[u8]> = TableDefinition::new("user_webhooks");
+/// User-webhook owner index `(owner_id, webhook_id)` (WP3) backing
+/// `list_user_webhooks` + `count_user_webhooks`.
+const USER_WEBHOOKS_BY_OWNER: TableDefinition<(&str, &str), u8> =
+    TableDefinition::new("user_webhooks_by_owner");
+/// User-webhook trigger index `(owner_id, trigger, webhook_id)` (WP3)
+/// backing `active_user_webhooks_for`.
+const USER_WEBHOOKS_BY_OWNER_TRIGGER: TableDefinition<(&str, &str, &str), u8> =
+    TableDefinition::new("user_webhooks_by_owner_trigger");
+/// Abuse-report notification recipients by id (WP3;
+/// `abuse-report/notification-recipient/*` parity). Values are JSON
+/// [`AbuseReportRecipient`] rows.
+const ABUSE_REPORT_RECIPIENTS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("abuse_report_recipients");
+/// Unique index of accounts by canonical ActivityPub `uri` → account id
+/// (WP5 federation). Written in the same transaction as the account row;
+/// rebuildable derived state, backfilled at open for older databases.
+/// The row is kept on soft-delete (scan parity: `find_by_uri` never
+/// filtered on flags).
+const ACCOUNTS_BY_URI: TableDefinition<&str, &str> = TableDefinition::new("accounts_by_uri");
+/// Full-handle alias `handle` → account id (WP5 federation), where
+/// `handle` is the lowercased username for local accounts and
+/// `username@host` (both lowercased) for remote ones. Maintained in the
+/// same transaction as the account row. `HANDLE_INDEX` stays the primary
+/// `(username, host)` lookup (exact parity, untouched); this table serves
+/// the WP5 full-handle actor-resolution path the parent wires next.
+const ACCOUNTS_BY_HANDLE: TableDefinition<&str, &str> =
+    TableDefinition::new("accounts_by_handle");
+/// Unique index of live notes by locally minted quote-request IRI →
+/// quoting note id (WP5 federation). Written in the same transaction as
+/// the note row; rebuildable derived state, backfilled at open.
+/// Last-writer-wins on collision (request IRIs are minted per quote).
+const NOTES_BY_QUOTE_REQUEST: TableDefinition<&str, &str> =
+    TableDefinition::new("notes_by_quote_request");
+/// Unique index of live notes by verified quote-authorization stamp IRI →
+/// quoting note id (WP5 federation). Maintained in the same transaction
+/// as the note row (create/edit/delete/authorization transitions);
+/// rebuildable derived state, backfilled at open. Last-writer-wins.
+const NOTES_BY_QUOTE_STAMP: TableDefinition<&str, &str> =
+    TableDefinition::new("notes_by_quote_stamp");
 
 /// META marker: `REACTIONS_BY_NOTE` has been built from `REACTIONS`.
 const REACTIONS_BY_NOTE_DONE_KEY: &str = "migration:reactions_by_note:v1";
@@ -286,6 +362,12 @@ const NOTIFICATION_ORDER_DONE_KEY: &str = "migration:notifications_by_user_order
 /// META marker: blob refcounts, durable owner totals, and the remote-cache
 /// index have been rebuilt from `MEDIA_META` (storage overhaul backfill).
 const STORAGE_ACCOUNTING_DONE_KEY: &str = "migration:storage_accounting:v1";
+/// META marker: `ACCOUNTS_BY_URI` + `ACCOUNTS_BY_HANDLE` have been built
+/// from `ACCOUNTS` (WP5 federation backfill, single transaction at open).
+const ACCOUNT_URI_INDEX_DONE_KEY: &str = "migration:accounts_by_uri:v1";
+/// META marker: `NOTES_BY_QUOTE_REQUEST` + `NOTES_BY_QUOTE_STAMP` have been
+/// built from `NOTES` (WP5 federation backfill, single transaction at open).
+const QUOTE_INDEX_DONE_KEY: &str = "migration:notes_by_quote:v1";
 
 pub struct RedbStore {
     db: Database,
@@ -332,6 +414,8 @@ impl RedbStore {
         store.run_reactions_by_note_backfill()?;
         store.run_token_id_backfill()?;
         store.run_storage_accounting_backfill()?;
+        store.run_account_uri_index_backfill()?;
+        store.run_quote_index_backfill()?;
         Ok(store)
     }
 
@@ -353,6 +437,17 @@ impl RedbStore {
 
     pub fn ids(&self) -> &Arc<dyn IdGenerator> {
         &self.ids
+    }
+
+    /// Clone this store as the [`RegistryStore`] handle backing the admin
+    /// global collections: `application::commands::admin_ext` persists
+    /// relays, ads, announcements, roles, abuse recipients, the proxy
+    /// account, and federation overrides under the `~instance` user id via
+    /// this registry. No dedicated admin tables exist by design (see
+    /// `crate::domain::admin`); the registry already serves every need,
+    /// so this helper is the whole admin wiring.
+    pub fn registry_handle(self: &Arc<Self>) -> Arc<dyn RegistryStore> {
+        self.clone()
     }
 
     pub fn set_abort_before_commit(&self, enabled: bool) {
@@ -491,6 +586,51 @@ impl RedbStore {
             .map_err(map_redb_err)?;
         let _ = write_txn.open_table(INVITES).map_err(map_redb_err)?;
         let _ = write_txn.open_table(INVITE_CODES).map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(DRIVE_FOLDERS)
+            .map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(DRIVE_FOLDERS_BY_OWNER_PARENT)
+            .map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(DRIVE_FOLDERS_BY_NAME)
+            .map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(DRIVE_FILE_FOLDERS)
+            .map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(DRIVE_FILES_IN_FOLDER)
+            .map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(SYSTEM_WEBHOOKS)
+            .map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(SYSTEM_WEBHOOKS_BY_TRIGGER)
+            .map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(USER_WEBHOOKS)
+            .map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(USER_WEBHOOKS_BY_OWNER)
+            .map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(USER_WEBHOOKS_BY_OWNER_TRIGGER)
+            .map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(ABUSE_REPORT_RECIPIENTS)
+            .map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(ACCOUNTS_BY_URI)
+            .map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(ACCOUNTS_BY_HANDLE)
+            .map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(NOTES_BY_QUOTE_REQUEST)
+            .map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(NOTES_BY_QUOTE_STAMP)
+            .map_err(map_redb_err)?;
         let _ = write_txn.open_table(META).map_err(map_redb_err)?;
         write_txn.commit().map_err(map_redb_err)?;
         Ok(())
@@ -841,6 +981,104 @@ impl RedbStore {
         self.commit_write(write_txn)
     }
 
+    /// WP5 federation backfill: build `ACCOUNTS_BY_URI` (trimmed non-empty
+    /// `uri` → id) and `ACCOUNTS_BY_HANDLE` (canonical full handle → id)
+    /// from `ACCOUNTS` once. Single transaction at open; idempotent via the
+    /// META marker. Colliding URIs resolve last-writer-wins in id order
+    /// (creation never enforced URI uniqueness); soft-deleted rows stay
+    /// indexed (scan parity — `find_by_uri` never filtered on flags).
+    pub fn run_account_uri_index_backfill(&self) -> Result<(), PortError> {
+        if self.meta_get(ACCOUNT_URI_INDEX_DONE_KEY)?.as_deref() == Some("done") {
+            return Ok(());
+        }
+        let write_txn = self.begin_write()?;
+        {
+            let accounts_table = write_txn.open_table(ACCOUNTS).map_err(map_redb_err)?;
+            let mut by_uri = write_txn.open_table(ACCOUNTS_BY_URI).map_err(map_redb_err)?;
+            let mut by_handle = write_txn
+                .open_table(ACCOUNTS_BY_HANDLE)
+                .map_err(map_redb_err)?;
+            for entry in accounts_table.iter().map_err(map_redb_err)? {
+                let (key, value) = entry.map_err(map_redb_err)?;
+                let account: Account = decode_json(value.value())?;
+                if let Some(uri) = account.uri.as_deref().map(str::trim).filter(|u| {
+                    !u.is_empty()
+                }) {
+                    by_uri
+                        .insert(uri, key.value())
+                        .map_err(map_redb_err)?;
+                }
+                by_handle
+                    .insert(
+                        Self::canonical_handle(&account).as_str(),
+                        key.value(),
+                    )
+                    .map_err(map_redb_err)?;
+            }
+            let mut meta_table = write_txn.open_table(META).map_err(map_redb_err)?;
+            meta_table
+                .insert(ACCOUNT_URI_INDEX_DONE_KEY, "done")
+                .map_err(map_redb_err)?;
+        }
+        self.commit_write(write_txn)
+    }
+
+    /// WP5 federation backfill: build `NOTES_BY_QUOTE_REQUEST`
+    /// (request IRI → quoting note id) and `NOTES_BY_QUOTE_STAMP` (stamp
+    /// IRI → quoting note id) from live `NOTES` rows once. Single
+    /// transaction at open; idempotent via the META marker. Deleted rows
+    /// stay out (both lookups skip deleted notes); collisions resolve
+    /// last-writer-wins in id order.
+    pub fn run_quote_index_backfill(&self) -> Result<(), PortError> {
+        if self.meta_get(QUOTE_INDEX_DONE_KEY)?.as_deref() == Some("done") {
+            return Ok(());
+        }
+        let write_txn = self.begin_write()?;
+        {
+            let notes_table = write_txn.open_table(NOTES).map_err(map_redb_err)?;
+            let mut by_request = write_txn
+                .open_table(NOTES_BY_QUOTE_REQUEST)
+                .map_err(map_redb_err)?;
+            let mut by_stamp = write_txn
+                .open_table(NOTES_BY_QUOTE_STAMP)
+                .map_err(map_redb_err)?;
+            for entry in notes_table.iter().map_err(map_redb_err)? {
+                let (key, value) = entry.map_err(map_redb_err)?;
+                let note: Note = decode_json(value.value())?;
+                if note.is_deleted {
+                    continue;
+                }
+                if let Some(quote) = note.quote.as_ref() {
+                    if let Some(uri) = quote
+                        .request_activity_uri
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|u| !u.is_empty())
+                    {
+                        by_request
+                            .insert(uri, key.value())
+                            .map_err(map_redb_err)?;
+                    }
+                    if let Some(uri) = quote
+                        .authorization_uri
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|u| !u.is_empty())
+                    {
+                        by_stamp
+                            .insert(uri, key.value())
+                            .map_err(map_redb_err)?;
+                    }
+                }
+            }
+            let mut meta_table = write_txn.open_table(META).map_err(map_redb_err)?;
+            meta_table
+                .insert(QUOTE_INDEX_DONE_KEY, "done")
+                .map_err(map_redb_err)?;
+        }
+        self.commit_write(write_txn)
+    }
+
     fn meta_get(&self, key: &str) -> Result<Option<String>, PortError> {
         let read_txn = self.db.begin_read().map_err(map_redb_err)?;
         let meta_table = read_txn.open_table(META).map_err(map_redb_err)?;
@@ -888,6 +1126,114 @@ impl RedbStore {
             }
             _ => format!("local:{username_lower}"),
         }
+    }
+
+    /// Canonical full handle for `ACCOUNTS_BY_HANDLE`: the lowercased
+    /// username for local accounts, `username@host` (both lowercased) for
+    /// remote ones.
+    fn canonical_handle(account: &Account) -> String {
+        match account.host.as_deref().map(str::trim).filter(|h| {
+            !h.is_empty()
+        }) {
+            Some(host) => format!("{}@{}", account.username_lower, host.to_ascii_lowercase()),
+            None => account.username_lower.clone(),
+        }
+    }
+
+    /// Storage key for a folder parent: the parent id, or `""` for the
+    /// drive root (aidx ids are never empty, so `""` never collides).
+    fn folder_parent_key(parent_id: Option<&str>) -> &str {
+        parent_id.unwrap_or("")
+    }
+
+    /// Insert the quote-relation index rows for a live note
+    /// (`NOTES_BY_QUOTE_REQUEST` + `NOTES_BY_QUOTE_STAMP`) inside the
+    /// ambient write transaction. Trims like every other URI index; empty
+    /// or missing URIs index nothing.
+    fn insert_quote_indexes_in_txn(
+        &self,
+        write_txn: &WriteTransaction,
+        note: &Note,
+    ) -> Result<(), PortError> {
+        let Some(quote) = note.quote.as_ref() else {
+            return Ok(());
+        };
+        if let Some(uri) = quote
+            .request_activity_uri
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+        {
+            let mut by_request = write_txn
+                .open_table(NOTES_BY_QUOTE_REQUEST)
+                .map_err(map_redb_err)?;
+            by_request
+                .insert(uri, note.id.as_str())
+                .map_err(map_redb_err)?;
+        }
+        if let Some(uri) = quote
+            .authorization_uri
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+        {
+            let mut by_stamp = write_txn
+                .open_table(NOTES_BY_QUOTE_STAMP)
+                .map_err(map_redb_err)?;
+            by_stamp
+                .insert(uri, note.id.as_str())
+                .map_err(map_redb_err)?;
+        }
+        Ok(())
+    }
+
+    /// Drop the quote-relation index rows a note held, but only when the
+    /// row still names this note (a newer note may have claimed the key).
+    /// Same ownership guard as the `NOTES_BY_URI` removal.
+    fn remove_quote_indexes_in_txn(
+        &self,
+        write_txn: &WriteTransaction,
+        note_id: &str,
+        quote: Option<&QuoteReference>,
+    ) -> Result<(), PortError> {
+        let Some(quote) = quote else {
+            return Ok(());
+        };
+        if let Some(uri) = quote
+            .request_activity_uri
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+        {
+            let mut by_request = write_txn
+                .open_table(NOTES_BY_QUOTE_REQUEST)
+                .map_err(map_redb_err)?;
+            let owned = by_request
+                .get(uri)
+                .map_err(map_redb_err)?
+                .is_some_and(|guard| guard.value() == note_id);
+            if owned {
+                by_request.remove(uri).map_err(map_redb_err)?;
+            }
+        }
+        if let Some(uri) = quote
+            .authorization_uri
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+        {
+            let mut by_stamp = write_txn
+                .open_table(NOTES_BY_QUOTE_STAMP)
+                .map_err(map_redb_err)?;
+            let owned = by_stamp
+                .get(uri)
+                .map_err(map_redb_err)?
+                .is_some_and(|guard| guard.value() == note_id);
+            if owned {
+                by_stamp.remove(uri).map_err(map_redb_err)?;
+            }
+        }
+        Ok(())
     }
 
     fn enqueue_jobs_in_txn(
@@ -1370,6 +1716,9 @@ impl RedbStore {
                 .insert(uri, note.id.as_str())
                 .map_err(map_redb_err)?;
         }
+        // WP5 federation: the quote-relation rows commit in the same
+        // transaction as the note row, the counter bumps, and the jobs.
+        self.insert_quote_indexes_in_txn(&write_txn, &note)?;
         // Slice A adjacency index: a resolved reply links its
         // `(parent, child)` row in the same transaction as the note, the
         // parent counter bump, and the durable jobs below. A pending
@@ -1881,6 +2230,13 @@ impl RedbStore {
         notes_table
             .insert(edited.id.as_str(), edited_bytes.as_slice())
             .map_err(map_redb_err)?;
+        // WP5 federation: the quote relation may have detached (renote
+        // cleared) or reset (renote swapped) — sync both index rows in
+        // this same transaction. A carried-over quote keeps its rows.
+        if old.quote != edited.quote {
+            self.remove_quote_indexes_in_txn(&write_txn, &edited.id, old.quote.as_ref())?;
+            self.insert_quote_indexes_in_txn(&write_txn, &edited)?;
+        }
         drop(notes_table);
         drop(accounts_table);
         drop(media_table);
@@ -1937,6 +2293,9 @@ impl RedbStore {
                     by_uri.remove(uri).map_err(map_redb_err)?;
                 }
             }
+            // WP5 federation: a deleted note releases its quote-relation
+            // rows too (both lookups skip deleted notes).
+            self.remove_quote_indexes_in_txn(&write_txn, &note.id, note.quote.as_ref())?;
             note.is_deleted = true;
             note.text = None;
             note.cw = None;
@@ -2803,6 +3162,7 @@ impl RedbStore {
         if note.is_deleted {
             return Err(PortError::NotFound("NO_SUCH_QUOTE".to_string()));
         }
+        let old_quote = note.quote.clone();
         let Some(quote) = note.quote.as_mut() else {
             return Err(PortError::NotFound("NO_SUCH_QUOTE".to_string()));
         };
@@ -2846,6 +3206,12 @@ impl RedbStore {
             .insert(note.id.as_str(), note_bytes.as_slice())
             .map_err(map_redb_err)?;
         drop(notes_table);
+        // WP5 federation: stamp transitions move the authorization row in
+        // this same transaction (request rows never change here).
+        if old_quote != note.quote {
+            self.remove_quote_indexes_in_txn(&write_txn, &note.id, old_quote.as_ref())?;
+            self.insert_quote_indexes_in_txn(&write_txn, &note)?;
+        }
         self.enqueue_jobs_in_txn(write_txn, jobs, Some(&note.id))?;
         Ok(note)
     }
@@ -3915,6 +4281,27 @@ impl RedbStore {
             handle_table
                 .insert(handle_key.as_str(), account.id.as_str())
                 .map_err(map_redb_err)?;
+            // WP5 federation: the URI + full-handle rows commit in the
+            // same transaction as the account row.
+            if let Some(uri) = account.uri.as_deref().map(str::trim).filter(|u| {
+                !u.is_empty()
+            }) {
+                let mut by_uri = write_txn
+                    .open_table(ACCOUNTS_BY_URI)
+                    .map_err(map_redb_err)?;
+                by_uri
+                    .insert(uri, account.id.as_str())
+                    .map_err(map_redb_err)?;
+            }
+            let mut by_handle = write_txn
+                .open_table(ACCOUNTS_BY_HANDLE)
+                .map_err(map_redb_err)?;
+            by_handle
+                .insert(
+                    Self::canonical_handle(account).as_str(),
+                    account.id.as_str(),
+                )
+                .map_err(map_redb_err)?;
             owners_table
                 .insert(account.id.as_str(), self.local_node_id.as_str())
                 .map_err(map_redb_err)?;
@@ -4077,6 +4464,17 @@ impl AccountStore for RedbStore {
                     .map_err(map_redb_err)?;
                 handle_table
                     .insert(new_key.as_str(), acc.id.as_str())
+                    .map_err(map_redb_err)?;
+                // WP5 federation: renames move the full-handle alias in
+                // the same transaction (the URI row is immutable).
+                let mut by_handle = write_txn
+                    .open_table(ACCOUNTS_BY_HANDLE)
+                    .map_err(map_redb_err)?;
+                by_handle
+                    .remove(old_lower.as_str())
+                    .map_err(map_redb_err)?;
+                by_handle
+                    .insert(acc.username_lower.as_str(), acc.id.as_str())
                     .map_err(map_redb_err)?;
                 acc
             }
@@ -4248,15 +4646,19 @@ impl AccountStore for RedbStore {
             return Ok(None);
         }
         let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let by_uri = read_txn.open_table(ACCOUNTS_BY_URI).map_err(map_redb_err)?;
+        let Some(id) = by_uri
+            .get(target)
+            .map_err(map_redb_err)?
+            .map(|guard| guard.value().to_string())
+        else {
+            return Ok(None);
+        };
         let table = read_txn.open_table(ACCOUNTS).map_err(map_redb_err)?;
-        for entry in table.iter().map_err(map_redb_err)? {
-            let (_, val) = entry.map_err(map_redb_err)?;
-            let acc: Account = decode_json(val.value())?;
-            if acc.uri.as_deref() == Some(target) {
-                return Ok(Some(acc));
-            }
+        match table.get(id.as_str()).map_err(map_redb_err)? {
+            Some(guard) => Ok(Some(decode_json(guard.value())?)),
+            None => Ok(None),
         }
-        Ok(None)
     }
 }
 
@@ -4778,23 +5180,22 @@ impl NoteStore for RedbStore {
             return Ok(None);
         }
         let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let by_request = read_txn
+            .open_table(NOTES_BY_QUOTE_REQUEST)
+            .map_err(map_redb_err)?;
+        let Some(id) = by_request
+            .get(target)
+            .map_err(map_redb_err)?
+            .map(|guard| guard.value().to_string())
+        else {
+            return Ok(None);
+        };
         let notes_table = read_txn.open_table(NOTES).map_err(map_redb_err)?;
-        for entry in notes_table.iter().map_err(map_redb_err)? {
-            let (_, v) = entry.map_err(map_redb_err)?;
-            let note: Note = decode_json(v.value())?;
-            if note.is_deleted {
-                continue;
-            }
-            if note
-                .quote
-                .as_ref()
-                .and_then(|q| q.request_activity_uri.as_deref())
-                == Some(target)
-            {
-                return Ok(Some(note));
-            }
-        }
-        Ok(None)
+        let found = match notes_table.get(id.as_str()).map_err(map_redb_err)? {
+            Some(guard) => Some(decode_json::<Note>(guard.value())?),
+            None => None,
+        };
+        Ok(found.filter(|note| !note.is_deleted))
     }
 
     fn find_note_by_quote_stamp(&self, stamp_uri: &str) -> Result<Option<Note>, PortError> {
@@ -4803,23 +5204,22 @@ impl NoteStore for RedbStore {
             return Ok(None);
         }
         let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let by_stamp = read_txn
+            .open_table(NOTES_BY_QUOTE_STAMP)
+            .map_err(map_redb_err)?;
+        let Some(id) = by_stamp
+            .get(target)
+            .map_err(map_redb_err)?
+            .map(|guard| guard.value().to_string())
+        else {
+            return Ok(None);
+        };
         let notes_table = read_txn.open_table(NOTES).map_err(map_redb_err)?;
-        for entry in notes_table.iter().map_err(map_redb_err)? {
-            let (_, v) = entry.map_err(map_redb_err)?;
-            let note: Note = decode_json(v.value())?;
-            if note.is_deleted {
-                continue;
-            }
-            if note
-                .quote
-                .as_ref()
-                .and_then(|q| q.authorization_uri.as_deref())
-                == Some(target)
-            {
-                return Ok(Some(note));
-            }
-        }
-        Ok(None)
+        let found = match notes_table.get(id.as_str()).map_err(map_redb_err)? {
+            Some(guard) => Some(decode_json::<Note>(guard.value())?),
+            None => None,
+        };
+        Ok(found.filter(|note| !note.is_deleted))
     }
 
     fn save_quote_stamp(&self, stamp: QuoteStamp, jobs: Vec<NewJob>) -> Result<(), PortError> {
@@ -10388,5 +10788,923 @@ impl RegistryStore for RedbStore {
             }
         }
         Ok(pairs)
+    }
+}
+
+// --- Drive folders (WP2 part A) --------------------------------------------
+
+impl RedbStore {
+    /// Append `folder_id` to the `(owner, parent, name)` bucket, keeping
+    /// the id list ordered. Buckets hold one name's folders, so they stay
+    /// tiny; the whole bucket rewrites in the ambient transaction.
+    fn drive_name_bucket_add(
+        write_txn: &WriteTransaction,
+        owner_id: &str,
+        parent_key: &str,
+        name: &str,
+        folder_id: &str,
+    ) -> Result<(), PortError> {
+        let mut bucket_table = write_txn
+            .open_table(DRIVE_FOLDERS_BY_NAME)
+            .map_err(map_redb_err)?;
+        let mut ids: Vec<String> =
+            match bucket_table
+                .get((owner_id, parent_key, name))
+                .map_err(map_redb_err)?
+            {
+                Some(guard) => decode_json(guard.value())?,
+                None => Vec::new(),
+            };
+        if !ids.iter().any(|id| id == folder_id) {
+            ids.push(folder_id.to_string());
+            ids.sort();
+            let encoded = encode_json(&ids)?;
+            bucket_table
+                .insert((owner_id, parent_key, name), encoded.as_slice())
+                .map_err(map_redb_err)?;
+        }
+        Ok(())
+    }
+
+    /// Drop `folder_id` from the `(owner, parent, name)` bucket, removing
+    /// the bucket row once empty.
+    fn drive_name_bucket_remove(
+        write_txn: &WriteTransaction,
+        owner_id: &str,
+        parent_key: &str,
+        name: &str,
+        folder_id: &str,
+    ) -> Result<(), PortError> {
+        let mut bucket_table = write_txn
+            .open_table(DRIVE_FOLDERS_BY_NAME)
+            .map_err(map_redb_err)?;
+        let mut ids: Vec<String> =
+            match bucket_table
+                .get((owner_id, parent_key, name))
+                .map_err(map_redb_err)?
+            {
+                Some(guard) => decode_json(guard.value())?,
+                None => return Ok(()),
+            };
+        let before = ids.len();
+        ids.retain(|id| id != folder_id);
+        if ids.len() == before {
+            return Ok(());
+        }
+        if ids.is_empty() {
+            bucket_table
+                .remove((owner_id, parent_key, name))
+                .map_err(map_redb_err)?;
+        } else {
+            let encoded = encode_json(&ids)?;
+            bucket_table
+                .insert((owner_id, parent_key, name), encoded.as_slice())
+                .map_err(map_redb_err)?;
+        }
+        Ok(())
+    }
+}
+
+impl DriveFolderStore for RedbStore {
+    fn create_folder(
+        &self,
+        folder: DriveFolder,
+        jobs: Vec<NewJob>,
+    ) -> Result<DriveFolder, PortError> {
+        folder.validate().map_err(|e| match e {
+            crate::domain::id::DomainError::Validation(msg) => PortError::Validation(msg),
+            crate::domain::id::DomainError::Conflict(msg) => PortError::Conflict(msg),
+            crate::domain::id::DomainError::NotFound(msg) => PortError::NotFound(msg),
+            crate::domain::id::DomainError::StorageUnavailable(msg) => {
+                PortError::StorageUnavailable(msg)
+            }
+        })?;
+        for job in &jobs {
+            job.validate()?;
+        }
+        let write_txn = self.begin_write()?;
+        {
+            let mut folders = write_txn.open_table(DRIVE_FOLDERS).map_err(map_redb_err)?;
+            let encoded = encode_json(&folder)?;
+            folders
+                .insert(folder.id.as_str(), encoded.as_slice())
+                .map_err(map_redb_err)?;
+            drop(folders);
+            let mut by_parent = write_txn
+                .open_table(DRIVE_FOLDERS_BY_OWNER_PARENT)
+                .map_err(map_redb_err)?;
+            by_parent
+                .insert(
+                    (
+                        folder.owner_id.as_str(),
+                        Self::folder_parent_key(folder.parent_id.as_deref()),
+                        folder.id.as_str(),
+                    ),
+                    &1u8,
+                )
+                .map_err(map_redb_err)?;
+            drop(by_parent);
+            Self::drive_name_bucket_add(
+                &write_txn,
+                folder.owner_id.as_str(),
+                Self::folder_parent_key(folder.parent_id.as_deref()),
+                folder.name.as_str(),
+                folder.id.as_str(),
+            )?;
+        }
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)?;
+        Ok(folder)
+    }
+
+    fn get_folder(&self, id: &str) -> Result<Option<DriveFolder>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let folders = read_txn.open_table(DRIVE_FOLDERS).map_err(map_redb_err)?;
+        match folders.get(id).map_err(map_redb_err)? {
+            Some(guard) => Ok(Some(decode_json(guard.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn update_folder(
+        &self,
+        folder: DriveFolder,
+        jobs: Vec<NewJob>,
+    ) -> Result<DriveFolder, PortError> {
+        folder.validate().map_err(|e| match e {
+            crate::domain::id::DomainError::Validation(msg) => PortError::Validation(msg),
+            crate::domain::id::DomainError::Conflict(msg) => PortError::Conflict(msg),
+            crate::domain::id::DomainError::NotFound(msg) => PortError::NotFound(msg),
+            crate::domain::id::DomainError::StorageUnavailable(msg) => {
+                PortError::StorageUnavailable(msg)
+            }
+        })?;
+        for job in &jobs {
+            job.validate()?;
+        }
+        let write_txn = self.begin_write()?;
+        {
+            let mut folders = write_txn.open_table(DRIVE_FOLDERS).map_err(map_redb_err)?;
+            let previous: Option<DriveFolder> = match folders
+                .get(folder.id.as_str())
+                .map_err(map_redb_err)?
+            {
+                Some(guard) => Some(decode_json(guard.value())?),
+                None => None,
+            };
+            let Some(previous) = previous else {
+                drop(folders);
+                let _ = write_txn.abort();
+                return Err(PortError::NotFound("NO_SUCH_FOLDER".to_string()));
+            };
+            let encoded = encode_json(&folder)?;
+            folders
+                .insert(folder.id.as_str(), encoded.as_slice())
+                .map_err(map_redb_err)?;
+            drop(folders);
+            // Re-home both indexes when placement or the name moved.
+            if previous.owner_id != folder.owner_id
+                || previous.parent_id != folder.parent_id
+            {
+                let mut by_parent = write_txn
+                    .open_table(DRIVE_FOLDERS_BY_OWNER_PARENT)
+                    .map_err(map_redb_err)?;
+                by_parent
+                    .remove((
+                        previous.owner_id.as_str(),
+                        Self::folder_parent_key(previous.parent_id.as_deref()),
+                        previous.id.as_str(),
+                    ))
+                    .map_err(map_redb_err)?;
+                by_parent
+                    .insert(
+                        (
+                            folder.owner_id.as_str(),
+                            Self::folder_parent_key(folder.parent_id.as_deref()),
+                            folder.id.as_str(),
+                        ),
+                        &1u8,
+                    )
+                    .map_err(map_redb_err)?;
+            }
+            if previous.owner_id != folder.owner_id
+                || previous.parent_id != folder.parent_id
+                || previous.name != folder.name
+            {
+                Self::drive_name_bucket_remove(
+                    &write_txn,
+                    previous.owner_id.as_str(),
+                    Self::folder_parent_key(previous.parent_id.as_deref()),
+                    previous.name.as_str(),
+                    previous.id.as_str(),
+                )?;
+                Self::drive_name_bucket_add(
+                    &write_txn,
+                    folder.owner_id.as_str(),
+                    Self::folder_parent_key(folder.parent_id.as_deref()),
+                    folder.name.as_str(),
+                    folder.id.as_str(),
+                )?;
+            }
+        }
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)?;
+        Ok(folder)
+    }
+
+    fn delete_folder(&self, id: &str, jobs: Vec<NewJob>) -> Result<(), PortError> {
+        for job in &jobs {
+            job.validate()?;
+        }
+        let write_txn = self.begin_write()?;
+        {
+            let mut folders = write_txn.open_table(DRIVE_FOLDERS).map_err(map_redb_err)?;
+            let previous: Option<DriveFolder> = match folders
+                .get(id)
+                .map_err(map_redb_err)?
+            {
+                Some(guard) => Some(decode_json(guard.value())?),
+                None => None,
+            };
+            let Some(previous) = previous else {
+                drop(folders);
+                let _ = write_txn.abort();
+                return Err(PortError::NotFound("NO_SUCH_FOLDER".to_string()));
+            };
+            folders.remove(id).map_err(map_redb_err)?;
+            drop(folders);
+            let mut by_parent = write_txn
+                .open_table(DRIVE_FOLDERS_BY_OWNER_PARENT)
+                .map_err(map_redb_err)?;
+            by_parent
+                .remove((
+                    previous.owner_id.as_str(),
+                    Self::folder_parent_key(previous.parent_id.as_deref()),
+                    previous.id.as_str(),
+                ))
+                .map_err(map_redb_err)?;
+            drop(by_parent);
+            Self::drive_name_bucket_remove(
+                &write_txn,
+                previous.owner_id.as_str(),
+                Self::folder_parent_key(previous.parent_id.as_deref()),
+                previous.name.as_str(),
+                previous.id.as_str(),
+            )?;
+            // Files mapped here keep their placement rows: the op refuses
+            // non-empty deletes, so no row can name this folder. The
+            // reverse rows name live folders only.
+        }
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)
+    }
+
+    fn child_folders(
+        &self,
+        owner_id: &str,
+        parent_id: Option<&str>,
+    ) -> Result<Vec<DriveFolder>, PortError> {
+        let parent_key = Self::folder_parent_key(parent_id);
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let by_parent = read_txn
+            .open_table(DRIVE_FOLDERS_BY_OWNER_PARENT)
+            .map_err(map_redb_err)?;
+        let folders = read_txn.open_table(DRIVE_FOLDERS).map_err(map_redb_err)?;
+        // The triple key orders by folder id, so the range reads id-ordered.
+        let mut out = Vec::new();
+        for entry in by_parent
+            .range((owner_id, parent_key, "")..=(owner_id, parent_key, "\u{10ffff}"))
+            .map_err(map_redb_err)?
+        {
+            let (key, _) = entry.map_err(map_redb_err)?;
+            let (_, _, folder_id) = key.value();
+            if let Some(guard) = folders.get(folder_id).map_err(map_redb_err)? {
+                out.push(decode_json(guard.value())?);
+            }
+        }
+        Ok(out)
+    }
+
+    fn find_folders_by_name(
+        &self,
+        owner_id: &str,
+        name: &str,
+        parent_id: Option<&str>,
+    ) -> Result<Vec<DriveFolder>, PortError> {
+        let parent_key = Self::folder_parent_key(parent_id);
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let buckets = read_txn
+            .open_table(DRIVE_FOLDERS_BY_NAME)
+            .map_err(map_redb_err)?;
+        let ids: Vec<String> = match buckets
+            .get((owner_id, parent_key, name))
+            .map_err(map_redb_err)?
+        {
+            Some(guard) => decode_json(guard.value())?,
+            None => return Ok(Vec::new()),
+        };
+        let folders = read_txn.open_table(DRIVE_FOLDERS).map_err(map_redb_err)?;
+        // Buckets stay id-ordered at write time, so this reads id-ordered.
+        let mut out = Vec::new();
+        for id in &ids {
+            if let Some(guard) = folders.get(id.as_str()).map_err(map_redb_err)? {
+                let folder: DriveFolder = decode_json(guard.value())?;
+                if folder.owner_id == owner_id {
+                    out.push(folder);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn count_child_folders(&self, folder_id: &str) -> Result<u64, PortError> {
+        // Parents are globally unique, so no owner prefix applies: one
+        // bounded pass over the placement index counts exact parent hits.
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let by_parent = read_txn
+            .open_table(DRIVE_FOLDERS_BY_OWNER_PARENT)
+            .map_err(map_redb_err)?;
+        let mut total = 0u64;
+        for entry in by_parent.iter().map_err(map_redb_err)? {
+            let (key, _) = entry.map_err(map_redb_err)?;
+            let (_, parent, _) = key.value();
+            if parent == folder_id {
+                total = total.saturating_add(1);
+            }
+        }
+        Ok(total)
+    }
+
+    fn set_file_folder(
+        &self,
+        file_id: &str,
+        folder_id: Option<&str>,
+        jobs: Vec<NewJob>,
+    ) -> Result<(), PortError> {
+        for job in &jobs {
+            job.validate()?;
+        }
+        let write_txn = self.begin_write()?;
+        {
+            let mut forward = write_txn
+                .open_table(DRIVE_FILE_FOLDERS)
+                .map_err(map_redb_err)?;
+            let previous: Option<String> = match forward
+                .get(file_id)
+                .map_err(map_redb_err)?
+            {
+                Some(guard) => Some(guard.value().to_string()),
+                None => None,
+            };
+            if previous.as_deref() != folder_id {
+                match (previous, folder_id) {
+                    (Some(old), Some(target)) => {
+                        forward
+                            .insert(file_id, target)
+                            .map_err(map_redb_err)?;
+                        drop(forward);
+                        let mut reverse = write_txn
+                            .open_table(DRIVE_FILES_IN_FOLDER)
+                            .map_err(map_redb_err)?;
+                        reverse
+                            .remove((old.as_str(), file_id))
+                            .map_err(map_redb_err)?;
+                        reverse
+                            .insert((target, file_id), &1u8)
+                            .map_err(map_redb_err)?;
+                    }
+                    (Some(old), None) => {
+                        forward.remove(file_id).map_err(map_redb_err)?;
+                        drop(forward);
+                        let mut reverse = write_txn
+                            .open_table(DRIVE_FILES_IN_FOLDER)
+                            .map_err(map_redb_err)?;
+                        reverse
+                            .remove((old.as_str(), file_id))
+                            .map_err(map_redb_err)?;
+                    }
+                    (None, Some(target)) => {
+                        forward
+                            .insert(file_id, target)
+                            .map_err(map_redb_err)?;
+                        drop(forward);
+                        let mut reverse = write_txn
+                            .open_table(DRIVE_FILES_IN_FOLDER)
+                            .map_err(map_redb_err)?;
+                        reverse
+                            .insert((target, file_id), &1u8)
+                            .map_err(map_redb_err)?;
+                    }
+                    (None, None) => {}
+                }
+            }
+        }
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)
+    }
+
+    fn file_folder_id(&self, file_id: &str) -> Result<Option<Option<String>>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let forward = read_txn.open_table(DRIVE_FILE_FOLDERS).map_err(map_redb_err)?;
+        match forward.get(file_id).map_err(map_redb_err)? {
+            Some(guard) => Ok(Some(Some(guard.value().to_string()))),
+            None => Ok(None),
+        }
+    }
+
+    fn count_files_in_folder(&self, folder_id: &str) -> Result<u64, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let reverse = read_txn
+            .open_table(DRIVE_FILES_IN_FOLDER)
+            .map_err(map_redb_err)?;
+        let mut total = 0u64;
+        for entry in reverse
+            .range((folder_id, "")..=(folder_id, "\u{10ffff}"))
+            .map_err(map_redb_err)?
+        {
+            entry.map_err(map_redb_err)?;
+            total = total.saturating_add(1);
+        }
+        Ok(total)
+    }
+}
+
+// --- Webhooks (WP3) ----------------------------------------------------------
+
+impl SystemWebhookStore for RedbStore {
+    fn insert_system_webhook(&self, row: SystemWebhook) -> Result<SystemWebhook, PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            let mut hooks = write_txn.open_table(SYSTEM_WEBHOOKS).map_err(map_redb_err)?;
+            if hooks
+                .get(row.id.as_str())
+                .map_err(map_redb_err)?
+                .is_some()
+            {
+                drop(hooks);
+                let _ = write_txn.abort();
+                return Err(PortError::Conflict(format!(
+                    "system webhook {} already exists",
+                    row.id
+                )));
+            }
+            let encoded = encode_json(&row)?;
+            hooks
+                .insert(row.id.as_str(), encoded.as_slice())
+                .map_err(map_redb_err)?;
+            drop(hooks);
+            let mut by_trigger = write_txn
+                .open_table(SYSTEM_WEBHOOKS_BY_TRIGGER)
+                .map_err(map_redb_err)?;
+            by_trigger
+                .insert((row.trigger.as_str(), row.id.as_str()), &1u8)
+                .map_err(map_redb_err)?;
+        }
+        self.commit_write(write_txn)?;
+        Ok(row)
+    }
+
+    fn get_system_webhook(&self, id: &str) -> Result<Option<SystemWebhook>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let hooks = read_txn.open_table(SYSTEM_WEBHOOKS).map_err(map_redb_err)?;
+        match hooks.get(id).map_err(map_redb_err)? {
+            Some(guard) => Ok(Some(decode_json(guard.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn list_system_webhooks(&self) -> Result<Vec<SystemWebhook>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let hooks = read_txn.open_table(SYSTEM_WEBHOOKS).map_err(map_redb_err)?;
+        let mut out: Vec<SystemWebhook> = Vec::new();
+        for entry in hooks.iter().map_err(map_redb_err)? {
+            let (_, value) = entry.map_err(map_redb_err)?;
+            out.push(decode_json(value.value())?);
+        }
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(out)
+    }
+
+    fn put_system_webhook(&self, row: SystemWebhook) -> Result<SystemWebhook, PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            let mut hooks = write_txn.open_table(SYSTEM_WEBHOOKS).map_err(map_redb_err)?;
+            let previous: Option<SystemWebhook> = match hooks
+                .get(row.id.as_str())
+                .map_err(map_redb_err)?
+            {
+                Some(guard) => Some(decode_json(guard.value())?),
+                None => None,
+            };
+            let encoded = encode_json(&row)?;
+            hooks
+                .insert(row.id.as_str(), encoded.as_slice())
+                .map_err(map_redb_err)?;
+            drop(hooks);
+            if previous.as_ref().map(|hook| hook.trigger.as_str()) != Some(row.trigger.as_str())
+            {
+                let mut by_trigger = write_txn
+                    .open_table(SYSTEM_WEBHOOKS_BY_TRIGGER)
+                    .map_err(map_redb_err)?;
+                if let Some(previous) = previous.as_ref() {
+                    by_trigger
+                        .remove((previous.trigger.as_str(), previous.id.as_str()))
+                        .map_err(map_redb_err)?;
+                }
+                by_trigger
+                    .insert((row.trigger.as_str(), row.id.as_str()), &1u8)
+                    .map_err(map_redb_err)?;
+            }
+        }
+        self.commit_write(write_txn)?;
+        Ok(row)
+    }
+
+    fn delete_system_webhook(&self, id: &str) -> Result<bool, PortError> {
+        let write_txn = self.begin_write()?;
+        let removed = {
+            let mut hooks = write_txn.open_table(SYSTEM_WEBHOOKS).map_err(map_redb_err)?;
+            let previous: Option<SystemWebhook> = match hooks
+                .get(id)
+                .map_err(map_redb_err)?
+            {
+                Some(guard) => Some(decode_json(guard.value())?),
+                None => None,
+            };
+            let Some(previous) = previous else {
+                return Ok(false);
+            };
+            hooks.remove(id).map_err(map_redb_err)?;
+            drop(hooks);
+            let mut by_trigger = write_txn
+                .open_table(SYSTEM_WEBHOOKS_BY_TRIGGER)
+                .map_err(map_redb_err)?;
+            by_trigger
+                .remove((previous.trigger.as_str(), previous.id.as_str()))
+                .map_err(map_redb_err)?;
+            true
+        };
+        self.commit_write(write_txn)?;
+        Ok(removed)
+    }
+
+    fn active_system_webhooks_for(
+        &self,
+        trigger: &str,
+        limit: usize,
+    ) -> Result<Vec<SystemWebhook>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let by_trigger = read_txn
+            .open_table(SYSTEM_WEBHOOKS_BY_TRIGGER)
+            .map_err(map_redb_err)?;
+        let hooks = read_txn.open_table(SYSTEM_WEBHOOKS).map_err(map_redb_err)?;
+        let mut out = Vec::new();
+        for entry in by_trigger
+            .range((trigger, "")..=(trigger, "\u{10ffff}"))
+            .map_err(map_redb_err)?
+        {
+            let (key, _) = entry.map_err(map_redb_err)?;
+            let (_, hook_id) = key.value();
+            if let Some(guard) = hooks.get(hook_id).map_err(map_redb_err)? {
+                let hook: SystemWebhook = decode_json(guard.value())?;
+                if hook.is_active {
+                    out.push(hook);
+                    if out.len() >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl UserWebhookStore for RedbStore {
+    fn insert_user_webhook(&self, row: UserWebhook) -> Result<UserWebhook, PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            let mut hooks = write_txn.open_table(USER_WEBHOOKS).map_err(map_redb_err)?;
+            if hooks
+                .get(row.id.as_str())
+                .map_err(map_redb_err)?
+                .is_some()
+            {
+                drop(hooks);
+                let _ = write_txn.abort();
+                return Err(PortError::Conflict(format!(
+                    "user webhook {} already exists",
+                    row.id
+                )));
+            }
+            let encoded = encode_json(&row)?;
+            hooks
+                .insert(row.id.as_str(), encoded.as_slice())
+                .map_err(map_redb_err)?;
+            drop(hooks);
+            let mut by_owner = write_txn
+                .open_table(USER_WEBHOOKS_BY_OWNER)
+                .map_err(map_redb_err)?;
+            by_owner
+                .insert((row.owner_id.as_str(), row.id.as_str()), &1u8)
+                .map_err(map_redb_err)?;
+            drop(by_owner);
+            let mut by_trigger = write_txn
+                .open_table(USER_WEBHOOKS_BY_OWNER_TRIGGER)
+                .map_err(map_redb_err)?;
+            by_trigger
+                .insert(
+                    (row.owner_id.as_str(), row.trigger.as_str(), row.id.as_str()),
+                    &1u8,
+                )
+                .map_err(map_redb_err)?;
+        }
+        self.commit_write(write_txn)?;
+        Ok(row)
+    }
+
+    fn get_user_webhook(&self, id: &str) -> Result<Option<UserWebhook>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let hooks = read_txn.open_table(USER_WEBHOOKS).map_err(map_redb_err)?;
+        match hooks.get(id).map_err(map_redb_err)? {
+            Some(guard) => Ok(Some(decode_json(guard.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn list_user_webhooks(&self, owner_id: &str) -> Result<Vec<UserWebhook>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let by_owner = read_txn
+            .open_table(USER_WEBHOOKS_BY_OWNER)
+            .map_err(map_redb_err)?;
+        let hooks = read_txn.open_table(USER_WEBHOOKS).map_err(map_redb_err)?;
+        let mut out = Vec::new();
+        for entry in by_owner
+            .range((owner_id, "")..=(owner_id, "\u{10ffff}"))
+            .map_err(map_redb_err)?
+        {
+            let (key, _) = entry.map_err(map_redb_err)?;
+            let (_, hook_id) = key.value();
+            if let Some(guard) = hooks.get(hook_id).map_err(map_redb_err)? {
+                out.push(decode_json(guard.value())?);
+            }
+        }
+        out.sort_by(|a: &UserWebhook, b: &UserWebhook| a.id.cmp(&b.id));
+        Ok(out)
+    }
+
+    fn count_user_webhooks(&self, owner_id: &str) -> Result<usize, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let by_owner = read_txn
+            .open_table(USER_WEBHOOKS_BY_OWNER)
+            .map_err(map_redb_err)?;
+        let mut total = 0usize;
+        for entry in by_owner
+            .range((owner_id, "")..=(owner_id, "\u{10ffff}"))
+            .map_err(map_redb_err)?
+        {
+            entry.map_err(map_redb_err)?;
+            total = total.saturating_add(1);
+        }
+        Ok(total)
+    }
+
+    fn put_user_webhook(&self, row: UserWebhook) -> Result<UserWebhook, PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            let mut hooks = write_txn.open_table(USER_WEBHOOKS).map_err(map_redb_err)?;
+            let previous: Option<UserWebhook> = match hooks
+                .get(row.id.as_str())
+                .map_err(map_redb_err)?
+            {
+                Some(guard) => Some(decode_json(guard.value())?),
+                None => None,
+            };
+            let encoded = encode_json(&row)?;
+            hooks
+                .insert(row.id.as_str(), encoded.as_slice())
+                .map_err(map_redb_err)?;
+            drop(hooks);
+            let owner_moved = previous
+                .as_ref()
+                .map(|hook| hook.owner_id.as_str())
+                != Some(row.owner_id.as_str());
+            let trigger_moved = previous
+                .as_ref()
+                .map(|hook| hook.trigger.as_str())
+                != Some(row.trigger.as_str());
+            if owner_moved || previous.is_none() {
+                let mut by_owner = write_txn
+                    .open_table(USER_WEBHOOKS_BY_OWNER)
+                    .map_err(map_redb_err)?;
+                if let Some(previous) = previous.as_ref() {
+                    by_owner
+                        .remove((previous.owner_id.as_str(), previous.id.as_str()))
+                        .map_err(map_redb_err)?;
+                }
+                by_owner
+                    .insert((row.owner_id.as_str(), row.id.as_str()), &1u8)
+                    .map_err(map_redb_err)?;
+            }
+            if owner_moved || trigger_moved || previous.is_none() {
+                let mut by_trigger = write_txn
+                    .open_table(USER_WEBHOOKS_BY_OWNER_TRIGGER)
+                    .map_err(map_redb_err)?;
+                if let Some(previous) = previous.as_ref() {
+                    by_trigger
+                        .remove((
+                            previous.owner_id.as_str(),
+                            previous.trigger.as_str(),
+                            previous.id.as_str(),
+                        ))
+                        .map_err(map_redb_err)?;
+                }
+                by_trigger
+                    .insert(
+                        (row.owner_id.as_str(), row.trigger.as_str(), row.id.as_str()),
+                        &1u8,
+                    )
+                    .map_err(map_redb_err)?;
+            }
+        }
+        self.commit_write(write_txn)?;
+        Ok(row)
+    }
+
+    fn delete_user_webhook(&self, id: &str) -> Result<bool, PortError> {
+        let write_txn = self.begin_write()?;
+        let removed = {
+            let mut hooks = write_txn.open_table(USER_WEBHOOKS).map_err(map_redb_err)?;
+            let previous: Option<UserWebhook> = match hooks
+                .get(id)
+                .map_err(map_redb_err)?
+            {
+                Some(guard) => Some(decode_json(guard.value())?),
+                None => None,
+            };
+            let Some(previous) = previous else {
+                return Ok(false);
+            };
+            hooks.remove(id).map_err(map_redb_err)?;
+            drop(hooks);
+            let mut by_owner = write_txn
+                .open_table(USER_WEBHOOKS_BY_OWNER)
+                .map_err(map_redb_err)?;
+            by_owner
+                .remove((previous.owner_id.as_str(), previous.id.as_str()))
+                .map_err(map_redb_err)?;
+            drop(by_owner);
+            let mut by_trigger = write_txn
+                .open_table(USER_WEBHOOKS_BY_OWNER_TRIGGER)
+                .map_err(map_redb_err)?;
+            by_trigger
+                .remove((
+                    previous.owner_id.as_str(),
+                    previous.trigger.as_str(),
+                    previous.id.as_str(),
+                ))
+                .map_err(map_redb_err)?;
+            true
+        };
+        self.commit_write(write_txn)?;
+        Ok(removed)
+    }
+
+    fn active_user_webhooks_for(
+        &self,
+        owner_id: &str,
+        trigger: &str,
+        limit: usize,
+    ) -> Result<Vec<UserWebhook>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let by_trigger = read_txn
+            .open_table(USER_WEBHOOKS_BY_OWNER_TRIGGER)
+            .map_err(map_redb_err)?;
+        let hooks = read_txn.open_table(USER_WEBHOOKS).map_err(map_redb_err)?;
+        let mut out = Vec::new();
+        for entry in by_trigger
+            .range((owner_id, trigger, "")..=(owner_id, trigger, "\u{10ffff}"))
+            .map_err(map_redb_err)?
+        {
+            let (key, _) = entry.map_err(map_redb_err)?;
+            let (_, _, hook_id) = key.value();
+            if let Some(guard) = hooks.get(hook_id).map_err(map_redb_err)? {
+                let hook: UserWebhook = decode_json(guard.value())?;
+                if hook.is_active {
+                    out.push(hook);
+                    if out.len() >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl AbuseReportRecipientStore for RedbStore {
+    fn insert_recipient(
+        &self,
+        row: AbuseReportRecipient,
+    ) -> Result<AbuseReportRecipient, PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            let mut recipients = write_txn
+                .open_table(ABUSE_REPORT_RECIPIENTS)
+                .map_err(map_redb_err)?;
+            if recipients
+                .get(row.id.as_str())
+                .map_err(map_redb_err)?
+                .is_some()
+            {
+                drop(recipients);
+                let _ = write_txn.abort();
+                return Err(PortError::Conflict(format!(
+                    "abuse-report recipient {} already exists",
+                    row.id
+                )));
+            }
+            let encoded = encode_json(&row)?;
+            recipients
+                .insert(row.id.as_str(), encoded.as_slice())
+                .map_err(map_redb_err)?;
+        }
+        self.commit_write(write_txn)?;
+        Ok(row)
+    }
+
+    fn get_recipient(&self, id: &str) -> Result<Option<AbuseReportRecipient>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let recipients = read_txn
+            .open_table(ABUSE_REPORT_RECIPIENTS)
+            .map_err(map_redb_err)?;
+        match recipients.get(id).map_err(map_redb_err)? {
+            Some(guard) => Ok(Some(decode_json(guard.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn list_recipients(&self) -> Result<Vec<AbuseReportRecipient>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let recipients = read_txn
+            .open_table(ABUSE_REPORT_RECIPIENTS)
+            .map_err(map_redb_err)?;
+        let mut out: Vec<AbuseReportRecipient> = Vec::new();
+        for entry in recipients.iter().map_err(map_redb_err)? {
+            let (_, value) = entry.map_err(map_redb_err)?;
+            out.push(decode_json(value.value())?);
+        }
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(out)
+    }
+
+    fn put_recipient(
+        &self,
+        row: AbuseReportRecipient,
+    ) -> Result<AbuseReportRecipient, PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            let mut recipients = write_txn
+                .open_table(ABUSE_REPORT_RECIPIENTS)
+                .map_err(map_redb_err)?;
+            let encoded = encode_json(&row)?;
+            recipients
+                .insert(row.id.as_str(), encoded.as_slice())
+                .map_err(map_redb_err)?;
+        }
+        self.commit_write(write_txn)?;
+        Ok(row)
+    }
+
+    fn delete_recipient(&self, id: &str) -> Result<bool, PortError> {
+        let write_txn = self.begin_write()?;
+        let removed = {
+            let mut recipients = write_txn
+                .open_table(ABUSE_REPORT_RECIPIENTS)
+                .map_err(map_redb_err)?;
+            recipients
+                .remove(id)
+                .map_err(map_redb_err)?
+                .is_some()
+        };
+        self.commit_write(write_txn)?;
+        Ok(removed)
+    }
+
+    fn active_recipient_emails(&self, limit: usize) -> Result<Vec<String>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let recipients = read_txn
+            .open_table(ABUSE_REPORT_RECIPIENTS)
+            .map_err(map_redb_err)?;
+        let mut active: Vec<(String, String)> = Vec::new();
+        for entry in recipients.iter().map_err(map_redb_err)? {
+            let (_, value) = entry.map_err(map_redb_err)?;
+            let row: AbuseReportRecipient = decode_json(value.value())?;
+            if row.is_active {
+                active.push((row.id.clone(), row.email.clone()));
+            }
+        }
+        active.sort();
+        active.truncate(limit);
+        Ok(active.into_iter().map(|(_, email)| email).collect())
     }
 }
