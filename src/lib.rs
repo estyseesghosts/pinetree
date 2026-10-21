@@ -9,4 +9,5 @@ pub mod jobs;
 pub mod media;
 pub mod observability;
 pub mod persistence;
+pub mod shutdown;
 pub mod streaming;

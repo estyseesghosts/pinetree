@@ -1,0 +1,8 @@
+{
+  "public_url": "http://localhost:3000",
+  "data_dir": "/data",
+  "listen": "0.0.0.0:3000",
+  "mode": "single",
+  "max_file_size": 262144000,
+  "preserved_usernames": ["admin", "root", "system", "i"]
+}

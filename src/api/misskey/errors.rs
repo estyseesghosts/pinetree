@@ -26,6 +26,14 @@ pub const CREDENTIAL_REQUIRED_ID: &str = "1384574d-a912-4b81-8601-c7b1c4085df1";
 pub const PERMISSION_DENIED_ID: &str = "1370e5b7-d4eb-4566-bb1d-7748ee6a1838";
 pub const ACCESS_DENIED_ID: &str = "56f35758-7dd5-468b-8439-5d6fb8ec9b8e";
 pub const USER_SUSPENDED_ID: &str = "a8c724b3-6e9c-4b46-b1a8-bc3ed6258370";
+/// Misskey `SigninApiService.ts` idents (verbatim upstream UUIDs; the web
+/// `signin-flow` password login, `HANDOFF_auth-signin.md`). Upstream mints
+/// these inline (no `code`/`message`), so the codes/messages below are
+/// pinetree-chosen; clients match on `id`.
+pub const SIGNIN_NO_SUCH_USER_ID: &str = "6cc579cc-885d-43d8-95c2-b8c7fc963280";
+pub const SIGNIN_SUSPENDED_ID: &str = "e03a5f46-d309-4865-9b69-56282d94e1eb";
+pub const SIGNIN_INCORRECT_PASSWORD_ID: &str = "932c904e-9460-45b7-9ce6-7ed33be7eb2c";
+pub const SIGNIN_RATE_LIMITED_ID: &str = "22d05606-fbcf-421a-a2db-b32610dcfd1b";
 pub const RATE_LIMIT_EXCEEDED_ID: &str = "d5826d14-3982-4d2e-8011-b9e9f02499ef";
 pub const INVALID_PARAM_ID: &str = "3d81ceae-475f-4600-b2a8-2bc116157532";
 pub const UNSUPPORTED_FIELD_ID: &str = "9307f30c-4400-421c-bf2f-1e6a37d0f978";
@@ -390,6 +398,57 @@ impl ApiError {
             USER_SUSPENDED_ID,
             403,
         )
+    }
+
+    /// Misskey `signin-flow` unknown username (verbatim upstream id,
+    /// 404; `SigninApiService.ts` answers `{ error: { id } }` with no
+    /// code/message — the code/message here are pinetree-chosen).
+    pub fn signin_no_such_user() -> Self {
+        Self::client("No such user.", "NO_SUCH_USER", SIGNIN_NO_SUCH_USER_ID, 404)
+    }
+
+    /// Misskey `signin-flow` suspended account (verbatim upstream id,
+    /// 403). Checked before the password, like upstream (unlike the
+    /// legacy `signin` arm, which checks after).
+    pub fn signin_suspended() -> Self {
+        Self::permission(
+            "Your account has been suspended.",
+            "USER_SUSPENDED",
+            SIGNIN_SUSPENDED_ID,
+            403,
+        )
+    }
+
+    /// Misskey `signin-flow` wrong password / wrong totp (verbatim
+    /// upstream id, 403).
+    pub fn signin_incorrect_password() -> Self {
+        Self::client(
+            "Incorrect password.",
+            "INCORRECT_PASSWORD",
+            SIGNIN_INCORRECT_PASSWORD_ID,
+            403,
+        )
+    }
+
+    /// Misskey `signin-flow` IP rate limit (verbatim upstream
+    /// code/message/id, 429 with `Retry-After`).
+    pub fn signin_too_many_failures(retry_after_secs: u64) -> Self {
+        let mut err = Self::client(
+            "Too many failed attempts to sign in. Try again later.",
+            "TOO_MANY_AUTHENTICATION_FAILURES",
+            SIGNIN_RATE_LIMITED_ID,
+            429,
+        )
+        .with_info(Value::Object({
+            let mut info = Map::new();
+            info.insert(
+                "retryAfter".to_string(),
+                Value::Number(retry_after_secs.into()),
+            );
+            info
+        }));
+        err.retry_after_secs = Some(retry_after_secs);
+        err
     }
 
     /// 429 `RATE_LIMIT_EXCEEDED` with a `Retry-After` hint.

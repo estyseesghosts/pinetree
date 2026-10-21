@@ -147,23 +147,31 @@ pub fn build_router(state: ApiState) -> Router {
         .with_state(services);
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/ready", get(ready))
         .route("/files/{id}", get(serve_file))
         .route("/files/{id}/{name}", get(serve_file_named))
         .route("/identicon/{id}", get(identicon))
         .route("/miauth/{session}", get(miauth_page).post(miauth_submit))
         .route("/miauth/{session}/check", post(miauth_check))
         .route("/api/miauth/{session}/check", post(miauth_check))
-        .route("/signup", post(signup))
-        .route("/api/signup", post(signup))
-        .route("/signin", post(signin))
-        .route("/api/signin", post(signin))
+        .route("/signup", post(signup).options(preflight))
+        .route("/api/signup", post(signup).options(preflight))
+        .route("/signin", post(signin).options(preflight))
+        .route("/api/signin", post(signin).options(preflight))
+        // Misskey `signin-flow` (the web password login; `ApiServerService`
+        // mounts the whole API plugin at `/api`, so upstream serves it at
+        // `/api/signin-flow` — the dispatcher arm below covers that path.
+        // The bare `/signin-flow` alias matches no upstream route; it exists
+        // so direct callers work the same with or without the prefix).
+        .route("/signin-flow", post(signin_flow).options(preflight))
+        .route("/api/signin-flow", post(signin_flow).options(preflight))
         .route("/api/drive/files/create", post(drive_files_create))
         // Batch Q Phase 1 (item 9): the route `meta.mediaProxy`
         // (`{uri}/proxy`) advertises. Upstream shape is `/proxy/:url*`
         // with a `?url=` override, so both forms route here.
         .route("/proxy", get(proxy_media))
         .route("/proxy/{*rest}", get(proxy_media))
-        .route("/api/{*endpoint}", post(api_dispatch))
+        .route("/api/{*endpoint}", post(api_dispatch).options(preflight))
         .route("/streaming", get(streaming_handler))
         // No `DefaultBodyLimit::disable()`: the Misskey JSON dispatcher
         // enforces its own 1 MiB cap in `api_dispatch_blocking` (testable
@@ -173,8 +181,11 @@ pub fn build_router(state: ApiState) -> Router {
         .with_state(state)
         .merge(federation_routes)
         // Slice 7 (H2): every response carries `nosniff`, including error
-        // bodies and redirects.
+        // bodies and redirects. CORS (`*`, Misskey `@fastify/cors`
+        // `origin: '*'` parity — the frontend sends `credentials: 'omit'`,
+        // so no allow-credentials is needed) rides a second layer.
         .layer(axum::middleware::from_fn(nosniff_middleware))
+        .layer(axum::middleware::from_fn(cors_middleware))
 }
 
 /// Slice 7 (H2): global `X-Content-Type-Options: nosniff` for all
@@ -188,10 +199,67 @@ async fn nosniff_middleware(req: Request, next: axum::middleware::Next) -> Respo
     response
 }
 
+/// CORS simple-response support (Misskey `@fastify/cors` `origin: '*'`
+/// parity, `HANDOFF_auth-signin.md` §4). Every response carries
+/// `Access-Control-Allow-Origin: *`. Upstream's per-route
+/// `Access-Control-Allow-Origin: <config.url>` + `Allow-Credentials` on
+/// the signin routes is not copied: the frontend sends
+/// `credentials: 'omit'` (`misskey-api.ts`), so `*` without credentials
+/// is the working subset for split deployments.
+async fn cors_middleware(req: Request, next: axum::middleware::Next) -> Response {
+    let mut response = next.run(req).await;
+    response.headers_mut().insert(
+        HeaderName::from_static("access-control-allow-origin"),
+        HeaderValue::from_static("*"),
+    );
+    response
+}
+
+/// Answer a CORS preflight: 204 with `*` origin and the methods/headers
+/// the JSON API + web auth routes accept.
+async fn preflight() -> Response {
+    (
+        StatusCode::NO_CONTENT,
+        [
+            (
+                HeaderName::from_static("access-control-allow-origin"),
+                HeaderValue::from_static("*"),
+            ),
+            (
+                HeaderName::from_static("access-control-allow-methods"),
+                HeaderValue::from_static("GET, POST, OPTIONS"),
+            ),
+            (
+                HeaderName::from_static("access-control-allow-headers"),
+                HeaderValue::from_static("Content-Type, Authorization"),
+            ),
+        ],
+    )
+        .into_response()
+}
+
 // --- Small helpers ---------------------------------------------------------
 
 async fn healthz() -> &'static str {
     "ok"
+}
+
+/// Readiness probe: the durable store can serve a read.
+///
+/// The liveness probe (`/healthz`) answers as long as the process is up.
+/// Readiness additionally proves storage is readable, so an orchestrator
+/// stops routing traffic to a node whose database has gone bad instead of
+/// serving 500s. The read is a single-row lookup in the instance-settings
+/// table: cheap, side-effect free, and it exercises the same redb read path
+/// the API uses.
+async fn ready(State(state): State<ApiState>) -> (StatusCode, &'static str) {
+    match state.services.instance_settings.get() {
+        Ok(_) => (StatusCode::OK, "ready"),
+        Err(err) => {
+            eprintln!("readiness probe failed: {err}");
+            (StatusCode::SERVICE_UNAVAILABLE, "not ready")
+        }
+    }
 }
 
 fn session_cookie_value(raw_token: &str) -> String {
@@ -2265,6 +2333,152 @@ async fn signin(
     Ok(response)
 }
 
+/// Misskey `signin-flow` step failure: plain empty 400 (upstream
+/// `reply.code(400); return;` for a missing/misshaped `username`,
+/// `password`, or `token`) versus a JSON error envelope.
+enum SigninFlowError {
+    BadRequest,
+    Api(ApiError),
+}
+
+impl From<ApiError> for SigninFlowError {
+    fn from(err: ApiError) -> Self {
+        SigninFlowError::Api(err)
+    }
+}
+
+/// Misskey `signin-flow` (upstream `SigninApiService.signin`): the
+/// multi-step password login the web frontend (`MkSignin.vue`) drives:
+///
+/// 1. `{ username }` → `200 { finished: false, next: 'captcha' }`
+///    (upstream answers `'password'` when the account has 2FA; pinetree
+///    accounts never do, so the hint is always `'captcha'` — both hints
+///    render the same password page, the flag only toggles captcha).
+/// 2. `{ username, password, [captcha responses] }` →
+///    `200 { finished: true, id, i }` on success, `403` incorrect-password
+///    otherwise. Unknown usernames are `404`, suspended accounts `403`,
+///    both before any password check (upstream order).
+///
+/// `token` (totp) and `credential` (passkey) fields are accepted and
+/// ignored: no account can have 2FA/security keys yet (packers hardcode
+/// `twoFactorEnabled: false`), so upstream's `!twoFactorEnabled` branch
+/// — which ignores both and checks only the password — is the whole
+/// reachable surface. Captcha verification is skipped the same way
+/// upstream skips it when no captcha provider is configured.
+///
+/// DIVERGENCES from upstream: no `2fa`/`passkey` `next` hints (nothing to
+/// enroll them with); throttling reuses the `auth/signin` failure-counted
+/// bucket (10/account + 30/IP per minute) instead of upstream's IP-only
+/// 10/hour + 1s min-interval, answering the verbatim upstream
+/// `TOO_MANY_AUTHENTICATION_FAILURES` id on 429; unknown fields are
+/// ignored rather than `UNSUPPORTED_FIELD`-rejected (upstream performs no
+/// field check on this route); the success response sets no session
+/// cookie (upstream `SigninService.signin` sets none either).
+async fn do_signin_flow(
+    state: &ApiState,
+    obj: &Map<String, Value>,
+    ip: &str,
+    headers: &HeaderMap,
+) -> Result<Value, SigninFlowError> {
+    // Upstream only rejects a non-string `username` (`typeof username !==
+    // 'string'` → 400); an empty string proceeds to the lookup and answers
+    // 404 like any unknown name.
+    let username = match obj.get("username").and_then(Value::as_str) {
+        Some(username) => username.to_string(),
+        _ => return Err(SigninFlowError::BadRequest),
+    };
+    if let Some(token) = obj.get("token") {
+        if !token.is_null() && token.as_str().is_none() {
+            return Err(SigninFlowError::BadRequest);
+        }
+    }
+    // Throttle before any lookup or hash check (same failure-counted
+    // bucket as the legacy `signin` arm).
+    let acct_key = auth_account_key(&username);
+    let ip_key = auth_ip_key(ip);
+    if let Err(throttled) = state
+        .rate_limiter
+        .check_auth_failures("auth/signin", &acct_key, &ip_key)
+    {
+        return Err(SigninFlowError::Api(ApiError::signin_too_many_failures(
+            throttled.retry_after_secs.unwrap_or(60),
+        )));
+    }
+    let found = state
+        .services
+        .accounts
+        .find_by_username_and_host(&username, None)
+        .map_err(ApiError::from_port_error)?;
+    let Some(account) = found else {
+        // Unknown usernames record nothing, so the history never reveals
+        // whether a name exists (same rule as `do_signin`).
+        return Err(SigninFlowError::Api(ApiError::signin_no_such_user()));
+    };
+    // Suspended accounts are refused before the password verifies
+    // (upstream `SigninApiService.ts` order; no history row, like
+    // upstream's direct `error()` return).
+    if account.is_suspended {
+        return Err(SigninFlowError::Api(ApiError::signin_suspended()));
+    }
+    let password = match obj.get("password") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(password)) => Some(password.clone()),
+        Some(_) => return Err(SigninFlowError::BadRequest),
+    };
+    let Some(password) = password else {
+        return Ok(serde_json::json!({ "finished": false, "next": "captcha" }));
+    };
+    let stored = state
+        .services
+        .auth
+        .get_password_hash(&account.id)
+        .map_err(ApiError::from_port_error)?;
+    if !verify_and_upgrade_password(state, &account.id, &password, stored).await? {
+        state
+            .rate_limiter
+            .record_auth_failure("auth/signin", &acct_key, &ip_key);
+        record_signin_attempt(&state.services, &account.id, ip, headers, false);
+        return Err(SigninFlowError::Api(ApiError::signin_incorrect_password()));
+    }
+    let raw_token = generate_random_token();
+    state
+        .services
+        .auth
+        .store_token(ApiTokenRecord {
+            id: state.services.ids.generate(),
+            token_hash: hash_token(&raw_token),
+            account_id: account.id.clone(),
+            permissions: Vec::new(),
+            is_first_party: true,
+            name: None,
+            description: None,
+            icon_url: None,
+            created_at_ms: state.services.clock.now_ms(),
+        })
+        .map_err(ApiError::from_port_error)?;
+    record_signin_attempt(&state.services, &account.id, ip, headers, true);
+    Ok(serde_json::json!({
+        "finished": true,
+        "id": account.id,
+        "i": raw_token,
+    }))
+}
+
+async fn signin_flow(
+    State(state): State<ApiState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let obj = parse_json_body(&body)?;
+    let ip = client_ip(peer, &headers, &state.trusted_proxies);
+    match do_signin_flow(&state, &obj, &ip, &headers).await {
+        Ok(value) => Ok(Json(value).into_response()),
+        Err(SigninFlowError::BadRequest) => Ok(StatusCode::BAD_REQUEST.into_response()),
+        Err(SigninFlowError::Api(err)) => Err(err),
+    }
+}
+
 // --- Drive upload ----------------------------------------------------------
 
 fn decode_base64(input: &str) -> Option<Vec<u8>> {
@@ -2831,6 +3045,31 @@ fn api_dispatch_blocking(
             }))
             .into_response())
         }
+
+        // Misskey `signin-flow` over the JSON dispatcher (what the web
+        // frontend calls: `POST /api/signin-flow`). Same state machine as
+        // the dedicated `signin_flow` handler; the plain-400 validation
+        // failures answer as empty 400s here too.
+        "signin-flow" => {
+            match tokio::runtime::Handle::current()
+                .block_on(do_signin_flow(&state, &obj, &client_ip, &headers))
+            {
+                Ok(value) => Ok(Json(value).into_response()),
+                Err(SigninFlowError::BadRequest) => {
+                    Ok(StatusCode::BAD_REQUEST.into_response())
+                }
+                Err(SigninFlowError::Api(err)) => Err(err),
+            }
+        }
+
+        // Misskey `signin-with-passkey` stub (DIVERGENCE): pinetree stores
+        // no WebAuthn credentials and runs no challenge ceremony, so both
+        // the init call (`{}` → `{ option, context }`) and the verify call
+        // are refused with a plain message instead of `UNKNOWN_API_ENDPOINT`.
+        "signin-with-passkey" => Err(ApiError::invalid_param(
+            "credential",
+            "passkey sign-in is not supported by this server",
+        )),
 
         "i" => {
             check_allowed_fields(&obj, &[])?;
@@ -10626,6 +10865,197 @@ mod tests {
         let token = value["token"].as_str().unwrap().to_string();
         let id = value["id"].as_str().unwrap().to_string();
         (id, token)
+    }
+
+    /// `signin-flow` contract (`HANDOFF_auth-signin.md`): the exact
+    /// request/response shapes `MkSignin.vue` drives — username-only step
+    /// returns the `captcha` hint, the password step mints a first-party
+    /// token usable as `i`, and the upstream error ids are verbatim.
+    #[tokio::test]
+    async fn signin_flow_password_login_roundtrip() {
+        let (state, _) = test_state();
+        let (alice_id, _) = signup_user(&state, "alice").await;
+
+        let (status, value) = call(
+            &state,
+            "signin-flow",
+            serde_json::json!({ "username": "alice" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value["finished"], false);
+        assert_eq!(value["next"], "captcha");
+
+        let (status, value) = call(
+            &state,
+            "signin-flow",
+            serde_json::json!({ "username": "alice", "password": "s3cret-pw" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value["finished"], true);
+        assert_eq!(value["id"], alice_id);
+        let token = value["i"].as_str().expect("flow mints i").to_string();
+
+        let (status, me) = call(&state, "i", serde_json::json!({}), Some(&token)).await;
+        assert_eq!(status, StatusCode::OK, "{me}");
+        assert_eq!(me["id"], alice_id);
+    }
+
+    #[tokio::test]
+    async fn signin_flow_unknown_user_is_404_no_such_user() {
+        let (state, _) = test_state();
+        let (status, value) = call(
+            &state,
+            "signin-flow",
+            serde_json::json!({ "username": "nobody", "password": "whatever" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{value}");
+        assert_eq!(value["error"]["id"], "6cc579cc-885d-43d8-95c2-b8c7fc963280");
+    }
+
+    #[tokio::test]
+    async fn signin_flow_wrong_password_is_403_incorrect_password() {
+        let (state, _) = test_state();
+        signup_user(&state, "alice").await;
+        let (status, value) = call(
+            &state,
+            "signin-flow",
+            serde_json::json!({ "username": "alice", "password": "wrong-pw" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{value}");
+        assert_eq!(value["error"]["id"], "932c904e-9460-45b7-9ce6-7ed33be7eb2c");
+    }
+
+    #[tokio::test]
+    async fn signin_flow_missing_or_misshaped_fields_are_empty_400() {
+        let (state, _) = test_state();
+        signup_user(&state, "alice").await;
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({ "username": 42 }),
+            serde_json::json!({ "username": "alice", "password": 42 }),
+            serde_json::json!({ "username": "alice", "password": "s3cret-pw", "token": 42 }),
+        ] {
+            let (status, value) = call(&state, "signin-flow", body, None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+            // Plain empty 400: no JSON error envelope, like upstream's
+            // `reply.code(400); return;`.
+            assert!(value.is_null(), "{value}");
+        }
+    }
+
+    #[tokio::test]
+    async fn signin_flow_empty_username_is_404_no_such_user() {
+        // Upstream only 400s a non-string `username`; `""` proceeds to the
+        // lookup and answers 404 like any unknown name.
+        let (state, _) = test_state();
+        let (status, value) = call(
+            &state,
+            "signin-flow",
+            serde_json::json!({ "username": "" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{value}");
+        assert_eq!(value["error"]["id"], "6cc579cc-885d-43d8-95c2-b8c7fc963280");
+    }
+
+    #[tokio::test]
+    async fn signin_flow_suspended_is_403_before_password_check() {
+        let (state, _) = test_state();
+        let (alice_id, _) = signup_user(&state, "alice").await;
+        state
+            .services
+            .suspend_user(&alice_id, &alice_id)
+            .expect("suspend alice");
+        // Correct password still refuses: the suspension gate runs before
+        // the password check (upstream order).
+        let (status, value) = call(
+            &state,
+            "signin-flow",
+            serde_json::json!({ "username": "alice", "password": "s3cret-pw" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{value}");
+        assert_eq!(value["error"]["id"], "e03a5f46-d309-4865-9b69-56282d94e1eb");
+    }
+
+    #[tokio::test]
+    async fn signin_flow_ignores_totp_token_without_2fa() {
+        let (state, _) = test_state();
+        signup_user(&state, "alice").await;
+        // No account can enroll 2FA yet, so upstream's `!twoFactorEnabled`
+        // branch (password-only, token ignored) is the whole surface.
+        let (status, value) = call(
+            &state,
+            "signin-flow",
+            serde_json::json!({ "username": "alice", "password": "s3cret-pw", "token": "123456" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value["finished"], true);
+    }
+
+    #[tokio::test]
+    async fn signin_flow_repeated_failures_throttle_with_upstream_id() {
+        let (mut state, clock) = test_state();
+        signup_user(&state, "alice").await;
+        // Small account cap; same bucket the legacy `signin` arm uses.
+        state.rate_limiter = Arc::new(
+            RateLimiter::new(clock.clone()).with_auth_limit("auth/signin", 3, 30, 60_000),
+        );
+        let bad = serde_json::json!({ "username": "alice", "password": "wrong-pw" });
+        let good = serde_json::json!({ "username": "alice", "password": "s3cret-pw" });
+
+        let (status, _) = call(&state, "signin-flow", bad.clone(), None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        // Right after a failure the progressive delay refuses with the
+        // verbatim upstream id (not pinetree's `RATE_LIMIT_EXCEEDED`).
+        let (status, value) = call(&state, "signin-flow", bad.clone(), None).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{value}");
+        assert_eq!(value["error"]["id"], "22d05606-fbcf-421a-a2db-b32610dcfd1b");
+
+        clock.advance_ms(1_000);
+        let (status, _) = call(&state, "signin-flow", bad.clone(), None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        clock.advance_ms(2_000);
+        let (status, _) = call(&state, "signin-flow", bad, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        // Account cap reached: even the right password waits for the window.
+        let (status, value) = call(&state, "signin-flow", good.clone(), None).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{value}");
+        assert_eq!(value["error"]["id"], "22d05606-fbcf-421a-a2db-b32610dcfd1b");
+        clock.advance_ms(60_000);
+        let (status, value) = call(&state, "signin-flow", good, None).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value["finished"], true);
+    }
+
+    #[tokio::test]
+    async fn signin_with_passkey_is_400_unsupported() {
+        let (state, _) = test_state();
+        let (status, value) = call(&state, "signin-with-passkey", serde_json::json!({}), None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["error"]["code"], "INVALID_PARAM");
+    }
+
+    #[tokio::test]
+    async fn preflight_answers_204_with_cors_headers() {
+        let response = preflight().await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let headers = response.headers();
+        assert_eq!(headers["access-control-allow-origin"], "*");
+        assert!(headers.contains_key("access-control-allow-methods"));
+        assert!(headers.contains_key("access-control-allow-headers"));
     }
 
     /// Slice 10: API writes do not wait for peers. The follower's inbox

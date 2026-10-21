@@ -1,5 +1,6 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use pinetree::api::misskey::auth::hash_password;
@@ -341,7 +342,12 @@ async fn main() {
         lease_duration_ms: 30_000,
         base_backoff_ms: 1_000,
     });
-    let _worker_handle = worker.clone().spawn(Duration::from_millis(50));
+    // The worker stops claiming new jobs once `stop` is set (see the
+    // shutdown arm below). A job claimed but not settled keeps its lease;
+    // the lease expires and the next process to start reclaims it, so no
+    // work is lost across a restart.
+    let stop = Arc::new(AtomicBool::new(false));
+    let _worker_handle = worker.clone().spawn_until(Duration::from_millis(50), stop.clone());
     let mut rate_limiter = RateLimiter::with_misskey_defaults(services.clock.clone());
     if debug_weak_rate_limits_flag {
         // Load tests only: 10x the endpoint bucket counts (same factor as birchtree).
@@ -363,10 +369,22 @@ async fn main() {
         .await
         .expect("bind listener");
     // Client IPs come from the TCP peer (`ConnectInfo`), not from headers.
+    //
+    // On `SIGTERM` (how a container runtime stops a container) the worker
+    // stops claiming jobs and the HTTP server stops accepting connections
+    // while the in-flight ones finish. Without this the default `SIGTERM`
+    // disposition kills the process mid-request and cuts streaming sockets
+    // without a close frame.
+    let shutdown = async move {
+        pinetree::shutdown::signal().await;
+        stop.store(true, Ordering::Relaxed);
+        eprintln!("shutdown signal received; draining in-flight requests");
+    };
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(shutdown)
     .await
     .expect("serve axum");
 }

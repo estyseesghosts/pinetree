@@ -916,3 +916,93 @@ back to ❤ through the Gap-4 reaction gate instead of erroring; the toggle
 catch in Sharkey's `like.ts` targets an error id its own `create` no longer
 throws — pinetree implements the toggle the endpoint advertises (same →
 unlike, different → replace, matching Catodon's documented replace rule).
+
+## §42 — Web `signin-flow` + CORS (handoff `HANDOFF_auth-signin.md`, 2026-10-21)
+
+Status: ADDENDUM only. Closes the handoff: Kissme (`split-project`)
+password login works with no client workaround. Code: `signin_flow` /
+`do_signin_flow` / `preflight` / `cors_middleware` (`mod.rs`), four new
+`ApiError` constructors (`errors.rs`).
+
+### 42.1 Endpoint inventory (Misskey `2026.10.1-alpha.0` reference)
+
+`ApiServerService` mounts the whole API plugin at `/api`, so the web
+routes below are served under `/api/*` upstream (same as pinetree's
+`/api/{*endpoint}` wildcard + dedicated aliases):
+
+| Route (upstream) | pinetree | Notes |
+|---|---|---|
+| `POST /api/signin-flow` (`SigninApiService.signin`) | ✅ `signin-flow` dispatcher arm + `POST /signin-flow`, `POST /api/signin-flow` aliases | Full state machine below; error ids verbatim |
+| `POST /api/signin-with-passkey` (`SigninWithPasskeyApiService`) | ⚠️ stub → `400 INVALID_PARAM` ("passkey sign-in is not supported") | Pinetree stores no WebAuthn credentials; only hit when the user clicks passkey |
+| `POST /api/signup`, `POST /api/signup-pending` | ✅ `signup` / ❌ `signup-pending` (no approval flow; stays 404) | Unchanged by this handoff |
+| `POST /api/signin` (legacy) | ✅ unchanged (pinetree compat extension — upstream `develop` has no `endpoints/signin.ts` and no `/signin` web route; `endpoint-list.ts` + `ApiServerService.ts` verified 2026-10-21) | "Add, don't alter" — byte-identical behavior kept |
+| `auth/session/generate|show|userkey`, `auth/accept` | ✅ (pre-existing) | DIVERGENCE kept: any `appSecret` accepted at generate, verified at userkey (`NO_SUCH_APP` has nothing to check against — no app registry); approval window 30 min (upstream: none) |
+| `miauth/gen-token`, `GET/POST /miauth/:session`, `/miauth/:session/check` (+ `/api` alias) | ✅ (pre-existing) | Unchanged |
+| `app/create`, `app/show` | ❌ 404 (no app registry) | Open; legacy `auth/*` flow does not need it |
+| `/oauth/*` (`OAuth2ProviderService`, prefix `/oauth`: `GET /authorize`, `POST /decision`, `POST /` token exchange `authorization_code` + PKCE, `ALL /*` → 404 `UNKNOWN_OAUTH_ENDPOINT`) | ❌ no `/oauth` routes | Open gap, documented only — out of this handoff's DoD (no reference client exercises it) |
+
+### 42.2 The `signin-flow` state machine (upstream `SigninApiService.ts`)
+
+1. `{ username }` (no `password`) → `200 { finished: false, next }` where
+   `next = 'captcha'` (pinetree accounts never have 2FA/security keys, so
+   upstream's `'password'`-for-2FA branch is unreachable; both hints render
+   the same password page).
+2. `{ username, password, [captcha responses…] }` → `200 { finished: true, id, i }`;
+   `i` is a freshly minted first-party app token, identified by `POST /api/i`
+   exactly like the legacy `signin` token (DIVERGENCE: upstream
+   `SigninService.signin` returns the account's stored `user.token`, so
+   repeated logins yield the same `i`; pinetree mints a new token per login.
+   Both resolve via the same `authenticate()` path, so no client observes a
+   difference except token rotation).
+3. Unknown username → `404` id `6cc579cc-885d-43d8-95c2-b8c7fc963280` (no
+   history row); suspended account → `403` id
+   `e03a5f46-d309-4865-9b69-56282d94e1eb` **before** the password check
+   (upstream order — the legacy arm checks after, kept as-is); wrong
+   password → `403` id `932c904e-9460-45b7-9ce6-7ed33be7eb2c` + failure
+   history row; throttled → `429` code `TOO_MANY_AUTHENTICATION_FAILURES`
+   id `22d05606-fbcf-421a-a2db-b32610dcfd1b`; missing/non-string `username`,
+   non-string `password`, or non-string non-null `token` → plain empty 400
+   (an empty-string `username` is a string, so upstream looks it up and
+   answers 404 — pinetree matches since 2026-10-21).
+4. `token` (totp) and `credential` (passkey) are accepted and ignored —
+   upstream's `!twoFactorEnabled` branch does exactly this, and it is the
+   only reachable branch here. Captcha verification is skipped the same way
+   upstream skips it with no provider configured. Success mints the token,
+   appends the success history row, and sets **no** cookie (upstream
+   `SigninService.signin` sets none). Only failures are throttle-counted, so
+   success is never blocked by earlier successes.
+
+### 42.3 Token semantics (unchanged)
+
+`signin` → `{ id, token, i, user: MeDetailed }` + session cookie;
+`signin-flow` → `{ finished, id?, i? }` (no `user`, no cookie — the client
+fetches it via `i`); both `i` values are first-party tokens resolved by the
+same `authenticate()` path (`Authorization: Bearer` → body `i` → cookie).
+MiAuth mints non-first-party scoped tokens; legacy `auth/*` mints
+unscoped tokens on accept.
+
+### 42.4 CORS (upstream `@fastify/cors { origin: '*' }` parity)
+
+Every response carries `Access-Control-Allow-Origin: *` (`cors_middleware`);
+`OPTIONS` on `/api/{*endpoint}`, `/signin`, `/api/signin`, `/signup`,
+`/api/signup`, `/signin-flow`, `/api/signin-flow` answers `204` with
+`Allow-Methods: GET, POST, OPTIONS` and
+`Allow-Headers: Content-Type, Authorization` (`preflight`). Upstream's
+per-route `Allow-Origin: <config.url>` + `Allow-Credentials` on the signin
+routes is not copied — the frontend sends `credentials: 'omit'`, so `*`
+without credentials is the working subset.
+
+### 42.5 Contract tests
+
+`mod.rs` tests: `signin_flow_password_login_roundtrip` (hint → mint → `i`
+resolves), `_unknown_user_is_404_no_such_user`,
+`_empty_username_is_404_no_such_user` (empty string looks up → 404, upstream
+parity),
+`_wrong_password_is_403_incorrect_password`,
+`_missing_or_misshaped_fields_are_empty_400` (also pins the empty body),
+`_suspended_is_403_before_password_check`,
+`_ignores_totp_token_without_2fa`,
+`_repeated_failures_throttle_with_upstream_id` (progressive-delay 429 then
+cap 429, both with the upstream id; window expiry restores login),
+`signin_with_passkey_is_400_unsupported`,
+`preflight_answers_204_with_cors_headers`.

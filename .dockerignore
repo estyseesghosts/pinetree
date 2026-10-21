@@ -1,0 +1,20 @@
+# Build artefacts
+/target/
+/data/
+
+# Version control and CI
+/.git/
+/.github/
+
+# Logs, bench output, local scratch
+/state/bench-results/
+/state/logs/
+*.log
+.env
+.env.local
+
+# Reference checkouts (git-ignored symlinks; large)
+foundationdb/
+redb/
+misskey
+sharkey

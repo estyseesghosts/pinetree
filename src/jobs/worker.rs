@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::api::misskey::packers::{
     pack_emoji_detailed, pack_note, pack_notification, pack_user_detailed_not_me,
@@ -784,8 +785,24 @@ impl JobWorker {
         self: Arc<Self>,
         poll_interval: std::time::Duration,
     ) -> tokio::task::JoinHandle<()> {
+        self.spawn_until(poll_interval, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Spawn the worker loop until `stop` is set.
+    ///
+    /// `spawn` is the never-stopping variant (tests, embedding). A server
+    /// that owns a shutdown signal uses `spawn_until` so the loop parks
+    /// between polls instead of racing the process exit: a job claimed but
+    /// not settled keeps its lease, the lease expires, and the next process
+    /// to start reclaims it. No work is lost either way, but the shutdown
+    /// path stops taking new jobs while the HTTP server drains.
+    pub fn spawn_until(
+        self: Arc<Self>,
+        poll_interval: std::time::Duration,
+        stop: Arc<AtomicBool>,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            loop {
+            while !stop.load(Ordering::Relaxed) {
                 let this = Arc::clone(&self);
                 // `process_one` already quarantines handler panics via
                 // `catch_unwind`; this outer catch only guards panics that
