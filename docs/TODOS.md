@@ -36,39 +36,39 @@ Conventions: `- [ ]` = open, `- [x]` = done (move to log, don't delete the line)
 - [x] Shared-blob refcount: `delete_media` drops row+bytes non-atomically (`application/commands/media.rs:211-216`) — fix before eviction. — LANDED 2026-10-21: `delete_media_record` decrements in-txn, bytes deleted only at refcount 0 outside txn, reconciler sweeps the rest.
 - [x] Stream-to-disk under byte cap (local upload + remote fetch hold full bodies in RAM: `media/remote_cache.rs:174,232-254`). — LANDED 2026-10-21: `fetch_stream.rs` stages to disk under cap with mid-stream abort + `import_file`; transport (`SafeHttpClient`) buffering is a documented follow-up, not a cap hole.
 - [ ] Backup/snapshot/restore for `pinetree.redb` + `blobs/` (crash-between-row-and-blob orphans; plan `:44-46`).
-- [ ] `drive/files/find|move-bulk|check-existence|attached-notes|attached-chat-messages` — missing (`→404`).
-- [ ] Thumbnails/transcoding/variants/`Range`/avatar-emoji static variants (declared-out; `thumbnail_url` always `None`).
+- [x] `drive/files/find|move-bulk|check-existence|attached-notes` — LANDED 2026-10-21 (gaps WP2a final; manifest §43.1). Still OPEN: `attached-chat-messages` (no chat model, SKIP stays).
+- [ ] Thumbnails/`Range`/avatar-emoji static variants (declared-out; `thumbnail_url` = own url until the thumbnail route exists). Transcode itself LANDED 2026-10-21 (WP1; WebM/VP9+WebP, toolchain gate; manifest §43.9).
 
 ## P1 — client-visible API holes (all → 404 `endpoints/mod.rs:9122` unless noted)
 
-- [ ] `[declared-out]` `drive/folders/*` + `drive` + `drive/stream`; `folderId` non-null rejected everywhere.
-- [ ] `[declared-out]` `channels/*` (16 endpoints).
-- [ ] `[declared-out]` `chat/*` (~25 incl. rooms/invitations).
-- [ ] `announcements(+/show)` + `i/read-announcement` + `promo/read` — badge never clears.
-- [ ] `following/update|update-all|list` + `following/requests/sent` — per-follow `withReplies`, bulk list, outgoing-review.
-- [ ] `[declared-out]` `hashtags/*` (list/search/show/trend/users); only `notes/search-by-tag` exists.
-- [ ] `[declared-out]` `notes/thread-muting/create|delete` (manifest §11).
-- [ ] `i/2fa/*` (8) + `my/apps` + `app/create|show`.
-- [ ] `users/update-memo`, `notes/show-partial-bulk` (N×`show` fallback), `notifications/create`, `notes/polls/recommendation`, `notes/clips` (renamed `clips/notes` exists — alias or document).
-- [ ] Admin families: [x] bulk/remote/copy/import-zip emoji — LANDED 2026-10-20 (manifest §40.1; `tests/emoji_admin_bulk.rs` 14 green). Still open: `admin/roles|queue|relays|webhook|ad|announcements|federation|stats|user-ips|send-email|server-info|proxy-account|mfa|reset-password`, abuse-report notification recipients.
-- [ ] Misc: `users/achievements|flashs|gallery/posts|pages|get-following-*-by-birthday|get-frequently-replied-users`, `users/lists/create-from-public`, `ping`, `page-push`, `retention`, `reset-db`, `export-custom-emojis` ([x] LANDED 2026-10-20, manifest §40.1), `sw/*`, `v2/admin/emoji/list`, `endpoint(s)`.
+- [x] `drive/folders/*` + `drive` + `drive/stream` — LANDED 2026-10-21 (gaps WP2a final; real folder model, `folderId` non-null, `drive/stream`; streaming `drive` channel in §43.8; manifest §43.1). No longer declared-out.
+- [ ] `[declared-out, SKIP 2026-10-21]` `channels/*` (16 endpoints). Code REMOVED from the tree (Misskey's implementation conflicts with pinetree's direction) — endpoints keep 404ing per the owner SKIP order (`docs/gaps.md:5`).
+- [ ] `[declared-out, SKIP 2026-10-21]` `chat/*` (~25 incl. rooms/invitations). Code REMOVED from the tree — endpoints keep 404ing per the owner SKIP order.
+- [x] `announcements(+/show)` + `i/read-announcement` + `promo/read` — LANDED 2026-10-21 (gaps WP2b final; badge clears on read; manifest §43.6).
+- [x] `following/update|update-all|list` + `following/requests/sent` — LANDED 2026-10-21 (gaps WP2a final; `following/list` op + report-specified update/sent ops; manifest §43.2).
+- [x] `hashtags/*` (list/search/show/trend/users) — LANDED 2026-10-21 (gaps WP2b final; manifest §43.6). No longer declared-out; `notes/search-by-tag` stays the note-search answer.
+- [x] `notes/thread-muting/create|delete` — LANDED 2026-10-21 (gaps WP2a final; manifest §43.2). Manifest §11 "stays out" line superseded.
+- [x] `i/2fa/*` (8) + `my/apps` + `app/create|show` — LANDED 2026-10-21 (gaps WP2c final; TOTP supported, WebAuthn 400 documented; manifest §43.3).
+- [x] `users/update-memo`, `notes/show-partial-bulk`, `notes/polls/recommendation`, `notes/clips` (alias of `clips/notes`), `users/pages`, `users/lists/create-from-public` — LANDED 2026-10-21 (gaps WP2a final; manifest §43.2). Still OPEN from this line: `notifications/create`, `users/achievements|flashs|get-following-*-by-birthday|get-frequently-replied-users`.
+- [x] Admin families: bulk/remote/copy/import-zip emoji (LANDED 2026-10-20) + `admin/roles|queue|relays|webhook|ad|announcements|federation|stats|user-ips|send-email|server-info|proxy-account|mfa|reset-password` + abuse-report notification recipients — LANDED 2026-10-21 (gaps WP2b/WP2c/WP3 final; `queue/*` = stats real + delay/clear loud 400; manifest §43.5/§43.7).
+- [x] Misc `gallery/posts`, `users/pages`, `users/lists/create-from-public`, `ping`, `retention`, `reset-db` (loud 400), `sw/*`, `v2/admin/emoji/list`, `endpoint(s)` (+ `export-custom-emojis` LANDED 2026-10-20) — LANDED 2026-10-21 (gaps WP2a/WP2b/WP2c final; gallery/flash shapes in manifest §43.6). Still OPEN from this line: `users/achievements|flashs|get-following-*-by-birthday|get-frequently-replied-users`, `page-push` (not an identifiable Misskey endpoint, stays 404 truly-unknown).
 
 ## P1 — streaming holes
 
-- [ ] Missing channels (→ `UNSUPPORTED_CHANNEL`): `hashtag`, `roleTimeline`, `channel`, `drive`, `serverStats`/`queueStats`, `admin`, `clip`, `chatUser`/`chatRoom`, `reversi`/`reversiGame` (`streaming/server.rs:410-425`). All `[declared-out]` except decide `clip`/`drive`/`hashtag` fate for upload-progress/badge clients.
-- [ ] Missing `main` events: `unreadNotification`, `unreadAntenna`/`readAntenna`, `readAllAnnouncements`/`announcementCreated`, `myTokenRegenerated`, `signin`, `registryUpdated`, `driveFileCreated`, `urlUploadFinished`, `pageEvent`, `newChatMessage` (`events.rs:65-83` ends at `NotificationFlushed`).
+- [x] Missing channels — LANDED 2026-10-21 (gaps WP4 final; manifest §43.8): `hashtag`, `roleTimeline` (silent, DIVERGENCE), `drive` (bodies `{id}` until folder packer, DIVERGENCE), `serverStats`/`queueStats` (snapshot + `statsLog`, no 1 s broadcast, DIVERGENCE), `admin`, `clip`. Stay OUT by decision: `chatUser`/`chatRoom`, `reversi`/`reversiGame` (no model; REST unwired per SKIP), `channel`. All other listed channels were never missing.
+- [x] Missing `main` events — LANDED 2026-10-21 (gaps WP4 final; manifest §43.8): all remaining keys (`unreadNotification`, `unreadAntenna`/`readAntenna`, `readAllAnnouncements`/`announcementCreated`, `myTokenRegenerated`, `signin`, `registryUpdated`, `driveFileCreated`, `urlUploadFinished`, `pageEvent`, `newChatMessage`) forwarded generically; owning-command emission rides the final-wiring commit.
 - [x] Missing broadcast `emojiAdded/Updated/Deleted` — LANDED 2026-10-20: `StreamingEvent::EmojiBroadcast` + `push_broadcast` + `{type,body}`-to-all dispatch; contract tests in `tests/emoji_streaming_transfer.rs` (manifest §40.2).
-- [ ] `reacted` lacks optional `emoji` detail (`server.rs:641-646` vs upstream `NoteEventTypes:117-123`).
-- [ ] `userList` ignores `withFiles/withRenotes` (`server.rs:399`).
-- [ ] `pollEnded`-as-`noteUpdated` is a pinetree extension stock clients ignore — also emit the `pollEnded` *notification* or document handling.
+- [x] `reacted` lacks optional `emoji` detail — LANDED 2026-10-21 (`{name, url} | null`, fail-open to null; manifest §43.8).
+- [x] `userList` ignores `withFiles/withRenotes` — LANDED 2026-10-21 (both honored; manifest §43.8).
+- [ ] `pollEnded`-as-`noteUpdated` is a pinetree extension stock clients ignore — the real `pollEnded` *notification* (`NotificationKind::PollEnded` + packer/receive-config + worker producers) rides the final-wiring commit (deferred in WP4; manifest §43.8).
 
 ## P2 — federation interop risks
 
-- [ ] `Update(Note)` string-URI accepted-without-fetch (`inbox.rs:1953-1991`) — never applied; decide fetch-and-apply (Sharkey) vs document.
+- [x] `Update(Note)` string-URI — LANDED 2026-10-21: fetch-and-apply (Sharkey parity; replay gate → SSRF/size/origin guards → `attributedTo == signer` + exact-authority → shared tail; manifest §43.10).
 - [ ] Inbound poll shape gate degrades to poll-less (`inbox.rs:2217-2247`) — exotic polls render as plain notes; decide parity vs document.
-- [ ] Stamp fetch is pre-txn network I/O (`inbox.rs:2341-2366`) — slow/quoted-host outage delays `Create`; consider defer/re-verify path only.
-- [ ] `Undo(Accept)` by-ID unresolvable (`inbox.rs:1259-1269`) — converges without effect; no activity store by design, document.
-- [ ] Generic `Add/Remove` beyond clips/featured + `Tombstone`-typed activities ignored (`inbox.rs:334-368` vs Misskey dispatch) — `202`-ignore is safe; document.
+- [ ] Stamp fetch is pre-txn network I/O (`inbox.rs:2341-2366`) — slow/quoted-host outage delays `Create`; consider defer/re-verify path only. (Negative stamp dedup landed WP5; the pre-txn placement decision stays.)
+- [x] `Undo(Accept)` by-ID — LANDED 2026-10-21: minimal `ActivityIdIndex` (`record/resolve/forget`); embedded shape keeps the same tear-down path (manifest §43.10).
+- [x] Generic `Add/Remove` + `Tombstone`-typed activities — LANDED 2026-10-21: per-Misskey-dispatch handling + `Delete(Tombstone)` recognition + documented relay refusal (manifest §43.10). Safe-202-ignore posture superseded.
 
 ## P2 — domain/application transitions (columns exist, decision fns live elsewhere or nowhere)
 
@@ -171,7 +171,7 @@ Items already covered above are NOT repeated. `[landed?]` = doc said TODO but in
 
 - [x] `notes/reactions` list endpoint — LANDED (bench P2 closed).
 - [x] Outbound poll options `type:Note` — LANDED (`objects.rs:1070`).
-- [ ] `EmojiReact` outbound still degrades to ❤ (`host_caps.rs:44-54`); inbound LANDED (`inbox.rs:346,1207`). Decide: implement Akkoma/Pleroma `EmojiReact` or keep documented-out. Needs a live Akkoma round-trip before claiming.
+- [ ] `EmojiReact` outbound per-host render LANDED 2026-10-21 (WP5; Akkoma/Pleroma get `EmojiReact`, Misskey-family emoji-aware `Like`, Mastodon-family bare `Like`; manifest §43.10). Live Akkoma round-trip before claiming interop → moved to the OPEN interop list below (was: needs a live round trip).
 - [x] Reply `replyId` via `ap/show` — LANDED: shared ingest with pending-parent machinery (`inbox.rs:2081-2153`).
 - [x] Remote media on `ap/show` path — LANDED: `RemoteMediaFetch` queued in-txn via shared ingest (`inbox.rs:2081-2153`). Quote-path fetch decision still open under the poll/quote items.
 - [ ] Poll-vote silent drops — counters/logs per drop reason + fixtures (fediverse-bench-fixes P6).
@@ -191,15 +191,14 @@ Items already covered above are NOT repeated. `[landed?]` = doc said TODO but in
 
 - [x] Manifest `UNSUPPORTED_FIELD` unknowns: `Update(Note)` TODO(§8) stub — edit branch LANDED (`inbox.rs:1796-1797,1953`); manifest addendum §39.
 - [ ] Manifest: string-URI `Update(Question)` not fetched / invalid-Question downgrade / custom-emoji passthrough (`:273-279`) — all recorded DIVERGENCE; confirm current code matches and close.
-- [ ] Manifest: `users/lists/create-from-public` deferred (`:148`, profile `:91`) — still 404; keep or schedule.
-- [ ] Manifest: verifiedLinks re-verification loop deferred (`:183`); decoration-registry filtering deferred (`:188`) — schedule or keep deferred.
-- [ ] Manifest: note-body cleanup job deferred (`:502`); `federation/instances` skipped (`:488`); admin notifications skipped (`:473`); remote-suspend sweeps local-only with possible revisit (`:452`).
-- [ ] Manifest needs-owner-decision: `federation/update-instance`, `refresh-remote-instance-metadata`, `find-by-email`, `get-user-ips` (`:588,591`).
+- [x] Manifest: `users/lists/create-from-public` deferred (`:148`, profile `:91`) — LANDED 2026-10-21 (gaps WP2a final; manifest §43.2). Remote-member system actor still open (owner decision pending).
+- [ ] Manifest: verifiedLinks re-verification loop deferred (`:183`); decoration-registry filtering deferred (`:188`) — schedule or keep deferred. (`federation/instances` skipped is CLOSED: LANDED 2026-10-21, manifest §43.5. Note-body cleanup job still deferred; admin notifications skipped; remote-suspend sweeps local-only with possible revisit.)
+- [x] Manifest needs-owner-decision — DECIDED + LANDED 2026-10-21 (gaps WP2c final; manifest §43.5): `federation/update-instance`, `refresh-remote-instance-metadata`, `find-by-email`, `get-user-ips` all ship (destructive `remove-all-following`/`delete-all-files` default-out).
 - [x] Profile: `i/notifications-grouped`, `notes/featured`, `notes/reactions` — shipped (`mod.rs:8998,9029,9067,6278`); profile lines superseded in WS1 addenda.
 - [x] Profile: `notes/search` offset/range — shipped (`mod.rs:8146-8178`); `channelId` still rejected.
-- [x] Manifest: `server-info` shipped (`mod.rs:7759`). `queue/*` + stats still OPEN (keep under P1 admin families).
+- [x] Manifest: `server-info` shipped (`mod.rs:7759`). `queue/stats` LANDED 2026-10-21 (gaps WP2c final; delay/clear arms loud 400; manifest §43.5). `stats` shipped (§35).
 - [x] Manifest: `reset-password` shipped (`mod.rs:7311`); superseded in manifest addendum.
-- [ ] Parity plan: outbound `EmojiReact` needs live Akkoma round-trip before claiming (`:101`); `customEmoji` export/import out (`:168`); smoke-gate fix + §6 docs pending (`:191`).
+- [ ] Parity plan: per-host `EmojiReact` render LANDED 2026-10-21 (WP5; manifest §43.10); the live Akkoma round-trip before claiming interop moves to the OPEN interop list below. `customEmoji` export/import out (`:168`); smoke-gate fix + §6 docs pending (`:191`).
 - [x] Domain-types deferred list partially SUPERSEDED — addendum written 2026-10-20 (antennas/pages/clips/polls landed; channels, folders, access keys, forensics still out) (`:13,34`).
 - [ ] Ports: `TimelineMaterialize` reserved Phase 5 (`:64`); closed `JobKind` payload schemas open (`:107`); lease/retry numbers deferred to delivery contract (`:108`); cursor/limit defaults belong to manifest (`:110`); `FeaturedChanged` relays deferred (`:172`).
 
@@ -213,7 +212,19 @@ Items already covered above are NOT repeated. `[landed?]` = doc said TODO but in
 - [ ] P3 Gate: `scripts/smoke-all.sh:53` pipes cargo through `tail -30` (exit status masked); SKIP still prints `SMOKE_ALL_OK` (`:77-92`). Fix the script (a separate, code-touching change; not part of this docs pass).
 - [ ] P3 Keystone sweep count: `scripts/smoke-all.sh` runs 38; `docs/testing.md` says 41. Reconcile by running the sweep.
 - [ ] Doc: Phase 2 Sharkey pin: `docs/phase-2-plan.md` header says `2025.4.4`; `docs/README.md` and `phase-2-exit-criteria.md` say `2025.4.7`. Reconcile; the 2025.4.4 run is the recorded evidence.
-- [ ] Verify: Batch M WP8 (admin emoji delete/list) and WP16 (`create-from-public`, remote-member system actor) still open per `implementer-guide-batch-m.md`.
+- [x] Verify: Batch M WP8 (admin emoji delete/list) LANDED 2026-10-20. `users/lists/create-from-public` LANDED 2026-10-21 (manifest §43.2). Still open: remote-member system actor (owner decision pending) per `implementer-guide-batch-m.md`.
 - [ ] Verify: Batch N/O/P endpoints exist (spot-checked 2026-10-20) but per-feature behaviour is not re-tested.
 - [ ] Verify: `docs/sharkey-parity.md` Sharkey and Misskey claims were not re-checked against the reference checkouts.
 - [ ] Open (from phase plans): phase2-5 slice 7 (`webfinger.rs:4`) and phase2-6 slice 13 gate evidence.
+
+## OPEN — live interop + bench (2026-10-21 gaps final)
+
+Internet-gated: none of these can be claimed hermetically. Everything above this section is code-complete in-tree; everything below requires live servers.
+
+- [ ] Akkoma round-trip: per-host `EmojiReact` render (§43.10) verified against a live Akkoma (content vs tag per host, Undo, inbound accept).
+- [ ] Pleroma round-trip: same `EmojiReact` matrix against live Pleroma.
+- [ ] Mastodon round-trip: bare-`Like` favouriting both directions; `Question`/`Update` handling; Mastodon/Glitch-Soc fixtures pinned to actual target revisions (quote-fixture revision still unpinned).
+- [ ] Glitch-Soc round-trip: same matrix as Mastodon + any Glitch extensions exercised.
+- [ ] Sharkey round-trip: `Update(Note)` fetch-and-apply, `EmojiReact`, like-toggle, schedule shim against live Sharkey.
+- [ ] Public-internet soak: staged allowlist → open, SSRF/TLS/redirect/size budgets unchanged; soak checklist signed.
+- [ ] Bench 0-fail: crossfamily + stress + features harness green with zero failures less documented-divergence (poll-vote drop counters/logs per reason still open; stamp-authority host-granular + `StampFetchPending` non-atomic + quote-lookup full-table scans still open as audit debt).

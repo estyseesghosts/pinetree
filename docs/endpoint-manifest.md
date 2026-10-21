@@ -1010,3 +1010,105 @@ cap 429, both with the upstream id; window expiry restores login),
 ### 42.6 Addendum 2026-10-21 (gaps WP6): domain-owned antenna rules
 
 Domain owns `should_auto_deactivate` / `deactivate_stale_antenna` (7 days, upstream `CleanProcessorService` parity) and `antenna_matches_with_sensitivity` (`exclude_sensitive` gate). The §29 "no 7-day auto-deactivation" divergence is retired as a rule; the stored `exclude_sensitive` column + endpoint param + packer field are still pending (no backfill needed — default false == legacy). The read-path reactivation sweep stays application-owned. Recorded in `state/logs/2026-10-21-gaps-wp6.md`.
+
+## §43 — Addendum 2026-10-21 (gaps final)
+
+Status: ADDENDUM only. Frozen text above is not rewritten. Supersedes the §39.2 "still 404" rows listed below and the §30/`§34` out/stays-404 lines for the families that now ship. Sources: `state/logs/2026-10-21-gaps-wp{1,2a,2b,2c,3,4,5,6}.md` (7 packages + WP6 layering). Domain/application/streaming/federation modules are landed in-tree and green in their `gaps_*` suites; dispatcher arms, ports-trait moves, redb tables, and worker arms land in the parent-owned final-wiring commit alongside this note. Where this section and an older section disagree, this section wins.
+
+`channels/*` + `chat/*` REST stay 404 by owner SKIP order (`docs/gaps.md:5`): their WP2b command modules were REMOVED from the tree (2026-10-21 removal commit; Misskey's implementations conflict with pinetree's direction). Streaming `channel`/`chatUser`/`chatRoom` + `reversi`/`reversiGame` stay `UNSUPPORTED_CHANNEL` (no channels/chat/Reversi model). `notifications/create` stays out (not in the gaps scope). `page-push` is not an identifiable Misskey endpoint (no manifest row, no checkout hit) and stays 404 `UNKNOWN_API_ENDPOINT` as truly-unknown.
+
+### 43.1 Drive folders + drive stream + drive file extras (WP2a; `commands/drive_folders.rs`)
+
+`DriveFolder{id, owner_id, name (0..=200 chars), parent_id?}`; verbatim codes `NO_SUCH_FOLDER`, `NO_SUCH_PARENT_FOLDER`, `RECURSIVE_NESTING`, `HAS_CHILD_FILES_OR_FOLDERS`. Miss self/foreign reads as missing (upstream `findOneBy({id, userId})` parity).
+
+| Endpoint | Auth | Params → Response; errors |
+|---|---|---|
+| `drive/folders/create` | credential `write:drive` | `{name = "Untitled", parentId?}` → `DriveFolder`; `NO_SUCH_FOLDER` on missing/foreign parent |
+| `drive/folders/show` | credential `read:drive` | `{folderId*}` → `DriveFolder`; miss/foreign → `NO_SUCH_FOLDER` |
+| `drive/folders/find` | credential `read:drive` | `{name*, parentId? (null = root)}` → `DriveFolder[]` directly under the parent; missing/foreign parent matches nothing → `[]` |
+| `drive/folders/update` | credential `write:drive` | `{folderId*, name?, parentId? (null moves to root; absent leaves)}` → `DriveFolder`; `NO_SUCH_FOLDER` / `NO_SUCH_PARENT_FOLDER` / `RECURSIVE_NESTING` (self-parenting or ancestor cycle) |
+| `drive/folders/delete` | credential `write:drive` | `{folderId*}` → 204; `HAS_CHILD_FILES_OR_FOLDERS` when child folders or mapped files exist |
+| `drive/files/move-bulk` | credential `write:drive` | `{fileIds[1..=100]*, folderId? (null = root)}` → 204; non-null missing/foreign target → `NO_SUCH_FOLDER` (DIVERGENCE: upstream `findOneByOrFail` throws → 500); missing/unowned files skip (bulk-`update` parity: `WHERE id IN (...) AND userId`) |
+| `drive/files/find` | credential `read:drive` | `{name*, folderId? (null = root)}` → `DriveFile[]` with that name directly in the folder; missing/foreign folder → `[]` |
+| `drive/files/check-existence` | credential `read:drive` | `{md5*}` → owner-scoped hit test (bool) over the ingest `md5` column |
+| `drive/files/attached-notes` | credential `read:drive` | `{fileId*, cursor}` → `Note[]` newest-first, cursor-paged; `NO_SUCH_FILE` (`c118ece3-…`) on miss; non-moderators see only their own files (moderator flag from the dispatcher, no new port); no visibility filter beyond the file gate (upstream `makePaginationQuery` parity). DIVERGENCE: bounded scan (≤50 id-ordered batches, single-node MVP) until the `NoteStore::notes_with_file` index lands |
+| `drive/stream` | credential `read:drive` | caller's files with shared `drive/files` filter semantics; `type` exact match unless `/*`-suffixed → prefix match (dispatcher strips the trailing `/*`; recorded DIVERGENCE against the frozen "rejected everywhere" rule) |
+| `drive/files` (folder-aware) | credential `read:drive` | existing filters + `folderId?` (null = root); missing/foreign folder → `[]`; page may shrink under `limit` (client pages with `untilId`) |
+| `drive/files/update` folder leg | credential `write:drive` | `{fileId*, folderId?}` moves one file; `NO_SUCH_FILE` on miss, `ACCESS_DENIED` for non-moderator foreign files, `NO_SUCH_FOLDER` on missing/foreign target (a moderator moving a foreign file targets the file owner's tree) |
+
+### 43.2 Following updates + thread-muting + memo + pages + create-from-public + partial bulk + polls recommendation + clips alias (WP2a; `commands/drive_bulk.rs` + report)
+
+- `following/list {notification = false, cursor, limit 1..=100 = 10}`: caller's own outgoing follows, id-ascending (store order); `notification` keeps only edges with a notify preference; cursor bounds apply in memory.
+- `following/update {userId*, withReplies?, notify?}` → updated `Follow` edge; `following/update-all {withReplies?, notify?}` applies to all own edges; `following/requests/sent` → own outgoing `FollowRequest[]`. Misskey params/errors verbatim; ops per the WP2a subagent report against `FollowStore::update_follow_options` + `follow_requests_from` (parent-owned ports).
+- `notes/thread-muting/create|delete {noteId*}` → 204; Misskey codes verbatim; `NoteThreadMuteStore` (parent-owned). Supersedes the manifest §11 "thread-muting stays out" line.
+- `users/update-memo {userId*, memo (nullable)}` → updated memo; `UserMemoStore` (parent-owned).
+- `users/pages {userId*, cursor, limit 1..=100 = 10}`: that user's **public** pages, newest-first, cursor-paged; unknown users → `[]` (upstream runs the query with no user check — parity).
+- `users/lists/create-from-public {name[1..=100], listId*}` → new private `UserList` with the source members copied through the exact `push` path (block refusal, remote proxy-follow, caps): `NO_SUCH_LIST` (source missing or not public), `TOO_MANY_USERLISTS`, `NO_SUCH_USER` (member vanished), `YOU_HAVE_BEEN_BLOCKED` (aborts; members added so far stay — no cross-member transaction, upstream parity), `ALREADY_ADDED` / `TOO_MANY_USERS`. Self-membership skips the block check. Supersedes the §34 "stays 404" line. DIVERGENCE: sources must be local public lists — user lists have no public (remote-fetchable) source, so unresolvable sources stay 404 `NO_SUCH_LIST`.
+- `notes/show-partial-bulk`, `notes/polls/recommendation`, `notes/clips` (alias of `clips/notes` — renamed `clips/notes` exists, the old name is the alias): Misskey params/errors verbatim per the WP2a report (poll/reaction aggregates, `ClipStore::clip_ids_for_note`; parent-owned ports).
+
+### 43.3 2FA + app registry (WP2c; `commands/auth_2fa.rs`)
+
+TOTP enrol/verify (RFC 6238 via `ring` HMAC-SHA1, hand-rolled base32, ±1-step window, Appendix-B vectors green): `i/2fa/register {password*} → {secret (base32), uri}`, `i/2fa/key-done {token*}`, `i/2fa/done {token*}` (enables), `i/2fa/password-less {value*}` toggle, `i/2fa/unregister {password*}`, `i/2fa/update-key` (rotate), `i/2fa/authenticate {token*}` (verify). Misskey codes verbatim.
+- `i/2fa/remove-key` → loud `400 INVALID_PARAM` (`SECURITY_KEY_UNSUPPORTED_REASON`); `signin-with-passkey` stays a 400 stub (§42): no RP/challenge store, no webauthn dep, offline build forbids new deps. TOTP is the supported second factor. DIVERGENCE, documented reason.
+- `admin/2fa/unset {userId*}`: clears without password (moderator-gated).
+- `my/apps` → caller's own `AppRecord[]`; `app/create {name*, description?, permission[]?, callbackUrl?}` → `AppRecord`; `app/show {appId*}` → `AppRecord`, miss → `NO_SUCH_APP`. DIVERGENCE: rows live per-creator in the `RegistryStore` until a dedicated table lands.
+
+### 43.4 Misc: ping, retention, reset-db, sw/*, v2 emoji list, endpoint(s) (WP2c; `commands/misc_endpoints.rs`)
+
+- `ping` (no credential) → `{}`.
+- `retention` get/set: stored policy object or `{}` when unset; write requires a JSON object (else `INVALID_PARAM`), `{}` clears. DIVERGENCE: upstream has no `retention` read endpoint in the pinned family — this get/set pair is the pinetree surface until the drive-retention job lands. Global registry singleton, no new port.
+- `reset-db` → loud `400 INVALID_PARAM` (development-only destructive reset, no single-node equivalent).
+- `sw/register {endpoint*, auth*, publickey*}` → subscription (idempotent overwrite, keyed by endpoint hash); `sw/show-registration {endpoint*}` → subscription, miss → `NO_SUCH_SUBSCRIPTION`; `sw/unregister {endpoint*}` → 204 (missing = no-op); `sw/update-registration {endpoint*, auth*, publickey*}` → replaced subscription (miss → `NO_SUCH_SUBSCRIPTION`). Stored in the existing `RegistryStore` under the owning account (`scope ["sw"]`); no new port.
+- `v2/admin/emoji/list` (credential + `read:admin:emoji` + moderator): local emoji by default; non-local `host` filter selects remote rows.
+- `endpoint {endpoint*}` → descriptor or `NO_SUCH_ENDPOINT`; `endpoints` → full name list.
+
+### 43.5 Admin families + federation/instances + queue + abuse recipients (WP2c; `commands/admin_ext.rs`)
+
+Admin-gated (`require_moderator`/`require_admin` + `read/write:admin:<family>` scopes; `NO_SUCH_*` → 404 via `from_port_error`; unknown fields 400 via `check_allowed_fields`). Global admin state lives in `RegistryStore` under reserved `~instance` id (real persistence, zero schema change); role policies stored verbatim, not enforced (documented). Misskey error codes verbatim; UUID pinning against the upstream checkout at wiring (symlink broken in the gaps env).
+- `admin/roles/*` (create/list/show/update/delete/assign/unassign/users), `admin/relays/*` (add/list/remove), `admin/ad/*` (create/list/update/delete/refresh), `admin/announcements/*` (create/list/update/delete), `admin/federation/*` + `federation/instances` (list with instance rows), `federation/show-instance {host*}`, `federation/update-instance`, `federation/refresh-remote-instance-metadata {host*}`, `federation/remove-all-following` / `federation/delete-all-files` (destructive bulk, default-out per §30 — refused unless the owner opts in), `admin/stats` (overview counters), `admin/server-info` (extends the public `server-info` for admins), `admin/get-user-ips {userId*}`, `admin/accounts/find-by-email {email*}`, `admin/proxy-account` (get/set/clear), `admin/unset-mfa` (+ `admin/reset-password {userId*}`), `admin/abuse-report/notification-recipient/*` (create/list/show/update/delete/active-toggle). Supersedes the §30 "out" rows for relays/ad/announcements/federation/stats/user-ips/server-info/proxy-account/mfa/reset-password and the "no webhook/email infra" line for abuse recipients.
+- `queue/stats` (real: `deliver.waiting = pending_count`, delayed counts from the queue): live. `queue/deliver-delayed`, `queue/inbox-delayed`, `queue/clear` → loud 400 (no BullMQ/admin-queue UI; observability via logs). Supersedes the §30 "`queue/*` out" row with this split.
+- `admin/send-email`: durable `EmailSend` job path (SMTP config `smtp_host/port/username/password/from`, `is_configured` gate; `verify-email` / `request-reset` / `reset-password` / `i/update-email` send live when configured, else the existing loud `EMAIL_NOT_CONFIGURED`); secrets in JSON config only (`0600` guidance). Arm lands in the final-wiring commit with the `EmailSend` worker arm.
+
+### 43.6 Gallery + flash + hashtags + announcements (WP2b; `commands/gallery.rs`, `hashtags.rs`, `announcements.rs`)
+
+- `gallery/posts/*` (create/show/update/delete/list/featured/popular/like/unlike): Misskey params verbatim; `fileIds` stored opaque (drive ownership checked at the dispatcher); `isLiked` only for the authed viewer.
+- `flash/*` (create/show/update/delete/my/like/unlike + featured/popular lists): Misskey params verbatim.
+- `hashtags/list|search|show|trend|users`: 5 ops over existing stores (bounded 10k-note scan + visibility); `trend` from `domain::note::{aggregate_hashtag_counts, rank_hashtag_trends}` (WP6); `search-by-tag` stays the note-search answer (no new endpoint). Supersedes the P1 declared-out row.
+- `announcements` (+ `show`) + `i/read-announcement {announcementId*}` + `promo/read`: badge clears on read; `announcements` list/show are public, read state per-account. `AnnouncementStore` seam + `MemAnnouncementStore`; admin creation via the admin seam. Supersedes the P1 badge-never-clears row.
+- Verbatim Misskey phrasing for `NO_SUCH_CHANNEL/ROOM/MESSAGE/INVITATION/POST/FLASH/HASHTAG/ANNOUNCEMENT` + reused `NO_SUCH_USER, ACCESS_DENIED, INVALID_PARAM, FILE_REQUIRED, ALREADY_LIKED, NOT_LIKED`; `UNKNOWN_API_ENDPOINT` untouched (truly-unknown only). Follow/unfollow/favorite (channels), room join/leave/mute/read, unlike-of-nothing: idempotent by design (no invented `ALREADY_*`). `channels/timeline` → `[]` (notes carry no channel column).
+
+### 43.7 Webhooks + SMTP (WP3; `commands/webhooks.rs`, `services/email.rs`)
+
+- `system-webhook/*` (admin-gated create/list/show/update/delete) + `webhooks/*` (owner-scoped user CRUD with `DEFAULT_WEBHOOK_LIMIT = 5` via `webhook_limit`) + `abuse-report/notification-recipient/*` (recipient CRUD + active toggle). Closed trigger sets: system (`userCreated/abuseReport/abuseReportResolved`), user (`mention/reply/renote/quote/reaction/pollEnded/follow/followed/note`); HMAC-SHA256 sign/verify (`ring`), canonical envelope + deterministic idempotency keys, bounded planners (`plan_system_event`/`plan_user_event`/`plan_abuse_report_emails`, `MAX_JOBS_PER_TXN` cap, single `enqueue_jobs` commit), `execute_webhook_deliver` (cooldown → `Deferred`, signed POST via `SafeHttpClient`, `classify_inbox_status` + `DestinationTracker`; SSRF = permanent). `JobKind::{WebhookDeliver, EmailSend}` + store tables land in the final-wiring commit.
+- SMTP: `SmtpConfig` (serde, `deny_unknown_fields`, `validate()`, `is_configured`), real plain-SMTP + `AUTH LOGIN` sender (10 s timeout, dot-stuffing, RFC-2047 subjects; no TLS — relay-terminated deployment, documented), builders (`verification_email`, `password_reset_email`, `abuse_report_email`), `signup_email_gate`, `execute_email_send`. Hermetic loopback/fake-tested, never live-send.
+- DIVERGENCEs (decided): trigger sets + `X-Pinetree-Hook-*` header names are pinetree-defined pending reconciliation against the `misskey/` checkout (symlink broken in the gaps env); no SMTPS/STARTTLS (no TLS crate, offline rule).
+
+### 43.8 Streaming complete, minus 3 (WP4; `streaming/server.rs`, `hub.rs`, `application/events.rs`)
+
+| Channel | Params | Behavior |
+|---|---|---|
+| `hashtag` | `q: string[][]` (AND-of-ORs, anon ok) | upstream `HashtagChannelService.init` parity: `q` must be an array of arrays (else refused) |
+| `roleTimeline` | `roleId*` | accepted; SILENT — no role model exists yet, so no producer publishes `RoleTimelineNote` (DIVERGENCE 1) |
+| `drive` | credential | `fileCreated/fileUpdated/fileDeleted`; bodies are `{id}` until the folder packer exists (DIVERGENCE 3) |
+| `serverStats` | none | one snapshot `stats` on connect + `statsLog` on `requestLog` — no 1 s broadcast (DIVERGENCE 2) |
+| `queueStats` | none | same shape; job counts from the queue |
+| `admin` | credential + moderator | `newAbuseUserReport` |
+| `clip` | `clipId*` | `updated`/`deleted` with null-body parity |
+| `userList` | + `withFiles`/`withRenotes` | now honored (closes the §39.2 gap) |
+| `main` | — | all remaining event keys forwarded generically (`unreadNotification`, `unreadAntenna`/`readAntenna`, `readAllAnnouncements`/`announcementCreated`, `myTokenRegenerated`, `signin`, `registryUpdated`, `driveFileCreated`, `urlUploadFinished`, `pageEvent`); `reacted` gains optional `emoji` detail (`{name, url} \| null`, fail-open to null) |
+
+DIVERGENCE 4: `reversi`/`reversiGame`/`channel`/`chatUser`/`chatRoom` stay `UNSUPPORTED_CHANNEL` by decision (no channels/chat/Reversi model; REST unwired per the SKIP above). Deferred to the final-wiring commit: `NotificationKind::PollEnded` + packer/receive-config, and worker-side producers (`push_notify_mains` unread-notification fan-out, poll-expiry `Notify`, antenna `UnreadAntenna`, drive/clip/admin/registry/signin/token/announcement/page event emission from the owning commands). `pollEnded`-as-`noteUpdated` stays the compat extra (§39.1).
+
+### 43.9 Transcode (WP1; `media/transcode.rs`, `media/processing.rs`, `jobs/transcode.rs`)
+
+GIF (animated or not) → WebM/VP9 wire `video`; video → WebM/VP9 + Opus 96k (passthrough iff VP9+Opus/no-audio within `max_file_size`: byte-identical if already WebM else `-c copy` into WebM, always serve WebM); stills (JPEG/PNG/BMP/HEIC/HEIF/TIFF/AVIF) → WebP q80 (WebP passthrough, `small` preview also WebP); audio passthrough. VP9 `-crf 30 -b:v 0 -cpu-used 2 -row-mt 1`; limits wall 120 s, output 64 MiB, RSS 1 GiB. Never strip metadata (`-map_metadata 0`; orientation kept as tag, clients apply it). Startup gate: `validate_toolchain` requires `libvpx-vp9/libopus/libwebp` encoders + the pinned decoder set — missing toolchain = startup error, never silent passthrough; `--no-transcode` routes around. Content-addressed adaptation: derived bytes land under their own SHA-256 CAS key and the row re-commits to the new key (read-back verified before commit; old bytes stay while dedup-sharers reference them; unreferenced bytes are reconciler-sweep candidates). `thumbnailUrl` = the file's own `url` until the thumbnail route exists. `TranscodeConfig`/`MediaState` ports + `upload_media_with_transcode_job` atomic enqueue + `JobKind::TranscodeMedia` worker arm + `failed → 422` API mapping + Dockerfile ffmpeg layer land in the final-wiring commit (16/16 `gaps_transcode` green, incl. real-ffmpeg png→webp+preview and vp9+opus remux/passthrough).
+
+### 43.10 Federation deltas (WP5; `domain/fed_policy.rs`, `activitypub/objects.rs`, `federation/*`)
+
+- `EmojiReact` 3-way (`ReactionStyle::{MisskeyLike, EmojiReact, PlainLike}` + `reaction_style_for_software`): Akkoma/Pleroma get `EmojiReact` (`content` + an `Emoji` tag only for custom `:shortcode:`), Misskey/Sharkey-family get emoji-aware `Like` + `_misskey_reaction`, Mastodon-family get bare `Like`. Inbound `EmojiReact` accepted onto the per-(user,note) row (`content`, else `Emoji`-tag `name`); `Undo(EmojiReact)` unreacts; outbound Like/UndoLike 3-way render (undone form matches the delivered form). Live Akkoma round-trip still required before claiming interop (TODOS OPEN list).
+- `Update(Note)` string-URI fetch-and-apply (Sharkey parity): replay gate → SSRF/size/origin guards → `attributedTo == signer` + exact-authority → shared tail. Supersedes the §15 `TODO(§8)` stub line and closes the P2 Update(Note) item.
+- `Undo(Accept)` by-ID via a minimal `ActivityIdIndex` (`record/resolve/forget`): closes the P2 "converges without effect" item (embedded shape keeps the same path).
+- `Delete(Tombstone)` recognition; generic `Add`/`Remove` per Misskey dispatch (beyond clips/featured) + documented relay refusal (`relay_decision()` — receive+forward refused with reason, no relay infra).
+- RFC 9421 verify-if-present permissive-first with logging, then tighten (proposed `federation.rfc9421_mode` + verifier; tightening deferred).
+- Stamp authority exact-host (`exact_authority_allows`), negative stamp dedup (`StampNegativeCache`), atomic `StampFetchPending`, reply coalescing (`ReplyCoalescer`, N-waiters → 1 job), `parse_question_poll` `type:"Note"`-tolerant, `tombstone_inner_id`. `Question.options[].type == "Note"` already landed (§15). Remaining indexes (`ACCOUNTS_BY_URI`, `NOTES_BY_QUOTE_*`, `ACCOUNTS_BY_HANDLE`), durable `ActivityIndex` + `JobQueue::has_pending_with_key`, late-link Reply notification + repair default, and the tightener land in the final-wiring commit; bench harness + live interop rounds (Akkoma/Pleroma/Mastodon/Glitch/Sharkey, public-internet soak) are internet-gated and stay OPEN.
+

@@ -275,3 +275,28 @@ Decision needed (tracked as a TODOS P2 item): either make these methods required
 Status: ADDENDUM only. Frozen text above is not rewritten. Verified: `grep -c 'unimplemented!' src/application/ports.rs` returns `0`.
 
 All 20 default bodies (`FollowStore` 3 + `ActivityDedup` 17) now return `Err(PortError::StorageUnavailable("<method> not implemented"))`, matching the existing convention in this file (e.g. `find_by_email_verify_code`). `StorageUnavailable` was chosen over required methods so the 4+ in-memory test doubles (`packers.rs`, `webfinger.rs`, `actor.rs` fakes) keep compiling; redb already implements all 20 for real, so production behavior is unchanged. Recorded in `state/logs/2026-10-21-gaps-wp6.md`.
+
+---
+
+## Addendum 2026-10-21 (gaps final)
+
+Status: ADDENDUM only. Frozen text above is not rewritten. Sources: `state/logs/2026-10-21-gaps-wp{1,2a,2b,2c,3,4,5}.md` + `state/logs/2026-10-21-gaps-wire1-ports.md` (what actually landed in `ports.rs`: `JobKind` ×3, `DriveFolderStore`, 3 webhook stores, `FollowStore` additions, `UserMemoStore`, `NoteThreadMuteStore`, `clip_ids_for_note`, `has_pending_with_key`, `count_drive_files`, `ActivityIndex`, `PollEnded`). The seams below live in the command modules (with Mem doubles as test fakes); redb tables + worker arms + dispatcher arms land in the final-wiring commits. Same atomicity as §2 throughout: state + jobs/log in one transaction; FDB inherits the signatures.
+
+### New store seams (gaps final)
+
+- `DriveFolderStore` (moved to `ports.rs` verbatim in wiring 1/5): `create_folder` / `get_folder` / `find_folders_by_name` / `child_folders` / `count_child_folders` / `update_folder` / `delete_folder` + file↔folder mapping `set_file_folder` / `file_folder_id` (`None` = no row, `Some(None)` = root) / `count_files_in_folder`.
+- `FollowStore` additions (in `ports.rs`): `update_follow_options` (per-follow `withReplies`/`notify`) + `follow_requests_from` (outgoing-request review).
+- `UserMemoStore`, `NoteThreadMuteStore` (in `ports.rs`): memo set/get, thread mute/unmute.
+- `ClipStore::clip_ids_for_note` (in `ports.rs`, empty default). Poll-listing and reaction-aggregate ports: proposed only, not yet in `ports.rs`.
+- `GalleryStore` + `MemGalleryStore`, `AnnouncementStore` + `MemAnnouncementStore` (WP2b command modules only — deliberately NOT in `ports.rs`; ops take explicit store params and work; dispatcher wires Mem or redb later). `ChannelStore`/`ChatStore`: REMOVED with their modules (SKIP order).
+- Admin/federation families (WP2c): NO new ports — everything persists via the existing `RegistryStore` under `~instance` (no new tables needed; enumeration via `registry_list`/`registry_get`). `RoleStore`/`RelayStore`/`AdStore`/`FederationInstanceStore` remain proposed-only.
+- `SystemWebhookStore`, `UserWebhookStore`, `AbuseReportRecipientStore` (all three in `ports.rs` verbatim): insert/get/list/put/delete + `active_*_for` planners' read side. (WP2c admin recipient records are a different, registry-scoped shape — kept separate.)
+- `JobQueue::enumerate_jobs`/`clear_queue`, `ModerationAction::ResetPassword`, stats counters beyond `count_drive_files`: proposed only, not yet in `ports.rs`.
+- `ModerationAction::resetPassword` (admin/reset-password log label).
+- Stats counters (`count_accounts/notes/local_notes/reactions`) already landed as defaulted-then-redb methods (manifest §35); reused by `admin/stats` + `queue/stats`.
+- No new port (RegistryStore reuse, recorded): app registry (per-creator rows, DIVERGENCE until a dedicated table), push subscriptions (`scope ["sw"]`, endpoint-hash keys), retention singleton (`~instance` global namespace), `~instance` admin state.
+
+### Conventions kept
+
+- `StorageUnavailable` convention kept and extended: every new trait default returns `Err(PortError::StorageUnavailable(..))`, never `unimplemented!()` (WP6 zero-`unimplemented!` rule; `grep -c` stays `0`). Mem doubles double as test fakes so nothing panics when an adapter omits a method.
+- Deferred (parent final-wiring, not this addendum): the `ports.rs` trait moves, redb tables + backfills, `JobKind::{TranscodeMedia, WebhookDeliver, EmailSend}` + worker arms, `TranscodeConfig`/`MediaState` + `commit_transcoded_media` + `upload_media_with_transcode_job`, durable `ActivityIndex` + `JobQueue::has_pending_with_key`, `NoteStore::notes_with_file` index (replaces the bounded attached-notes scan), stored antenna `exclude_sensitive` column. All are specified in the WP reports cited above.
