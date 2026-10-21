@@ -20,6 +20,9 @@ Conventions: `- [ ]` = open, `- [x]` = done (move to log, don't delete the line)
 
 ## P1 — media lifecycle + storage safety (single-node, broken/risky)
 
+> WIP 2026-10-21 (storage overhaul, `docs/remote-media-cache-plan.md` addendum 2026-10-21): S1 shared contracts landed (config keys, ports, redb tables, dual pools, `drive/cache/stats`). Subagents building domain/storage/fetch_stream, commands/reconciler/remote-cache, and `tests/storage_*.rs` suites in parallel. Boxes below stay open until `cargo test --offline` + `bash scripts/smoke-all.sh` (incl. cap-never-exceeded, local-survives-eviction, cross-owner delete, crash-heal) are green.
+
+
 - [ ] Remote-media GC/quotas/eviction/reconciler (unbounded disk growth; per-note 64 MiB is per-job-run, not a total) — plan `docs/remote-media-cache-plan.md:35-39,102-138`.
 - [ ] Shared-blob refcount: `delete_media` drops row+bytes non-atomically (`application/commands/media.rs:211-216`) — fix before eviction.
 - [ ] Stream-to-disk under byte cap (local upload + remote fetch hold full bodies in RAM: `media/remote_cache.rs:174,232-254`).

@@ -1,3 +1,5 @@
+> **Status (2026-10-21 overhaul WIP):** S1 shared contracts landed (config keys, ports, redb tables, dual pools, drive/cache/stats). Pending subagent slices: MediaMeta variant/class/evicted, fetch_stream, quota-aware commands/media, reconciler, remote-cache rework, tests/storage_*.rs. Open boxes below unchanged until cargo test --offline + smoke-all.sh (cap-never-exceeded, local-survives-eviction, cross-owner delete, crash-heal) are green.
+>
 > **Status (2026-10-20 freshness pass):** Build-step status below. Landed: per-note 64 MiB budget, 16-attachment cap, SHA-256 blob keys, durable RemoteMediaFetch job. Open: reference-safe delete, eviction, global/class budgets, on-demand default, stream-to-disk, reconciler, observability, warming, FDB parity. No GC/reconciler exists (grep `evict|quota|warm|reconcil` over `src/media` and `src/config.rs` is empty).
 > Tags: `[LANDED — evidence]` verified in code at HEAD; `[OPEN]` not in code; `[SUPERSEDED by …]`; `[DECISION — still binding]`; `[PLAN HISTORY]`. Original text is unchanged; tag blocks are additions. Short paths are under `src/`; `mod.rs` = `src/api/misskey/endpoints/mod.rs`.
 
