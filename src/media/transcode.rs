@@ -159,11 +159,11 @@ impl TranscodeConfig {
         }
     }
 
-    /// Validate the configuration. When transcoding is enabled this runs the
-    /// toolchain check ([`validate_toolchain`]): a missing or non-working
-    /// ffmpeg is a startup error, never a silent passthrough. Returns the
-    /// probed toolchain on success.
-    pub fn validate(&self) -> std::result::Result<ToolchainInfo, String> {
+    /// Validate the static knob ranges (no environment access: safe in
+    /// `Config::validate()` and unit tests). The environment-dependent
+    /// toolchain probe is [`TranscodeConfig::validate`], run once at
+    /// startup by the main gate.
+    pub fn validate_ranges(&self) -> std::result::Result<(), String> {
         if self.webp_quality > 100 {
             return Err(format!("webp_quality {} out of range 0-100", self.webp_quality));
         }
@@ -191,6 +191,17 @@ impl TranscodeConfig {
         if self.max_file_size == 0 {
             return Err("max_file_size must be > 0".to_string());
         }
+        Ok(())
+    }
+
+    /// Validate the configuration. Runs [`TranscodeConfig::validate_ranges`]
+    /// first, then — when transcoding is enabled — the toolchain check
+    /// ([`validate_toolchain`]): a missing or non-working ffmpeg is a
+    /// startup error, never a silent passthrough. Returns the probed
+    /// toolchain on success. Run once at startup (the main gate), never
+    /// from `Config::validate()`.
+    pub fn validate(&self) -> std::result::Result<ToolchainInfo, String> {
+        self.validate_ranges()?;
         if !self.enabled {
             return Ok(ToolchainInfo::disabled());
         }

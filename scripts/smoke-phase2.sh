@@ -159,7 +159,7 @@ start_bg sharkey "$ROOT/sharkey/packages/backend" \
 for n in 3 4; do
   rm -rf "$WORK/pt$n"; mkdir -p "$WORK/pt$n"
   start_bg "pt$n" "$ROOT" PINETREE_ALLOW_PRIVATE_IPS=1 -- \
-    "$BIN" --public-url="http://127.0.1.$n" --data-dir="$WORK/pt$n" --listen="127.0.0.1:310$n"
+    "$BIN" --public-url="http://127.0.1.$n" --data-dir="$WORK/pt$n" --listen="127.0.0.1:310$n" --no-transcode
 done
 start_bg proxy "$ROOT" -- node scripts/interop/proxy.mjs 127.0.1.1=3101 127.0.1.2=3102 127.0.1.3=3103 127.0.1.4=3104
 

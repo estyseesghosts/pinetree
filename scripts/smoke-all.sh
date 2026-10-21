@@ -18,6 +18,11 @@
 # built ./misskey + ./sharkey checkouts; when those are absent it reports
 # SKIP instead of failing. SMOKE_ALL_SKIP_PHASE2=1 skips it explicitly.
 #
+# All serve steps pass --no-transcode: lab/test ffmpeg builds (e.g. Fedora)
+# lack software h264/hevc decoders, and the startup gate correctly refuses
+# to boot with an incomplete toolchain. Production images carry full ffmpeg;
+# transcode itself is covered by the gaps_transcode suite (real ffmpeg).
+#
 # Browser topologies (pinetree+keystone, pinetree+misskey, misskey+keystone,
 # sharkey-native) need eyes, not automation: see docs/testing.md.
 set -euo pipefail

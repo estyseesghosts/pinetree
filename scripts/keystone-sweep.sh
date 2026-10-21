@@ -47,7 +47,7 @@ pick_port() {
 }
 PORT="$(pick_port)"
 ORIGIN="http://127.0.0.1:$PORT"
-"$BIN" --data-dir="$DATA_DIR" --listen="127.0.0.1:$PORT" --public-url="$ORIGIN" &
+"$BIN" --data-dir="$DATA_DIR" --listen="127.0.0.1:$PORT" --public-url="$ORIGIN" --no-transcode &
 SERVER_PID=$!
 for _ in $(seq 1 100); do
   if curl -fs -o /dev/null -m 2 "$ORIGIN/healthz" 2>/dev/null; then break; fi

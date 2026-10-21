@@ -20,6 +20,7 @@ use pinetree::federation::retry::DestinationTracker;
 use pinetree::jobs::worker::JobWorker;
 use pinetree::media::storage::FsBlobStore;
 use pinetree::persistence::redb::RedbStore;
+use pinetree::services::email::{EmailSender, SmtpEmailSender};
 
 fn build_services(cfg: &Config) -> Result<(Arc<AppServices>, pinetree::streaming::hub::Hub), String> {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -84,6 +85,12 @@ fn build_services(cfg: &Config) -> Result<(Arc<AppServices>, pinetree::streaming
             registry: store.clone(),
             clips: store.clone(),
             pages: store.clone(),
+            folders: store.clone(),
+            system_webhooks: store.clone(),
+            user_webhooks: store.clone(),
+            abuse_recipients: store.clone(),
+            memos: store.clone(),
+            thread_mutes: store.clone(),
         federation_http: SafeHttpClient::new(SafeHttpConfig::default()),
         public_url: cfg.normalized_public_url(),
         max_file_size: cfg.max_file_size,
@@ -388,6 +395,8 @@ async fn async_main() {
             cfg.durable_dir = Some(dir.into());
         } else if let Some(dir) = arg.strip_prefix("--cache-dir=") {
             cfg.cache_dir = Some(dir.into());
+        } else if arg == "--no-transcode" {
+            cfg.transcode.enabled = false;
         } else {
             positional.push(arg);
         }
@@ -397,6 +406,7 @@ async fn async_main() {
         eprintln!("{err}");
         std::process::exit(1);
     }
+
 
     // Federation debug lines (accept/reject, delivery). Off unless the flag or
     // PINETREE_DEBUG_FEDERATION is set. See `pinetree::observability`.
@@ -417,6 +427,40 @@ async fn async_main() {
         eprintln!("unknown subcommand: {cmd}");
         std::process::exit(2);
     }
+
+    // Transcode startup gate (gaps WP1): when enabled, the ffmpeg
+    // toolchain must probe cleanly — a missing/broken binary is a
+    // startup error, never a silent passthrough of untranscoded bytes
+    // (the worker also refuses stray `TranscodeMedia` jobs when
+    // disabled). `--no-transcode` (or `transcode.enabled=false` in the
+    // file) routes around ffmpeg entirely. Only the serve path reaches
+    // here (`create-account`/`set-role` return above); `validate()`
+    // checks static ranges, this probe checks the live toolchain and
+    // prints the running version for the logs.
+    let transcode_config = cfg.transcode.to_runtime();
+    if transcode_config.enabled {
+        match transcode_config.validate() {
+            Ok(info) => eprintln!("transcode toolchain: {}", info.version),
+            Err(err) => {
+                eprintln!("transcode toolchain unavailable: {err}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        eprintln!("transcode disabled (--no-transcode or transcode.enabled=false)");
+    }
+    // Crash-heal: a SIGKILL between ffmpeg spawn and temp-guard drop
+    // orphans `pinetree-transcode-*` files, so sweep hour-old ones at
+    // boot (bounded; never touches a live job's fresh files).
+    let swept = pinetree::media::transcode::sweep_tmp_files(
+        &std::env::temp_dir(),
+        pinetree::media::transcode::TMP_SWEEP_GRACE_MS,
+        pinetree::media::transcode::TMP_SWEEP_CAP,
+    );
+    if swept > 0 {
+        eprintln!("transcode temp sweep: removed {swept} stale files");
+    }
+
 
     let (services, hub) = build_services(&cfg).unwrap_or_else(|err| {
         eprintln!("{err}");
@@ -447,6 +491,19 @@ async fn async_main() {
             ),
         }
     }
+    // Outbound email transport (gaps WP3): the worker holds the sender
+    // as `Arc<dyn EmailSender>` and runs sends on blocking threads. An
+    // unconfigured transport stays dormant here — sends fail loudly and
+    // the job quarantines (endpoints map the same state to
+    // `EMAIL_NOT_CONFIGURED`).
+    let email_sender: Arc<dyn EmailSender> =
+        Arc::new(SmtpEmailSender::new(cfg.smtp_config()));
+    // Publish the sender to the dispatcher slot so the email-identity arms
+    // (`i/update-email`, `request-reset-password`) send live when SMTP is
+    // configured; unconfigured stays dormant (`EMAIL_NOT_CONFIGURED`).
+    if cfg.smtp_config().is_configured() {
+        pinetree::api::misskey::endpoints::set_email_sender(email_sender.clone());
+    }
     let worker = Arc::new(JobWorker {
         clock: services.clock.clone(),
         ids: services.ids.clone(),
@@ -457,6 +514,8 @@ async fn async_main() {
         delivery_tracker: Arc::new(DestinationTracker::new()),
         lease_duration_ms: 30_000,
         base_backoff_ms: 1_000,
+        transcode_config,
+        email_sender,
     });
     // The worker stops claiming new jobs once `stop` is set (see the
     // shutdown arm below). A job claimed but not settled keeps its lease;

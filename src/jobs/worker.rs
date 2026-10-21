@@ -2,17 +2,20 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::api::misskey::packers::{
-    pack_emoji_detailed, pack_note, pack_notification, pack_user_detailed_not_me,
+    pack_antenna, pack_emoji_detailed, pack_note, pack_notification, pack_user_detailed_not_me,
 };
 use crate::application::commands::AppServices;
 use crate::application::events::{EmojiBroadcastOp, MainEventKind, MainMessage, NotifyJobPayload, StreamingEvent};
 use crate::application::ports::{
     BackfillDurablePayload, CacheEvictPayload, Clock, IdGenerator, Job, JobKind, JobQueue,
     NewJob, NotificationStore, PortError, ReconcileStoragePayload, RemoteMediaFetchPayload,
-    StreamingSink, MAX_JOBS_PER_TXN, MAX_JOB_ATTEMPTS,
+    StreamingSink, TimelineCursor, MAX_JOBS_PER_TXN, MAX_JOB_ATTEMPTS,
 };
+use crate::domain::antenna::ANTENNA_NOTES_CAP;
 use crate::domain::notification::{Notification, NotificationKind};
 use crate::federation::retry::{DeliveryOutcome, DestinationTracker};
+use crate::media::transcode::TranscodeConfig;
+use crate::services::email::EmailSender;
 
 /// In-process durable-job worker (Phase 1, single node).
 pub struct JobWorker {
@@ -25,6 +28,15 @@ pub struct JobWorker {
     pub delivery_tracker: Arc<DestinationTracker>,
     pub lease_duration_ms: i64,
     pub base_backoff_ms: i64,
+    /// Transcode runtime config (toolchain path + quality/cap knobs from
+    /// the `transcode` config section; see `crate::media::transcode`).
+    /// The `TranscodeMedia` arm refuses stray jobs when disabled.
+    pub transcode_config: TranscodeConfig,
+    /// Outbound email transport (usually the configured
+    /// `crate::services::email::SmtpEmailSender`). The `EmailSend` arm
+    /// calls it on a blocking thread; an unconfigured transport fails
+    /// sends loudly and the job quarantines.
+    pub email_sender: Arc<dyn EmailSender>,
 }
 
 /// How a claimed job's record is settled after its handler runs.
@@ -203,10 +215,12 @@ impl JobWorker {
                 Err(_) => Ok(Disposition::Retry { retry_after_ms: None }),
             },
             // Poll expiry (§4): publish the `pollEnded` streaming event
-            // once the poll has expired. Bad payloads quarantine; a gone
-            // note/poll or a not-yet-expired poll completes quietly (a
-            // re-armed job covers clock skew). Only storage faults retry.
-            JobKind::PollExpiry => match self.handle_poll_expiry(&job.payload) {
+            // once the poll has expired, then enqueue the `pollEnded`
+            // `Notify` job for the note author. Bad payloads quarantine;
+            // a gone note/poll or a not-yet-expired poll completes quietly
+            // (a re-armed job covers clock skew). Only storage faults
+            // retry.
+            JobKind::PollExpiry => match self.run_poll_expiry(&job.payload) {
                 Ok(_) => Ok(Disposition::Done),
                 Err(PortError::Validation(reason)) => {
                     Ok(Disposition::Quarantine(format!("bad-payload: {reason}")))
@@ -370,6 +384,42 @@ impl JobWorker {
                     }
                 }
             }
+            // Post-commit ffmpeg transcode (gaps WP1): finish processing
+            // staged bytes outside any transaction. Bad payloads
+            // quarantine; deterministic input failures (bad decode, ffmpeg
+            // error, wall/output/RSS breach) quarantine with the ffmpeg
+            // reason; only storage faults retry.
+            JobKind::TranscodeMedia => match self.dispatch_transcode_media(&job.payload) {
+                Ok(disposition) => Ok(disposition),
+                Err(PortError::Validation(reason)) => {
+                    Ok(Disposition::Quarantine(format!("bad-payload: {reason}")))
+                }
+                Err(_) => Ok(Disposition::Retry { retry_after_ms: None }),
+            },
+            // Durable webhook delivery (gaps WP3): signed POST reusing the
+            // federation outbox's cooldown/backoff discipline
+            // (`classify_inbox_status` + `DestinationTracker`). Bad
+            // payloads quarantine; transport outcomes map like
+            // `FederateDeliver` (Done/Retry/Defer/Fanout).
+            JobKind::WebhookDeliver => match self.dispatch_webhook_deliver(&job.payload) {
+                Ok(disposition) => Ok(disposition),
+                Err(PortError::Validation(reason)) => {
+                    Ok(Disposition::Quarantine(format!("bad-payload: {reason}")))
+                }
+                Err(_) => Ok(Disposition::Retry { retry_after_ms: None }),
+            },
+            // Durable email send (gaps WP3): render-and-send one message
+            // through the configured transport. Bad payloads and terminal
+            // send failures (unconfigured transport, invalid message,
+            // auth) quarantine; connection/rejection failures retry with
+            // backoff.
+            JobKind::EmailSend => match self.handle_email_send(&job.payload) {
+                Ok(()) => Ok(Disposition::Done),
+                Err(PortError::Validation(reason)) => {
+                    Ok(Disposition::Quarantine(format!("bad-payload: {reason}")))
+                }
+                Err(_) => Ok(Disposition::Retry { retry_after_ms: None }),
+            },
         }
     }
 
@@ -398,9 +448,11 @@ impl JobWorker {
         // notifier (the exporter), so this kind takes the dedicated
         // notifier-less gate instead. Batch P `test` rides the same gate
         // (upstream `createNotification(user.id, 'test', {})` is equally
-        // notifier-less).
+        // notifier-less), as does §4 `pollEnded` (upstream notifies with
+        // no notifier; the row carries the author as a placeholder).
         let allowed = if notify.kind == NotificationKind::ExportCompleted
             || notify.kind == NotificationKind::Test
+            || notify.kind == NotificationKind::PollEnded
         {
             self.services
                 .system_notification_allowed(&notify.notifiee_id, notify.kind)?
@@ -467,6 +519,14 @@ impl JobWorker {
         services.streaming.push_main(MainMessage {
             user_id: notifiee.to_string(),
             kind: MainEventKind::Notification,
+            body: packed_notification.clone(),
+        })?;
+        // Every stored notification also nudges the badge counter
+        // (Misskey `unreadNotification` parity): the body is the same
+        // packed notification the `notification` event carries.
+        services.streaming.push_main(MainMessage {
+            user_id: notifiee.to_string(),
+            kind: MainEventKind::UnreadNotification,
             body: packed_notification,
         })?;
         let packed_note = |note_id: &str| -> Result<Option<serde_json::Value>, PortError> {
@@ -538,11 +598,13 @@ impl JobWorker {
             // posted note / failed draft rides in the packed body).
             // `exportCompleted` (§13) likewise: the drive file rides in the
             // packed body (`fileId`). `followRequestAccepted` likewise:
-            // the packed body carries the acceptor.
+            // the packed body carries the acceptor. `pollEnded` (§4)
+            // likewise: the expired note rides in the packed body.
             NotificationKind::FollowRequestAccepted
             | NotificationKind::ScheduledNotePosted
             | NotificationKind::ScheduledNotePostFailed
             | NotificationKind::ExportCompleted
+            | NotificationKind::PollEnded
             | NotificationKind::ClipUpdated
             | NotificationKind::PageLiked
             | NotificationKind::Test => {}
@@ -655,25 +717,94 @@ impl JobWorker {
     }
 
     /// Run one `AntennaMatch` job (Batch N WS4): fan one committed note
-    /// into matching antenna feeds (+ post-commit stream events). Gone
-    /// notes converge quietly; only storage faults retry.
+    /// into matching antenna feeds (+ post-commit stream events), then
+    /// push one `unreadAntenna` main event per matched antenna owner.
+    /// Gone notes converge quietly; only storage faults retry.
     fn handle_antenna_match(&self, payload: &[u8]) -> Result<(), PortError> {
         use crate::application::ports::AntennaMatchPayload;
         let parsed: AntennaMatchPayload = serde_json::from_slice(payload)
             .map_err(|e| PortError::Validation(format!("antenna-match payload invalid: {e}")))?;
-        self.services.match_antenna_note(&parsed.note_id)
+        self.services.match_antenna_note(&parsed.note_id)?;
+        self.push_unread_antennas(&parsed.note_id)
+    }
+
+    /// Push one `unreadAntenna` main event per antenna whose feed gained
+    /// `note_id` (Misskey `publishMainStream(userId, 'unreadAntenna',
+    /// { antenna, note })` parity). Membership is re-read from the feed
+    /// (newest-first, one page covers the trimmed feed), so this stays
+    /// inside the worker without duplicating the matcher. Bounded: one
+    /// feed read per active antenna. A replayed job re-pushes hints for
+    /// feeds the note already joined (the row append dedups, the hint
+    /// does not) — the same at-most-once-per-run behavior as the
+    /// `antenna` stream events the matcher publishes.
+    fn push_unread_antennas(&self, note_id: &str) -> Result<(), PortError> {
+        let Some(note) = self.services.notes.get_note(note_id)? else {
+            return Ok(());
+        };
+        if note.is_deleted {
+            return Ok(());
+        }
+        let antennas = self.services.antennas.all_active_antennas()?;
+        if antennas.is_empty() {
+            return Ok(());
+        }
+        let cursor = TimelineCursor::with_limit(ANTENNA_NOTES_CAP);
+        for antenna in &antennas {
+            let feed = self
+                .services
+                .antenna_notes
+                .antenna_notes(&antenna.id, &cursor)?;
+            if !feed.iter().any(|id| id == note_id) {
+                continue;
+            }
+            let packed_note = pack_note(&note, Some(&antenna.owner_id), &self.services, 0)?;
+            let body = serde_json::json!({
+                "antenna": pack_antenna(antenna, &self.services),
+                "note": packed_note,
+            });
+            self.services.streaming.push_main(MainMessage {
+                user_id: antenna.owner_id.clone(),
+                kind: MainEventKind::UnreadAntenna,
+                body,
+            })?;
+        }
+        Ok(())
     }
 
     /// Run one `PollExpiry` job (§4): publish the `pollEnded` streaming
-    /// event when the poll has expired. Gone notes/polls and premature
-    /// runs complete quietly.
-    fn handle_poll_expiry(&self, payload: &[u8]) -> Result<(), PortError> {
+    /// event when the poll has expired, then enqueue the `pollEnded`
+    /// `Notify` job for the note author (Misskey
+    /// `EndedPollNotificationProcessorService` parity, author-only —
+    /// pinetree has no voter fan-out yet). Gone notes/polls and premature
+    /// runs complete quietly. Only storage faults retry.
+    fn run_poll_expiry(&self, payload: &[u8]) -> Result<(), PortError> {
         use crate::application::ports::PollExpiryPayload;
         let parsed: PollExpiryPayload = serde_json::from_slice(payload)
             .map_err(|e| PortError::Validation(format!("poll-expiry payload invalid: {e}")))?;
-        self.services
-            .handle_poll_expiry(&parsed.note_id)
-            .map(|_| ())
+        if !self.services.handle_poll_expiry(&parsed.note_id)? {
+            return Ok(());
+        }
+        let Some(note) = self.services.notes.get_note(&parsed.note_id)? else {
+            return Ok(());
+        };
+        let notify = NotifyJobPayload {
+            notifiee_id: note.author_id.clone(),
+            notifier_id: note.author_id.clone(),
+            kind: NotificationKind::PollEnded,
+            note_id: Some(note.id.clone()),
+            reaction: None,
+            file_id: None,
+            exported_entity: None,
+            clip_id: None,
+            page_id: None,
+        };
+        let job = NewJob::new_json(
+            JobKind::Notify,
+            &notify,
+            format!("notify:poll-ended:{}", note.id),
+            self.clock.now_ms(),
+        )?;
+        self.jobs.enqueue_jobs(vec![job])
     }
 
     /// Run one `PostScheduledDraft` job (§5): post the draft when its
@@ -799,6 +930,84 @@ impl JobWorker {
             Err(PortError::Validation(_)) | Err(PortError::NotFound(_)) => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    /// Run one `TranscodeMedia` job (gaps WP1): finish processing the
+    /// staged bytes and commit the derived result. A missing row or an
+    /// already-converged row completes quietly; deterministic input
+    /// failures quarantine with the ffmpeg reason (surfaced as `422`
+    /// once `MediaState::Failed` lands); only missing/unreadable storage
+    /// (or a vanishing toolchain) propagates for the caller to retry.
+    fn dispatch_transcode_media(&self, payload: &[u8]) -> Result<Disposition, PortError> {
+        use crate::jobs::transcode::{TranscodeJobPayload, TranscodeOutcome, run_transcode_job};
+        let file_id = TranscodeJobPayload::file_id_from_bytes(payload)?;
+        match run_transcode_job(
+            self.services.media.as_ref(),
+            self.services.blobs.as_ref(),
+            &file_id,
+            &self.transcode_config,
+        ) {
+            Ok(TranscodeOutcome::Noop) | Ok(TranscodeOutcome::Ready(_)) => {
+                Ok(Disposition::Done)
+            }
+            Ok(TranscodeOutcome::FailedDeterministic(reason)) => {
+                Ok(Disposition::Quarantine(reason))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Run one `WebhookDeliver` job (gaps WP3): cooldown-aware signed
+    /// POST reusing the federation outbox's classification/backoff
+    /// discipline. Outcomes map like `FederateDeliver`
+    /// (Done/Retry/Defer/Fanout); only the payload parse can fail here
+    /// (the executor reports transport outcomes as values, never errors).
+    fn dispatch_webhook_deliver(&self, payload: &[u8]) -> Result<Disposition, PortError> {
+        use crate::application::commands::webhooks::{
+            WebhookDeliverPayload, execute_webhook_deliver,
+        };
+        let parsed: WebhookDeliverPayload = serde_json::from_slice(payload).map_err(|e| {
+            PortError::Validation(format!("webhook-deliver payload invalid: {e}"))
+        })?;
+        let outcome = execute_webhook_deliver(
+            &self.services.federation_http,
+            &self.delivery_tracker,
+            self.base_backoff_ms,
+            self.clock.now_ms(),
+            &parsed,
+        );
+        crate::fed_debug!("out webhook job url={:?} outcome={outcome:?}", parsed.url);
+        Ok(match outcome {
+            DeliveryOutcome::Delivered => Disposition::Done,
+            DeliveryOutcome::PermanentFailure(reason) => {
+                Disposition::Quarantine(format!("permanent-failure: {reason}"))
+            }
+            DeliveryOutcome::TransientFailure { retry_after_ms, .. } => {
+                Disposition::Retry { retry_after_ms }
+            }
+            DeliveryOutcome::Deferred { until_ms } => Disposition::Defer(until_ms),
+            DeliveryOutcome::Split { followups } => Disposition::Fanout(followups),
+        })
+    }
+
+    /// Run one `EmailSend` job (gaps WP3): render-and-send one message
+    /// through the configured transport. Terminal failures (bad payload
+    /// shape, unconfigured transport, invalid message, auth rejection)
+    /// quarantine; connection and content rejections propagate for the
+    /// caller to retry with backoff.
+    fn handle_email_send(&self, payload: &[u8]) -> Result<(), PortError> {
+        use crate::services::email::{EmailError, EmailSendPayload, execute_email_send};
+        let parsed: EmailSendPayload = serde_json::from_slice(payload).map_err(|e| {
+            PortError::Validation(format!("email-send payload invalid: {e}"))
+        })?;
+        execute_email_send(self.email_sender.as_ref(), &parsed).map_err(|err| match err {
+            EmailError::NotConfigured | EmailError::InvalidMessage(_) | EmailError::Auth(_) => {
+                PortError::Validation(format!("email send failed: {err}"))
+            }
+            EmailError::Connection(_) | EmailError::Rejected(_) => {
+                PortError::StorageUnavailable(format!("email send failed: {err}"))
+            }
+        })
     }
 
     fn dispatch_federate(&self, job: &Job) -> Result<Disposition, PortError> {

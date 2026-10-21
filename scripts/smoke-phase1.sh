@@ -100,7 +100,7 @@ wait_for_health() {
 start_server() {
   local port="$1"
   ORIGIN="http://127.0.0.1:$port"
-  "$BIN" --data-dir="$DATA_DIR" --listen="127.0.0.1:$port" --public-url="$ORIGIN" &
+  "$BIN" --data-dir="$DATA_DIR" --listen="127.0.0.1:$port" --public-url="$ORIGIN" --no-transcode &
   SERVER_PID=$!
   SERVER_STARTED=1
   wait_for_health "$ORIGIN" || {
