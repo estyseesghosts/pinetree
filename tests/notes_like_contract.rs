@@ -52,7 +52,8 @@ fn test_services_with_like(prefix: &str, default_like: Option<&str>) -> AppServi
         polls: store.clone(),
         jobs: store.clone(),
         media: store.clone(),
-        blobs,
+        blobs: blobs.clone(),
+        cache_blobs: blobs.clone(),
         notifications: store.clone(),
         auth: store.clone(),
         streaming: Arc::new(NoopStreamingSink),
@@ -81,6 +82,16 @@ fn test_services_with_like(prefix: &str, default_like: Option<&str>) -> AppServi
         scheduled_note_limit: pinetree::domain::draft::DEFAULT_SCHEDULED_NOTE_LIMIT,
         pin_limit: pinetree::domain::pinning::DEFAULT_PIN_LIMIT,
         default_like: default_like.map(str::to_string),
+        drive_capacity_per_user_bytes: 1 << 30,
+        remote_cache_max_bytes: 512 << 20,
+        remote_cache_avatar_bytes: 128 << 20,
+        remote_cache_preview_bytes: 256 << 20,
+        remote_cache_full_bytes: 128 << 20,
+        remote_cache_mode: pinetree::config::RemoteCacheMode::OnDemand,
+        remote_cache_avatar_ttl_days: 30,
+        remote_cache_preview_ttl_days: 7,
+        remote_cache_full_ttl_days: 3,
+        remote_cache_warming_enabled: false,
     }
 }
 

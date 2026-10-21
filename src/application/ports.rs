@@ -1929,48 +1929,10 @@ pub struct PollChoiceCount {
 }
 
 /// Remote-cache media class (`docs/remote-media-cache-plan.md` §5).
-/// Serialized as `avatar` | `preview` | `full` | `audio_video`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MediaClass {
-    Avatar,
-    #[default]
-    Preview,
-    Full,
-    AudioVideo,
-}
-
-impl MediaClass {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            MediaClass::Avatar => "avatar",
-            MediaClass::Preview => "preview",
-            MediaClass::Full => "full",
-            MediaClass::AudioVideo => "audio_video",
-        }
-    }
-
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "avatar" => Some(MediaClass::Avatar),
-            "preview" => Some(MediaClass::Preview),
-            "full" => Some(MediaClass::Full),
-            "audio_video" => Some(MediaClass::AudioVideo),
-            _ => None,
-        }
-    }
-
-    /// MIME-based default class (avatar/emoji is a caller-context override).
-    pub fn classify_mime(mime: &str) -> Self {
-        if mime.starts_with("audio/") || mime.starts_with("video/") {
-            MediaClass::AudioVideo
-        } else if mime.starts_with("image/") {
-            MediaClass::Preview
-        } else {
-            MediaClass::Full
-        }
-    }
-}
+/// Canonical definition lives in [`crate::domain::media`] (dependency rule:
+/// `domain` ← `application`, so domain cannot import ports); re-exported
+/// here for the store/API layer.
+pub use crate::domain::media::MediaClass;
 
 /// One `(source_url, variant)` remote-cache index row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2023,9 +1985,15 @@ pub trait MediaStore: Send + Sync {
     /// application op sorts newest-first and pages.
     fn list_all_media(&self, cursor: &TimelineCursor) -> Result<Vec<MediaMeta>, PortError>;
     /// Durable bytes currently charged to `owner_id` (sum over owned rows).
-    fn durable_bytes(&self, owner_id: &str) -> Result<u64, PortError>;
+    /// Test-double default: no rows.
+    fn durable_bytes(&self, _owner_id: &str) -> Result<u64, PortError> {
+        Ok(0)
+    }
     /// Live metadata references to `blob_key` (0 ⇒ bytes may be deleted).
-    fn blob_refcount(&self, blob_key: &str) -> Result<u64, PortError>;
+    /// Test-double default: unreferenced.
+    fn blob_refcount(&self, _blob_key: &str) -> Result<u64, PortError> {
+        Ok(0)
+    }
     /// Atomic durable insert: quota check + metadata write + refcount inc +
     /// owner-bytes adjust in one transaction. Breach ⇒
     /// `Validation("DRIVE_CAPACITY_EXCEEDED")`.
@@ -2054,43 +2022,68 @@ pub trait MediaStore: Send + Sync {
         }
     }
     /// Remote-cache index lookup by `(source_url, variant)`.
+    /// Test-double defaults: empty index, zero stats, reservations always
+    /// succeed. Production backends must override (accounting correctness
+    /// depends on it).
     fn remote_cache_lookup(
         &self,
-        source_url: &str,
-        variant: &str,
-    ) -> Result<Option<RemoteCacheRecord>, PortError>;
-    fn remote_cache_insert(&self, rec: &RemoteCacheRecord) -> Result<(), PortError>;
+        _source_url: &str,
+        _variant: &str,
+    ) -> Result<Option<RemoteCacheRecord>, PortError> {
+        Ok(None)
+    }
+    fn remote_cache_insert(&self, _rec: &RemoteCacheRecord) -> Result<(), PortError> {
+        Ok(())
+    }
     fn remote_cache_touch(
         &self,
-        source_url: &str,
-        variant: &str,
-        now_ms: i64,
-    ) -> Result<(), PortError>;
+        _source_url: &str,
+        _variant: &str,
+        _now_ms: i64,
+    ) -> Result<(), PortError> {
+        Ok(())
+    }
     /// LRU-ordered eviction candidates (oldest `last_access_ms` first),
     /// at most `limit` rows.
     fn remote_cache_evict_candidates(
         &self,
-        limit: usize,
-    ) -> Result<Vec<RemoteCacheRecord>, PortError>;
-    fn remote_cache_remove(&self, source_url: &str, variant: &str) -> Result<(), PortError>;
-    fn cache_stats(&self) -> Result<CacheStats, PortError>;
+        _limit: usize,
+    ) -> Result<Vec<RemoteCacheRecord>, PortError> {
+        Ok(Vec::new())
+    }
+    fn remote_cache_remove(
+        &self,
+        _source_url: &str,
+        _variant: &str,
+    ) -> Result<(), PortError> {
+        Ok(())
+    }
+    fn cache_stats(&self) -> Result<CacheStats, PortError> {
+        Ok(CacheStats::default())
+    }
     /// Apply accounting deltas (all saturating). `total_delta`/`class_delta`
     /// are signed (eviction/release negative, insert positive).
     fn cache_accounting_apply(
         &self,
-        total_delta: i64,
-        class: MediaClass,
-        class_delta: i64,
-        hits: u64,
-        misses: u64,
-        bytes_fetched: u64,
-        evictions: u64,
-        failed_origins: u64,
-    ) -> Result<(), PortError>;
+        _total_delta: i64,
+        _class: MediaClass,
+        _class_delta: i64,
+        _hits: u64,
+        _misses: u64,
+        _bytes_fetched: u64,
+        _evictions: u64,
+        _failed_origins: u64,
+    ) -> Result<(), PortError> {
+        Ok(())
+    }
     /// In-flight byte reservation under the global cap. Returns `false`
     /// (no reservation made) when `bytes` would exceed the cap.
-    fn reserve_cache_bytes(&self, bytes: u64) -> Result<bool, PortError>;
-    fn release_cache_reservation(&self, bytes: u64) -> Result<(), PortError>;
+    fn reserve_cache_bytes(&self, _bytes: u64) -> Result<bool, PortError> {
+        Ok(true)
+    }
+    fn release_cache_reservation(&self, _bytes: u64) -> Result<(), PortError> {
+        Ok(())
+    }
     /// Persist the global cache cap consulted by `reserve_cache_bytes`.
     /// Backends without persistent limits may no-op.
     fn set_cache_cap(&self, _cap_bytes: u64) -> Result<(), PortError> {

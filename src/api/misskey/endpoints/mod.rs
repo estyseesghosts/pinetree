@@ -31,7 +31,7 @@ use crate::application::commands::invites::SignupRejection;
 use crate::application::commands::pins::FeaturedCache;
 use crate::application::commands::AppServices;
 use crate::application::ports::{
-    AbuseReportFilter, ApiTokenRecord, CreateDraftInput, CreateNoteInput, EditNoteInput, ExportEntity, ImportEntity,
+    AbuseReportFilter, ApiTokenRecord, BlobStore, CreateDraftInput, CreateNoteInput, EditNoteInput, ExportEntity, ImportEntity,
     InviteListFilter, InviteSort, InviteTypeFilter, LegacyAuthSessionRecord, MiAuthSessionRecord,
     ModerationLogFilter, PasswordResetRequest, PortError, RegistryItem, SigninRecord, TimelineCursor,
     UpdateAccountPatch, UpdateDraftPatch,
@@ -1329,7 +1329,7 @@ async fn serve_file(
                 match crate::media::remote_cache::fetch_on_first_request(
                     &state.services,
                     &url,
-                    "original",
+                    &meta.variant,
                 ) {
                     Ok(refreshed) => {
                         bytes = state
@@ -10777,7 +10777,7 @@ mod tests {
             polls: store.clone(),
             jobs: store.clone(),
             media: store.clone(),
-            blobs,
+            blobs: blobs.clone(),
             notifications: store.clone(),
             auth: store.clone(),
             streaming: streaming.clone(),

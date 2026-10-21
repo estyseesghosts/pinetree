@@ -4871,6 +4871,11 @@ impl NoteStore for RedbStore {
             thumbnail_url: input.thumbnail_url.clone(),
             comment: input.comment.clone(),
             source_url: input.source_url.clone(),
+            variant: "original".to_string(),
+            media_class: MediaClass::classify_mime(input.mime.as_str())
+                .as_str()
+                .to_string(),
+            evicted: false,
         };
         meta.validate(input.max_file_size)?;
         let write_txn = self.begin_write()?;
@@ -4978,10 +4983,85 @@ impl NoteStore for RedbStore {
         notes_table
             .insert(note.id.as_str(), note_bytes.as_slice())
             .map_err(map_redb_err)?;
+        // Storage-overhaul accounting for the attach path: the row is new
+        // (or a same-id rewrite), so refcount and durable totals move here
+        // — `insert_metadata` is bypassed on this path.
+        let old_attached: Option<MediaMeta> = match media_table
+            .get(meta.id.as_str())
+            .map_err(map_redb_err)?
+        {
+            Some(g) => Some(decode_json(g.value())?),
+            None => None,
+        };
         let meta_bytes = encode_json(&meta)?;
         media_table
             .insert(meta.id.as_str(), meta_bytes.as_slice())
             .map_err(map_redb_err)?;
+        {
+            let mut refcounts = write_txn.open_table(BLOB_REFCOUNT).map_err(map_redb_err)?;
+            if let Some(old) = old_attached.as_ref() {
+                if old.blob_key != meta.blob_key {
+                    let left = refcounts
+                        .get(old.blob_key.as_str())
+                        .map_err(map_redb_err)?
+                        .map(|g| g.value())
+                        .unwrap_or(0)
+                        .saturating_sub(1);
+                    if left == 0 {
+                        refcounts
+                            .remove(old.blob_key.as_str())
+                            .map_err(map_redb_err)?;
+                    } else {
+                        refcounts
+                            .insert(old.blob_key.as_str(), left)
+                            .map_err(map_redb_err)?;
+                    }
+                }
+            }
+            if old_attached.as_ref().is_none_or(|o| o.blob_key != meta.blob_key) {
+                let count = refcounts
+                    .get(meta.blob_key.as_str())
+                    .map_err(map_redb_err)?
+                    .map(|g| g.value())
+                    .unwrap_or(0);
+                refcounts
+                    .insert(meta.blob_key.as_str(), count.saturating_add(1))
+                    .map_err(map_redb_err)?;
+            }
+            if old_attached.as_ref().map(|o| o.owner_id.as_deref())
+                != Some(meta.owner_id.as_deref())
+                || old_attached.as_ref().map(|o| o.size_bytes) != Some(meta.size_bytes)
+            {
+                if let Some(old) = old_attached.as_ref() {
+                    if let Some(owner) = old.owner_id.as_deref() {
+                        let mut durable = write_txn
+                            .open_table(DURABLE_BYTES_BY_OWNER)
+                            .map_err(map_redb_err)?;
+                        let total = durable
+                            .get(owner)
+                            .map_err(map_redb_err)?
+                            .map(|g| g.value())
+                            .unwrap_or(0);
+                        durable
+                            .insert(owner, total.saturating_sub(old.size_bytes))
+                            .map_err(map_redb_err)?;
+                    }
+                }
+                if let Some(owner) = meta.owner_id.as_deref() {
+                    let mut durable = write_txn
+                        .open_table(DURABLE_BYTES_BY_OWNER)
+                        .map_err(map_redb_err)?;
+                    let total = durable
+                        .get(owner)
+                        .map_err(map_redb_err)?
+                        .map(|g| g.value())
+                        .unwrap_or(0);
+                    durable
+                        .insert(owner, total.saturating_add(meta.size_bytes))
+                        .map_err(map_redb_err)?;
+                }
+            }
+        }
         drop(notes_table);
         drop(media_table);
         self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
@@ -9123,10 +9203,15 @@ impl MediaStore for RedbStore {
             let mut durable = write_txn
                 .open_table(DURABLE_BYTES_BY_OWNER)
                 .map_err(map_redb_err)?;
-            let Some(g) = media.get(id).map_err(map_redb_err)? else {
+            let meta: Option<MediaMeta> = {
+                let guard = media.get(id).map_err(map_redb_err)?;
+                guard
+                    .map(|g| decode_json(g.value()))
+                    .transpose()?
+            };
+            let Some(meta) = meta else {
                 return Ok(None);
             };
-            let meta: MediaMeta = decode_json(g.value())?;
             media.remove(id).map_err(map_redb_err)?;
             let remaining = refcounts
                 .get(meta.blob_key.as_str())
@@ -9199,13 +9284,17 @@ impl MediaStore for RedbStore {
         let write_txn = self.begin_write()?;
         {
             let mut table = write_txn.open_table(REMOTE_CACHE).map_err(map_redb_err)?;
-            let Some(g) = table
-                .get((source_url, variant))
-                .map_err(map_redb_err)?
-            else {
+            let rec: Option<RemoteCacheRecord> = {
+                let guard = table
+                    .get((source_url, variant))
+                    .map_err(map_redb_err)?;
+                guard
+                    .map(|g| decode_json(g.value()))
+                    .transpose()?
+            };
+            let Some(mut rec) = rec else {
                 return Ok(());
             };
-            let mut rec: RemoteCacheRecord = decode_json(g.value())?;
             rec.last_access_ms = now_ms;
             rec.access_count = rec.access_count.saturating_add(1);
             let encoded = encode_json(&rec)?;
@@ -9380,6 +9469,9 @@ impl MediaStore for RedbStore {
         quota_bytes: u64,
     ) -> Result<MediaMeta, PortError> {
         let id = input.id.unwrap_or_else(|| self.ids.generate());
+        let media_class = MediaClass::classify_mime(input.mime.as_str())
+            .as_str()
+            .to_string();
         let meta = MediaMeta {
             id,
             owner_id: input.owner_id,
@@ -9396,6 +9488,9 @@ impl MediaStore for RedbStore {
             thumbnail_url: input.thumbnail_url,
             comment: input.comment,
             source_url: input.source_url,
+            variant: "original".to_string(),
+            media_class,
+            evicted: false,
         };
         meta.validate(input.max_file_size)?;
 
@@ -9449,7 +9544,15 @@ impl MediaStore for RedbStore {
                     .map(|g| g.value())
                     .unwrap_or(0);
                 let next = total.saturating_add(meta.size_bytes);
-                if next > quota_bytes {
+                // Grandfathered updates: rewriting the same row with the
+                // same owner and no byte growth never breaches, so
+                // over-quota users keep rename/comment/sensitivity edits.
+                let same_row_same_owner = old.as_ref().is_some_and(|o| {
+                    o.id == meta.id
+                        && o.owner_id.as_deref() == Some(owner)
+                        && meta.size_bytes <= o.size_bytes
+                });
+                if next > quota_bytes && !same_row_same_owner {
                     return Err(PortError::Validation(
                         "DRIVE_CAPACITY_EXCEEDED".to_string(),
                     ));

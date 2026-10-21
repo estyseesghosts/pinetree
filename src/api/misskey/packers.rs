@@ -3606,7 +3606,7 @@ mod tests {
             scheduled_note_limit: crate::domain::draft::DEFAULT_SCHEDULED_NOTE_LIMIT,
             pin_limit: crate::domain::pinning::DEFAULT_PIN_LIMIT,
             default_like: None,
-        cache_blobs: blobs.clone(),
+        cache_blobs: mem.clone(),
         drive_capacity_per_user_bytes: 1 << 30,
         remote_cache_max_bytes: 512 << 20,
         remote_cache_avatar_bytes: 128 << 20,
@@ -3687,6 +3687,9 @@ mod tests {
             thumbnail_url: None,
             comment: None,
             source_url: None,
+            variant: "original".to_string(),
+            media_class: "preview".to_string(),
+            evicted: false,
         }
     }
 

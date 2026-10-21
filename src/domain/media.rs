@@ -39,6 +39,85 @@ pub struct MediaMeta {
     /// (Phase 2.6 slice 7); `#[serde(default)]` so pre-slice-7 rows decode.
     #[serde(default)]
     pub source_url: Option<String>,
+    /// Cache variant within one `(source_url)` family (e.g. `original`,
+    /// `preview`, `avatar`). Defaults to `original` so pre-change rows
+    /// decode; validated to `1..=64` chars of alnum plus `-`/`_`.
+    #[serde(default = "default_media_variant")]
+    pub variant: String,
+    /// Remote-cache media class: `avatar` | `preview` | `full` |
+    /// `audio_video`. Plain `String` (not the enum) so unknown future
+    /// classes decode instead of failing the row read; validated against
+    /// the four known values. Defaults to `preview` for pre-change rows.
+    #[serde(default = "default_media_class")]
+    pub media_class: String,
+    /// Eviction marker: `true` means the bytes are gone (dropped under
+    /// cache pressure) but this metadata row plus `source_url` are
+    /// retained so the bytes can be re-fetched. Defaults to `false` for
+    /// pre-change rows.
+    #[serde(default)]
+    pub evicted: bool,
+}
+
+/// Default `MediaMeta::variant` for rows written before variants existed.
+fn default_media_variant() -> String {
+    "original".to_string()
+}
+
+/// Default `MediaMeta::media_class` for rows written before classes existed.
+fn default_media_class() -> String {
+    MediaClass::Preview.as_str().to_string()
+}
+
+/// Remote-cache media class (`docs/remote-media-cache-plan.md` §5).
+/// Serialized as `avatar` | `preview` | `full` | `audio_video`.
+///
+/// Lives here (not in `application::ports`) because the dependency rule is
+/// `domain` ← `application`: domain must not import ports. `ports.rs`
+/// carries a mirror enum with identical semantics for the store/API
+/// layer; keep the two in sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaClass {
+    Avatar,
+    #[default]
+    Preview,
+    Full,
+    AudioVideo,
+}
+
+impl MediaClass {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MediaClass::Avatar => "avatar",
+            MediaClass::Preview => "preview",
+            MediaClass::Full => "full",
+            MediaClass::AudioVideo => "audio_video",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "avatar" => Some(MediaClass::Avatar),
+            "preview" => Some(MediaClass::Preview),
+            "full" => Some(MediaClass::Full),
+            "audio_video" => Some(MediaClass::AudioVideo),
+            _ => None,
+        }
+    }
+
+    /// MIME-based default class. Avatars/emoji are a caller-context
+    /// override (the caller passes `avatar` explicitly); everything else
+    /// classifies by content type: audio/video → `AudioVideo`, images →
+    /// `Preview`, all other types → `Full`.
+    pub fn classify_mime(mime: &str) -> Self {
+        if mime.starts_with("audio/") || mime.starts_with("video/") {
+            MediaClass::AudioVideo
+        } else if mime.starts_with("image/") {
+            MediaClass::Preview
+        } else {
+            MediaClass::Full
+        }
+    }
 }
 
 impl MediaMeta {
@@ -119,6 +198,23 @@ impl MediaMeta {
                     "source_url exceeds 1024 chars".to_string(),
                 ));
             }
+        }
+        let variant_len = self.variant.chars().count();
+        if variant_len == 0
+            || variant_len > 64
+            || !self
+                .variant
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err(DomainError::Validation(
+                "variant must be 1..=64 chars of alnum, - or _".to_string(),
+            ));
+        }
+        if MediaClass::from_str(&self.media_class).is_none() {
+            return Err(DomainError::Validation(
+                "media_class must be avatar|preview|full|audio_video".to_string(),
+            ));
         }
         Ok(())
     }
@@ -260,6 +356,9 @@ mod tests {
             thumbnail_url: None,
             comment: None,
             source_url: None,
+            variant: default_media_variant(),
+            media_class: default_media_class(),
+            evicted: false,
         }
     }
 
@@ -440,5 +539,118 @@ mod tests {
         // still sniffs as audio, and so does an ID3 tag.
         assert_eq!(sniff_mime(&[0xFF, 0xFB, 0x90, 0x00]), "audio/mpeg");
         assert_eq!(sniff_mime(b"ID3\x04\x00\x00\x00"), "audio/mpeg");
+    }
+
+    // --- Remote-cache fields (variant / media_class / evicted) ---
+
+    #[test]
+    fn new_fields_default_on_valid_media() {
+        let m = valid_media();
+        assert_eq!(m.variant, "original");
+        assert_eq!(m.media_class, "preview");
+        assert!(!m.evicted);
+        assert!(m.validate(MAX_FILE_SIZE).is_ok());
+    }
+
+    #[test]
+    fn pre_change_rows_decode_with_defaults() {
+        // Rows written before the cache fields existed carry no
+        // `variant`/`media_class`/`evicted` keys; serde defaults must fill
+        // them so old rows never fail a read.
+        let old_row = serde_json::json!({
+            "id": "mid00000000000001",
+            "owner_id": null,
+            "name": "photo.png",
+            "mime": "image/png",
+            "size_bytes": 512,
+            "hash": "d41d8cd98f00b204e9800998ecf8427e",
+            "blob_key": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "blurhash": null,
+            "properties": {"width": null, "height": null, "orientation": null, "avg_color": null},
+            "is_sensitive": false,
+            "is_link": true,
+            "url": "https://example.local/files/mid00000000000001",
+            "thumbnail_url": null,
+            "comment": null,
+            "source_url": "https://remote.invalid/pic.png"
+        });
+        let m: MediaMeta = serde_json::from_value(old_row).expect("old row must decode");
+        assert_eq!(m.variant, "original");
+        assert_eq!(m.media_class, "preview");
+        assert!(!m.evicted);
+        assert!(m.validate(MAX_FILE_SIZE).is_ok());
+        // Round-trip keeps the new fields.
+        let rt: MediaMeta =
+            serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(rt, m);
+    }
+
+    #[test]
+    fn variant_bounds() {
+        let mut m = valid_media();
+        assert!(m.validate(MAX_FILE_SIZE).is_ok());
+        for bad in ["", "has space", "has/slash", "semi;colon", "dot.name"] {
+            m.variant = bad.to_string();
+            assert!(m.validate(MAX_FILE_SIZE).is_err(), "expected err: {bad:?}");
+        }
+        m.variant = "v".repeat(64);
+        assert!(m.validate(MAX_FILE_SIZE).is_ok());
+        m.variant = "v".repeat(65);
+        assert!(m.validate(MAX_FILE_SIZE).is_err());
+        m.variant = "preview-2_thumb".to_string();
+        assert!(m.validate(MAX_FILE_SIZE).is_ok());
+    }
+
+    #[test]
+    fn media_class_values() {
+        let mut m = valid_media();
+        for good in ["avatar", "preview", "full", "audio_video"] {
+            m.media_class = good.to_string();
+            assert!(m.validate(MAX_FILE_SIZE).is_ok(), "expected ok: {good:?}");
+        }
+        for bad in ["", "image", "Preview", "AUDIO_VIDEO", "original"] {
+            m.media_class = bad.to_string();
+            assert!(m.validate(MAX_FILE_SIZE).is_err(), "expected err: {bad:?}");
+        }
+    }
+
+    #[test]
+    fn media_class_str_roundtrip_and_defaults() {
+        assert_eq!(MediaClass::default(), MediaClass::Preview);
+        for class in [
+            MediaClass::Avatar,
+            MediaClass::Preview,
+            MediaClass::Full,
+            MediaClass::AudioVideo,
+        ] {
+            assert_eq!(MediaClass::from_str(class.as_str()), Some(class));
+        }
+        assert_eq!(MediaClass::from_str("image"), None);
+        assert_eq!(MediaClass::from_str(""), None);
+        // Serde uses the same snake_case wire form as `as_str`.
+        for class in [
+            MediaClass::Avatar,
+            MediaClass::Preview,
+            MediaClass::Full,
+            MediaClass::AudioVideo,
+        ] {
+            let wire = serde_json::to_string(&class).unwrap();
+            assert_eq!(wire, format!("\"{}\"", class.as_str()));
+            assert_eq!(serde_json::from_str::<MediaClass>(&wire).unwrap(), class);
+        }
+    }
+
+    #[test]
+    fn media_class_classify_mime() {
+        // Avatar is caller-context, never inferred from MIME.
+        assert_eq!(MediaClass::classify_mime("image/png"), MediaClass::Preview);
+        assert_eq!(MediaClass::classify_mime("image/avif"), MediaClass::Preview);
+        assert_eq!(MediaClass::classify_mime("audio/mpeg"), MediaClass::AudioVideo);
+        assert_eq!(MediaClass::classify_mime("video/mp4"), MediaClass::AudioVideo);
+        assert_eq!(MediaClass::classify_mime("text/plain"), MediaClass::Full);
+        assert_eq!(
+            MediaClass::classify_mime("application/octet-stream"),
+            MediaClass::Full
+        );
     }
 }

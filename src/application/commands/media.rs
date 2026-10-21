@@ -1,6 +1,6 @@
 use super::AppServices;
 
-use crate::application::ports::{InsertMediaInput, PortError, TimelineCursor};
+use crate::application::ports::{CacheStats, InsertMediaInput, PortError, TimelineCursor};
 use crate::domain::media::{sniff_mime, MediaMeta, MediaProperties};
 use crate::media::ingest::{md5_hex, sanitize_filename, sha256_hex};
 use crate::media::remote_cache::validate_remote_media_url;
@@ -42,9 +42,24 @@ impl AppServices {
         // content address.
         let md5 = md5_hex(bytes);
         if !force {
+            // Dedup hit is free: no quota is charged for an existing row.
             if let Some(existing) = self.media.find_by_owner_and_hash(owner_id, &md5)? {
                 return Ok(existing);
             }
+        }
+        // Best-effort pre-check so the common over-quota case fails BEFORE
+        // the durable `blobs.put` below (a breach after `put` would leave
+        // orphan bytes for the reconciler to sweep). The in-transaction
+        // check inside `insert_metadata_with_durable_quota` is authoritative
+        // — this read-then-write gap can only over-admit, never over-reject
+        // relative to it, and the atomic method still returns
+        // `DRIVE_CAPACITY_EXCEEDED` on a lost race.
+        let size_bytes = bytes.len() as u64;
+        let used = self.media.durable_bytes(owner_id)?;
+        if used.saturating_add(size_bytes) > self.drive_capacity_per_user_bytes {
+            return Err(PortError::Validation(
+                "DRIVE_CAPACITY_EXCEEDED".to_string(),
+            ));
         }
         // Slice 7 (H2): the stored MIME comes from the shared sniffer only.
         // The caller-supplied content type is deliberately ignored so a
@@ -54,24 +69,33 @@ impl AppServices {
         let url = format!("{}/files/{media_id}", self.public_url.trim_end_matches('/'));
         let blob_key = sha256_hex(bytes);
         self.blobs.put(&blob_key, bytes)?;
-        self.media.insert_metadata(InsertMediaInput {
-            id: Some(media_id),
-            owner_id: Some(owner_id.to_string()),
-            name,
-            mime: sniffed,
-            size_bytes: bytes.len() as u64,
-            hash: md5,
-            blob_key,
-            blurhash: None,
-            properties: MediaProperties::default(),
-            is_sensitive,
-            is_link: false,
-            url,
-            thumbnail_url: None,
-            comment,
-            source_url: None,
-            max_file_size: self.max_file_size,
-        })
+        // Quota-checked insert: breach maps to
+        // `Validation("DRIVE_CAPACITY_EXCEEDED")` (raised by the store; the
+        // pre-check above only avoids creating orphan bytes first).
+        // The just-written blob bytes use the durable pool (`self.blobs`,
+        // never `cache_blobs`, so remote-cache eviction can never touch
+        // local uploads).
+        self.media.insert_metadata_with_durable_quota(
+            InsertMediaInput {
+                id: Some(media_id),
+                owner_id: Some(owner_id.to_string()),
+                name,
+                mime: sniffed,
+                size_bytes,
+                hash: md5,
+                blob_key,
+                blurhash: None,
+                properties: MediaProperties::default(),
+                is_sensitive,
+                is_link: false,
+                url,
+                thumbnail_url: None,
+                comment,
+                source_url: None,
+                max_file_size: self.max_file_size,
+            },
+            self.drive_capacity_per_user_bytes,
+        )
     }
 
     /// Fetch `url` and store it as the caller's drive file (Batch O WP13
@@ -151,7 +175,8 @@ impl AppServices {
 
     /// Owner-scoped file read (Phase 3 `drive/files/show`). Anything that is
     /// not the caller's own row — missing, unowned, or a remote-cache row —
-    /// is `NO_SUCH_FILE` (profile §3).
+    /// is `NO_SUCH_FILE` (profile §3). Grandfathered over-quota reads are
+    /// unaffected: no quota check applies on reads.
     pub fn get_media_for(
         &self,
         caller_id: &str,
@@ -166,7 +191,10 @@ impl AppServices {
 
     /// Update a file's metadata (Phase 3 `drive/files/update`). Bytes never
     /// change: the row is re-inserted under the same id (`insert_metadata`
-    /// upserts), so only `name`/`isSensitive`/`comment` move.
+    /// upserts), so only `name`/`isSensitive`/`comment` move. Routed through
+    /// the quota-checked insert like the upload path; the byte size is
+    /// identical so a correct backend treats the upsert as charge-neutral
+    /// (the default impl is a plain upsert with no quota state).
     pub fn update_media(
         &self,
         caller_id: &str,
@@ -186,33 +214,61 @@ impl AppServices {
         if let Some(comment) = comment {
             meta.comment = comment;
         }
-        self.media.insert_metadata(InsertMediaInput {
-            id: Some(meta.id.clone()),
-            owner_id: meta.owner_id.clone(),
-            name: meta.name.clone(),
-            mime: meta.mime.clone(),
-            size_bytes: meta.size_bytes,
-            hash: meta.hash.clone(),
-            blob_key: meta.blob_key.clone(),
-            blurhash: meta.blurhash.clone(),
-            properties: meta.properties.clone(),
-            is_sensitive: meta.is_sensitive,
-            is_link: meta.is_link,
-            url: meta.url.clone(),
-            thumbnail_url: meta.thumbnail_url.clone(),
-            comment: meta.comment.clone(),
-            source_url: meta.source_url.clone(),
-            max_file_size: self.max_file_size,
-        })
+        self.media.insert_metadata_with_durable_quota(
+            InsertMediaInput {
+                id: Some(meta.id.clone()),
+                owner_id: meta.owner_id.clone(),
+                name: meta.name.clone(),
+                mime: meta.mime.clone(),
+                size_bytes: meta.size_bytes,
+                hash: meta.hash.clone(),
+                blob_key: meta.blob_key.clone(),
+                blurhash: meta.blurhash.clone(),
+                properties: meta.properties.clone(),
+                is_sensitive: meta.is_sensitive,
+                is_link: meta.is_link,
+                url: meta.url.clone(),
+                thumbnail_url: meta.thumbnail_url.clone(),
+                comment: meta.comment.clone(),
+                source_url: meta.source_url.clone(),
+                max_file_size: self.max_file_size,
+            },
+            self.drive_capacity_per_user_bytes,
+        )
     }
 
-    /// Delete a file's metadata row and its blob bytes (Phase 3
-    /// `drive/files/delete`). Owner-scoped like [`Self::get_media_for`].
+    /// Delete a file's metadata row and — only when no other metadata row
+    /// references the same bytes — its durable blob bytes (Phase 3
+    /// `drive/files/delete`, plan §2 shared-blob fix). Owner-scoped like
+    /// [`Self::get_media_for`]. The in-transaction
+    /// `delete_media_record` removes the row and decrements the refcount
+    /// plus the owner's durable bytes atomically; the physical `delete`
+    /// happens outside the transaction only when `remaining == 0`, so
+    /// cross-owner identical bytes (and byte-identical remote rows, which
+    /// share SHA-256 keys) survive a sharer's delete. A crash between the
+    /// record delete and the blob delete leaves orphan bytes that the
+    /// reconciler sweeps — never a dangling reference.
     pub fn delete_media(&self, caller_id: &str, file_id: &str) -> Result<(), PortError> {
         let meta = self.get_media_for(caller_id, file_id)?;
-        self.media.delete_metadata(&meta.id)?;
-        self.blobs.delete(&meta.blob_key)?;
-        Ok(())
+        match self.media.delete_media_record(&meta.id)? {
+            Some((removed, remaining)) if remaining > 0 => {
+                debug_assert_eq!(removed.blob_key, meta.blob_key);
+                Ok(())
+            }
+            Some((removed, _)) => {
+                // Last reference gone: drop the durable bytes. `remove` is
+                // idempotent in the filesystem backend, so a retried delete
+                // after a crash between record-delete and blob-delete still
+                // converges (the second `delete_media_record` returns
+                // `None` and we land here via `meta.blob_key`).
+                self.blobs.delete(&removed.blob_key)?;
+                Ok(())
+            }
+            // Already gone between the owner check and the record delete
+            // (concurrent delete): converge to success without touching
+            // bytes another row may still reference.
+            None => Ok(()),
+        }
     }
 
     /// Owner's files with `drive/files` list filtering (Phase 3): optional
@@ -269,5 +325,13 @@ impl AppServices {
         }
         files.truncate(cursor.limit);
         Ok(files)
+    }
+
+    /// Remote-cache observability snapshot (plan §5.6): totals, per-class
+    /// breakdown, in-flight bytes, hits/misses, bytes fetched, evictions and
+    /// failed origins — without shell access. Pure passthrough to the media
+    /// store's counters.
+    pub fn get_cache_stats(&self) -> Result<CacheStats, PortError> {
+        self.media.cache_stats()
     }
 }

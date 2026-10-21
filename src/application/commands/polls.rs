@@ -377,7 +377,7 @@ mod tests {
             polls: store.clone(),
             jobs: store.clone(),
             media: store.clone(),
-            blobs,
+            blobs: blobs.clone(),
             notifications: store.clone(),
             auth: store.clone(),
             streaming: Arc::new(NoopStreamingSink),

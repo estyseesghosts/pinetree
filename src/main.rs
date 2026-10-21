@@ -26,6 +26,9 @@ fn build_services(cfg: &Config) -> Result<(Arc<AppServices>, pinetree::streaming
     let ids: Arc<dyn IdGenerator> = Arc::new(AidxGenerator::new(clock.clone()));
     let store = RedbStore::open(cfg.data_dir.join("pinetree.redb"), clock.clone(), ids.clone())
         .map_err(|err| format!("open redb store: {err}"))?;
+    store
+        .set_cache_cap(cfg.remote_cache_max_bytes)
+        .map_err(|err| format!("init cache cap: {err}"))?;
     // Storage overhaul: durable local uploads live in `blobs_durable/`
     // (never evicted), remote fetches in `blobs_cache/` (LRU+TTL, capped).
     // A pre-overhaul `blobs/` directory is migrated once via rename.
@@ -99,6 +102,10 @@ fn build_services(cfg: &Config) -> Result<(Arc<AppServices>, pinetree::streaming
         remote_cache_full_ttl_days: cfg.remote_cache_full_ttl_days,
         remote_cache_warming_enabled: cfg.remote_cache_warming_enabled,
     });
+    // Crash-heal: a previous process may have died mid-fetch holding an
+    // in-flight reservation. Clear it before serving (idempotent).
+    pinetree::media::reconciler::reset_in_flight(&services)
+        .map_err(|err| format!("reset cache in-flight: {err}"))?;
     Ok((services, hub))
 }
 
