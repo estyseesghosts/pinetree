@@ -2,9 +2,15 @@ use super::AppServices;
 
 use crate::activitypub::signatures::{rsa_sha256_sign, rsa_sha256_verify};
 use crate::application::ports::{
-    ActivityDedup, AuthStore, BlobStore, Clock, IdGenerator, NoopStreamingSink,
+    AbuseReportRecipientStore, ActivityDedup, AuthStore, BlobStore, Clock, DriveFolderStore,
+    IdGenerator, NewJob, NoopStreamingSink, NoteThreadMuteStore, PortError, SystemWebhookStore,
+    UserMemoStore, UserWebhookStore,
 };
+use crate::domain::drive_folder::DriveFolder;
 use crate::domain::id::{AidxGenerator, ManualClock};
+use crate::domain::webhook::AbuseReportRecipient;
+use crate::domain::webhook::SystemWebhook;
+use crate::domain::webhook::UserWebhook;
 use crate::federation::delivery::{SafeHttpClient, SafeHttpConfig};
 use crate::media::storage::FsBlobStore;
 use crate::persistence::redb::RedbStore;
@@ -55,6 +61,12 @@ pub(crate) fn test_services(prefix: &str) -> AppServices {
             registry: store.clone(),
             clips: store.clone(),
             pages: store.clone(),
+            folders: store.clone(),
+            system_webhooks: store.clone(),
+            user_webhooks: store.clone(),
+            abuse_recipients: store.clone(),
+            memos: store.clone(),
+            thread_mutes: store.clone(),
         federation_http: SafeHttpClient::new(SafeHttpConfig {
             allow_private_ips: true,
             ..Default::default()
@@ -552,4 +564,152 @@ fn profile_unlock_accepts_pending_requests() {
         .unwrap();
     assert!(services.follows.get_follow_request(&alice.id, &bob.id).unwrap().is_none());
     assert!(services.follows.is_following(&alice.id, &bob.id).unwrap());
+}
+
+/// Fail-closed stand-in for the six durable stores behind the new
+/// [`AppServices`] fields (`folders`, `system_webhooks`,
+/// `user_webhooks`, `abuse_recipients`, `memos`, `thread_mutes`).
+/// Used only by `Mem`-double service literals (webfinger/packer unit
+/// tests) that never touch those stores: any accidental call is a
+/// loud [`PortError::StorageUnavailable`], never silent test data.
+pub(crate) struct UnavailableStores;
+
+/// Fail-closed constructor for the stub below (keeps every method
+/// body on one line within the 100-column budget).
+fn unavailable(store: &str) -> PortError {
+    PortError::StorageUnavailable(format!("{store} unavailable in this test double"))
+}
+
+impl DriveFolderStore for UnavailableStores {
+    fn create_folder(&self, _: DriveFolder, _: Vec<NewJob>) -> Result<DriveFolder, PortError> {
+        Err(unavailable("DriveFolderStore"))
+    }
+    fn get_folder(&self, _: &str) -> Result<Option<DriveFolder>, PortError> {
+        Err(unavailable("DriveFolderStore"))
+    }
+    fn update_folder(&self, _: DriveFolder, _: Vec<NewJob>) -> Result<DriveFolder, PortError> {
+        Err(unavailable("DriveFolderStore"))
+    }
+    fn delete_folder(&self, _: &str, _: Vec<NewJob>) -> Result<(), PortError> {
+        Err(unavailable("DriveFolderStore"))
+    }
+    fn child_folders(&self, _: &str, _: Option<&str>) -> Result<Vec<DriveFolder>, PortError> {
+        Err(unavailable("DriveFolderStore"))
+    }
+    fn find_folders_by_name(
+        &self,
+        _: &str,
+        _: &str,
+        _: Option<&str>,
+    ) -> Result<Vec<DriveFolder>, PortError> {
+        Err(unavailable("DriveFolderStore"))
+    }
+    fn count_child_folders(&self, _: &str) -> Result<u64, PortError> {
+        Err(unavailable("DriveFolderStore"))
+    }
+    fn set_file_folder(&self, _: &str, _: Option<&str>, _: Vec<NewJob>) -> Result<(), PortError> {
+        Err(unavailable("DriveFolderStore"))
+    }
+    fn file_folder_id(&self, _: &str) -> Result<Option<Option<String>>, PortError> {
+        Err(unavailable("DriveFolderStore"))
+    }
+    fn count_files_in_folder(&self, _: &str) -> Result<u64, PortError> {
+        Err(unavailable("DriveFolderStore"))
+    }
+}
+
+impl SystemWebhookStore for UnavailableStores {
+    fn insert_system_webhook(&self, _: SystemWebhook) -> Result<SystemWebhook, PortError> {
+        Err(unavailable("SystemWebhookStore"))
+    }
+    fn get_system_webhook(&self, _: &str) -> Result<Option<SystemWebhook>, PortError> {
+        Err(unavailable("SystemWebhookStore"))
+    }
+    fn list_system_webhooks(&self) -> Result<Vec<SystemWebhook>, PortError> {
+        Err(unavailable("SystemWebhookStore"))
+    }
+    fn put_system_webhook(&self, _: SystemWebhook) -> Result<SystemWebhook, PortError> {
+        Err(unavailable("SystemWebhookStore"))
+    }
+    fn delete_system_webhook(&self, _: &str) -> Result<bool, PortError> {
+        Err(unavailable("SystemWebhookStore"))
+    }
+    fn active_system_webhooks_for(
+        &self,
+        _: &str,
+        _: usize,
+    ) -> Result<Vec<SystemWebhook>, PortError> {
+        Err(unavailable("SystemWebhookStore"))
+    }
+}
+
+impl UserWebhookStore for UnavailableStores {
+    fn insert_user_webhook(&self, _: UserWebhook) -> Result<UserWebhook, PortError> {
+        Err(unavailable("UserWebhookStore"))
+    }
+    fn get_user_webhook(&self, _: &str) -> Result<Option<UserWebhook>, PortError> {
+        Err(unavailable("UserWebhookStore"))
+    }
+    fn list_user_webhooks(&self, _: &str) -> Result<Vec<UserWebhook>, PortError> {
+        Err(unavailable("UserWebhookStore"))
+    }
+    fn count_user_webhooks(&self, _: &str) -> Result<usize, PortError> {
+        Err(unavailable("UserWebhookStore"))
+    }
+    fn put_user_webhook(&self, _: UserWebhook) -> Result<UserWebhook, PortError> {
+        Err(unavailable("UserWebhookStore"))
+    }
+    fn delete_user_webhook(&self, _: &str) -> Result<bool, PortError> {
+        Err(unavailable("UserWebhookStore"))
+    }
+    fn active_user_webhooks_for(
+        &self,
+        _: &str,
+        _: &str,
+        _: usize,
+    ) -> Result<Vec<UserWebhook>, PortError> {
+        Err(unavailable("UserWebhookStore"))
+    }
+}
+
+impl AbuseReportRecipientStore for UnavailableStores {
+    fn insert_recipient(&self, _: AbuseReportRecipient) -> Result<AbuseReportRecipient, PortError> {
+        Err(unavailable("AbuseReportRecipientStore"))
+    }
+    fn get_recipient(&self, _: &str) -> Result<Option<AbuseReportRecipient>, PortError> {
+        Err(unavailable("AbuseReportRecipientStore"))
+    }
+    fn list_recipients(&self) -> Result<Vec<AbuseReportRecipient>, PortError> {
+        Err(unavailable("AbuseReportRecipientStore"))
+    }
+    fn put_recipient(&self, _: AbuseReportRecipient) -> Result<AbuseReportRecipient, PortError> {
+        Err(unavailable("AbuseReportRecipientStore"))
+    }
+    fn delete_recipient(&self, _: &str) -> Result<bool, PortError> {
+        Err(unavailable("AbuseReportRecipientStore"))
+    }
+    fn active_recipient_emails(&self, _: usize) -> Result<Vec<String>, PortError> {
+        Err(unavailable("AbuseReportRecipientStore"))
+    }
+}
+
+impl UserMemoStore for UnavailableStores {
+    fn set_memo(&self, _: &str, _: &str, _: Option<String>) -> Result<(), PortError> {
+        Err(unavailable("UserMemoStore"))
+    }
+    fn get_memo(&self, _: &str, _: &str) -> Result<Option<String>, PortError> {
+        Err(unavailable("UserMemoStore"))
+    }
+}
+
+impl NoteThreadMuteStore for UnavailableStores {
+    fn mute_thread(&self, _: &str, _: &str) -> Result<bool, PortError> {
+        Err(unavailable("NoteThreadMuteStore"))
+    }
+    fn unmute_thread(&self, _: &str, _: &str) -> Result<bool, PortError> {
+        Err(unavailable("NoteThreadMuteStore"))
+    }
+    fn is_thread_muted(&self, _: &str, _: &str) -> Result<bool, PortError> {
+        Err(unavailable("NoteThreadMuteStore"))
+    }
 }

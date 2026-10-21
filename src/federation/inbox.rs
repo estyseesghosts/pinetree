@@ -2709,6 +2709,8 @@ mod media_safety_tests {
     };
     use crate::federation::retry::DestinationTracker;
     use crate::jobs::worker::JobWorker;
+    use crate::media::transcode::TranscodeConfig;
+    use crate::services::email::{SmtpConfig, SmtpEmailSender};
     use crate::media::storage::FsBlobStore;
     use crate::persistence::redb::RedbStore;
 
@@ -2758,6 +2760,12 @@ mod media_safety_tests {
             registry: store.clone(),
             clips: store.clone(),
             pages: store.clone(),
+            folders: store.clone(),
+            system_webhooks: store.clone(),
+            user_webhooks: store.clone(),
+            abuse_recipients: store.clone(),
+            memos: store.clone(),
+            thread_mutes: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()
@@ -2922,6 +2930,8 @@ mod media_safety_tests {
             delivery_tracker: Arc::new(DestinationTracker::new()),
             lease_duration_ms: 60_000,
             base_backoff_ms: 10,
+            transcode_config: TranscodeConfig::default(),
+            email_sender: Arc::new(SmtpEmailSender::new(SmtpConfig::default())),
         };
         assert_eq!(worker.drain(16).unwrap(), 3);
         assert_eq!(hits.load(Ordering::SeqCst), 1);
@@ -3188,6 +3198,12 @@ mod flag_tests {
             registry: store.clone(),
             clips: store.clone(),
             pages: store.clone(),
+            folders: store.clone(),
+            system_webhooks: store.clone(),
+            user_webhooks: store.clone(),
+            abuse_recipients: store.clone(),
+            memos: store.clone(),
+            thread_mutes: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()
@@ -3411,6 +3427,12 @@ mod key_ownership_tests {
             registry: store.clone(),
             clips: store.clone(),
             pages: store.clone(),
+            folders: store.clone(),
+            system_webhooks: store.clone(),
+            user_webhooks: store.clone(),
+            abuse_recipients: store.clone(),
+            memos: store.clone(),
+            thread_mutes: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()
@@ -3920,6 +3942,8 @@ mod reply_resolution_tests {
     };
     use crate::federation::retry::DestinationTracker;
     use crate::jobs::worker::JobWorker;
+    use crate::media::transcode::TranscodeConfig;
+    use crate::services::email::{SmtpConfig, SmtpEmailSender};
     use crate::media::storage::FsBlobStore;
     use crate::persistence::redb::RedbStore;
 
@@ -3970,6 +3994,12 @@ mod reply_resolution_tests {
             registry: store.clone(),
             clips: store.clone(),
             pages: store.clone(),
+            folders: store.clone(),
+            system_webhooks: store.clone(),
+            user_webhooks: store.clone(),
+            abuse_recipients: store.clone(),
+            memos: store.clone(),
+            thread_mutes: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()
@@ -4057,6 +4087,8 @@ mod reply_resolution_tests {
             delivery_tracker: Arc::new(DestinationTracker::new()),
             lease_duration_ms: 60_000,
             base_backoff_ms: 10,
+            transcode_config: TranscodeConfig::default(),
+            email_sender: Arc::new(SmtpEmailSender::new(SmtpConfig::default())),
         }
     }
 

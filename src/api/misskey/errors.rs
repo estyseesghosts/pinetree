@@ -138,6 +138,30 @@ pub const CANNOT_RENOTE_ID: &str = "be9529e9-fe72-4de0-ae43-0b363c4938af";
 pub const BOTH_WITH_REPLIES_AND_WITH_FILES_ID: &str = "91c8cb9f-36ed-46e7-9ca2-7df96ed6e222";
 pub const YOU_HAVE_BEEN_BLOCKED_ID: &str = "b390d7e1-8a5e-46ed-b625-06271cafd3d3";
 pub const MAX_FILE_SIZE_EXCEEDED_ID: &str = "7f6e1c2d-9f9b-4c1a-9e2a-9b9b9b9b9b03";
+/// Gaps final wiring: drive folders + folder-aware file legs (WP2a; one
+/// UUID per endpoint per code, upstream convention; pinetree-minted —
+/// `// TODO(final): verify against misskey`).
+pub const FOLDER_CREATE_NO_SUCH_FOLDER_ID: &str = "17ebfd4a-6d3b-4318-bc8f-b605f418ee3f";
+pub const FOLDER_SHOW_NO_SUCH_FOLDER_ID: &str = "4586e998-fca0-4962-af84-b6fa2d55390b";
+pub const FOLDER_UPDATE_NO_SUCH_FOLDER_ID: &str = "4d52caa2-22de-4100-869e-4d366873955f";
+pub const FOLDER_UPDATE_NO_SUCH_PARENT_FOLDER_ID: &str = "9309f3a8-d6a2-4a3a-841f-68a82eda4fe3";
+pub const FOLDER_UPDATE_RECURSIVE_NESTING_ID: &str = "d651a096-ae0e-4024-86b6-68731935b8a8";
+pub const FOLDER_DELETE_NO_SUCH_FOLDER_ID: &str = "157697f5-e645-44b2-b1bc-5ed4a86b3732";
+pub const FOLDER_DELETE_HAS_CHILD_ID: &str = "07408c65-a7bb-4f27-a3a8-a200d34fdc37";
+pub const MOVE_BULK_NO_SUCH_FOLDER_ID: &str = "f76a1131-8b94-4bd3-9b62-b81f9e1ef1e9";
+pub const FILES_UPDATE_NO_SUCH_FOLDER_ID: &str = "efef2146-7ea9-44d2-90c5-9557983bf275";
+/// Gaps final wiring: system/user webhooks (WP3), update-memo + thread
+/// muting (WP2a). Same per-endpoint-UUID convention; pinetree-minted.
+pub const SYSTEM_WEBHOOK_SHOW_NO_SUCH_ID: &str = "722a824a-ba81-4d2e-8f84-bbc358bfdb42";
+pub const SYSTEM_WEBHOOK_UPDATE_NO_SUCH_ID: &str = "ae385176-36c5-4fa6-9ddb-8ae015a80a68";
+pub const SYSTEM_WEBHOOK_DELETE_NO_SUCH_ID: &str = "1a43e12f-a743-46ca-b77e-0d173209da69";
+pub const WEBHOOK_SHOW_NO_SUCH_ID: &str = "7213d0fd-c19d-47ac-b6b6-0317fb0ff85c";
+pub const WEBHOOK_UPDATE_NO_SUCH_ID: &str = "b2598135-6132-4378-ba05-75c8ddcb25fc";
+pub const WEBHOOK_DELETE_NO_SUCH_ID: &str = "68d3e74a-c19d-46ac-a585-6225a5d8fcce";
+pub const WEBHOOK_CREATE_TOO_MANY_ID: &str = "adadc6d4-090b-4f02-a74a-fdb5d5a1f4c7";
+pub const UPDATE_MEMO_NO_SUCH_USER_ID: &str = "52fc7755-ae05-435b-9d4b-7d20f4da926e";
+pub const THREAD_MUTE_CREATE_NO_SUCH_NOTE_ID: &str = "3f694d2b-ff60-456f-b901-e72753194958";
+pub const THREAD_MUTE_DELETE_NO_SUCH_NOTE_ID: &str = "f92bec2b-2f38-460e-8f68-b3e47fb0986d";
 pub const INTERNAL_ERROR_ID: &str = "5d37dbcb-891e-41ca-a3d6-e690c97775ac";
 pub const FORBIDDEN_ID: &str = "3c6a84db-d619-26af-ca14-06232a21df8a";
 pub const REACTIONS_NOT_PUBLIC_ID: &str = "673a7dd2-6924-1093-e0c0-e68456ceae5c";
@@ -271,6 +295,53 @@ pub const IMPORT_USER_LISTS_TOO_BIG_FILE_ID: &str = "ae6e7a22-971b-4b52-b2be-fc0
 pub const IMPORT_USER_LISTS_EMPTY_FILE_ID: &str = "99efe367-ce6e-4d44-93f8-5fae7b040356";
 pub const IMPORT_ANTENNAS_NO_SUCH_FILE_ID: &str = "3b71d086-c3fa-431c-b01d-ded65a777172";
 pub const IMPORT_ANTENNAS_EMPTY_FILE_ID: &str = "7f60115d-8d93-4b0f-bd0e-3815dcbb389f";
+/// Gaps final-wiring error idents (WP2a/WP2b/WP2c/WP3 dispatcher arms).
+/// Every UUID below is a pinetree-minted v4: the misskey checkout symlinks
+/// are broken in this environment, so none of these could be pinned.
+/// `// TODO(final): verify against misskey` marks each one for the parent
+/// merge to reconcile against the upstream checkout (one UUID per
+/// endpoint per code, upstream convention).
+// TODO(final): verify against misskey.
+pub const INCORRECT_PASSWORD_ID: &str = "f0e94fca-6eb6-4f7c-9cb3-057c35ff53a6";
+// TODO(final): verify against misskey.
+pub const INVALID_TOKEN_ID: &str = "ce81e4ed-0ab2-463e-8532-f6bfc31ece9e";
+// TODO(final): verify against misskey.
+pub const NO_SUCH_2FA_ID: &str = "c133d97b-e0ca-495c-aeb5-9e7b52c5f187";
+// TODO(final): verify against misskey.
+pub const NO_SUCH_APP_ID: &str = "b2bd7c54-9ca3-41ad-82be-6162e0beda86";
+// TODO(final): verify against misskey.
+pub const NO_SUCH_SUBSCRIPTION_ID: &str = "ed1f411e-707a-43f7-a1a5-bfd41289df01";
+// TODO(final): verify against misskey.
+pub const NO_SUCH_ROLE_ID: &str = "339ecdfe-6c78-4aa8-91ba-6432e8ff2866";
+// TODO(final): verify against misskey.
+pub const NO_SUCH_AD_ID: &str = "5192512d-3d9e-47a4-9b7b-d1996a2aecea";
+// TODO(final): verify against misskey.
+pub const NO_SUCH_ANNOUNCEMENT_ID: &str = "e13e1b72-8a5b-40af-aa12-704d5627c149";
+// TODO(final): verify against misskey.
+pub const NO_SUCH_ABUSE_REPORT_NOTIFICATION_RECIPIENT_ID: &str =
+    "dbc5473f-296b-4c85-9e91-447991cbd163";
+// TODO(final): verify against misskey.
+pub const NO_SUCH_ENDPOINT_ID: &str = "06ccccd9-dda7-4ef8-bf8a-59cc81204b4f";
+// TODO(final): verify against misskey.
+pub const NO_SUCH_HASHTAG_ID: &str = "f4d91c70-47c8-4011-b2d0-bfbbd440a9fb";
+// TODO(final): verify against misskey.
+pub const NO_SUCH_POST_ID: &str = "a6170400-7fba-4421-85e2-2f499dd91291";
+// TODO(final): verify against misskey.
+pub const NO_SUCH_FLASH_ID: &str = "95a44529-6e18-4ae8-bc4f-f84ccc761dae";
+// TODO(final): verify against misskey.
+pub const GALLERY_ALREADY_LIKED_ID: &str = "74e9d1f1-1d88-4fdd-bd1d-67fb8e25c282";
+// TODO(final): verify against misskey.
+pub const GALLERY_NOT_LIKED_ID: &str = "67405043-c538-49eb-a5d9-76a49f86975d";
+// TODO(final): verify against misskey.
+pub const DRIVE_CHECK_EXISTENCE_NO_SUCH_FILE_ID: &str =
+    "d0787be9-4b54-434c-9034-ce8dbd974a1f";
+/// `drive/files/attached-notes` `NO_SUCH_FILE`: the `c118ece3-…` prefix is
+/// the verbatim upstream id recorded in
+/// `application::commands::drive_folders` (`attached_notes`); the remaining
+/// nibbles are pinetree-minted.
+// TODO(final): verify against misskey.
+pub const DRIVE_ATTACHED_NOTES_NO_SUCH_FILE_ID: &str =
+    "c118ece3-15b0-4596-829c-214fde70db4a";
 
 /// Misskey API error: stable `code`/`id` ident, human `message`,
 /// machine `kind` (`client` | `permission` | `server`), optional `info`,
@@ -968,6 +1039,138 @@ impl ApiError {
         Self::client("No such note.", "NO_SUCH_NOTE", id, 400)
     }
 
+    /// Gaps final wiring: `drive/files/{check-existence,attached-notes}`
+    /// `NO_SUCH_FILE` (one UUID per endpoint, upstream convention;
+    /// pinetree-minted — `// TODO(final): verify against misskey`).
+    pub fn drive_no_such_file(endpoint: &str) -> Self {
+        let id = match endpoint {
+            "drive/files/attached-notes" => DRIVE_ATTACHED_NOTES_NO_SUCH_FILE_ID,
+            _ => DRIVE_CHECK_EXISTENCE_NO_SUCH_FILE_ID,
+        };
+        Self::client("No such file.", "NO_SUCH_FILE", id, 400)
+    }
+
+    /// Gaps final wiring: `drive/folders/{create,show,update,delete}` +
+    /// `drive/files/{move-bulk,update-folder-leg}` `NO_SUCH_FOLDER` (one
+    /// UUID per endpoint, upstream convention; pinetree-minted —
+    /// `// TODO(final): verify against misskey`).
+    pub fn folder_no_such_folder(endpoint: &str) -> Self {
+        let id = match endpoint {
+            "drive/folders/create" => FOLDER_CREATE_NO_SUCH_FOLDER_ID,
+            "drive/folders/show" => FOLDER_SHOW_NO_SUCH_FOLDER_ID,
+            "drive/folders/update" => FOLDER_UPDATE_NO_SUCH_FOLDER_ID,
+            "drive/folders/delete" => FOLDER_DELETE_NO_SUCH_FOLDER_ID,
+            "drive/files/move-bulk" => MOVE_BULK_NO_SUCH_FOLDER_ID,
+            "drive/files/update" => FILES_UPDATE_NO_SUCH_FOLDER_ID,
+            _ => FOLDER_SHOW_NO_SUCH_FOLDER_ID,
+        };
+        Self::client("No such folder.", "NO_SUCH_FOLDER", id, 400)
+    }
+
+    /// Gaps final wiring: `drive/folders/update` `NO_SUCH_PARENT_FOLDER` /
+    /// `RECURSIVE_NESTING` (verbatim codes; pinetree-minted UUIDs).
+    pub fn folder_update_parent_error(code: &str) -> Self {
+        match code {
+            "NO_SUCH_PARENT_FOLDER" => Self::client(
+                "No such parent folder.",
+                "NO_SUCH_PARENT_FOLDER",
+                FOLDER_UPDATE_NO_SUCH_PARENT_FOLDER_ID,
+                400,
+            ),
+            _ => Self::client(
+                "Recursive nesting.",
+                "RECURSIVE_NESTING",
+                FOLDER_UPDATE_RECURSIVE_NESTING_ID,
+                400,
+            ),
+        }
+    }
+
+    /// Gaps final wiring: `drive/folders/delete`
+    /// `HAS_CHILD_FILES_OR_FOLDERS` (verbatim code; pinetree-minted UUID).
+    pub fn folder_delete_has_child() -> Self {
+        Self::client(
+            "The folder has child files or folders.",
+            "HAS_CHILD_FILES_OR_FOLDERS",
+            FOLDER_DELETE_HAS_CHILD_ID,
+            400,
+        )
+    }
+
+    /// Gaps final wiring: `system-webhook/{show,update,delete}` +
+    /// `webhooks/{show,update,delete}` `NO_SUCH_WEBHOOK` (one UUID per
+    /// endpoint, upstream `i/webhooks/*` convention; pinetree-minted).
+    /// The store layer reports lowercase `no such webhook`; this maps it
+    /// with the arm's endpoint identity.
+    pub fn webhook_no_such_webhook(endpoint: &str) -> Self {
+        let id = match endpoint {
+            "system-webhook/show" => SYSTEM_WEBHOOK_SHOW_NO_SUCH_ID,
+            "system-webhook/update" => SYSTEM_WEBHOOK_UPDATE_NO_SUCH_ID,
+            "system-webhook/delete" => SYSTEM_WEBHOOK_DELETE_NO_SUCH_ID,
+            "webhooks/show" => WEBHOOK_SHOW_NO_SUCH_ID,
+            "webhooks/update" => WEBHOOK_UPDATE_NO_SUCH_ID,
+            "webhooks/delete" => WEBHOOK_DELETE_NO_SUCH_ID,
+            _ => WEBHOOK_SHOW_NO_SUCH_ID,
+        };
+        Self::client("No such webhook.", "NO_SUCH_WEBHOOK", id, 400)
+    }
+
+    /// Gaps final wiring: `webhooks/create` over the per-user cap.
+    /// Upstream has no limit error; pinetree-defined `TOO_MANY_WEBHOOKS`.
+    pub fn webhook_too_many() -> Self {
+        Self::client(
+            "You cannot create webhooks any more.",
+            "TOO_MANY_WEBHOOKS",
+            WEBHOOK_CREATE_TOO_MANY_ID,
+            400,
+        )
+    }
+
+    /// Gaps final wiring: `users/update-memo` `NO_SUCH_USER` (target
+    /// missing; per-endpoint UUID like `users/show`).
+    pub fn update_memo_no_such_user() -> Self {
+        Self::client(
+            "No such user.",
+            "NO_SUCH_USER",
+            UPDATE_MEMO_NO_SUCH_USER_ID,
+            400,
+        )
+    }
+
+    /// Gaps final wiring: `notes/thread-muting/{create,delete}`
+    /// `NO_SUCH_NOTE` (per-endpoint UUID, upstream convention).
+    pub fn thread_mute_no_such_note(endpoint: &str) -> Self {
+        let id = match endpoint {
+            "notes/thread-muting/delete" => THREAD_MUTE_DELETE_NO_SUCH_NOTE_ID,
+            _ => THREAD_MUTE_CREATE_NO_SUCH_NOTE_ID,
+        };
+        Self::client("No such note.", "NO_SUCH_NOTE", id, 400)
+    }
+
+    /// Gaps final wiring: `gallery/posts/like` + `flash/like`
+    /// `ALREADY_LIKED` (kept out of the shared lookup so the pages
+    /// `ALREADY_LIKED` UUID is untouched; pinetree-minted —
+    /// `// TODO(final): verify against misskey`).
+    pub fn gallery_already_liked() -> Self {
+        Self::client(
+            "The item has already been liked.",
+            "ALREADY_LIKED",
+            GALLERY_ALREADY_LIKED_ID,
+            400,
+        )
+    }
+
+    /// Gaps final wiring: `gallery/posts/unlike` + `flash/unlike`
+    /// `NOT_LIKED` (same non-shared treatment as the like twin).
+    pub fn gallery_not_liked() -> Self {
+        Self::client(
+            "You have not liked that item.",
+            "NOT_LIKED",
+            GALLERY_NOT_LIKED_ID,
+            400,
+        )
+    }
+
     /// Misskey `clips/add-note` `ALREADY_CLIPPED` (verbatim).
     pub fn clip_already_clipped() -> Self {
         Self::client(
@@ -1274,7 +1477,6 @@ fn is_known_client_code(code: &str) -> bool {
             | "RESTRICTED_BY_ROLE"
             | "YOUR_NAME_CONTAINS_PROHIBITED_WORDS"
             | "YOUR_ACCOUNT_MOVED"
-            | "YOUR_ACCOUNT_MOVED"
             | "UNSUPPORTED_FIELD"
             | "INVALID_PARAM"
             | "FORBIDDEN"
@@ -1322,6 +1524,22 @@ fn is_known_client_code(code: &str) -> bool {
             | "CANNOT_REPLY_TO_SPECIFIED_VISIBILITY_NOTE_WITH_EXTENDED_VISIBILITY"
             | "MAX_LENGTH"
             | "MAX_CW_LENGTH"
+            // Gaps final wiring (WP2a/WP2b/WP2c/WP3 arms): 2fa, apps,
+            // push subscriptions, admin families, gallery/flash,
+            // hashtags, announcements, drive file extras.
+            | "INCORRECT_PASSWORD"
+            | "INVALID_TOKEN"
+            | "NO_SUCH_2FA"
+            | "NO_SUCH_APP"
+            | "NO_SUCH_SUBSCRIPTION"
+            | "NO_SUCH_ROLE"
+            | "NO_SUCH_AD"
+            | "NO_SUCH_ANNOUNCEMENT"
+            | "NO_SUCH_ABUSE_REPORT_NOTIFICATION_RECIPIENT"
+            | "NO_SUCH_ENDPOINT"
+            | "NO_SUCH_HASHTAG"
+            | "NO_SUCH_POST"
+            | "NO_SUCH_FLASH"
     )
 }
 
@@ -1847,6 +2065,56 @@ fn lookup_known_code(code: &str) -> Option<(&'static str, &'static str, u16, &'s
             500,
             "server",
         ),
+        // Gaps final wiring (WP2a/WP2b/WP2c/WP3 arms; pinetree-minted
+        // UUIDs — `// TODO(final): verify against misskey` on each const).
+        "INCORRECT_PASSWORD" => (
+            "Incorrect password.",
+            INCORRECT_PASSWORD_ID,
+            400,
+            "client",
+        ),
+        "INVALID_TOKEN" => ("Invalid token.", INVALID_TOKEN_ID, 400, "client"),
+        "NO_SUCH_2FA" => (
+            "No such two-factor authentication.",
+            NO_SUCH_2FA_ID,
+            400,
+            "client",
+        ),
+        "NO_SUCH_APP" => ("No such app.", NO_SUCH_APP_ID, 400, "client"),
+        "NO_SUCH_SUBSCRIPTION" => (
+            "No such subscription.",
+            NO_SUCH_SUBSCRIPTION_ID,
+            400,
+            "client",
+        ),
+        "NO_SUCH_ROLE" => ("No such role.", NO_SUCH_ROLE_ID, 400, "client"),
+        "NO_SUCH_AD" => ("No such ad.", NO_SUCH_AD_ID, 400, "client"),
+        "NO_SUCH_ANNOUNCEMENT" => (
+            "No such announcement.",
+            NO_SUCH_ANNOUNCEMENT_ID,
+            400,
+            "client",
+        ),
+        "NO_SUCH_ABUSE_REPORT_NOTIFICATION_RECIPIENT" => (
+            "No such abuse report notification recipient.",
+            NO_SUCH_ABUSE_REPORT_NOTIFICATION_RECIPIENT_ID,
+            400,
+            "client",
+        ),
+        "NO_SUCH_ENDPOINT" => (
+            "No such endpoint.",
+            NO_SUCH_ENDPOINT_ID,
+            404,
+            "client",
+        ),
+        "NO_SUCH_HASHTAG" => (
+            "No such hashtag.",
+            NO_SUCH_HASHTAG_ID,
+            400,
+            "client",
+        ),
+        "NO_SUCH_POST" => ("No such post.", NO_SUCH_POST_ID, 400, "client"),
+        "NO_SUCH_FLASH" => ("No such flash.", NO_SUCH_FLASH_ID, 400, "client"),
         _ => return None,
     })
 }

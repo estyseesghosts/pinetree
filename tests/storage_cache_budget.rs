@@ -72,6 +72,12 @@ fn cache_harness() -> (CacheHarness, String) {
         registry: store.clone(),
         clips: store.clone(),
         pages: store.clone(),
+        folders: store.clone(),
+        system_webhooks: store.clone(),
+        user_webhooks: store.clone(),
+        abuse_recipients: store.clone(),
+        memos: store.clone(),
+        thread_mutes: store.clone(),
         federation_http: SafeHttpClient::new(SafeHttpConfig {
             allow_private_ips: true,
             ..Default::default()

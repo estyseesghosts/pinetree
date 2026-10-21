@@ -824,6 +824,32 @@ impl AppServices {
         }
         self.reactions.unreact(user_id, note_id, jobs)
     }
+
+    /// `notes/thread-muting/create {noteId*}`: mute the note's thread for
+    /// the caller (gaps WP2a; idempotent — repeats stay 204). The note must
+    /// exist and be live (`NO_SUCH_NOTE` on miss/deleted). Thread identity
+    /// is the note itself (single-node: no reply-tree walk).
+    pub fn mute_note_thread(&self, user_id: &str, note_id: &str) -> Result<(), PortError> {
+        self.accounts.get_owner(user_id)?;
+        match self.notes.get_note(note_id)? {
+            Some(note) if !note.is_deleted => {}
+            _ => return Err(PortError::NotFound("NO_SUCH_NOTE".to_string())),
+        }
+        self.thread_mutes.mute_thread(user_id, note_id)?;
+        Ok(())
+    }
+
+    /// `notes/thread-muting/delete {noteId*}`: unmute the note's thread
+    /// (idempotent twin of [`Self::mute_note_thread`]).
+    pub fn unmute_note_thread(&self, user_id: &str, note_id: &str) -> Result<(), PortError> {
+        self.accounts.get_owner(user_id)?;
+        match self.notes.get_note(note_id)? {
+            Some(note) if !note.is_deleted => {}
+            _ => return Err(PortError::NotFound("NO_SUCH_NOTE".to_string())),
+        }
+        self.thread_mutes.unmute_thread(user_id, note_id)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -32,6 +32,8 @@ use pinetree::domain::notification::NotificationKind;
 use pinetree::federation::delivery::{SafeHttpClient, SafeHttpConfig};
 use pinetree::federation::retry::DestinationTracker;
 use pinetree::jobs::worker::JobWorker;
+use pinetree::media::transcode::TranscodeConfig;
+use pinetree::services::email::{SmtpConfig, SmtpEmailSender};
 use pinetree::media::storage::FsBlobStore;
 use pinetree::persistence::redb::RedbStore;
 
@@ -107,6 +109,12 @@ fn open_stack(dir: &Path) -> (Arc<RedbStore>, Arc<FsBlobStore>, Arc<AppServices>
             registry: store.clone(),
             clips: store.clone(),
             pages: store.clone(),
+            folders: store.clone(),
+            system_webhooks: store.clone(),
+            user_webhooks: store.clone(),
+            abuse_recipients: store.clone(),
+            memos: store.clone(),
+            thread_mutes: store.clone(),
         streaming: Arc::new(NoopStreamingSink),
         dedup: store.clone() as Arc<dyn ActivityDedup>,
         federation_http: SafeHttpClient::new(SafeHttpConfig {
@@ -148,6 +156,8 @@ fn open_worker(store: &Arc<RedbStore>, services: &Arc<AppServices>) -> JobWorker
         delivery_tracker: Arc::new(DestinationTracker::new()),
         lease_duration_ms: 60_000,
         base_backoff_ms: 1_000,
+        transcode_config: TranscodeConfig::default(),
+        email_sender: Arc::new(SmtpEmailSender::new(SmtpConfig::default())),
     }
 }
 

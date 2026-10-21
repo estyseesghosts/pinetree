@@ -442,18 +442,43 @@ fn strip_event_handlers(s: &str) -> String {
 }
 
 fn neutralize_scheme_case_insensitive(s: &str, scheme: &str) -> String {
-    // Replace every case-variant of `{scheme}:` with `blocked:`.
+    // Replace every case-variant of `{scheme}` followed by `:` or `,`
+    // with `blocked` (separator kept): `JAVASCRIPT:x` → `blocked:x`,
+    // `data:text/html,x` → `blocked:,x`. A scheme-looking word without
+    // a URL separator is kept verbatim.
+    let lower_scheme = scheme.to_lowercase();
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     loop {
         let lower = rest.to_lowercase();
-        let Some(pos) = lower.find(&format!("{scheme}:")) else {
+        let Some(rel) = lower.find(&lower_scheme) else {
             out.push_str(rest);
             break;
         };
-        out.push_str(rest.get(..pos).unwrap_or(""));
+        let end = rel + scheme.len();
+        let sep = rest.get(end..end + 1);
+        if !matches!(sep, Some(":") | Some(",")) {
+            let Some(keep) = rest.get(..end) else {
+                out.push_str(rest);
+                break;
+            };
+            out.push_str(keep);
+            rest = rest.get(end..).unwrap_or("");
+            continue;
+        }
+        let Some(prefix) = rest.get(..rel) else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(prefix);
+        // `blocked:` replaces `{scheme}{sep}`; a comma separator is kept
+        // (`data:text/html,x` → `blocked:,x`) while a colon is absorbed
+        // (`JAVASCRIPT:x` → `blocked:x`).
         out.push_str("blocked:");
-        rest = rest.get(pos + scheme.len() + 1..).unwrap_or("");
+        if sep == Some(",") {
+            out.push(',');
+        }
+        rest = rest.get(end + 1..).unwrap_or("");
     }
     out
 }

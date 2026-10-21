@@ -21,6 +21,8 @@ use pinetree::domain::media::MediaProperties;
 use pinetree::federation::delivery::{SafeHttpClient, SafeHttpConfig};
 use pinetree::federation::retry::DestinationTracker;
 use pinetree::jobs::worker::JobWorker;
+use pinetree::media::transcode::TranscodeConfig;
+use pinetree::services::email::{SmtpConfig, SmtpEmailSender};
 use pinetree::media::ingest::{md5_hex, sha256_hex};
 use pinetree::media::reconciler;
 use pinetree::media::storage::FsBlobStore;
@@ -84,6 +86,12 @@ fn recon_harness() -> (ReconHarness, String) {
         registry: store.clone(),
         clips: store.clone(),
         pages: store.clone(),
+        folders: store.clone(),
+        system_webhooks: store.clone(),
+        user_webhooks: store.clone(),
+        abuse_recipients: store.clone(),
+        memos: store.clone(),
+        thread_mutes: store.clone(),
         federation_http: SafeHttpClient::new(SafeHttpConfig {
             allow_private_ips: true,
             ..Default::default()
@@ -118,6 +126,8 @@ fn recon_harness() -> (ReconHarness, String) {
         delivery_tracker: Arc::new(DestinationTracker::new()),
         lease_duration_ms: 30_000,
         base_backoff_ms: 1_000,
+        transcode_config: TranscodeConfig::default(),
+        email_sender: Arc::new(SmtpEmailSender::new(SmtpConfig::default())),
     };
     let owner = store
         .create_account(CreateAccountInput::local(format!("recon_user_{n}")), None)

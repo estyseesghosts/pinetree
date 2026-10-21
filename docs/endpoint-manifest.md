@@ -1112,3 +1112,28 @@ GIF (animated or not) → WebM/VP9 wire `video`; video → WebM/VP9 + Opus 96k (
 - RFC 9421 verify-if-present permissive-first with logging, then tighten (proposed `federation.rfc9421_mode` + verifier; tightening deferred).
 - Stamp authority exact-host (`exact_authority_allows`), negative stamp dedup (`StampNegativeCache`), atomic `StampFetchPending`, reply coalescing (`ReplyCoalescer`, N-waiters → 1 job), `parse_question_poll` `type:"Note"`-tolerant, `tombstone_inner_id`. `Question.options[].type == "Note"` already landed (§15). Remaining indexes (`ACCOUNTS_BY_URI`, `NOTES_BY_QUOTE_*`, `ACCOUNTS_BY_HANDLE`), durable `ActivityIndex` + `JobQueue::has_pending_with_key`, late-link Reply notification + repair default, and the tightener land in the final-wiring commit; bench harness + live interop rounds (Akkoma/Pleroma/Mastodon/Glitch/Sharkey, public-internet soak) are internet-gated and stay OPEN.
 
+### 43.11 Addendum 2026-10-21 (final-wiring 5/5 landed)
+
+Status: ADDENDUM only. The arms §43.1/§43.2/§43.7 prospectively
+described now ship, verified by `tests/gaps_final_wiring.rs`
+(CRUD + verbatim codes + per-endpoint UUID pins + guards + cap + job
+enqueue): `drive/folders/*` ×5, `drive/files/{find,move-bulk}`, the
+folder-aware `drive/files` leg + `drive/files/update` folder leg
+(`pack_drive_file.folderId` now resolves the durable mapping;
+fail-open null), `notes/thread-muting/*`, `users/update-memo`,
+`system-webhook/*` ×5, `webhooks/*` ×5, `admin/send-email` (durable
+`EmailSend` enqueue). The dispatcher slot publishes the SMTP sender
+when configured (`main.rs`); the transcode/toolchain and email gates
+behave per §43.9/§43.7.
+
+New divergences (pinetree-defined, documented in the arms):
+`webhookId` names the id param in both webhook families (upstream
+`i/webhooks/*` parity on the user side; no upstream system shape —
+consistent within pinetree); over-cap create is `TOO_MANY_WEBHOOKS`
+(upstream has no limit error); `drive/files` with `folderId` may
+return short pages under `limit` (client pages with `untilId`).
+Abuse-report → email fan-out stays deferred with the §43.8
+worker-side producers (`EmailSend` jobs today come only from
+`admin/send-email`). The `ActivityIndex` field stays out of
+`AppServices` (deferred per §43.10, zero call sites).
+

@@ -17,6 +17,7 @@ use crate::application::ports::{
     RegistryItem, RegistryStore, ClipStore, PageStore,
     RemotePublicKeyRecord, TimelineCursor, UpdateAccountPatch, SigninRecord, SigninStore, UserListStore, MAX_JOBS_PER_TXN, MAX_JOB_ATTEMPTS, MAX_SIGNIN_ROWS_PER_USER,
     DriveFolderStore, SystemWebhookStore, UserWebhookStore, AbuseReportRecipientStore,
+    UserMemoStore, NoteThreadMuteStore,
 };
 use crate::domain::account::{validate_local_username, Account};
 use crate::domain::blocking::Blocking;
@@ -42,6 +43,14 @@ use crate::domain::antenna::Antenna;
 use crate::domain::drive_folder::DriveFolder;
 use crate::domain::emoji::{CustomEmoji, RemoteEmoji};
 use crate::domain::webhook::{AbuseReportRecipient, SystemWebhook, UserWebhook};
+use crate::application::commands::announcements::Announcement;
+use crate::application::commands::announcements::AnnouncementStore;
+use crate::application::commands::gallery::Flash;
+use crate::application::commands::gallery::FlashLike;
+use crate::application::commands::gallery::GalleryLike;
+use crate::application::commands::gallery::GalleryPost;
+use crate::application::commands::gallery::GalleryStore;
+use std::collections::HashSet;
 
 const ACCOUNTS: TableDefinition<&str, &[u8]> = TableDefinition::new("accounts");
 const HANDLE_INDEX: TableDefinition<&str, &str> = TableDefinition::new("handle_index");
@@ -161,6 +170,34 @@ const PAGES_BY_URI: TableDefinition<&str, &str> = TableDefinition::new("pages_by
 /// Page likes `(page_id, user_id)` → JSON
 /// [`PageLike`](crate::domain::page::PageLike) row.
 const PAGE_LIKES: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new("page_likes");
+/// User memos `(owner_id, target_id)` → memo text bytes (gaps WP2a;
+/// `users/update-memo`). `None`/empty clears the row (no empty rows).
+const USER_MEMOS: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new("user_memos");
+/// Thread mutes `(user_id, note_id)` → () (gaps WP2a;
+/// `notes/thread-muting/*`). The muted thread root is resolved by the op.
+const THREAD_MUTES: TableDefinition<(&str, &str), u8> =
+    TableDefinition::new("thread_mutes");
+/// Gallery posts by id (gaps WP2b). Values are JSON
+/// [`GalleryPost`](crate::application::commands::gallery::GalleryPost) rows.
+const GALLERY_POSTS: TableDefinition<&str, &[u8]> = TableDefinition::new("gallery_posts");
+/// Gallery post likes `(post_id, user_id)` → JSON
+/// [`GalleryLike`](crate::application::commands::gallery::GalleryLike) row.
+const GALLERY_POST_LIKES: TableDefinition<(&str, &str), &[u8]> =
+    TableDefinition::new("gallery_post_likes");
+/// Play pages (flash) by id (gaps WP2b). Values are JSON
+/// [`Flash`](crate::application::commands::gallery::Flash) rows.
+const FLASHES: TableDefinition<&str, &[u8]> = TableDefinition::new("flashes");
+/// Flash likes `(flash_id, user_id)` → JSON
+/// [`FlashLike`](crate::application::commands::gallery::FlashLike) row.
+const FLASH_LIKES: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new("flash_likes");
+/// Announcements by id (gaps WP2b). Values are JSON
+/// [`Announcement`](crate::application::commands::announcements::Announcement) rows.
+const ANNOUNCEMENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("announcements");
+/// Announcement reads `(announcement_id, user_id)` → () (idempotent marks).
+const ANNOUNCE_READS: TableDefinition<(&str, &str), u8> =
+    TableDefinition::new("announce_reads");
+/// Promo reads `user_id` → () (one flag per user).
+const PROMO_READS: TableDefinition<&str, u8> = TableDefinition::new("promo_reads");
 /// Polls by note id (`docs/misskey-parity-plan.md` §4; Misskey `MiPoll`).
 const POLLS: TableDefinition<&str, &[u8]> = TableDefinition::new("polls");
 /// Poll votes keyed `(user_id, note_id, choice)` (`UNIQUE(user,note,choice)`
@@ -630,6 +667,31 @@ impl RedbStore {
             .map_err(map_redb_err)?;
         let _ = write_txn
             .open_table(NOTES_BY_QUOTE_STAMP)
+            .map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(USER_MEMOS)
+            .map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(THREAD_MUTES)
+            .map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(GALLERY_POSTS)
+            .map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(GALLERY_POST_LIKES)
+            .map_err(map_redb_err)?;
+        let _ = write_txn.open_table(FLASHES).map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(FLASH_LIKES)
+            .map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(ANNOUNCEMENTS)
+            .map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(ANNOUNCE_READS)
+            .map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(PROMO_READS)
             .map_err(map_redb_err)?;
         let _ = write_txn.open_table(META).map_err(map_redb_err)?;
         write_txn.commit().map_err(map_redb_err)?;
@@ -11706,5 +11768,596 @@ impl AbuseReportRecipientStore for RedbStore {
         active.sort();
         active.truncate(limit);
         Ok(active.into_iter().map(|(_, email)| email).collect())
+    }
+}
+
+impl UserMemoStore for RedbStore {
+    fn set_memo(
+        &self,
+        owner_id: &str,
+        target_id: &str,
+        memo: Option<String>,
+    ) -> Result<(), PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            let mut table = write_txn.open_table(USER_MEMOS).map_err(map_redb_err)?;
+            match memo {
+                Some(text) if !text.is_empty() => {
+                    table
+                        .insert((owner_id, target_id), text.as_bytes())
+                        .map_err(map_redb_err)?;
+                }
+                _ => {
+                    table
+                        .remove((owner_id, target_id))
+                        .map_err(map_redb_err)?;
+                }
+            }
+        }
+        self.commit_write(write_txn)?;
+        Ok(())
+    }
+
+    fn get_memo(&self, owner_id: &str, target_id: &str) -> Result<Option<String>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(USER_MEMOS).map_err(map_redb_err)?;
+        match table.get((owner_id, target_id)).map_err(map_redb_err)? {
+            Some(value) => Ok(Some(
+                String::from_utf8(value.value().to_vec())
+                    .map_err(|err| PortError::StorageUnavailable(format!("memo not utf-8: {err}")))?,
+            )),
+            None => Ok(None),
+        }
+    }
+}
+
+impl NoteThreadMuteStore for RedbStore {
+    fn mute_thread(&self, user_id: &str, note_id: &str) -> Result<bool, PortError> {
+        let write_txn = self.begin_write()?;
+        let inserted = {
+            let mut table = write_txn
+                .open_table(THREAD_MUTES)
+                .map_err(map_redb_err)?;
+            let existed = table
+                .get((user_id, note_id))
+                .map_err(map_redb_err)?
+                .is_some();
+            if !existed {
+                table
+                    .insert((user_id, note_id), 1u8)
+                    .map_err(map_redb_err)?;
+            }
+            !existed
+        };
+        self.commit_write(write_txn)?;
+        Ok(inserted)
+    }
+
+    fn unmute_thread(&self, user_id: &str, note_id: &str) -> Result<bool, PortError> {
+        let write_txn = self.begin_write()?;
+        let removed = {
+            let mut table = write_txn
+                .open_table(THREAD_MUTES)
+                .map_err(map_redb_err)?;
+            table
+                .remove((user_id, note_id))
+                .map_err(map_redb_err)?
+                .is_some()
+        };
+        self.commit_write(write_txn)?;
+        Ok(removed)
+    }
+
+    fn is_thread_muted(&self, user_id: &str, note_id: &str) -> Result<bool, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(THREAD_MUTES).map_err(map_redb_err)?;
+        Ok(table
+            .get((user_id, note_id))
+            .map_err(map_redb_err)?
+            .is_some())
+    }
+}
+
+impl GalleryStore for RedbStore {
+    fn insert_post(&self, post: GalleryPost, jobs: Vec<NewJob>) -> Result<GalleryPost, PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            let mut table = write_txn.open_table(GALLERY_POSTS).map_err(map_redb_err)?;
+            let encoded = encode_json(&post)?;
+            table.insert(post.id.as_str(), encoded.as_slice()).map_err(map_redb_err)?;
+        }
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)?;
+        Ok(post)
+    }
+
+    fn update_post(&self, post: GalleryPost, jobs: Vec<NewJob>) -> Result<GalleryPost, PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            let mut table = write_txn.open_table(GALLERY_POSTS).map_err(map_redb_err)?;
+            if table
+                .get(post.id.as_str())
+                .map_err(map_redb_err)?
+                .is_none()
+            {
+                drop(table);
+                let _ = write_txn.abort();
+                return Err(PortError::NotFound("NO_SUCH_POST".to_string()));
+            }
+            let encoded = encode_json(&post)?;
+            table.insert(post.id.as_str(), encoded.as_slice()).map_err(map_redb_err)?;
+        }
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)?;
+        Ok(post)
+    }
+
+    fn delete_post(&self, post_id: &str, jobs: Vec<NewJob>) -> Result<bool, PortError> {
+        let write_txn = self.begin_write()?;
+        let existed = {
+            let mut posts = write_txn.open_table(GALLERY_POSTS).map_err(map_redb_err)?;
+            let existed = posts.remove(post_id).map_err(map_redb_err)?.is_some();
+            if existed {
+                let mut likes = write_txn
+                    .open_table(GALLERY_POST_LIKES)
+                    .map_err(map_redb_err)?;
+                let keys: Vec<(String, String)> = likes
+                    .range((post_id, "")..=(post_id, "\u{10ffff}"))
+                    .map_err(map_redb_err)?
+                    .map(|entry| {
+                        let (k, _) = entry.map_err(map_redb_err)?;
+                        Ok::<(String, String), PortError>((
+                            k.value().0.to_string(),
+                            k.value().1.to_string(),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                for key in keys {
+                    likes
+                        .remove((key.0.as_str(), key.1.as_str()))
+                        .map_err(map_redb_err)?;
+                }
+            }
+            existed
+        };
+        if existed {
+            self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        }
+        self.commit_write(write_txn)?;
+        Ok(existed)
+    }
+
+    fn get_post(&self, post_id: &str) -> Result<Option<GalleryPost>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(GALLERY_POSTS).map_err(map_redb_err)?;
+        match table.get(post_id).map_err(map_redb_err)? {
+            Some(value) => Ok(Some(decode_json(value.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn all_posts(&self) -> Result<Vec<GalleryPost>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(GALLERY_POSTS).map_err(map_redb_err)?;
+        let mut out: Vec<GalleryPost> = Vec::new();
+        for entry in table.iter().map_err(map_redb_err)? {
+            let (_, value) = entry.map_err(map_redb_err)?;
+            out.push(decode_json(value.value())?);
+        }
+        out.sort_by(|a: &GalleryPost, b: &GalleryPost| {
+            b.created_at_ms.cmp(&a.created_at_ms).then(b.id.cmp(&a.id))
+        });
+        Ok(out)
+    }
+
+    fn posts_by_owner(&self, owner_id: &str) -> Result<Vec<GalleryPost>, PortError> {
+        let mut out: Vec<GalleryPost> = self
+            .all_posts()?
+            .into_iter()
+            .filter(|post| post.owner_id == owner_id)
+            .collect();
+        out.sort_by(|a: &GalleryPost, b: &GalleryPost| {
+            b.created_at_ms.cmp(&a.created_at_ms).then(b.id.cmp(&a.id))
+        });
+        Ok(out)
+    }
+
+    fn like_post(&self, like: GalleryLike, jobs: Vec<NewJob>) -> Result<GalleryLike, PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            let mut posts = write_txn.open_table(GALLERY_POSTS).map_err(map_redb_err)?;
+            let raw: Option<Vec<u8>> = posts
+                .get(like.post_id.as_str())
+                .map_err(map_redb_err)?
+                .map(|guard| guard.value().to_vec());
+            let mut post: GalleryPost = match raw {
+                Some(bytes) => decode_json(&bytes)?,
+                None => {
+                    drop(posts);
+                    let _ = write_txn.abort();
+                    return Err(PortError::NotFound("NO_SUCH_POST".to_string()));
+                }
+            };
+            let mut likes = write_txn
+                .open_table(GALLERY_POST_LIKES)
+                .map_err(map_redb_err)?;
+            if likes
+                .get((like.post_id.as_str(), like.user_id.as_str()))
+                .map_err(map_redb_err)?
+                .is_some()
+            {
+                drop(likes);
+                drop(posts);
+                let _ = write_txn.abort();
+                return Err(PortError::Conflict("ALREADY_LIKED".to_string()));
+            }
+            let encoded = encode_json(&like)?;
+            likes
+                .insert(
+                    (like.post_id.as_str(), like.user_id.as_str()),
+                    encoded.as_slice(),
+                )
+                .map_err(map_redb_err)?;
+            post.liked_count = post.liked_count.saturating_add(1);
+            let encoded_post = encode_json(&post)?;
+            posts
+                .insert(post.id.as_str(), encoded_post.as_slice())
+                .map_err(map_redb_err)?;
+        }
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)?;
+        Ok(like)
+    }
+
+    fn unlike_post(&self, post_id: &str, user_id: &str, jobs: Vec<NewJob>) -> Result<(), PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            let mut likes = write_txn
+                .open_table(GALLERY_POST_LIKES)
+                .map_err(map_redb_err)?;
+            if likes
+                .remove((post_id, user_id))
+                .map_err(map_redb_err)?
+                .is_none()
+            {
+                drop(likes);
+                let _ = write_txn.abort();
+                return Err(PortError::Conflict("NOT_LIKED".to_string()));
+            }
+            let mut posts = write_txn.open_table(GALLERY_POSTS).map_err(map_redb_err)?;
+            let raw: Option<Vec<u8>> = posts
+                .get(post_id)
+                .map_err(map_redb_err)?
+                .map(|guard| guard.value().to_vec());
+            if let Some(bytes) = raw {
+                let mut post: GalleryPost = decode_json(&bytes)?;
+                post.liked_count = post.liked_count.saturating_sub(1);
+                let encoded = encode_json(&post)?;
+                posts
+                    .insert(post.id.as_str(), encoded.as_slice())
+                    .map_err(map_redb_err)?;
+            }
+        }
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)?;
+        Ok(())
+    }
+
+    fn insert_flash(&self, flash: Flash, jobs: Vec<NewJob>) -> Result<Flash, PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            let mut table = write_txn.open_table(FLASHES).map_err(map_redb_err)?;
+            let encoded = encode_json(&flash)?;
+            table
+                .insert(flash.id.as_str(), encoded.as_slice())
+                .map_err(map_redb_err)?;
+        }
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)?;
+        Ok(flash)
+    }
+
+    fn update_flash(&self, flash: Flash, jobs: Vec<NewJob>) -> Result<Flash, PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            let mut table = write_txn.open_table(FLASHES).map_err(map_redb_err)?;
+            if table
+                .get(flash.id.as_str())
+                .map_err(map_redb_err)?
+                .is_none()
+            {
+                drop(table);
+                let _ = write_txn.abort();
+                return Err(PortError::NotFound("NO_SUCH_FLASH".to_string()));
+            }
+            let encoded = encode_json(&flash)?;
+            table
+                .insert(flash.id.as_str(), encoded.as_slice())
+                .map_err(map_redb_err)?;
+        }
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)?;
+        Ok(flash)
+    }
+
+    fn delete_flash(&self, flash_id: &str, jobs: Vec<NewJob>) -> Result<bool, PortError> {
+        let write_txn = self.begin_write()?;
+        let existed = {
+            let mut flashes = write_txn.open_table(FLASHES).map_err(map_redb_err)?;
+            let existed = flashes.remove(flash_id).map_err(map_redb_err)?.is_some();
+            if existed {
+                let mut likes = write_txn
+                    .open_table(FLASH_LIKES)
+                    .map_err(map_redb_err)?;
+                let keys: Vec<(String, String)> = likes
+                    .range((flash_id, "")..=(flash_id, "\u{10ffff}"))
+                    .map_err(map_redb_err)?
+                    .map(|entry| {
+                        let (k, _) = entry.map_err(map_redb_err)?;
+                        Ok::<(String, String), PortError>((
+                            k.value().0.to_string(),
+                            k.value().1.to_string(),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                for key in keys {
+                    likes
+                        .remove((key.0.as_str(), key.1.as_str()))
+                        .map_err(map_redb_err)?;
+                }
+            }
+            existed
+        };
+        if existed {
+            self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        }
+        self.commit_write(write_txn)?;
+        Ok(existed)
+    }
+
+    fn get_flash(&self, flash_id: &str) -> Result<Option<Flash>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(FLASHES).map_err(map_redb_err)?;
+        match table.get(flash_id).map_err(map_redb_err)? {
+            Some(value) => Ok(Some(decode_json(value.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn all_flashes(&self) -> Result<Vec<Flash>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(FLASHES).map_err(map_redb_err)?;
+        let mut out: Vec<Flash> = Vec::new();
+        for entry in table.iter().map_err(map_redb_err)? {
+            let (_, value) = entry.map_err(map_redb_err)?;
+            out.push(decode_json(value.value())?);
+        }
+        out.sort_by(|a: &Flash, b: &Flash| {
+            b.created_at_ms.cmp(&a.created_at_ms).then(b.id.cmp(&a.id))
+        });
+        Ok(out)
+    }
+
+    fn flashes_by_owner(&self, owner_id: &str) -> Result<Vec<Flash>, PortError> {
+        let mut out: Vec<Flash> = self
+            .all_flashes()?
+            .into_iter()
+            .filter(|flash| flash.owner_id == owner_id)
+            .collect();
+        out.sort_by(|a: &Flash, b: &Flash| {
+            b.created_at_ms.cmp(&a.created_at_ms).then(b.id.cmp(&a.id))
+        });
+        Ok(out)
+    }
+
+    fn like_flash(&self, like: FlashLike, jobs: Vec<NewJob>) -> Result<FlashLike, PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            let mut flashes = write_txn.open_table(FLASHES).map_err(map_redb_err)?;
+            let raw: Option<Vec<u8>> = flashes
+                .get(like.flash_id.as_str())
+                .map_err(map_redb_err)?
+                .map(|guard| guard.value().to_vec());
+            let mut flash: Flash = match raw {
+                Some(bytes) => decode_json(&bytes)?,
+                None => {
+                    drop(flashes);
+                    let _ = write_txn.abort();
+                    return Err(PortError::NotFound("NO_SUCH_FLASH".to_string()));
+                }
+            };
+            let mut likes = write_txn.open_table(FLASH_LIKES).map_err(map_redb_err)?;
+            if likes
+                .get((like.flash_id.as_str(), like.user_id.as_str()))
+                .map_err(map_redb_err)?
+                .is_some()
+            {
+                drop(likes);
+                drop(flashes);
+                let _ = write_txn.abort();
+                return Err(PortError::Conflict("ALREADY_LIKED".to_string()));
+            }
+            let encoded = encode_json(&like)?;
+            likes
+                .insert(
+                    (like.flash_id.as_str(), like.user_id.as_str()),
+                    encoded.as_slice(),
+                )
+                .map_err(map_redb_err)?;
+            flash.liked_count = flash.liked_count.saturating_add(1);
+            let encoded_flash = encode_json(&flash)?;
+            flashes
+                .insert(flash.id.as_str(), encoded_flash.as_slice())
+                .map_err(map_redb_err)?;
+        }
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)?;
+        Ok(like)
+    }
+
+    fn unlike_flash(
+        &self,
+        flash_id: &str,
+        user_id: &str,
+        jobs: Vec<NewJob>,
+    ) -> Result<(), PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            let mut likes = write_txn.open_table(FLASH_LIKES).map_err(map_redb_err)?;
+            if likes
+                .remove((flash_id, user_id))
+                .map_err(map_redb_err)?
+                .is_none()
+            {
+                drop(likes);
+                let _ = write_txn.abort();
+                return Err(PortError::Conflict("NOT_LIKED".to_string()));
+            }
+            let mut flashes = write_txn.open_table(FLASHES).map_err(map_redb_err)?;
+            let raw: Option<Vec<u8>> = flashes
+                .get(flash_id)
+                .map_err(map_redb_err)?
+                .map(|guard| guard.value().to_vec());
+            if let Some(bytes) = raw {
+                let mut flash: Flash = decode_json(&bytes)?;
+                flash.liked_count = flash.liked_count.saturating_sub(1);
+                let encoded = encode_json(&flash)?;
+                flashes
+                    .insert(flash.id.as_str(), encoded.as_slice())
+                    .map_err(map_redb_err)?;
+            }
+        }
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)?;
+        Ok(())
+    }
+
+    fn flash_likes_by_user(&self, user_id: &str) -> Result<Vec<FlashLike>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(FLASH_LIKES).map_err(map_redb_err)?;
+        let mut out: Vec<FlashLike> = Vec::new();
+        for entry in table.iter().map_err(map_redb_err)? {
+            let (key, value) = entry.map_err(map_redb_err)?;
+            if key.value().1 == user_id {
+                out.push(decode_json(value.value())?);
+            }
+        }
+        out.sort_by(|a: &FlashLike, b: &FlashLike| {
+            b.created_at_ms.cmp(&a.created_at_ms).then(b.id.cmp(&a.id))
+        });
+        Ok(out)
+    }
+}
+
+impl AnnouncementStore for RedbStore {
+    fn insert_announcement(
+        &self,
+        announcement: Announcement,
+        jobs: Vec<NewJob>,
+    ) -> Result<Announcement, PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            let mut table = write_txn
+                .open_table(ANNOUNCEMENTS)
+                .map_err(map_redb_err)?;
+            let encoded = encode_json(&announcement)?;
+            table
+                .insert(announcement.id.as_str(), encoded.as_slice())
+                .map_err(map_redb_err)?;
+        }
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)?;
+        Ok(announcement)
+    }
+
+    fn get_announcement(
+        &self,
+        announcement_id: &str,
+    ) -> Result<Option<Announcement>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(ANNOUNCEMENTS).map_err(map_redb_err)?;
+        match table.get(announcement_id).map_err(map_redb_err)? {
+            Some(value) => Ok(Some(decode_json(value.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn all_announcements(&self) -> Result<Vec<Announcement>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(ANNOUNCEMENTS).map_err(map_redb_err)?;
+        let mut out: Vec<Announcement> = Vec::new();
+        for entry in table.iter().map_err(map_redb_err)? {
+            let (_, value) = entry.map_err(map_redb_err)?;
+            out.push(decode_json(value.value())?);
+        }
+        out.sort_by(|a: &Announcement, b: &Announcement| {
+            b.created_at_ms.cmp(&a.created_at_ms).then(b.id.cmp(&a.id))
+        });
+        Ok(out)
+    }
+
+    fn mark_announcement_read(
+        &self,
+        announcement_id: &str,
+        user_id: &str,
+        jobs: Vec<NewJob>,
+    ) -> Result<Option<Announcement>, PortError> {
+        let write_txn = self.begin_write()?;
+        let row = {
+            let announcements = write_txn
+                .open_table(ANNOUNCEMENTS)
+                .map_err(map_redb_err)?;
+            match announcements.get(announcement_id).map_err(map_redb_err)? {
+                Some(value) => decode_json(value.value())?,
+                None => return Ok(None),
+            }
+        };
+        {
+            let mut reads = write_txn
+                .open_table(ANNOUNCE_READS)
+                .map_err(map_redb_err)?;
+            reads
+                .insert((announcement_id, user_id), 1u8)
+                .map_err(map_redb_err)?;
+        }
+        self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        self.commit_write(write_txn)?;
+        Ok(Some(row))
+    }
+
+    fn read_announcement_ids(&self, user_id: &str) -> Result<HashSet<String>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(ANNOUNCE_READS).map_err(map_redb_err)?;
+        let mut out = HashSet::new();
+        for entry in table.iter().map_err(map_redb_err)? {
+            let (key, _) = entry.map_err(map_redb_err)?;
+            if key.value().1 == user_id {
+                out.insert(key.value().0.to_string());
+            }
+        }
+        Ok(out)
+    }
+
+    fn mark_promo_read(&self, user_id: &str, jobs: Vec<NewJob>) -> Result<bool, PortError> {
+        let write_txn = self.begin_write()?;
+        let inserted = {
+            let mut table = write_txn.open_table(PROMO_READS).map_err(map_redb_err)?;
+            let existed = table.get(user_id).map_err(map_redb_err)?.is_some();
+            if !existed {
+                table.insert(user_id, 1u8).map_err(map_redb_err)?;
+            }
+            !existed
+        };
+        if inserted {
+            self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
+        }
+        self.commit_write(write_txn)?;
+        Ok(inserted)
+    }
+
+    fn promo_is_read(&self, user_id: &str) -> Result<bool, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(PROMO_READS).map_err(map_redb_err)?;
+        Ok(table.get(user_id).map_err(map_redb_err)?.is_some())
     }
 }

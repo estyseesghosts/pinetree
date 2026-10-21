@@ -58,6 +58,8 @@ use pinetree::federation::delivery::{
 use pinetree::federation::inbox::{inbox_handler, user_inbox_handler};
 use pinetree::federation::retry::DestinationTracker;
 use pinetree::jobs::worker::JobWorker;
+use pinetree::media::transcode::TranscodeConfig;
+use pinetree::services::email::{SmtpConfig, SmtpEmailSender};
 use pinetree::media::remote_cache::fetch_and_cache_remote_media;
 use pinetree::media::storage::FsBlobStore;
 use pinetree::persistence::redb::RedbStore;
@@ -187,6 +189,12 @@ fn boot_node_inner(tag: &'static str) -> FedNode {
             registry: store.clone(),
             clips: store.clone(),
             pages: store.clone(),
+            folders: store.clone(),
+            system_webhooks: store.clone(),
+            user_webhooks: store.clone(),
+            abuse_recipients: store.clone(),
+            memos: store.clone(),
+            thread_mutes: store.clone(),
         streaming: Arc::new(NoopStreamingSink),
         dedup: store.clone() as Arc<dyn ActivityDedup>,
         federation_http: SafeHttpClient::new(SafeHttpConfig {
@@ -229,6 +237,8 @@ fn boot_node_inner(tag: &'static str) -> FedNode {
         delivery_tracker: Arc::new(DestinationTracker::new()),
         lease_duration_ms: 30_000,
         base_backoff_ms: 50,
+        transcode_config: TranscodeConfig::default(),
+        email_sender: Arc::new(SmtpEmailSender::new(SmtpConfig::default())),
     });
     let rate_limiter = Arc::new(RateLimiter::with_misskey_defaults(clock.clone()));
     // Warm the instance actor keypair now: pure-Rust RSA-2048 keygen takes
@@ -1465,6 +1475,12 @@ fn federation_remote_media_cache() {
             registry: store.clone(),
             clips: store.clone(),
             pages: store.clone(),
+            folders: store.clone(),
+            system_webhooks: store.clone(),
+            user_webhooks: store.clone(),
+            abuse_recipients: store.clone(),
+            memos: store.clone(),
+            thread_mutes: store.clone(),
         streaming: Arc::new(NoopStreamingSink),
         dedup: store.clone() as Arc<dyn ActivityDedup>,
         federation_http: SafeHttpClient::new(SafeHttpConfig {

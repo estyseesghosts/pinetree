@@ -542,6 +542,7 @@ mod tests {
     use axum::extract::{Query, State};
 
     use super::*;
+    use crate::application::commands::tests::UnavailableStores;
     use crate::application::ports::{
         AccountStore, ActivityDedup, ApiTokenRecord, AuthStore, BlobStore, BlockStore,
         CreateAccountInput, CreateNoteInput, FollowStore, HostCapsStore, HostSoftware,
@@ -1670,6 +1671,12 @@ mod tests {
             registry: mem.clone(),
             clips: mem.clone(),
             pages: mem.clone(),
+            folders: Arc::new(UnavailableStores),
+            system_webhooks: Arc::new(UnavailableStores),
+            user_webhooks: Arc::new(UnavailableStores),
+            abuse_recipients: Arc::new(UnavailableStores),
+            memos: Arc::new(UnavailableStores),
+            thread_mutes: Arc::new(UnavailableStores),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()

@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use axum::{
     body::{Body, Bytes},
@@ -29,11 +30,32 @@ use crate::activitypub::{actor as ap_actor, objects as ap_objects, webfinger as 
 use crate::activitypub::federated_collections as ap_collections;
 use crate::application::commands::invites::SignupRejection;
 use crate::application::commands::pins::FeaturedCache;
+use crate::application::commands::webhooks::CreateSystemWebhookInput;
+use crate::application::commands::webhooks::CreateUserWebhookInput;
+use crate::application::commands::webhooks::UpdateSystemWebhookInput;
+use crate::application::commands::webhooks::UpdateUserWebhookInput;
+use crate::application::commands::webhooks::create_system_webhook;
+use crate::application::commands::webhooks::create_user_webhook;
+use crate::application::commands::webhooks::delete_system_webhook;
+use crate::application::commands::webhooks::delete_user_webhook;
+use crate::application::commands::webhooks::show_system_webhook;
+use crate::application::commands::webhooks::show_user_webhook;
+use crate::application::commands::webhooks::update_system_webhook;
+use crate::application::commands::webhooks::update_user_webhook;
 use crate::application::commands::AppServices;
+use crate::application::commands::announcements::MemAnnouncementStore;
+use crate::application::commands::gallery::FlashVisibility;
+use crate::application::commands::gallery::IdCursor;
+use crate::application::commands::gallery::MemGalleryStore;
+use crate::domain::follow::FollowNotify;
+use crate::application::commands::misc_endpoints::EmojisV2Page;
+use crate::application::commands::misc_endpoints::ping;
 use crate::application::ports::{
     AbuseReportFilter, ApiTokenRecord, BlobStore, CreateDraftInput, CreateNoteInput, EditNoteInput, ExportEntity, ImportEntity,
-    InviteListFilter, InviteSort, InviteTypeFilter, LegacyAuthSessionRecord, MiAuthSessionRecord,
-    ModerationLogFilter, PasswordResetRequest, PortError, RegistryItem, SigninRecord, TimelineCursor,
+    InviteListFilter, InviteSort, InviteTypeFilter, JobKind, LegacyAuthSessionRecord,
+    MiAuthSessionRecord,
+    ModerationLogFilter, NewJob, PasswordResetRequest, PortError, RegistryItem, SigninRecord,
+    TimelineCursor,
     UpdateAccountPatch, UpdateDraftPatch,
 };
 use crate::domain::account::{
@@ -51,6 +73,7 @@ use crate::federation::delivery::{
 };
 use crate::federation::inbox as fed_inbox;
 use crate::jobs::worker::JobWorker;
+use crate::media::transcode::TranscodeConfig;
 use crate::streaming::hub::{Hub, ONLINE_THRESHOLD_MS};
 use crate::streaming::server::streaming_handler;
 
@@ -61,17 +84,27 @@ use super::auth::{
 };
 use super::errors::ApiError;
 use super::packers::{
-    pack_abuse_report, pack_antenna, pack_blocking, pack_clip, pack_drive_file, pack_emoji_detailed, pack_emoji_simple,
+    pack_abuse_report, pack_antenna, pack_blocking, pack_clip, pack_drive_file, pack_drive_folder,
+    pack_emoji_detailed, pack_emoji_simple,
     pack_remote_emoji_detailed,
     pack_following, pack_invite_code, pack_me_detailed,
     pack_meta, pack_moderation_log, pack_muting, pack_note, pack_note_draft,
     pack_note_reaction_with_note, pack_page, pack_scheduled_note,
-    pack_notification, pack_renote_muting, pack_user_detailed_not_me, pack_user_list,
+    pack_notification, pack_renote_muting, pack_system_webhook, pack_user_detailed_not_me,
+    pack_user_list,
     pack_user_lite,
-    pack_user_relation,
+    pack_user_relation, pack_user_webhook,
 };
 use super::request::check_allowed_fields;
 use super::response::{RateLimiter, UploadSlots};
+use crate::services::email::EmailError;
+use crate::services::email::EmailMessage;
+use crate::services::email::EmailSendPayload;
+use crate::services::email::EmailSender;
+use crate::services::email::SmtpConfig;
+use crate::services::email::SmtpEmailSender;
+use crate::services::email::password_reset_email;
+use crate::services::email::verification_email;
 
 /// Shared API state: application services, the durable-job worker, the
 /// Misskey rate limiter, the concurrent-upload slots, the live-streaming
@@ -1112,6 +1145,410 @@ fn map_import_file_error(err: PortError, endpoint: &str) -> ApiError {
         }
         other => ApiError::from_port_error(other),
     }
+}
+
+/// Map a gallery/flash op [`PortError`] to the caller's verbatim upstream
+/// error. `NO_SUCH_POST` / `NO_SUCH_FLASH` / `ACCESS_DENIED` flow through
+/// [`ApiError::from_port_error`]; the like twins stay out of the shared
+/// lookup (so the pages `ALREADY_LIKED` UUID is untouched) via the
+/// `gallery_*` constructors.
+fn map_gallery_error(err: PortError) -> ApiError {
+    match &err {
+        PortError::Conflict(msg) if msg == "ALREADY_LIKED" => {
+            ApiError::gallery_already_liked()
+        }
+        PortError::Conflict(msg) if msg == "NOT_LIKED" => ApiError::gallery_not_liked(),
+        _ => ApiError::from_port_error(err),
+    }
+}
+
+/// Map a drive file-extra op [`PortError`] to the caller's per-endpoint
+/// verbatim upstream error (`NO_SUCH_FILE` carries one UUID per endpoint).
+fn map_drive_extra_error(err: PortError, endpoint: &str) -> ApiError {
+    match &err {
+        PortError::NotFound(msg) if msg == "NO_SUCH_FILE" => {
+            ApiError::drive_no_such_file(endpoint)
+        }
+        _ => ApiError::from_port_error(err),
+    }
+}
+
+/// Map drive-folder store errors to the per-endpoint Misskey envelopes
+/// (gaps WP2a final wiring). Verbatim codes; unknown shapes fall through
+/// to the generic lookup.
+fn map_drive_folder_error(err: PortError, endpoint: &str) -> ApiError {
+    match &err {
+        PortError::NotFound(msg) if msg == "NO_SUCH_FOLDER" => {
+            ApiError::folder_no_such_folder(endpoint)
+        }
+        PortError::NotFound(msg) if msg == "NO_SUCH_PARENT_FOLDER" => {
+            ApiError::folder_update_parent_error("NO_SUCH_PARENT_FOLDER")
+        }
+        PortError::Validation(msg) if msg == "RECURSIVE_NESTING" => {
+            ApiError::folder_update_parent_error("RECURSIVE_NESTING")
+        }
+        PortError::Conflict(msg) if msg == "HAS_CHILD_FILES_OR_FOLDERS" => {
+            ApiError::folder_delete_has_child()
+        }
+        _ => ApiError::from_port_error(err),
+    }
+}
+
+/// Map webhook store errors to the per-endpoint Misskey envelopes (gaps
+/// WP3 final wiring). The store layer reports lowercase
+/// `no such webhook`; the limit conflict maps to the pinetree-defined
+/// `TOO_MANY_WEBHOOKS`.
+fn map_webhook_error(err: PortError, endpoint: &str) -> ApiError {
+    match &err {
+        PortError::NotFound(msg) if msg == "no such webhook" => {
+            ApiError::webhook_no_such_webhook(endpoint)
+        }
+        PortError::Conflict(msg) if msg.starts_with("too many webhooks") => {
+            ApiError::webhook_too_many()
+        }
+        _ => ApiError::from_port_error(err),
+    }
+}
+
+/// Process-global gallery store for the `gallery/*` + `flash/*` arms.
+// TODO(final): swap to redb. The `GalleryStore` port has no durable
+// implementation yet (sibling-owned `ports.rs`/`redb`), so the arms run
+// against the command-layer in-memory store. Single-process, non-durable,
+// lost on restart — the arm comments carry the same marker.
+static GALLERY_STORE: OnceLock<MemGalleryStore> = OnceLock::new();
+
+fn gallery_store() -> &'static MemGalleryStore {
+    GALLERY_STORE.get_or_init(MemGalleryStore::new)
+}
+
+/// Process-global announcement store for the `announcements*` +
+/// `i/read-announcement` + `promo/read` arms (same interim posture as
+/// [`gallery_store`]).
+// TODO(final): swap to redb.
+static ANNOUNCEMENT_STORE: OnceLock<MemAnnouncementStore> = OnceLock::new();
+
+fn announcement_store() -> &'static MemAnnouncementStore {
+    ANNOUNCEMENT_STORE.get_or_init(MemAnnouncementStore::new)
+}
+
+/// Process-global outbound-mail sender slot. The SMTP settings live in the
+/// sibling-owned config/`main.rs` wiring; that layer publishes its sender
+/// here via [`set_email_sender`]/[`configure_smtp`]. Until then the slot
+/// is empty and every send attempt answers `EMAIL_NOT_CONFIGURED`.
+static EMAIL_SENDER: OnceLock<Arc<dyn EmailSender>> = OnceLock::new();
+
+/// Publish the process-global mail sender (called once by the
+/// sibling-owned `main.rs` wiring when SMTP is configured).
+pub fn set_email_sender(sender: Arc<dyn EmailSender>) {
+    let _ = EMAIL_SENDER.set(sender);
+}
+
+/// Build the SMTP sender from config and publish it (convenience for the
+/// sibling-owned `main.rs` wiring).
+pub fn configure_smtp(config: SmtpConfig) {
+    set_email_sender(Arc::new(SmtpEmailSender::new(config)));
+}
+
+/// Send one message through the configured sender, or answer
+/// `EMAIL_NOT_CONFIGURED` when no sender was published. Transport failures
+/// are 500s (loud, never silently dropped).
+fn send_email_now(message: &EmailMessage) -> Result<(), ApiError> {
+    match EMAIL_SENDER.get() {
+        None => Err(ApiError::email_not_configured()),
+        Some(sender) => sender.send(message).map_err(|err| match err {
+            EmailError::NotConfigured => ApiError::email_not_configured(),
+            other => ApiError::internal().with_info(Value::String(format!("{other}"))),
+        }),
+    }
+}
+
+/// Pack one follow request row (`following/requests/*` shape: id + lite
+/// follower/followee).
+fn pack_follow_request(
+    state: &ApiState,
+    id: &str,
+    follower_id: &str,
+    followee_id: &str,
+) -> Result<Value, ApiError> {
+    let now = state.services.clock.now_ms();
+    let public_url = &state.services.public_url;
+    let follower = state
+        .services
+        .accounts
+        .find_by_id(follower_id)
+        .map_err(ApiError::from_port_error)?;
+    let followee = state
+        .services
+        .accounts
+        .find_by_id(followee_id)
+        .map_err(ApiError::from_port_error)?;
+    Ok(serde_json::json!({
+        "id": id,
+        "follower": follower.map(|account| pack_user_lite(&account, public_url, now)),
+        "followee": followee.map(|account| pack_user_lite(&account, public_url, now)),
+    }))
+}
+
+/// Pack one [`GalleryPost`](crate::application::commands::gallery::GalleryPost)
+/// (upstream `GalleryPost` shape subset: no `isLiked` — the store seam has
+/// no per-viewer like query; the field is omitted rather than lied about).
+fn pack_gallery_post(
+    state: &ApiState,
+    post: &crate::application::commands::gallery::GalleryPost,
+) -> Result<Value, ApiError> {
+    let owner = state
+        .services
+        .accounts
+        .find_by_id(&post.owner_id)
+        .map_err(ApiError::from_port_error)?
+        .ok_or_else(|| ApiError::from_port_error(PortError::NotFound("NO_SUCH_USER".to_string())))?;
+    let services = &state.services;
+    let created_at = services
+        .ids
+        .parse_time(&post.id)
+        .map(crate::activitypub::format_millis)
+        .unwrap_or_else(|_| crate::activitypub::format_millis(post.created_at_ms));
+    let mut files = Vec::new();
+    for file_id in &post.file_ids {
+        if let Some(meta) = services
+            .media
+            .get(file_id)
+            .map_err(ApiError::from_port_error)?
+        {
+            files.push(pack_drive_file(&meta, services));
+        }
+    }
+    Ok(serde_json::json!({
+        "id": post.id,
+        "createdAt": created_at,
+        "updatedAt": crate::activitypub::format_millis(post.updated_at_ms),
+        "userId": post.owner_id,
+        "user": pack_user_lite(&owner, &services.public_url, services.clock.now_ms()),
+        "title": post.title,
+        "description": post.description,
+        "fileIds": post.file_ids,
+        "files": files,
+        "isSensitive": post.is_sensitive,
+        "likedCount": post.liked_count,    }))
+}
+
+/// Pack one [`Flash`](crate::application::commands::gallery::Flash) (same
+/// `isLiked` omission as [`pack_gallery_post`]).
+fn pack_flash(
+    state: &ApiState,
+    flash: &crate::application::commands::gallery::Flash,
+) -> Result<Value, ApiError> {
+    let owner = state
+        .services
+        .accounts
+        .find_by_id(&flash.owner_id)
+        .map_err(ApiError::from_port_error)?
+        .ok_or_else(|| ApiError::from_port_error(PortError::NotFound("NO_SUCH_USER".to_string())))?;
+    let services = &state.services;
+    let created_at = services
+        .ids
+        .parse_time(&flash.id)
+        .map(crate::activitypub::format_millis)
+        .unwrap_or_else(|_| crate::activitypub::format_millis(flash.created_at_ms));
+    let visibility = match flash.visibility {
+        FlashVisibility::Public => "public",
+        FlashVisibility::Home => "home",
+    };
+    Ok(serde_json::json!({
+        "id": flash.id,
+        "createdAt": created_at,
+        "updatedAt": crate::activitypub::format_millis(flash.updated_at_ms),
+        "userId": flash.owner_id,
+        "user": pack_user_lite(&owner, &services.public_url, services.clock.now_ms()),
+        "title": flash.title,
+        "summary": flash.summary,
+        "script": flash.script,
+        "visibility": visibility,
+        "likedCount": flash.liked_count,
+    }))
+}
+
+/// Pack one announcement view (user `announcements*` shape, with the
+/// per-viewer `isRead` flag).
+fn pack_announcement_view(
+    view: &crate::application::commands::announcements::AnnouncementView,
+) -> Value {
+    let announcement = &view.announcement;
+    let created_at = announcement.created_at_ms;
+    serde_json::json!({
+        "id": announcement.id,
+        "createdAt": crate::activitypub::format_millis(created_at),
+        "updatedAt": announcement.updated_at_ms.map(crate::activitypub::format_millis),
+        "text": announcement.text,
+        "title": announcement.title,
+        "imageUrl": announcement.image_url,
+        "isRead": view.is_read,
+        "showPopup": announcement.show_popup,
+        "isGoodNews": announcement.is_good_news,
+    })
+}
+
+/// Pack one developer-app row. The secret is only included for the
+/// creator-facing endpoints (`app/create`, `app/show`); `my/apps` omits it.
+fn pack_app_record(record: &crate::domain::admin::AppRecord, include_secret: bool) -> Value {
+    let mut obj = serde_json::json!({
+        "id": record.id,
+        "name": record.name,
+        "callbackUrl": record.callback_url,
+        "permission": record.permission,
+        "description": record.description,
+        "createdAt": crate::activitypub::format_millis(record.created_at_ms),
+    });
+    if include_secret {
+        if let Some(map) = obj.as_object_mut() {
+            map.insert("secret".to_string(), Value::String(record.secret.clone()));
+        }
+    }
+    obj
+}
+
+/// Parse an `IdCursor` (`sinceId`/`untilId`/`limit`, Misskey gallery
+/// parity: default 10, range 1–100) for the gallery/flash list endpoints.
+fn parse_id_cursor(obj: &Map<String, Value>) -> Result<IdCursor, ApiError> {
+    Ok(IdCursor {
+        since_id: opt_string(obj, "sinceId")?,
+        until_id: opt_string(obj, "untilId")?,
+        limit: get_limit_with_default(obj, 10)?,
+    })
+}
+
+/// Parse the optional `notify` tri-state for `following/update`
+/// (`normal` enables, `none`/absent clears).
+fn parse_follow_notify(obj: &Map<String, Value>) -> Result<Option<FollowNotify>, ApiError> {
+    match obj.get("notify") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s == "normal" => Ok(Some(FollowNotify::Normal)),
+        Some(Value::String(s)) if s == "none" => Ok(None),
+        Some(_) => Err(ApiError::invalid_param(
+            "notify",
+            "must be normal or none",
+        )),
+    }
+}
+
+/// Record a 2fa password-check failure against the shared `auth/2fa`
+/// throttle bucket (mirrors the `auth/change-password` pattern).
+fn record_2fa_auth_failure(state: &ApiState, account_id: &str, client_ip: &str) {
+    state.rate_limiter.record_auth_failure(
+        "auth/2fa",
+        &format!("acctid:{account_id}"),
+        &auth_ip_key(client_ip),
+    );
+}
+
+/// Required integer param (Misskey ad/role numeric fields).
+fn required_i64(obj: &Map<String, Value>, key: &str) -> Result<i64, ApiError> {
+    match obj.get(key) {
+        Some(Value::Number(n)) => n
+            .as_i64()
+            .ok_or_else(|| ApiError::invalid_param(key, "must be an integer")),
+        _ => Err(ApiError::invalid_param(key, "this field is required")),
+    }
+}
+
+/// Required float param (`admin/ad` `ratio`).
+fn parse_ad_ratio(obj: &Map<String, Value>) -> Result<f64, ApiError> {
+    match obj.get("ratio") {
+        Some(Value::Number(n)) => n.as_f64().ok_or_else(|| {
+            ApiError::invalid_param("ratio", "must be a number")
+        }),
+        _ => Err(ApiError::invalid_param("ratio", "this field is required")),
+    }
+}
+
+/// Optional boolean param (`None` when absent or null — the tri-state
+/// federation override flags).
+fn parse_opt_bool(obj: &Map<String, Value>, key: &str) -> Result<Option<bool>, ApiError> {
+    match obj.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(_) => Err(ApiError::invalid_param(key, "must be a boolean")),
+    }
+}
+
+/// Pack one role row (admin `roles/*` shape).
+fn pack_role_record(record: &crate::domain::admin::RoleRecord) -> Value {
+    serde_json::json!({
+        "id": record.id,
+        "name": record.name,
+        "description": record.description,
+        "color": record.color,
+        "iconUrl": record.icon_url,
+        "target": record.target,
+        "condFormula": record.cond_formula,
+        "isPublic": record.is_public,
+        "asBadge": record.as_badge,
+        "canEditMembersByModerator": record.can_edit_members_by_moderator,
+        "displayOrder": record.display_order,
+        "policies": record.policies,
+    })
+}
+
+/// Pack one relay row (admin `relays/*` shape).
+fn pack_relay_record(record: &crate::domain::admin::RelayRecord) -> Value {
+    serde_json::json!({
+        "inbox": record.inbox,
+        "status": record.status,
+    })
+}
+
+/// Pack one ad row (admin `ad/*` shape; millisecond bounds as ISO-8601).
+fn pack_ad_record(record: &crate::domain::admin::AdRecord) -> Value {
+    serde_json::json!({
+        "id": record.id,
+        "url": record.url,
+        "memo": record.memo,
+        "place": record.place,
+        "ratio": record.ratio,
+        "priority": record.priority,
+        "expiresAt": crate::activitypub::format_millis(record.expires_at_ms),
+        "startsAt": crate::activitypub::format_millis(record.starts_at_ms),
+        "imageUrl": record.image_url,
+        "dayOfWeek": record.day_of_week,
+    })
+}
+
+/// Pack one admin announcement row (admin `announcements/*` shape).
+fn pack_admin_announcement_record(record: &crate::domain::admin::AnnouncementRecord) -> Value {
+    serde_json::json!({
+        "id": record.id,
+        "title": record.title,
+        "text": record.text,
+        "imageUrl": record.image_url,
+        "createdAt": crate::activitypub::format_millis(record.created_at_ms),
+        "updatedAt": crate::activitypub::format_millis(record.updated_at_ms),
+    })
+}
+
+/// Pack one federation override row (admin/federation `update-instance`
+/// shape).
+fn pack_federation_override(record: &crate::domain::admin::FederationInstanceOverride) -> Value {
+    serde_json::json!({
+        "host": record.host,
+        "isSuspended": record.is_suspended,
+        "isBlocked": record.is_blocked,
+        "isSilenced": record.is_silenced,
+        "moderationNote": record.moderation_note,
+        "updatedAt": crate::activitypub::format_millis(record.updated_at_ms),
+    })
+}
+
+/// Pack one abuse-report notification recipient row.
+fn pack_abuse_recipient(record: &crate::domain::admin::AbuseRecipientRecord) -> Value {
+    serde_json::json!({
+        "id": record.id,
+        "isActive": record.is_active,
+        "name": record.name,
+        "method": record.method,
+        "userId": record.user_id,
+        "email": record.email,
+        "webhookUrl": record.webhook_url,
+    })
 }
 
 /// Cursor paging for the block/mute list endpoints (Misskey parity: `limit`
@@ -3103,9 +3540,31 @@ fn api_dispatch_blocking(
             check_allowed_fields(&obj, &[])?;
             let caller = require_caller(caller)?;
             caller.require_permission("read:account")?;
-            let packed =
+            let mut packed =
                 pack_me_detailed(&caller.account, caller.is_first_party, &state.services)
                     .map_err(ApiError::from_port_error)?;
+            // Gaps final wiring (WP2b §4d): the real announcement badge.
+            // `unreadAnnouncements` carries the unread packs and
+            // `hasUnreadAnnouncement` mirrors their emptiness; chat stays
+            // hardcoded false in the packer (channels/chat skipped).
+            if let Some(map) = packed.as_object_mut() {
+                let unread: Vec<Value> = state
+                    .services
+                    .announcements_list(announcement_store(), Some(&caller.account.id))
+                    .map_err(ApiError::from_port_error)?
+                    .iter()
+                    .filter(|view| !view.is_read)
+                    .map(pack_announcement_view)
+                    .collect();
+                map.insert(
+                    "hasUnreadAnnouncement".to_string(),
+                    Value::Bool(!unread.is_empty()),
+                );
+                map.insert(
+                    "unreadAnnouncements".to_string(),
+                    Value::Array(unread),
+                );
+            }
             Ok(Json(packed).into_response())
         }
 
@@ -7593,14 +8052,10 @@ fn api_dispatch_blocking(
             )?;
             let caller = require_caller(caller)?;
             caller.require_permission("read:drive")?;
-            if let Some(folder) = obj.get("folderId") {
-                if !folder.is_null() {
-                    return Err(ApiError::invalid_param(
-                        "folderId",
-                        "folders are unsupported; folderId must be null",
-                    ));
-                }
-            }
+            // Folder-aware listing (gaps WP2a final wiring): a non-null
+            // `folderId` scopes the page to that folder (missing/foreign
+            // folders match nothing → `[]`); absent/null lists everything.
+            let folder_id = opt_string(&obj, "folderId")?;
             let type_prefix: Option<String> = match opt_string(&obj, "type")? {
                 None => None,
                 Some(raw) => {
@@ -7638,15 +8093,32 @@ fn api_dispatch_blocking(
             }
             let sort = opt_string(&obj, "sort")?;
             let cursor = parse_cursor(&obj)?;
-            let files = state
-                .services
-                .list_drive_files(
-                    &caller.account.id,
-                    &cursor,
-                    type_prefix.as_deref(),
-                    sort.as_deref(),
-                )
-                .map_err(ApiError::from_port_error)?;
+            let files = match folder_id.as_deref() {
+                None => {
+                    state
+                        .services
+                        .list_drive_files(
+                            &caller.account.id,
+                            &cursor,
+                            type_prefix.as_deref(),
+                            sort.as_deref(),
+                        )
+                        .map_err(ApiError::from_port_error)?
+                }
+                Some(_) => {
+                    state
+                        .services
+                        .list_drive_files_in(
+                            state.services.folders.as_ref(),
+                            &caller.account.id,
+                            folder_id.as_deref(),
+                            &cursor,
+                            type_prefix.as_deref(),
+                            sort.as_deref(),
+                        )
+                        .map_err(ApiError::from_port_error)?
+                }
+            };
             let packed: Vec<Value> = files
                 .iter()
                 .map(|meta| pack_drive_file(meta, &state.services))
@@ -7668,15 +8140,15 @@ fn api_dispatch_blocking(
 
         // Batch P §1 email identity loop (upstream `i/update-email.ts`,
         // `request-reset-password.ts`, `reset-password.ts`,
-        // `verify-email.ts`). Owner decision: NO SMTP is configured anywhere
-        // in this repo, so the loop is code-complete and dormant — the
-        // state transitions (store + verify + mint + TTL) are real, the
-        // send paths fail loudly (`EMAIL_NOT_CONFIGURED`) instead of
-        // silently dropping a password reset. Token/code lifecycle:
-        // `emailVerifyCode` 16 chars minted on update-email, cleared on
-        // verify; reset rows single-use with a 30-minute TTL read off the
-        // aidx id timestamp (upstream `reset-password.ts` parity — unknown
-        // or expired tokens answer 500 like upstream's bare throws).
+        // `verify-email.ts`). The state transitions (store + verify + mint
+        // + TTL) are real; the send paths go through the configured sender
+        // published via `set_email_sender` (unconfigured still answers
+        // `EMAIL_NOT_CONFIGURED` instead of silently dropping). Token/code
+        // lifecycle: `emailVerifyCode` 16 chars minted on update-email,
+        // cleared on verify; reset rows single-use with a 30-minute TTL
+        // read off the aidx id timestamp (upstream `reset-password.ts`
+        // parity — unknown or expired tokens answer 500 like upstream's
+        // bare throws).
         "i/update-email" => {
             check_allowed_fields(&obj, &["password", "email", "token"])?;
             let caller = require_caller(caller)?;
@@ -7739,14 +8211,26 @@ fn api_dispatch_blocking(
                     Vec::new(),
                 )
                 .map_err(ApiError::from_port_error)?;
-            // Dormant transport: the verification link is minted and stored
-            // (exercisable via `verify-email`), but no mail leaves this
-            // server — the send is a loud no-op, logged, never silent.
-            if email.is_some() {
-                eprintln!(
-                    "email dormant: verification code for {} not sent (no SMTP configured)",
-                    caller.account.id
-                );
+            // Live send through the configured sender (published by the
+            // sibling-owned `main.rs` wiring via `set_email_sender`); no
+            // sender keeps the previous dormant posture — mint and store
+            // the code, log loudly, succeed. A configured sender that
+            // fails at transport level is a loud 500 (never silently
+            // dropped); a configured-but-unconfigured sender degrades to
+            // the dormant posture.
+            if let Some(addr) = email.as_deref() {
+                let code_value = code.as_deref().unwrap_or("");
+                let message = verification_email(addr, &state.services.public_url, code_value);
+                match send_email_now(&message) {
+                    Ok(()) => {}
+                    Err(err) if err.code == "EMAIL_NOT_CONFIGURED" => {
+                        eprintln!(
+                            "email dormant: verification code for {} not sent (no SMTP configured)",
+                            caller.account.id
+                        );
+                    }
+                    Err(err) => return Err(err),
+                }
             }
             Ok(Json(
                 pack_me_detailed(&updated, caller.is_first_party, &state.services)
@@ -7764,7 +8248,7 @@ fn api_dispatch_blocking(
             let email = required_str(&obj, "email")?;
             // Information-leak posture (upstream: unknown user, email
             // mismatch, and unverified address are all silently ignored).
-            // The dormant transport errors UNIFORMLY below, so no oracle
+            // The transport errors UNIFORMLY below, so no oracle
             // distinguishes the cases (DIVERGENCE: without SMTP the
             // endpoint cannot operate, so it fails loudly instead of
             // silently dropping — uniformly, preserving the posture).
@@ -7786,12 +8270,21 @@ fn api_dispatch_blocking(
                     .create_reset_request(PasswordResetRequest {
                         id: state.services.ids.generate(),
                         user_id: acc.id.clone(),
-                        token,
+                        token: token.clone(),
                     })
                     .map_err(ApiError::from_port_error)?;
+                // Live send through the configured sender (the sibling-owned
+                // `main.rs` wiring publishes it via `set_email_sender`).
+                // Unconfigured answers `EMAIL_NOT_CONFIGURED` — uniformly,
+                // like the non-mailable path below, so no oracle
+                // distinguishes the cases.
+                let message = password_reset_email(&email, &state.services.public_url, &token);
+                send_email_now(&message)?;
+                return Ok(StatusCode::NO_CONTENT.into_response());
             }
             // The row above keeps the loop code-complete and testable
-            // (white-box token read); the user-visible send never happens.
+            // (white-box token read); the user-visible send needs a
+            // configured sender.
             Err(ApiError::email_not_configured())
         }
 
@@ -8570,12 +9063,30 @@ fn api_dispatch_blocking(
         }
 
         "drive/files/update" => {
-            check_allowed_fields(&obj, &["fileId", "isSensitive", "comment", "name"])?;
+            check_allowed_fields(&obj, &["fileId", "isSensitive", "comment", "name", "folderId"])?;
             let caller = require_caller(caller)?;
             caller.require_permission("write:drive")?;
             // Same cost class as uploads; no dedicated bucket exists.
             state.rate_limiter.check(&rate_key, "drive/files/create")?;
             let file_id = required_str(&obj, "fileId")?;
+            // Folder leg (gaps WP2a final wiring): a present `folderId`
+            // (even null = move to root) re-files the note before the
+            // metadata update below. `NO_SUCH_FILE` on miss,
+            // `ACCESS_DENIED` for non-moderator foreign files,
+            // `NO_SUCH_FOLDER` on a missing/foreign target.
+            if obj.contains_key("folderId") {
+                let folder_id = opt_nullable_string(&obj, "folderId")?.flatten();
+                state
+                    .services
+                    .set_drive_file_folder(
+                        state.services.folders.as_ref(),
+                        &caller.account.id,
+                        &file_id,
+                        folder_id.as_deref(),
+                        caller.account.has_moderator_powers(),
+                    )
+                    .map_err(|err| map_drive_folder_error(err, "drive/files/update"))?;
+            }
             let name = match obj.get("name") {
                 None | Some(Value::Null) => None,
                 Some(Value::String(s)) => Some(s.clone()),
@@ -9622,6 +10133,2620 @@ fn api_dispatch_blocking(
             );
             packed.truncate(query.cursor.limit.max(1));
             Ok(Json(Value::Array(packed)).into_response())
+        }
+
+        // --- Gaps final wiring: admin families -------------------------------
+        // Registry-backed admin surfaces (no new stores). Reads take
+        // `read:admin:<family>` + moderator powers; writes take
+        // `write:admin:<family>` + moderator powers, except the
+        // destructive/security-sensitive controls below, which require a
+        // full admin.
+        "admin/roles/create" => {
+            check_allowed_fields(
+                &obj,
+                &[
+                    "name",
+                    "description",
+                    "color",
+                    "iconUrl",
+                    "target",
+                    "condFormula",
+                    "isPublic",
+                    "asBadge",
+                    "canEditMembersByModerator",
+                    "displayOrder",
+                    "policies",
+                ],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:roles")?;
+            require_moderator(&caller)?;
+            state.rate_limiter.check(&rate_key, "admin/roles/create")?;
+            let name = required_str(&obj, "name")?;
+            let record = state
+                .services
+                .role_create(
+                    &name,
+                    opt_string(&obj, "description")?.as_deref().unwrap_or(""),
+                    opt_string(&obj, "color")?,
+                    opt_string(&obj, "iconUrl")?,
+                    opt_string(&obj, "target")?.as_deref().unwrap_or("manual"),
+                    obj.get("condFormula")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({})),
+                    opt_bool(&obj, "isPublic", false)?,
+                    opt_bool(&obj, "asBadge", false)?,
+                    opt_bool(&obj, "canEditMembersByModerator", false)?,
+                    opt_i64(&obj, "displayOrder")?.unwrap_or(0),
+                    obj.get("policies")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({})),
+                )
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(pack_role_record(&record)).into_response())
+        }
+
+        "admin/roles/list" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:admin:roles")?;
+            require_moderator(&caller)?;
+            let rows = state
+                .services
+                .role_list()
+                .map_err(ApiError::from_port_error)?;
+            let out: Vec<Value> = rows.iter().map(pack_role_record).collect();
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        "admin/roles/show" => {
+            check_allowed_fields(&obj, &["roleId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:admin:roles")?;
+            require_moderator(&caller)?;
+            let role_id = required_str(&obj, "roleId")?;
+            let record = state
+                .services
+                .role_show(&role_id)
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(pack_role_record(&record)).into_response())
+        }
+
+        "admin/roles/delete" => {
+            check_allowed_fields(&obj, &["roleId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:roles")?;
+            require_admin(&caller)?;
+            state.rate_limiter.check(&rate_key, "admin/roles/delete")?;
+            let role_id = required_str(&obj, "roleId")?;
+            state
+                .services
+                .role_delete(&role_id)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "admin/roles/update" => {
+            check_allowed_fields(
+                &obj,
+                &[
+                    "roleId",
+                    "name",
+                    "description",
+                    "color",
+                    "iconUrl",
+                    "target",
+                    "condFormula",
+                    "isPublic",
+                    "asBadge",
+                    "canEditMembersByModerator",
+                    "displayOrder",
+                    "policies",
+                ],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:roles")?;
+            require_moderator(&caller)?;
+            state.rate_limiter.check(&rate_key, "admin/roles/update")?;
+            let role_id = required_str(&obj, "roleId")?;
+            let name = required_str(&obj, "name")?;
+            let record = state
+                .services
+                .role_update(
+                    &role_id,
+                    &name,
+                    opt_string(&obj, "description")?.as_deref().unwrap_or(""),
+                    opt_string(&obj, "color")?,
+                    opt_string(&obj, "iconUrl")?,
+                    opt_string(&obj, "target")?.as_deref().unwrap_or("manual"),
+                    obj.get("condFormula")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({})),
+                    opt_bool(&obj, "isPublic", false)?,
+                    opt_bool(&obj, "asBadge", false)?,
+                    opt_bool(&obj, "canEditMembersByModerator", false)?,
+                    opt_i64(&obj, "displayOrder")?.unwrap_or(0),
+                    obj.get("policies")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({})),
+                )
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(pack_role_record(&record)).into_response())
+        }
+
+        "admin/roles/assign" => {
+            check_allowed_fields(&obj, &["roleId", "userId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:roles")?;
+            require_admin(&caller)?;
+            state.rate_limiter.check(&rate_key, "admin/roles/assign")?;
+            let role_id = required_str(&obj, "roleId")?;
+            let user_id = required_str(&obj, "userId")?;
+            state
+                .services
+                .role_assign(&role_id, &user_id)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "admin/roles/unassign" => {
+            check_allowed_fields(&obj, &["roleId", "userId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:roles")?;
+            require_admin(&caller)?;
+            state
+                .rate_limiter
+                .check(&rate_key, "admin/roles/unassign")?;
+            let role_id = required_str(&obj, "roleId")?;
+            let user_id = required_str(&obj, "userId")?;
+            state
+                .services
+                .role_unassign(&role_id, &user_id)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "admin/roles/users" => {
+            check_allowed_fields(&obj, &["roleId", "limit", "offset"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:admin:roles")?;
+            require_moderator(&caller)?;
+            let role_id = required_str(&obj, "roleId")?;
+            let limit = get_limit_with_default(&obj, 10)?;
+            let offset = opt_usize(&obj, "offset")?.unwrap_or(0);
+            let accounts = state
+                .services
+                .role_users(&role_id, limit, offset)
+                .map_err(ApiError::from_port_error)?;
+            let mut out = Vec::with_capacity(accounts.len());
+            for account in &accounts {
+                out.push(pack_account_for(account, Some(&caller), &state.services)?);
+            }
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        "admin/queue/stats" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:admin:queue")?;
+            require_moderator(&caller)?;
+            let stats = state
+                .services
+                .queue_stats()
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(stats).into_response())
+        }
+
+        // `admin/queue/deliver-delayed`, `admin/queue/inbox-delayed`,
+        // `admin/queue/clear`: loud 400s — no enumeration/clear ports exist
+        // for the unified queue (proposed in the subagent report).
+        "admin/queue/deliver-delayed" | "admin/queue/inbox-delayed" | "admin/queue/clear" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:queue")?;
+            require_admin(&caller)?;
+            state
+                .services
+                .queue_delayed_unsupported()
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "admin/relays/add" => {
+            check_allowed_fields(&obj, &["inbox"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:relays")?;
+            require_admin(&caller)?;
+            state.rate_limiter.check(&rate_key, "admin/relays/add")?;
+            let inbox = required_str(&obj, "inbox")?;
+            let record = state
+                .services
+                .relay_add(&inbox)
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(pack_relay_record(&record)).into_response())
+        }
+
+        "admin/relays/list" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:admin:relays")?;
+            require_moderator(&caller)?;
+            let rows = state
+                .services
+                .relay_list()
+                .map_err(ApiError::from_port_error)?;
+            let out: Vec<Value> = rows.iter().map(pack_relay_record).collect();
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        "admin/relays/remove" => {
+            check_allowed_fields(&obj, &["inbox"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:relays")?;
+            require_admin(&caller)?;
+            state.rate_limiter.check(&rate_key, "admin/relays/remove")?;
+            let inbox = required_str(&obj, "inbox")?;
+            state
+                .services
+                .relay_remove(&inbox)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "admin/ad/create" => {
+            check_allowed_fields(
+                &obj,
+                &[
+                    "url",
+                    "memo",
+                    "place",
+                    "ratio",
+                    "priority",
+                    "expiresAt",
+                    "startsAt",
+                    "imageUrl",
+                    "dayOfWeek",
+                ],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:ad")?;
+            require_moderator(&caller)?;
+            state.rate_limiter.check(&rate_key, "admin/ad/create")?;
+            let record = state
+                .services
+                .ad_create(
+                    &required_str(&obj, "url")?,
+                    &required_str(&obj, "memo")?,
+                    &required_str(&obj, "place")?,
+                    parse_ad_ratio(&obj)?,
+                    &required_str(&obj, "priority")?,
+                    required_i64(&obj, "expiresAt")?,
+                    required_i64(&obj, "startsAt")?,
+                    &required_str(&obj, "imageUrl")?,
+                    required_i64(&obj, "dayOfWeek")?,
+                )
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(pack_ad_record(&record)).into_response())
+        }
+
+        "admin/ad/list" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:admin:ad")?;
+            require_moderator(&caller)?;
+            let rows = state
+                .services
+                .ad_list()
+                .map_err(ApiError::from_port_error)?;
+            let out: Vec<Value> = rows.iter().map(pack_ad_record).collect();
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        "admin/ad/update" => {
+            check_allowed_fields(
+                &obj,
+                &[
+                    "id",
+                    "url",
+                    "memo",
+                    "place",
+                    "ratio",
+                    "priority",
+                    "expiresAt",
+                    "startsAt",
+                    "imageUrl",
+                    "dayOfWeek",
+                ],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:ad")?;
+            require_moderator(&caller)?;
+            state.rate_limiter.check(&rate_key, "admin/ad/update")?;
+            let record = state
+                .services
+                .ad_update(
+                    &required_str(&obj, "id")?,
+                    &required_str(&obj, "url")?,
+                    &required_str(&obj, "memo")?,
+                    &required_str(&obj, "place")?,
+                    parse_ad_ratio(&obj)?,
+                    &required_str(&obj, "priority")?,
+                    required_i64(&obj, "expiresAt")?,
+                    required_i64(&obj, "startsAt")?,
+                    &required_str(&obj, "imageUrl")?,
+                    required_i64(&obj, "dayOfWeek")?,
+                )
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(pack_ad_record(&record)).into_response())
+        }
+
+        "admin/ad/delete" => {
+            check_allowed_fields(&obj, &["id"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:ad")?;
+            require_moderator(&caller)?;
+            state.rate_limiter.check(&rate_key, "admin/ad/delete")?;
+            let id = required_str(&obj, "id")?;
+            state
+                .services
+                .ad_delete(&id)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // `admin/ad/refresh`: prune expired rows (204; the pruned count is
+        // an op-level detail).
+        "admin/ad/refresh" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:ad")?;
+            require_moderator(&caller)?;
+            state.rate_limiter.check(&rate_key, "admin/ad/refresh")?;
+            state
+                .services
+                .ad_refresh()
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "admin/announcements/create" => {
+            check_allowed_fields(&obj, &["title", "text", "imageUrl"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:announcements")?;
+            require_moderator(&caller)?;
+            state
+                .rate_limiter
+                .check(&rate_key, "admin/announcements/create")?;
+            let title = required_str(&obj, "title")?;
+            let text = required_str(&obj, "text")?;
+            let image_url = opt_string(&obj, "imageUrl")?;
+            let record = state
+                .services
+                .admin_announcement_create(&title, &text, image_url)
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(pack_admin_announcement_record(&record)).into_response())
+        }
+
+        "admin/announcements/list" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:admin:announcements")?;
+            require_moderator(&caller)?;
+            let rows = state
+                .services
+                .admin_announcement_list()
+                .map_err(ApiError::from_port_error)?;
+            let out: Vec<Value> = rows.iter().map(pack_admin_announcement_record).collect();
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        "admin/announcements/update" => {
+            check_allowed_fields(&obj, &["id", "title", "text", "imageUrl"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:announcements")?;
+            require_moderator(&caller)?;
+            state
+                .rate_limiter
+                .check(&rate_key, "admin/announcements/update")?;
+            let id = required_str(&obj, "id")?;
+            let title = required_str(&obj, "title")?;
+            let text = required_str(&obj, "text")?;
+            let image_url = opt_string(&obj, "imageUrl")?;
+            let record = state
+                .services
+                .admin_announcement_update(&id, &title, &text, image_url)
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(pack_admin_announcement_record(&record)).into_response())
+        }
+
+        "admin/announcements/delete" => {
+            check_allowed_fields(&obj, &["id"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:announcements")?;
+            require_moderator(&caller)?;
+            state
+                .rate_limiter
+                .check(&rate_key, "admin/announcements/delete")?;
+            let id = required_str(&obj, "id")?;
+            state
+                .services
+                .admin_announcement_delete(&id)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // `admin/federation/list` + `federation/instances`: observed remote
+        // hosts merged with moderator overrides.
+        "admin/federation/list" | "federation/instances" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:admin:federation")?;
+            require_moderator(&caller)?;
+            let rows = state
+                .services
+                .federation_instances()
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(Value::Array(rows)).into_response())
+        }
+
+        // `admin/federation/show-instance` + `federation/show-instance
+        // {host!}`: one observed host merged with its override, or null
+        // when unknown.
+        "admin/federation/show-instance" | "federation/show-instance" => {
+            check_allowed_fields(&obj, &["host"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:admin:federation")?;
+            require_moderator(&caller)?;
+            let host = required_str(&obj, "host")?;
+            let row = state
+                .services
+                .federation_show_instance(&host)
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(row.unwrap_or(Value::Null)).into_response())
+        }
+
+        // `admin/federation/update-instance` +
+        // `federation/update-instance`: store the moderator override.
+        "admin/federation/update-instance" | "federation/update-instance" => {
+            check_allowed_fields(
+                &obj,
+                &[
+                    "host",
+                    "isSuspended",
+                    "isBlocked",
+                    "isSilenced",
+                    "moderationNote",
+                ],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:federation")?;
+            require_admin(&caller)?;
+            state
+                .rate_limiter
+                .check(&rate_key, "admin/federation/update-instance")?;
+            let host = required_str(&obj, "host")?;
+            let record = state
+                .services
+                .federation_update_instance(
+                    &host,
+                    parse_opt_bool(&obj, "isSuspended")?,
+                    parse_opt_bool(&obj, "isBlocked")?,
+                    parse_opt_bool(&obj, "isSilenced")?,
+                    opt_string(&obj, "moderationNote")?,
+                )
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(pack_federation_override(&record)).into_response())
+        }
+
+        // `admin/federation/refresh-remote-instance-metadata` +
+        // `federation/refresh-remote-instance-metadata {host!}`: touch the
+        // override so caches re-read it (no live metadata refetch).
+        "admin/federation/refresh-remote-instance-metadata"
+        | "federation/refresh-remote-instance-metadata" => {
+            check_allowed_fields(&obj, &["host"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:federation")?;
+            require_admin(&caller)?;
+            state
+                .rate_limiter
+                .check(&rate_key, "admin/federation/refresh-remote-instance-metadata")?;
+            let host = required_str(&obj, "host")?;
+            state
+                .services
+                .federation_refresh_metadata(&host)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // `admin/stats`: instance totals computable from existing stores
+        // (no per-day deltas — no time-series ports).
+        "admin/stats" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:admin:meta")?;
+            require_moderator(&caller)?;
+            let stats = state
+                .services
+                .admin_stats_overview()
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(stats).into_response())
+        }
+
+        // `admin/server-info`: machine/cpu/mem/fs (same reduced shape as
+        // the op documents).
+        "admin/server-info" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:admin:meta")?;
+            require_moderator(&caller)?;
+            Ok(Json(state.services.admin_server_info()).into_response())
+        }
+
+        // `admin/get-user-ips` + `federation/get-user-ips {userId!,
+        // limit?}`: recent signin IPs for one account, newest-first.
+        "admin/get-user-ips" | "federation/get-user-ips" => {
+            check_allowed_fields(&obj, &["userId", "limit"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:admin:users")?;
+            require_moderator(&caller)?;
+            let user_id = required_str(&obj, "userId")?;
+            let limit = get_limit_with_default(&obj, 10)?;
+            let rows = state
+                .services
+                .get_user_ips(&user_id, limit)
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(Value::Array(rows)).into_response())
+        }
+
+        // `admin/accounts/find-by-email` + `federation/find-by-email
+        // {email}`: exact (case-insensitive) match, or null.
+        "admin/accounts/find-by-email" | "federation/find-by-email" => {
+            check_allowed_fields(&obj, &["email"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:admin:users")?;
+            require_moderator(&caller)?;
+            let email = required_str(&obj, "email")?;
+            let found = state
+                .services
+                .find_account_by_email(&email)
+                .map_err(ApiError::from_port_error)?;
+            match found {
+                Some(account) => {
+                    Ok(Json(pack_account_for(&account, Some(&caller), &state.services)?)
+                        .into_response())
+                }
+                None => Ok(Json(Value::Null).into_response()),
+            }
+        }
+
+        // `admin/update-proxy-account {userId?}`: set (or clear with null)
+        // the proxy account. The target must be local.
+        "admin/update-proxy-account" => {
+            check_allowed_fields(&obj, &["userId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:proxy-account")?;
+            require_admin(&caller)?;
+            state
+                .rate_limiter
+                .check(&rate_key, "admin/update-proxy-account")?;
+            let user_id = opt_string(&obj, "userId")?;
+            state
+                .services
+                .proxy_account_set(user_id.as_deref())
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // `admin/proxy-account`: the stored proxy account id, if any.
+        "admin/proxy-account" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:admin:proxy-account")?;
+            require_moderator(&caller)?;
+            let user_id = state
+                .services
+                .proxy_account_get()
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(serde_json::json!({ "userId": user_id })).into_response())
+        }
+
+        // `admin/unset-mfa {userId!}`: admin clears a user's TOTP row
+        // (missing row is a no-op success).
+        "admin/unset-mfa" => {
+            check_allowed_fields(&obj, &["userId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:users")?;
+            require_admin(&caller)?;
+            state.rate_limiter.check(&rate_key, "admin/unset-mfa")?;
+            let user_id = required_str(&obj, "userId")?;
+            state
+                .services
+                .admin_unset_2fa(&user_id)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // `admin/reset-password {userId!, password!}`: admin sets a user's
+        // password hash directly (the plaintext is hashed off-request).
+        "admin/reset-password" => {
+            check_allowed_fields(&obj, &["userId", "password"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:users")?;
+            require_admin(&caller)?;
+            state.rate_limiter.check(&rate_key, "admin/reset-password")?;
+            let user_id = required_str(&obj, "userId")?;
+            let password = required_str(&obj, "password")?;
+            if password.is_empty() {
+                return Err(ApiError::invalid_param(
+                    "password",
+                    "must be a non-empty string",
+                ));
+            }
+            let hash =
+                tokio::runtime::Handle::current().block_on(hash_password_async(password))?;
+            state
+                .services
+                .admin_reset_password(&user_id, &hash)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // --- Gaps final wiring: queue (top level) --------------------------
+        // `queue/stats`: the single unified job queue reports its pending
+        // count on `deliver.waiting` (BullMQ lanes do not exist).
+        "queue/stats" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:admin:queue")?;
+            require_moderator(&caller)?;
+            let stats = state
+                .services
+                .queue_stats()
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(stats).into_response())
+        }
+
+        // `queue/deliver-delayed`: loud 400 like the admin queue controls.
+        "queue/deliver-delayed" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:queue")?;
+            require_admin(&caller)?;
+            state
+                .services
+                .queue_delayed_unsupported()
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // --- Gaps final wiring: abuse-report notification recipients -------
+        // Endpoint names carry dashes in this repo's inventory
+        // (`misc_endpoints::ENDPOINT_NAMES`); the parent merge reconciles
+        // them against the upstream checkout.
+        // TODO(final): verify endpoint spelling against misskey.
+        "abuse-report-notification-recipient/create" => {
+            check_allowed_fields(
+                &obj,
+                &["name", "method", "isActive", "userId", "email", "webhookUrl"],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:abuse-report")?;
+            require_admin(&caller)?;
+            state
+                .rate_limiter
+                .check(&rate_key, "abuse-report-notification-recipient/create")?;
+            let record = state
+                .services
+                .abuse_recipient_create(
+                    opt_bool(&obj, "isActive", true)?,
+                    &required_str(&obj, "name")?,
+                    &required_str(&obj, "method")?,
+                    opt_string(&obj, "userId")?,
+                    opt_string(&obj, "email")?,
+                    opt_string(&obj, "webhookUrl")?,
+                )
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(pack_abuse_recipient(&record)).into_response())
+        }
+
+        "abuse-report-notification-recipient/list" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:admin:abuse-report")?;
+            require_moderator(&caller)?;
+            let rows = state
+                .services
+                .abuse_recipient_list()
+                .map_err(ApiError::from_port_error)?;
+            let out: Vec<Value> = rows.iter().map(pack_abuse_recipient).collect();
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        "abuse-report-notification-recipient/show" => {
+            check_allowed_fields(&obj, &["id"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:admin:abuse-report")?;
+            require_moderator(&caller)?;
+            let id = required_str(&obj, "id")?;
+            let record = state
+                .services
+                .abuse_recipient_show(&id)
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(pack_abuse_recipient(&record)).into_response())
+        }
+
+        "abuse-report-notification-recipient/update" => {
+            check_allowed_fields(
+                &obj,
+                &["id", "name", "method", "isActive", "userId", "email", "webhookUrl"],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:abuse-report")?;
+            require_admin(&caller)?;
+            state
+                .rate_limiter
+                .check(&rate_key, "abuse-report-notification-recipient/update")?;
+            let record = state
+                .services
+                .abuse_recipient_update(
+                    &required_str(&obj, "id")?,
+                    opt_bool(&obj, "isActive", true)?,
+                    &required_str(&obj, "name")?,
+                    &required_str(&obj, "method")?,
+                    opt_string(&obj, "userId")?,
+                    opt_string(&obj, "email")?,
+                    opt_string(&obj, "webhookUrl")?,
+                )
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(pack_abuse_recipient(&record)).into_response())
+        }
+
+        "abuse-report-notification-recipient/delete" => {
+            check_allowed_fields(&obj, &["id"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:abuse-report")?;
+            require_admin(&caller)?;
+            state
+                .rate_limiter
+                .check(&rate_key, "abuse-report-notification-recipient/delete")?;
+            let id = required_str(&obj, "id")?;
+            state
+                .services
+                .abuse_recipient_delete(&id)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // --- Gaps final wiring: 2fa + apps --------------------------------
+        // TOTP enrol/verify + the developer app registry (registry-backed
+        // ops, no new ports). Password-bearing arms throttle through the
+        // shared `auth/2fa` failure-counted bucket like `i/change-password`.
+        "i/2fa/register" => {
+            check_allowed_fields(&obj, &["password"])?;
+            let caller = require_caller(caller)?;
+            caller.require_secure()?;
+            state.rate_limiter.check(&rate_key, "i/2fa/register")?;
+            let password = required_str(&obj, "password")?;
+            let acct_key = format!("acctid:{}", caller.account.id);
+            let ip_key = auth_ip_key(&client_ip);
+            state
+                .rate_limiter
+                .check_auth_failures("auth/2fa", &acct_key, &ip_key)?;
+            match state
+                .services
+                .register_2fa(&caller.account.id, &password)
+            {
+                Ok(enrol) => Ok(Json(serde_json::json!({
+                    "qr": enrol.qr,
+                    "url": enrol.url,
+                    "secret": enrol.secret,
+                    "label": enrol.label,
+                }))
+                .into_response()),
+                Err(err) => {
+                    if matches!(&err, PortError::Validation(msg) if msg == "INCORRECT_PASSWORD") {
+                        record_2fa_auth_failure(&state, &caller.account.id, &client_ip);
+                    }
+                    Err(ApiError::from_port_error(err))
+                }
+            }
+        }
+
+        "i/2fa/key-done" => {
+            check_allowed_fields(&obj, &["password", "token"])?;
+            let caller = require_caller(caller)?;
+            caller.require_secure()?;
+            state.rate_limiter.check(&rate_key, "i/2fa/key-done")?;
+            let password = required_str(&obj, "password")?;
+            let token = required_str(&obj, "token")?;
+            let acct_key = format!("acctid:{}", caller.account.id);
+            let ip_key = auth_ip_key(&client_ip);
+            state
+                .rate_limiter
+                .check_auth_failures("auth/2fa", &acct_key, &ip_key)?;
+            match state
+                .services
+                .confirm_2fa_key(&caller.account.id, &password, &token)
+            {
+                Ok(()) => Ok(StatusCode::NO_CONTENT.into_response()),
+                Err(err) => {
+                    if matches!(&err, PortError::Validation(msg) if msg == "INCORRECT_PASSWORD") {
+                        record_2fa_auth_failure(&state, &caller.account.id, &client_ip);
+                    }
+                    Err(ApiError::from_port_error(err))
+                }
+            }
+        }
+
+        "i/2fa/done" => {
+            check_allowed_fields(&obj, &["token"])?;
+            let caller = require_caller(caller)?;
+            caller.require_secure()?;
+            state.rate_limiter.check(&rate_key, "i/2fa/done")?;
+            let token = required_str(&obj, "token")?;
+            state
+                .services
+                .done_2fa(&caller.account.id, &token)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "i/2fa/password-less" => {
+            check_allowed_fields(&obj, &["value"])?;
+            let caller = require_caller(caller)?;
+            caller.require_secure()?;
+            state
+                .rate_limiter
+                .check(&rate_key, "i/2fa/password-less")?;
+            let value = match obj.get("value") {
+                Some(Value::Bool(b)) => *b,
+                _ => {
+                    return Err(ApiError::invalid_param(
+                        "value",
+                        "must be a boolean",
+                    ));
+                }
+            };
+            state
+                .services
+                .set_2fa_passwordless(&caller.account.id, value)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "i/2fa/unregister" => {
+            check_allowed_fields(&obj, &["password"])?;
+            let caller = require_caller(caller)?;
+            caller.require_secure()?;
+            state.rate_limiter.check(&rate_key, "i/2fa/unregister")?;
+            let password = required_str(&obj, "password")?;
+            let acct_key = format!("acctid:{}", caller.account.id);
+            let ip_key = auth_ip_key(&client_ip);
+            state
+                .rate_limiter
+                .check_auth_failures("auth/2fa", &acct_key, &ip_key)?;
+            match state
+                .services
+                .unregister_2fa(&caller.account.id, &password)
+            {
+                Ok(()) => Ok(StatusCode::NO_CONTENT.into_response()),
+                Err(err) => {
+                    if matches!(&err, PortError::Validation(msg) if msg == "INCORRECT_PASSWORD") {
+                        record_2fa_auth_failure(&state, &caller.account.id, &client_ip);
+                    }
+                    Err(ApiError::from_port_error(err))
+                }
+            }
+        }
+
+        "i/2fa/update-key" => {
+            check_allowed_fields(&obj, &["password"])?;
+            let caller = require_caller(caller)?;
+            caller.require_secure()?;
+            state.rate_limiter.check(&rate_key, "i/2fa/update-key")?;
+            let password = required_str(&obj, "password")?;
+            let acct_key = format!("acctid:{}", caller.account.id);
+            let ip_key = auth_ip_key(&client_ip);
+            state
+                .rate_limiter
+                .check_auth_failures("auth/2fa", &acct_key, &ip_key)?;
+            match state
+                .services
+                .rotate_2fa_key(&caller.account.id, &password)
+            {
+                Ok(enrol) => Ok(Json(serde_json::json!({
+                    "qr": enrol.qr,
+                    "url": enrol.url,
+                    "secret": enrol.secret,
+                    "label": enrol.label,
+                }))
+                .into_response()),
+                Err(err) => {
+                    if matches!(&err, PortError::Validation(msg) if msg == "INCORRECT_PASSWORD") {
+                        record_2fa_auth_failure(&state, &caller.account.id, &client_ip);
+                    }
+                    Err(ApiError::from_port_error(err))
+                }
+            }
+        }
+
+        // `i/2fa/remove-key`: loud 400 — no WebAuthn credentials are
+        // stored, so there is nothing to remove (WP2c decision, same as
+        // the `signin-with-passkey` stub).
+        "i/2fa/remove-key" => {
+            check_allowed_fields(&obj, &["credentialId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_secure()?;
+            let credential_id = opt_string(&obj, "credentialId")?.unwrap_or_default();
+            state
+                .services
+                .remove_2fa_security_key(&caller.account.id, &credential_id)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // `i/2fa/authenticate {userId!, token!}`: the unauthenticated
+        // second step of the password login. Verifies the TOTP token, then
+        // mints a first-party token exactly like the password path (so the
+        // signin attempt is recorded either way). Unknown users and
+        // unenrolled accounts both read as `NO_SUCH_2FA` (no oracle).
+        "i/2fa/authenticate" => {
+            check_allowed_fields(&obj, &["userId", "token"])?;
+            state.rate_limiter.check(&rate_key, "i/2fa/authenticate")?;
+            let user_id = required_str(&obj, "userId")?;
+            let token = required_str(&obj, "token")?;
+            let acct_key = format!("acctid:{user_id}");
+            let ip_key = auth_ip_key(&client_ip);
+            state
+                .rate_limiter
+                .check_auth_failures("auth/2fa-authenticate", &acct_key, &ip_key)?;
+            let authed = state.services.authenticate_2fa(&user_id, &token);
+            if let Err(err) = authed {
+                state
+                    .rate_limiter
+                    .record_auth_failure("auth/2fa-authenticate", &acct_key, &ip_key);
+                record_signin_attempt(&state.services, &user_id, &client_ip, &headers, false);
+                return Err(ApiError::from_port_error(err));
+            }
+            let raw_token = generate_random_token();
+            state
+                .services
+                .auth
+                .store_token(ApiTokenRecord {
+                    id: state.services.ids.generate(),
+                    token_hash: hash_token(&raw_token),
+                    account_id: user_id.clone(),
+                    permissions: Vec::new(),
+                    is_first_party: true,
+                    name: None,
+                    description: None,
+                    icon_url: None,
+                    created_at_ms: state.services.clock.now_ms(),
+                })
+                .map_err(ApiError::from_port_error)?;
+            record_signin_attempt(&state.services, &user_id, &client_ip, &headers, true);
+            Ok(Json(serde_json::json!({ "token": raw_token })).into_response())
+        }
+
+        // `my/apps`: the caller's own developer-app rows (secret omitted).
+        "my/apps" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:account")?;
+            let apps = state
+                .services
+                .list_my_apps(&caller.account.id)
+                .map_err(ApiError::from_port_error)?;
+            let out: Vec<Value> = apps
+                .iter()
+                .map(|record| pack_app_record(record, false))
+                .collect();
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        // `app/create {name!, description?, callbackUrl?, permission!}`:
+        // owner-scoped app row; the secret is returned to the creator.
+        "app/create" => {
+            check_allowed_fields(
+                &obj,
+                &["name", "description", "callbackUrl", "permission"],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state.rate_limiter.check(&rate_key, "app/create")?;
+            let name = required_str(&obj, "name")?;
+            let description = opt_string(&obj, "description")?;
+            let callback_url = opt_string(&obj, "callbackUrl")?;
+            let permission = required_str_array(&obj, "permission")?;
+            let record = state
+                .services
+                .create_app(
+                    &caller.account.id,
+                    &name,
+                    description,
+                    callback_url.as_deref(),
+                    permission,
+                )
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(pack_app_record(&record, true)).into_response())
+        }
+
+        // `app/show {appId!}`: owner-scoped lookup.
+        "app/show" => {
+            check_allowed_fields(&obj, &["appId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:account")?;
+            let app_id = required_str(&obj, "appId")?;
+            let record = state
+                .services
+                .show_app(&caller.account.id, &app_id)
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(pack_app_record(&record, true)).into_response())
+        }
+
+        // --- Gaps final wiring: misc --------------------------------------
+        // `ping`: connectivity probe, no credential.
+        "ping" => {
+            check_allowed_fields(&obj, &[])?;
+            Ok(Json(ping()).into_response())
+        }
+
+        // `retention`: read half (no `policy` param) returns the stored
+        // policy object or `{}`; write half (`policy` object) replaces it.
+        "retention" => {
+            check_allowed_fields(&obj, &["policy"])?;
+            let caller = require_caller(caller)?;
+            match obj.get("policy") {
+                None | Some(Value::Null) => {
+                    caller.require_permission("read:admin:meta")?;
+                    require_moderator(&caller)?;
+                    let policy = state
+                        .services
+                        .retention_get()
+                        .map_err(ApiError::from_port_error)?;
+                    Ok(Json(policy).into_response())
+                }
+                Some(policy) => {
+                    caller.require_permission("write:admin:meta")?;
+                    require_moderator(&caller)?;
+                    state.rate_limiter.check(&rate_key, "retention")?;
+                    let stored = state
+                        .services
+                        .retention_set(policy.clone())
+                        .map_err(ApiError::from_port_error)?;
+                    Ok(Json(stored).into_response())
+                }
+            }
+        }
+
+        // `reset-db`: always refused (loud 400, no destructive reset on a
+        // single node).
+        "reset-db" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            require_admin(&caller)?;
+            state
+                .services
+                .refuse_reset_db()
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // `sw/register {endpoint!, auth!, publickey!}`: store one push
+        // subscription for the caller (idempotent overwrite).
+        "sw/register" => {
+            check_allowed_fields(&obj, &["endpoint", "auth", "publickey"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state.rate_limiter.check(&rate_key, "sw/register")?;
+            let endpoint = required_str(&obj, "endpoint")?;
+            let auth = required_str(&obj, "auth")?;
+            let publickey = required_str(&obj, "publickey")?;
+            state
+                .services
+                .sw_register(&caller.account.id, &endpoint, &auth, &publickey)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // `sw/show-registration {endpoint!}`: fetch one subscription.
+        "sw/show-registration" => {
+            check_allowed_fields(&obj, &["endpoint"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:account")?;
+            let endpoint = required_str(&obj, "endpoint")?;
+            let subscription = state
+                .services
+                .sw_show(&caller.account.id, &endpoint)
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(serde_json::json!({
+                "endpoint": subscription.endpoint,
+                "auth": subscription.auth,
+                "publickey": subscription.publickey,
+            }))
+            .into_response())
+        }
+
+        // `sw/unregister {endpoint!}`: drop one subscription (missing is a
+        // no-op success).
+        "sw/unregister" => {
+            check_allowed_fields(&obj, &["endpoint"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state.rate_limiter.check(&rate_key, "sw/unregister")?;
+            let endpoint = required_str(&obj, "endpoint")?;
+            state
+                .services
+                .sw_unregister(&caller.account.id, &endpoint)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // `sw/update-registration {endpoint!, auth!, publickey!}`: replace
+        // the keys of an existing subscription (`NO_SUCH_SUBSCRIPTION` on
+        // miss).
+        "sw/update-registration" => {
+            check_allowed_fields(&obj, &["endpoint", "auth", "publickey"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state
+                .rate_limiter
+                .check(&rate_key, "sw/update-registration")?;
+            let endpoint = required_str(&obj, "endpoint")?;
+            let auth = required_str(&obj, "auth")?;
+            let publickey = required_str(&obj, "publickey")?;
+            state
+                .services
+                .sw_update(&caller.account.id, &endpoint, &auth, &publickey)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // `v2/admin/emoji/list`: local `EmojiDetailed` by default; a
+        // non-local `host` filter selects the remote list instead. Same
+        // cursor shape as `admin/emoji/list`.
+        "v2/admin/emoji/list" => {
+            check_allowed_fields(
+                &obj,
+                &["query", "host", "limit", "sinceId", "untilId", "sinceDate", "untilDate"],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:admin:emoji")?;
+            require_moderator(&caller)?;
+            let query = opt_string(&obj, "query")?;
+            let host = opt_string(&obj, "host")?;
+            let cursor = TimelineCursor {
+                since_id: opt_string(&obj, "sinceId")?,
+                until_id: opt_string(&obj, "untilId")?,
+                since_date: opt_i64(&obj, "sinceDate")?,
+                until_date: opt_i64(&obj, "untilDate")?,
+                limit: get_limit_with_default(&obj, 10)?,
+            };
+            let page = state
+                .services
+                .list_emojis_v2(query.as_deref(), host.as_deref(), &cursor)
+                .map_err(ApiError::from_port_error)?;
+            match page {
+                EmojisV2Page::Local(_) => {
+                    let rows = state
+                        .services
+                        .emojis
+                        .list_emojis(query.as_deref(), &cursor)
+                        .map_err(ApiError::from_port_error)?;
+                    let packed: Vec<Value> = rows
+                        .iter()
+                        .map(|emoji| pack_emoji_detailed(emoji, &state.services))
+                        .collect();
+                    Ok(Json(Value::Array(packed)).into_response())
+                }
+                EmojisV2Page::Remote(_) => {
+                    let rows = state
+                        .services
+                        .emojis
+                        .list_remote_emojis(query.as_deref(), host.as_deref(), &cursor)
+                        .map_err(ApiError::from_port_error)?;
+                    let packed: Vec<Value> = rows
+                        .iter()
+                        .map(|emoji| pack_remote_emoji_detailed(emoji, &state.services))
+                        .collect();
+                    Ok(Json(Value::Array(packed)).into_response())
+                }
+            }
+        }
+
+        // `endpoint {endpoint!}`: self-description for one endpoint
+        // (`NO_SUCH_ENDPOINT` for unknown names). Public.
+        "endpoint" => {
+            check_allowed_fields(&obj, &["endpoint"])?;
+            let name = required_str(&obj, "endpoint")?;
+            let described = state
+                .services
+                .endpoint_describe(&name)
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(described).into_response())
+        }
+
+        // `endpoints`: names of every Misskey API endpoint this server
+        // answers. Public. (The static inventory lives in
+        // `misc_endpoints::ENDPOINT_NAMES`; the parent merge extends it to
+        // the full arm list.)
+        "endpoints" => {
+            check_allowed_fields(&obj, &[])?;
+            let names = state.services.endpoint_names();
+            Ok(Json(Value::Array(
+                names
+                    .iter()
+                    .map(|name| Value::String(name.to_string()))
+                    .collect(),
+            ))
+            .into_response())
+        }
+
+        // --- Gaps final wiring: gallery + flash ---------------------------
+        // Gallery/flash reads are public; mutations need the credential +
+        // `write:account`. `fileIds` are ownership-checked against the
+        // drive store at the dispatcher (stored opaque per the WP2b
+        // contract). All arms below run on the interim in-memory store.
+        // TODO(final): swap to redb.
+        "gallery/posts/create" => {
+            check_allowed_fields(
+                &obj,
+                &["title", "description", "fileIds", "isSensitive"],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state
+                .rate_limiter
+                .check(&rate_key, "gallery/posts/create")?;
+            let title = opt_string(&obj, "title")?;
+            let description = opt_string(&obj, "description")?;
+            let file_ids = str_list(&obj, "fileIds")?;
+            for file_id in &file_ids {
+                state
+                    .services
+                    .get_media_for(&caller.account.id, file_id)
+                    .map_err(ApiError::from_port_error)?;
+            }
+            let is_sensitive = opt_bool(&obj, "isSensitive", false)?;
+            let post = state
+                .services
+                .gallery_post_create(
+                    gallery_store(),
+                    &caller.account.id,
+                    title.as_deref(),
+                    description.as_deref(),
+                    file_ids,
+                    is_sensitive,
+                )
+                .map_err(map_gallery_error)?;
+            Ok(Json(pack_gallery_post(&state, &post)?).into_response())
+        }
+
+        "gallery/posts/show" => {
+            check_allowed_fields(&obj, &["postId"])?;
+            let post_id = required_str(&obj, "postId")?;
+            let post = state
+                .services
+                .gallery_post_show(gallery_store(), &post_id)
+                .map_err(map_gallery_error)?;
+            Ok(Json(pack_gallery_post(&state, &post)?).into_response())
+        }
+
+        "gallery/posts/update" => {
+            check_allowed_fields(
+                &obj,
+                &["postId", "title", "description", "fileIds", "isSensitive"],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state
+                .rate_limiter
+                .check(&rate_key, "gallery/posts/update")?;
+            let post_id = required_str(&obj, "postId")?;
+            let title = match obj.get("title") {
+                None => None,
+                Some(Value::Null) => Some(None),
+                Some(Value::String(s)) => Some(Some(s.as_str())),
+                Some(_) => {
+                    return Err(ApiError::invalid_param("title", "must be a string"));
+                }
+            };
+            let description = match obj.get("description") {
+                None => None,
+                Some(Value::Null) => Some(None),
+                Some(Value::String(s)) => Some(Some(s.as_str())),
+                Some(_) => {
+                    return Err(ApiError::invalid_param(
+                        "description",
+                        "must be a string",
+                    ));
+                }
+            };
+            let file_ids = match obj.get("fileIds") {
+                None | Some(Value::Null) => None,
+                Some(Value::Array(_)) => {
+                    let ids = str_list(&obj, "fileIds")?;
+                    for file_id in &ids {
+                        state
+                            .services
+                            .get_media_for(&caller.account.id, file_id)
+                            .map_err(ApiError::from_port_error)?;
+                    }
+                    Some(ids)
+                }
+                Some(_) => {
+                    return Err(ApiError::invalid_param(
+                        "fileIds",
+                        "must be an array of strings",
+                    ));
+                }
+            };
+            let is_sensitive = match obj.get("isSensitive") {
+                None | Some(Value::Null) => None,
+                Some(Value::Bool(b)) => Some(*b),
+                Some(_) => {
+                    return Err(ApiError::invalid_param(
+                        "isSensitive",
+                        "must be a boolean",
+                    ));
+                }
+            };
+            let post = state
+                .services
+                .gallery_post_update(
+                    gallery_store(),
+                    &caller.account.id,
+                    &post_id,
+                    title,
+                    description,
+                    file_ids,
+                    is_sensitive,
+                )
+                .map_err(map_gallery_error)?;
+            Ok(Json(pack_gallery_post(&state, &post)?).into_response())
+        }
+
+        "gallery/posts/delete" => {
+            check_allowed_fields(&obj, &["postId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state
+                .rate_limiter
+                .check(&rate_key, "gallery/posts/delete")?;
+            let post_id = required_str(&obj, "postId")?;
+            state
+                .services
+                .gallery_post_delete(gallery_store(), &caller.account.id, &post_id)
+                .map_err(map_gallery_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "gallery/posts/like" => {
+            check_allowed_fields(&obj, &["postId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state.rate_limiter.check(&rate_key, "gallery/posts/like")?;
+            let post_id = required_str(&obj, "postId")?;
+            state
+                .services
+                .gallery_post_like(gallery_store(), &caller.account.id, &post_id)
+                .map_err(map_gallery_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "gallery/posts/unlike" => {
+            check_allowed_fields(&obj, &["postId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state
+                .rate_limiter
+                .check(&rate_key, "gallery/posts/unlike")?;
+            let post_id = required_str(&obj, "postId")?;
+            state
+                .services
+                .gallery_post_unlike(gallery_store(), &caller.account.id, &post_id)
+                .map_err(map_gallery_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "gallery/posts" => {
+            check_allowed_fields(&obj, &["limit", "sinceId", "untilId"])?;
+            let cursor = parse_id_cursor(&obj)?;
+            let posts = state
+                .services
+                .gallery_posts_list(gallery_store(), &cursor)
+                .map_err(ApiError::from_port_error)?;
+            let mut out = Vec::with_capacity(posts.len());
+            for post in &posts {
+                out.push(pack_gallery_post(&state, post)?);
+            }
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        "gallery/featured" => {
+            check_allowed_fields(&obj, &["limit", "sinceId", "untilId"])?;
+            let cursor = parse_id_cursor(&obj)?;
+            let posts = state
+                .services
+                .gallery_featured(gallery_store(), &cursor)
+                .map_err(ApiError::from_port_error)?;
+            let mut out = Vec::with_capacity(posts.len());
+            for post in &posts {
+                out.push(pack_gallery_post(&state, post)?);
+            }
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        "gallery/popular" => {
+            check_allowed_fields(&obj, &["limit", "sinceId", "untilId"])?;
+            let cursor = parse_id_cursor(&obj)?;
+            let posts = state
+                .services
+                .gallery_popular(gallery_store(), &cursor)
+                .map_err(ApiError::from_port_error)?;
+            let mut out = Vec::with_capacity(posts.len());
+            for post in &posts {
+                out.push(pack_gallery_post(&state, post)?);
+            }
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        "flash/create" => {
+            check_allowed_fields(&obj, &["title", "summary", "script", "visibility"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state.rate_limiter.check(&rate_key, "flash/create")?;
+            let title = required_str(&obj, "title")?;
+            let summary = opt_string(&obj, "summary")?;
+            let script = required_str(&obj, "script")?;
+            let visibility = opt_string(&obj, "visibility")?
+                .unwrap_or_else(|| "public".to_string());
+            let flash = state
+                .services
+                .flash_create(
+                    gallery_store(),
+                    &caller.account.id,
+                    &title,
+                    summary.as_deref(),
+                    &script,
+                    &visibility,
+                )
+                .map_err(map_gallery_error)?;
+            Ok(Json(pack_flash(&state, &flash)?).into_response())
+        }
+
+        "flash/show" => {
+            check_allowed_fields(&obj, &["flashId"])?;
+            let flash_id = required_str(&obj, "flashId")?;
+            let flash = state
+                .services
+                .flash_show(gallery_store(), &flash_id)
+                .map_err(map_gallery_error)?;
+            Ok(Json(pack_flash(&state, &flash)?).into_response())
+        }
+
+        "flash/update" => {
+            check_allowed_fields(
+                &obj,
+                &["flashId", "title", "summary", "script", "visibility"],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state.rate_limiter.check(&rate_key, "flash/update")?;
+            let flash_id = required_str(&obj, "flashId")?;
+            let title = opt_string(&obj, "title")?;
+            let summary = match obj.get("summary") {
+                None => None,
+                Some(Value::Null) => Some(None),
+                Some(Value::String(s)) => Some(Some(s.clone())),
+                Some(_) => {
+                    return Err(ApiError::invalid_param(
+                        "summary",
+                        "must be a string",
+                    ));
+                }
+            };
+            let script = opt_string(&obj, "script")?;
+            let visibility = opt_string(&obj, "visibility")?;
+            let flash = state
+                .services
+                .flash_update(
+                    gallery_store(),
+                    &caller.account.id,
+                    &flash_id,
+                    title.as_deref(),
+                    summary.as_ref().map(|inner| inner.as_deref()),
+                    script.as_deref(),
+                    visibility.as_deref(),
+                )
+                .map_err(map_gallery_error)?;
+            Ok(Json(pack_flash(&state, &flash)?).into_response())
+        }
+
+        "flash/delete" => {
+            check_allowed_fields(&obj, &["flashId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state.rate_limiter.check(&rate_key, "flash/delete")?;
+            let flash_id = required_str(&obj, "flashId")?;
+            state
+                .services
+                .flash_delete(gallery_store(), &caller.account.id, &flash_id)
+                .map_err(map_gallery_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "flash/like" => {
+            check_allowed_fields(&obj, &["flashId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state.rate_limiter.check(&rate_key, "flash/like")?;
+            let flash_id = required_str(&obj, "flashId")?;
+            state
+                .services
+                .flash_like(gallery_store(), &caller.account.id, &flash_id)
+                .map_err(map_gallery_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "flash/unlike" => {
+            check_allowed_fields(&obj, &["flashId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state.rate_limiter.check(&rate_key, "flash/unlike")?;
+            let flash_id = required_str(&obj, "flashId")?;
+            state
+                .services
+                .flash_unlike(gallery_store(), &caller.account.id, &flash_id)
+                .map_err(map_gallery_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        "flash/featured" => {
+            check_allowed_fields(&obj, &["limit", "sinceId", "untilId"])?;
+            let cursor = parse_id_cursor(&obj)?;
+            let flashes = state
+                .services
+                .flash_featured(gallery_store(), &cursor)
+                .map_err(ApiError::from_port_error)?;
+            let mut out = Vec::with_capacity(flashes.len());
+            for flash in &flashes {
+                out.push(pack_flash(&state, flash)?);
+            }
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        "flash/my" => {
+            check_allowed_fields(&obj, &["limit", "sinceId", "untilId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:account")?;
+            let cursor = parse_id_cursor(&obj)?;
+            let flashes = state
+                .services
+                .flash_my(gallery_store(), &caller.account.id, &cursor)
+                .map_err(ApiError::from_port_error)?;
+            let mut out = Vec::with_capacity(flashes.len());
+            for flash in &flashes {
+                out.push(pack_flash(&state, flash)?);
+            }
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        "flash/my-likes" => {
+            check_allowed_fields(&obj, &["limit", "sinceId", "untilId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:account")?;
+            let cursor = parse_id_cursor(&obj)?;
+            let flashes = state
+                .services
+                .flash_my_likes(gallery_store(), &caller.account.id, &cursor)
+                .map_err(ApiError::from_port_error)?;
+            let mut out = Vec::with_capacity(flashes.len());
+            for flash in &flashes {
+                out.push(pack_flash(&state, flash)?);
+            }
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        // --- Gaps final wiring: hashtags --------------------------------
+        // All hashtag reads are public (optional credential only scopes
+        // visibility). Counts reflect the bounded recent-notes scan
+        // (documented DIVERGENCE in the op module — no durable tag index).
+        "hashtags/list" => {
+            check_allowed_fields(&obj, &["limit"])?;
+            let viewer = caller.as_ref().map(|caller| caller.account.id.clone());
+            let limit = get_limit_with_default(&obj, 10)?;
+            let entries = state
+                .services
+                .hashtags_list(viewer.as_deref(), limit)
+                .map_err(ApiError::from_port_error)?;
+            let out: Vec<Value> = entries
+                .iter()
+                .map(|entry| {
+                    serde_json::json!({
+                        "tag": entry.tag,
+                        "mentionedNotesCount": entry.mentioned_notes_count,
+                    })
+                })
+                .collect();
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        "hashtags/search" => {
+            check_allowed_fields(&obj, &["query", "limit"])?;
+            let viewer = caller.as_ref().map(|caller| caller.account.id.clone());
+            let query = required_str(&obj, "query")?;
+            let limit = get_limit_with_default(&obj, 10)?;
+            let entries = state
+                .services
+                .hashtags_search(viewer.as_deref(), &query, limit)
+                .map_err(ApiError::from_port_error)?;
+            let out: Vec<Value> = entries
+                .iter()
+                .map(|entry| {
+                    serde_json::json!({
+                        "tag": entry.tag,
+                        "mentionedNotesCount": entry.mentioned_notes_count,
+                    })
+                })
+                .collect();
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        "hashtags/show" => {
+            check_allowed_fields(&obj, &["tag"])?;
+            let viewer = caller.as_ref().map(|caller| caller.account.id.clone());
+            let tag = required_str(&obj, "tag")?;
+            let view = state
+                .services
+                .hashtag_show(viewer.as_deref(), &tag)
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(serde_json::json!({
+                "tag": view.tag,
+                "mentionedUsersCount": view.mentioned_users_count,
+                "mentionedLocalUsersCount": view.mentioned_local_users_count,
+                "mentionedRemoteUsersCount": view.mentioned_remote_users_count,
+            }))
+            .into_response())
+        }
+
+        "hashtags/trend" => {
+            check_allowed_fields(&obj, &[])?;
+            let viewer = caller.as_ref().map(|caller| caller.account.id.clone());
+            let entries = state
+                .services
+                .hashtags_trend(viewer.as_deref())
+                .map_err(ApiError::from_port_error)?;
+            let out: Vec<Value> = entries
+                .iter()
+                .map(|entry| {
+                    serde_json::json!({
+                        "tag": entry.tag,
+                        "mentionedNotesCount": entry.mentioned_notes_count,
+                    })
+                })
+                .collect();
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        "hashtags/users" => {
+            check_allowed_fields(&obj, &["tag", "limit"])?;
+            let viewer = caller.as_ref().map(|caller| caller.account.id.clone());
+            let tag = required_str(&obj, "tag")?;
+            let limit = get_limit_with_default(&obj, 10)?;
+            let accounts = state
+                .services
+                .hashtag_users(viewer.as_deref(), &tag, limit)
+                .map_err(ApiError::from_port_error)?;
+            let now = state.services.clock.now_ms();
+            let public_url = &state.services.public_url;
+            let out: Vec<Value> = accounts
+                .iter()
+                .map(|account| pack_user_lite(account, public_url, now))
+                .collect();
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        // --- Gaps final wiring: announcements -----------------------------
+        // `announcements` + `announcements/show` are public (optional
+        // credential scopes `isRead`). All arms below run on the interim
+        // in-memory store.
+        // TODO(final): swap to redb.
+        "announcements" => {
+            check_allowed_fields(&obj, &[])?;
+            let viewer = caller.as_ref().map(|caller| caller.account.id.clone());
+            let views = state
+                .services
+                .announcements_list(announcement_store(), viewer.as_deref())
+                .map_err(ApiError::from_port_error)?;
+            let out: Vec<Value> = views.iter().map(pack_announcement_view).collect();
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        "announcements/show" => {
+            check_allowed_fields(&obj, &["announcementId"])?;
+            let viewer = caller.as_ref().map(|caller| caller.account.id.clone());
+            let announcement_id = required_str(&obj, "announcementId")?;
+            let view = state
+                .services
+                .announcement_show(announcement_store(), &announcement_id, viewer.as_deref())
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(pack_announcement_view(&view)).into_response())
+        }
+
+        // `i/read-announcement {announcementId!}` (idempotent).
+        "i/read-announcement" => {
+            check_allowed_fields(&obj, &["announcementId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state
+                .rate_limiter
+                .check(&rate_key, "i/read-announcement")?;
+            let announcement_id = required_str(&obj, "announcementId")?;
+            state
+                .services
+                .announcement_read(announcement_store(), &caller.account.id, &announcement_id)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // `promo/read` (idempotent, no params).
+        "promo/read" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state.rate_limiter.check(&rate_key, "promo/read")?;
+            state
+                .services
+                .promo_read(announcement_store(), &caller.account.id)
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // --- Gaps final wiring: following extras ---------------------------
+        // `following/update {userId!, withReplies?, notify?}`: rewrite one
+        // live edge. At least one of the two options is required (upstream
+        // parity). Absent options keep the stored value. The store call
+        // carries no jobs: federated `Update(Follow)` fan-out is sibling
+        // work (the port documents the job contract).
+        // TODO(final): confirm `Update(Follow)` fan-out with the redb owner.
+        "following/update" => {
+            check_allowed_fields(&obj, &["userId", "withReplies", "notify"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:following")?;
+            state.rate_limiter.check(&rate_key, "following/update")?;
+            let user_id = required_str(&obj, "userId")?;
+            if obj.get("withReplies").is_none() && obj.get("notify").is_none() {
+                return Err(ApiError::invalid_param(
+                    "withReplies",
+                    "at least one of withReplies, notify is required",
+                ));
+            }
+            let edge = state
+                .services
+                .follows
+                .get_follow(&caller.account.id, &user_id)
+                .map_err(ApiError::from_port_error)?
+                .ok_or_else(|| {
+                    ApiError::from_port_error(PortError::NotFound("NOT_FOLLOWING".to_string()))
+                })?;
+            let with_replies = opt_bool(&obj, "withReplies", edge.with_replies)?;
+            let notify = match obj.get("notify") {
+                None | Some(Value::Null) => edge.notify.clone(),
+                _ => parse_follow_notify(&obj)?,
+            };
+            let updated = state
+                .services
+                .follows
+                .update_follow_options(
+                    &caller.account.id,
+                    &user_id,
+                    with_replies,
+                    notify,
+                    Vec::new(),
+                )
+                .map_err(ApiError::from_port_error)?;
+            Ok(Json(
+                pack_following(&updated, Some(&caller.account.id), &state.services)
+                    .map_err(ApiError::from_port_error)?,
+            )
+            .into_response())
+        }
+
+        // `following/update-all {withReplies?, notify?}`: apply the given
+        // options to every live edge (10 000-edge single-node bound, same
+        // precedent as `following_list`). Same jobs caveat as
+        // `following/update`.
+        // TODO(final): confirm `Update(Follow)` fan-out with the redb owner.
+        "following/update-all" => {
+            check_allowed_fields(&obj, &["withReplies", "notify"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:following")?;
+            state.rate_limiter.check(&rate_key, "following/update-all")?;
+            if obj.get("withReplies").is_none() && obj.get("notify").is_none() {
+                return Err(ApiError::invalid_param(
+                    "withReplies",
+                    "at least one of withReplies, notify is required",
+                ));
+            }
+            let with_replies = match obj.get("withReplies") {
+                None | Some(Value::Null) => None,
+                Some(Value::Bool(_)) => Some(opt_bool(&obj, "withReplies", false)?),
+                Some(_) => {
+                    return Err(ApiError::invalid_param(
+                        "withReplies",
+                        "must be a boolean",
+                    ));
+                }
+            };
+            let notify = match obj.get("notify") {
+                None | Some(Value::Null) => None,
+                _ => Some(parse_follow_notify(&obj)?),
+            };            for edge in state
+                .services
+                .follows
+                .following_of(&caller.account.id, None, 10_000)
+                .map_err(ApiError::from_port_error)?
+            {
+                state
+                    .services
+                    .follows
+                    .update_follow_options(
+                        &caller.account.id,
+                        &edge.followee_id,
+                        with_replies.unwrap_or(edge.with_replies),
+                        notify.clone().unwrap_or(edge.notify.clone()),
+                        Vec::new(),
+                    )
+                    .map_err(ApiError::from_port_error)?;
+            }
+            Ok(Json(Value::Object(Map::new())).into_response())
+        }
+
+        // `following/list {notification = false, ...cursor}`: the caller's
+        // own outgoing follows (`following_list` op). 1..=100, default 10.
+        "following/list" => {
+            check_allowed_fields(
+                &obj,
+                &[
+                    "notification",
+                    "limit",
+                    "sinceId",
+                    "untilId",
+                    "sinceDate",
+                    "untilDate",
+                ],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:following")?;
+            let notify_only = opt_bool(&obj, "notification", false)?;
+            let cursor = parse_cursor(&obj)?;
+            let edges = state
+                .services
+                .following_list(&caller.account.id, notify_only, &cursor)
+                .map_err(ApiError::from_port_error)?;
+            let mut out = Vec::with_capacity(edges.len());
+            for edge in &edges {
+                out.push(
+                    pack_following(edge, Some(&caller.account.id), &state.services)
+                        .map_err(ApiError::from_port_error)?,
+                );
+            }
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        // `following/requests/sent {...cursor}`: pending requests the
+        // caller sent (default store answers `[]` until the sibling-owned
+        // redb `follow_requests_from` lands).
+        // TODO(final): swap to redb.
+        "following/requests/sent" => {
+            check_allowed_fields(&obj, &["limit", "sinceId", "untilId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:following")?;
+            let limit = get_limit_with_default(&obj, 10)?;
+            let reqs = state
+                .services
+                .follows
+                .follow_requests_from(&caller.account.id, None, limit)
+                .map_err(ApiError::from_port_error)?;
+            let mut out = Vec::new();
+            for request in reqs.iter().take(limit) {
+                out.push(pack_follow_request(
+                    &state,
+                    &request.id,
+                    &request.follower_id,
+                    &request.followee_id,
+                )?);
+            }
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        // --- Gaps final wiring: drive file extras --------------------------
+        // `drive/files/check-existence {md5!}`: 204 when the caller owns a
+        // file with this hash, else per-endpoint `NO_SUCH_FILE`.
+        "drive/files/check-existence" => {
+            check_allowed_fields(&obj, &["md5"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:drive")?;
+            state
+                .rate_limiter
+                .check(&rate_key, "drive/files/check-existence")?;
+            let md5 = required_str(&obj, "md5")?;
+            let exists = state
+                .services
+                .drive_file_exists(&caller.account.id, &md5)
+                .map_err(ApiError::from_port_error)?;
+            if !exists {
+                return Err(ApiError::drive_no_such_file("drive/files/check-existence"));
+            }
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // `drive/files/attached-notes {fileId!, ...cursor}`: notes
+        // referencing the file, newest-first. Moderators may query foreign
+        // files; everyone else sees only their own (`NO_SUCH_FILE` on
+        // miss, per-endpoint UUID).
+        "drive/files/attached-notes" => {
+            check_allowed_fields(
+                &obj,
+                &["fileId", "limit", "sinceId", "untilId", "sinceDate", "untilDate"],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:drive")?;
+            state
+                .rate_limiter
+                .check(&rate_key, "drive/files/attached-notes")?;
+            let file_id = required_str(&obj, "fileId")?;
+            let cursor = parse_cursor(&obj)?;
+            let notes = state
+                .services
+                .attached_notes(
+                    &caller.account.id,
+                    &file_id,
+                    caller.account.has_moderator_powers(),
+                    &cursor,
+                )
+                .map_err(|err| map_drive_extra_error(err, "drive/files/attached-notes"))?;
+            pack_note_list(&state.services, &notes, Some(&caller.account.id))
+        }
+
+        // `drive/stream {limit?, sinceId?, untilId?, type?, sort?}`: the
+        // caller's files with the shared `drive/files` filter semantics
+        // (`type` exact match unless `/*`-suffixed, then prefix).
+        "drive/stream" => {
+            check_allowed_fields(
+                &obj,
+                &[
+                    "limit",
+                    "sinceId",
+                    "untilId",
+                    "sinceDate",
+                    "untilDate",
+                    "type",
+                    "sort",
+                ],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:drive")?;
+            state.rate_limiter.check(&rate_key, "drive/stream")?;
+            let type_prefix: Option<String> = match opt_string(&obj, "type")? {
+                None => None,
+                Some(raw) => {
+                    if raw.is_empty()
+                        || !raw
+                            .chars()
+                            .all(|c| c.is_ascii_alphabetic() || c == '/' || c == '-' || c == '*')
+                    {
+                        return Err(ApiError::invalid_param(
+                            "type",
+                            "must match /^[a-zA-Z/\\-*]+$/",
+                        ));
+                    }
+                    Some(raw.strip_suffix('*').unwrap_or(&raw).to_string())
+                }
+            };
+            match opt_string(&obj, "sort")? {
+                None => {}
+                Some(sort)
+                    if [
+                        "+createdAt",
+                        "-createdAt",
+                        "+name",
+                        "-name",
+                        "+size",
+                        "-size",
+                    ]
+                    .contains(&sort.as_str()) => {}
+                Some(_) => {
+                    return Err(ApiError::invalid_param(
+                        "sort",
+                        "must be one of +createdAt, -createdAt, +name, -name, +size, -size",
+                    ));
+                }
+            }
+            let sort = opt_string(&obj, "sort")?;
+            let cursor = parse_cursor(&obj)?;
+            let files = state
+                .services
+                .stream_drive_files(
+                    &caller.account.id,
+                    &cursor,
+                    type_prefix.as_deref(),
+                    sort.as_deref(),
+                )
+                .map_err(ApiError::from_port_error)?;
+            let packed: Vec<Value> = files
+                .iter()
+                .map(|meta| pack_drive_file(meta, &state.services))
+                .collect();
+            Ok(Json(Value::Array(packed)).into_response())
+        }
+
+        // --- Gaps final wiring 5/5: drive folders + folder-aware files ---
+        // `drive/folders/create {name = "Untitled", parentId?}`: the
+        // caller's folder under `parentId` (`None` = root).
+        // `NO_SUCH_FOLDER` when a requested parent is missing or foreign.
+        "drive/folders/create" => {
+            check_allowed_fields(&obj, &["name", "parentId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:drive")?;
+            state
+                .rate_limiter
+                .check(&rate_key, "drive/folders/create")?;
+            let name = opt_string(&obj, "name")?;
+            let parent_id = opt_string(&obj, "parentId")?;
+            let folder = state
+                .services
+                .create_drive_folder(
+                    state.services.folders.as_ref(),
+                    &caller.account.id,
+                    name,
+                    parent_id,
+                )
+                .map_err(|err| map_drive_folder_error(err, "drive/folders/create"))?;
+            Ok(Json(pack_drive_folder(&folder)).into_response())
+        }
+
+        // `drive/folders/show {folderId*}`: miss and foreign both read as
+        // `NO_SUCH_FOLDER` (upstream `findOneBy({id, userId})` parity).
+        "drive/folders/show" => {
+            check_allowed_fields(&obj, &["folderId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:drive")?;
+            state.rate_limiter.check(&rate_key, "drive/folders/show")?;
+            let folder_id = required_str(&obj, "folderId")?;
+            let folder = state
+                .services
+                .show_drive_folder(state.services.folders.as_ref(), &caller.account.id, &folder_id)
+                .map_err(|err| map_drive_folder_error(err, "drive/folders/show"))?;
+            Ok(Json(pack_drive_folder(&folder)).into_response())
+        }
+
+        // `drive/folders/find {name*, parentId? (null = root)}`: the
+        // caller's folders with `name` directly under the parent. A
+        // missing/foreign parent matches nothing → `[]`.
+        "drive/folders/find" => {
+            check_allowed_fields(&obj, &["name", "parentId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:drive")?;
+            state.rate_limiter.check(&rate_key, "drive/folders/find")?;
+            let name = required_str(&obj, "name")?;
+            let parent_id = opt_string(&obj, "parentId")?;
+            let folders = state
+                .services
+                .find_drive_folders(
+                    state.services.folders.as_ref(),
+                    &caller.account.id,
+                    &name,
+                    parent_id.as_deref(),
+                )
+                .map_err(ApiError::from_port_error)?;
+            let packed: Vec<Value> = folders.iter().map(pack_drive_folder).collect();
+            Ok(Json(Value::Array(packed)).into_response())
+        }
+
+        // `drive/folders/update {folderId*, name?, parentId?}` (`parentId:
+        // null` moves to root; absent leaves placement).
+        // `NO_SUCH_FOLDER` / `NO_SUCH_PARENT_FOLDER` / `RECURSIVE_NESTING`.
+        "drive/folders/update" => {
+            check_allowed_fields(&obj, &["folderId", "name", "parentId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:drive")?;
+            state
+                .rate_limiter
+                .check(&rate_key, "drive/folders/update")?;
+            let folder_id = required_str(&obj, "folderId")?;
+            let name = opt_string(&obj, "name")?;
+            let parent_id = opt_nullable_string(&obj, "parentId")?;
+            let folder = state
+                .services
+                .update_drive_folder(
+                    state.services.folders.as_ref(),
+                    &caller.account.id,
+                    &folder_id,
+                    name,
+                    parent_id,
+                )
+                .map_err(|err| map_drive_folder_error(err, "drive/folders/update"))?;
+            Ok(Json(pack_drive_folder(&folder)).into_response())
+        }
+
+        // `drive/folders/delete {folderId*}` → 204. Refuses non-empty
+        // folders (`HAS_CHILD_FILES_OR_FOLDERS`).
+        "drive/folders/delete" => {
+            check_allowed_fields(&obj, &["folderId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:drive")?;
+            state
+                .rate_limiter
+                .check(&rate_key, "drive/folders/delete")?;
+            let folder_id = required_str(&obj, "folderId")?;
+            state
+                .services
+                .delete_drive_folder(
+                    state.services.folders.as_ref(),
+                    &caller.account.id,
+                    &folder_id,
+                )
+                .map_err(|err| map_drive_folder_error(err, "drive/folders/delete"))?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // `drive/files/find {name*, folderId? (null = root)}`: the caller's
+        // files with `name` directly in the folder. A missing/foreign
+        // folder matches nothing → `[]`.
+        "drive/files/find" => {
+            check_allowed_fields(&obj, &["name", "folderId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:drive")?;
+            state.rate_limiter.check(&rate_key, "drive/files/find")?;
+            let name = required_str(&obj, "name")?;
+            let folder_id = opt_string(&obj, "folderId")?;
+            let files = state
+                .services
+                .find_drive_files(
+                    state.services.folders.as_ref(),
+                    &caller.account.id,
+                    &name,
+                    folder_id.as_deref(),
+                )
+                .map_err(ApiError::from_port_error)?;
+            let packed: Vec<Value> = files
+                .iter()
+                .map(|meta| pack_drive_file(meta, &state.services))
+                .collect();
+            Ok(Json(Value::Array(packed)).into_response())
+        }
+
+        // `drive/files/move-bulk {fileIds[1..=100]*, folderId? (null =
+        // root)}` → 204. Missing/unowned files skip (bulk-`update`
+        // parity); a missing/foreign non-null target is `NO_SUCH_FOLDER`.
+        "drive/files/move-bulk" => {
+            check_allowed_fields(&obj, &["fileIds", "folderId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:drive")?;
+            state
+                .rate_limiter
+                .check(&rate_key, "drive/files/move-bulk")?;
+            let file_ids = str_list(&obj, "fileIds")?;
+            if file_ids.is_empty() || file_ids.len() > 100 {
+                return Err(ApiError::invalid_param(
+                    "fileIds",
+                    "must be an array of 1..=100 file ids",
+                ));
+            }
+            let folder_id = opt_string(&obj, "folderId")?;
+            state
+                .services
+                .move_drive_files(
+                    state.services.folders.as_ref(),
+                    &caller.account.id,
+                    &file_ids,
+                    folder_id.as_deref(),
+                )
+                .map_err(|err| map_drive_folder_error(err, "drive/files/move-bulk"))?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // --- Gaps final wiring: thread muting + memo -------------------------
+        // `notes/thread-muting/create {noteId*}` → 204 (idempotent).
+        // `NO_SUCH_NOTE` on miss/deleted.
+        "notes/thread-muting/create" => {
+            check_allowed_fields(&obj, &["noteId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state
+                .rate_limiter
+                .check(&rate_key, "notes/thread-muting/create")?;
+            let note_id = required_str(&obj, "noteId")?;
+            state
+                .services
+                .mute_note_thread(&caller.account.id, &note_id)
+                .map_err(|err| match &err {
+                    PortError::NotFound(msg) if msg == "NO_SUCH_NOTE" => {
+                        ApiError::thread_mute_no_such_note("notes/thread-muting/create")
+                    }
+                    _ => ApiError::from_port_error(err),
+                })?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // `notes/thread-muting/delete {noteId*}` → 204 (idempotent twin).
+        "notes/thread-muting/delete" => {
+            check_allowed_fields(&obj, &["noteId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state
+                .rate_limiter
+                .check(&rate_key, "notes/thread-muting/delete")?;
+            let note_id = required_str(&obj, "noteId")?;
+            state
+                .services
+                .unmute_note_thread(&caller.account.id, &note_id)
+                .map_err(|err| match &err {
+                    PortError::NotFound(msg) if msg == "NO_SUCH_NOTE" => {
+                        ApiError::thread_mute_no_such_note("notes/thread-muting/delete")
+                    }
+                    _ => ApiError::from_port_error(err),
+                })?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // `users/update-memo {userId*, memo?}`: replace the memo the caller
+        // keeps about the user (`None`/empty clears). Returns the stored
+        // memo (`None` cleared). `NO_SUCH_USER` on a missing target.
+        "users/update-memo" => {
+            check_allowed_fields(&obj, &["userId", "memo"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state.rate_limiter.check(&rate_key, "users/update-memo")?;
+            let user_id = required_str(&obj, "userId")?;
+            let memo = opt_string(&obj, "memo")?;
+            let stored = state
+                .services
+                .update_memo(&caller.account.id, &user_id, memo)
+                .map_err(|err| match &err {
+                    PortError::NotFound(msg) if msg == "NO_SUCH_USER" => {
+                        ApiError::update_memo_no_such_user()
+                    }
+                    _ => ApiError::from_port_error(err),
+                })?;
+            Ok(Json(stored.map(Value::String).unwrap_or(Value::Null)).into_response())
+        }
+
+        // --- Gaps final wiring: webhooks + send-email ------------------------
+        // `system-webhook/create {name*, url*, secret?, trigger*}`:
+        // admin-gated; absent secrets are minted server-side.
+        "system-webhook/create" => {
+            check_allowed_fields(&obj, &["name", "url", "secret", "trigger"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:system-webhook")?;
+            require_admin(&caller)?;
+            state
+                .rate_limiter
+                .check(&rate_key, "system-webhook/create")?;
+            let input = CreateSystemWebhookInput {
+                name: required_str(&obj, "name")?,
+                url: required_str(&obj, "url")?,
+                secret: opt_string(&obj, "secret")?,
+                trigger: required_str(&obj, "trigger")?,
+            };
+            let row = create_system_webhook(
+                state.services.system_webhooks.as_ref(),
+                state.services.ids.as_ref(),
+                state.services.clock.as_ref(),
+                caller.account.is_admin,
+                input,
+            )
+            .map_err(|err| map_webhook_error(err, "system-webhook/create"))?;
+            Ok(Json(pack_system_webhook(&row)).into_response())
+        }
+
+        // `system-webhook/list` → all rows, admin-gated.
+        "system-webhook/list" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:admin:system-webhook")?;
+            require_admin(&caller)?;
+            state.rate_limiter.check(&rate_key, "system-webhook/list")?;
+            let rows = state
+                .services
+                .system_webhooks
+                .list_system_webhooks()
+                .map_err(ApiError::from_port_error)?;
+            let packed: Vec<Value> = rows.iter().map(pack_system_webhook).collect();
+            Ok(Json(Value::Array(packed)).into_response())
+        }
+
+        // `system-webhook/show {webhookId*}` — miss reads as
+        // `NO_SUCH_WEBHOOK`.
+        "system-webhook/show" => {
+            check_allowed_fields(&obj, &["webhookId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:admin:system-webhook")?;
+            require_admin(&caller)?;
+            state.rate_limiter.check(&rate_key, "system-webhook/show")?;
+            let webhook_id = required_str(&obj, "webhookId")?;
+            let row = show_system_webhook(
+                state.services.system_webhooks.as_ref(),
+                caller.account.is_admin,
+                &webhook_id,
+            )
+            .map_err(|err| map_webhook_error(err, "system-webhook/show"))?;
+            Ok(Json(pack_system_webhook(&row)).into_response())
+        }
+
+        // `system-webhook/update {webhookId*, name?, url?, secret?,
+        // trigger?, isActive?}` (`secret` present rotates; `isActive`
+        // toggles delivery without deleting).
+        "system-webhook/update" => {
+            check_allowed_fields(
+                &obj,
+                &["webhookId", "name", "url", "secret", "trigger", "isActive"],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:system-webhook")?;
+            require_admin(&caller)?;
+            state
+                .rate_limiter
+                .check(&rate_key, "system-webhook/update")?;
+            let webhook_id = required_str(&obj, "webhookId")?;
+            let patch = UpdateSystemWebhookInput {
+                name: opt_string(&obj, "name")?,
+                url: opt_string(&obj, "url")?,
+                secret: opt_string(&obj, "secret")?,
+                trigger: opt_string(&obj, "trigger")?,
+                is_active: match obj.get("isActive") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::Bool(active)) => Some(*active),
+                    Some(_) => {
+                        return Err(ApiError::invalid_param(
+                            "isActive",
+                            "must be a boolean",
+                        ));
+                    }
+                },
+            };
+            let row = update_system_webhook(
+                state.services.system_webhooks.as_ref(),
+                state.services.clock.as_ref(),
+                caller.account.is_admin,
+                &webhook_id,
+                patch,
+            )
+            .map_err(|err| map_webhook_error(err, "system-webhook/update"))?;
+            Ok(Json(pack_system_webhook(&row)).into_response())
+        }
+
+        // `system-webhook/delete {webhookId*}` → 204.
+        "system-webhook/delete" => {
+            check_allowed_fields(&obj, &["webhookId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:system-webhook")?;
+            require_admin(&caller)?;
+            state
+                .rate_limiter
+                .check(&rate_key, "system-webhook/delete")?;
+            let webhook_id = required_str(&obj, "webhookId")?;
+            delete_system_webhook(
+                state.services.system_webhooks.as_ref(),
+                caller.account.is_admin,
+                &webhook_id,
+            )
+            .map_err(|err| map_webhook_error(err, "system-webhook/delete"))?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // `webhooks/create {name*, url*, secret?, trigger?}`: owner-scoped,
+        // capped at the instance `webhook_limit` (`TOO_MANY_WEBHOOKS`).
+        "webhooks/create" => {
+            check_allowed_fields(&obj, &["name", "url", "secret", "trigger"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state.rate_limiter.check(&rate_key, "webhooks/create")?;
+            let input = CreateUserWebhookInput {
+                name: required_str(&obj, "name")?,
+                url: required_str(&obj, "url")?,
+                secret: opt_string(&obj, "secret")?,
+                trigger: required_str(&obj, "trigger")?,
+            };
+            let row = create_user_webhook(
+                state.services.user_webhooks.as_ref(),
+                state.services.ids.as_ref(),
+                state.services.clock.as_ref(),
+                &caller.account.id,
+                crate::domain::webhook::DEFAULT_WEBHOOK_LIMIT,
+                input,
+            )
+            .map_err(|err| map_webhook_error(err, "webhooks/create"))?;
+            Ok(Json(pack_user_webhook(&row)).into_response())
+        }
+
+        // `webhooks/list` → the caller's rows.
+        "webhooks/list" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:account")?;
+            state.rate_limiter.check(&rate_key, "webhooks/list")?;
+            let rows = state
+                .services
+                .user_webhooks
+                .list_user_webhooks(&caller.account.id)
+                .map_err(ApiError::from_port_error)?;
+            let packed: Vec<Value> = rows.iter().map(pack_user_webhook).collect();
+            Ok(Json(Value::Array(packed)).into_response())
+        }
+
+        // `webhooks/show {webhookId*}` — foreign ids read as not-found,
+        // never touched.
+        "webhooks/show" => {
+            check_allowed_fields(&obj, &["webhookId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:account")?;
+            state.rate_limiter.check(&rate_key, "webhooks/show")?;
+            let webhook_id = required_str(&obj, "webhookId")?;
+            let row = show_user_webhook(
+                state.services.user_webhooks.as_ref(),
+                &caller.account.id,
+                &webhook_id,
+            )
+            .map_err(|err| map_webhook_error(err, "webhooks/show"))?;
+            Ok(Json(pack_user_webhook(&row)).into_response())
+        }
+
+        // `webhooks/update {webhookId*, name?, url?, secret?, trigger?,
+        // isActive?}`.
+        "webhooks/update" => {
+            check_allowed_fields(
+                &obj,
+                &["webhookId", "name", "url", "secret", "trigger", "isActive"],
+            )?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state.rate_limiter.check(&rate_key, "webhooks/update")?;
+            let webhook_id = required_str(&obj, "webhookId")?;
+            let patch = UpdateUserWebhookInput {
+                name: opt_string(&obj, "name")?,
+                url: opt_string(&obj, "url")?,
+                secret: opt_string(&obj, "secret")?,
+                trigger: opt_string(&obj, "trigger")?,
+                is_active: match obj.get("isActive") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::Bool(active)) => Some(*active),
+                    Some(_) => {
+                        return Err(ApiError::invalid_param(
+                            "isActive",
+                            "must be a boolean",
+                        ));
+                    }
+                },
+            };
+            let row = update_user_webhook(
+                state.services.user_webhooks.as_ref(),
+                state.services.clock.as_ref(),
+                &caller.account.id,
+                &webhook_id,
+                patch,
+            )
+            .map_err(|err| map_webhook_error(err, "webhooks/update"))?;
+            Ok(Json(pack_user_webhook(&row)).into_response())
+        }
+
+        // `webhooks/delete {webhookId*}` → 204.
+        "webhooks/delete" => {
+            check_allowed_fields(&obj, &["webhookId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state.rate_limiter.check(&rate_key, "webhooks/delete")?;
+            let webhook_id = required_str(&obj, "webhookId")?;
+            delete_user_webhook(
+                state.services.user_webhooks.as_ref(),
+                &caller.account.id,
+                &webhook_id,
+            )
+            .map_err(|err| map_webhook_error(err, "webhooks/delete"))?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // `admin/send-email {to*, subject*, text*}`: enqueue one durable
+        // `EmailSend` job (the worker delivers through the configured
+        // SMTP transport; unconfigured answers `EMAIL_NOT_CONFIGURED`).
+        "admin/send-email" => {
+            check_allowed_fields(&obj, &["to", "subject", "text"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:email")?;
+            require_admin(&caller)?;
+            state.rate_limiter.check(&rate_key, "admin/send-email")?;
+            if EMAIL_SENDER.get().is_none() {
+                return Err(ApiError::email_not_configured());
+            }
+            let to = required_str(&obj, "to")?;
+            if !email_shape_valid(&to) {
+                return Err(ApiError::invalid_param("to", "must be an email address"));
+            }
+            let subject = required_str(&obj, "subject")?;
+            let text = required_str(&obj, "text")?;
+            let now = state.services.clock.now_ms();
+            let payload = EmailSendPayload {
+                to: vec![to.clone()],
+                subject,
+                body: text,
+                dedup_key: format!("admin-send:{}:{now}", caller.account.id),
+            };
+            let job = NewJob::new_json(
+                JobKind::EmailSend,
+                &payload,
+                format!("email:admin-send:{}:{now}", caller.account.id),
+                now,
+            )
+            .map_err(ApiError::from_port_error)?;
+            state
+                .services
+                .jobs
+                .enqueue_jobs(vec![job])
+                .map_err(ApiError::from_port_error)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // --- Gaps final wiring: social reads -------------------------------
+        // `users/pages {userId!, ...cursor}`: that user's public pages,
+        // newest-first. Unknown users yield `[]` (upstream parity). Public:
+        // no credential required.
+        "users/pages" => {
+            check_allowed_fields(
+                &obj,
+                &["userId", "limit", "sinceId", "untilId", "sinceDate", "untilDate"],
+            )?;
+            let viewer = caller.as_ref().map(|caller| caller.account.id.clone());
+            let user_id = required_str(&obj, "userId")?;
+            let cursor = parse_cursor(&obj)?;
+            let pages = state
+                .services
+                .pages_of_user(&user_id, &cursor)
+                .map_err(ApiError::from_port_error)?;
+            let mut out = Vec::with_capacity(pages.len());
+            for page in &pages {
+                out.push(
+                    pack_page(page, viewer.as_deref(), &state.services)
+                        .map_err(ApiError::from_port_error)?,
+                );
+            }
+            Ok(Json(Value::Array(out)).into_response())
+        }
+
+        // `users/lists/create-from-public {name!, listId!}`: copy the
+        // members of another user's public list into a new private list.
+        "users/lists/create-from-public" => {
+            check_allowed_fields(&obj, &["name", "listId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:account")?;
+            state
+                .rate_limiter
+                .check(&rate_key, "users/lists/create-from-public")?;
+            let name = required_str(&obj, "name")?;
+            if name.chars().count() > 100 {
+                return Err(ApiError::invalid_param(
+                    "name",
+                    "must be at most 100 chars",
+                ));
+            }
+            let list_id = required_str(&obj, "listId")?;
+            let list = state
+                .services
+                .create_list_from_public(&caller.account.id, name, &list_id)
+                .map_err(|err| map_list_error(err, "users/lists/create-from-public"))?;
+            // The source members were just copied in; pack the member ids
+            // for the `UserList` shape (same pattern as `users/lists/show`).
+            let members = state
+                .services
+                .lists
+                .members_of_list(&list.id)
+                .map_err(ApiError::from_port_error)?;
+            let ids = members
+                .iter()
+                .map(|member| member.member_id.clone())
+                .collect::<Vec<_>>();
+            Ok(Json(pack_user_list(&list, &ids, &state.services)).into_response())
         }
 
         _ => Err(ApiError::unknown_endpoint()),
@@ -10793,6 +13918,12 @@ mod tests {
             registry: store.clone(),
             clips: store.clone(),
             pages: store.clone(),
+            folders: store.clone(),
+            system_webhooks: store.clone(),
+            user_webhooks: store.clone(),
+            abuse_recipients: store.clone(),
+            memos: store.clone(),
+            thread_mutes: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()
@@ -10828,6 +13959,8 @@ mod tests {
             delivery_tracker: Arc::new(DestinationTracker::new()),
             lease_duration_ms: 30_000,
             base_backoff_ms: 1_000,
+            transcode_config: TranscodeConfig::default(),
+            email_sender: Arc::new(SmtpEmailSender::new(SmtpConfig::default())),
         });
         let rate_limiter = Arc::new(RateLimiter::with_misskey_defaults(clock.clone()));
         let upload_slots = Arc::new(UploadSlots::with_defaults());
@@ -14806,7 +17939,6 @@ mod tests {
         // Param validation.
         for (body, param) in [
             (serde_json::json!({ "sort": "newest" }), "sort"),
-            (serde_json::json!({ "folderId": "did00000000000001" }), "folderId"),
             (serde_json::json!({ "type": "not a mime!!" }), "type"),
             (serde_json::json!({ "limit": 0 }), "limit"),
         ] {
@@ -14814,6 +17946,16 @@ mod tests {
             assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
             assert_eq!(value["code"], "INVALID_PARAM", "param {param}");
         }
+        // Folder-aware listing (gaps WP2a final wiring): a missing/foreign
+        // folder matches nothing (→ `[]`), it is no longer rejected.
+        let (status, value) = call(
+            &state,
+            "drive/files",
+            serde_json::json!({ "folderId": "did00000000000001" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!((status, value), (StatusCode::OK, serde_json::json!([])));
         // All six Misskey sort variants are honored (inverted mapping).
         for sort in ["+createdAt", "-createdAt", "+name", "-name", "+size", "-size"] {
             let (status, value) = call(

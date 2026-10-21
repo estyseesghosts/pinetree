@@ -1,9 +1,14 @@
 use std::sync::Arc;
 
 use crate::application::ports::{
-    AbuseReportStore, AccountStore, ActivityDedup, AntennaNoteStore, AntennaStore, AuthStore, BlobStore, BlockStore, ClipStore, Clock, EmojiStore, FavoriteStore, FollowStore, HostCapsStore,
+    AbuseReportRecipientStore, AbuseReportStore, AccountStore, ActivityDedup, AntennaNoteStore,
+    AntennaStore, AuthStore, BlobStore, BlockStore, ClipStore, Clock,
+    DriveFolderStore, EmojiStore, FavoriteStore, FollowStore, HostCapsStore,
     IdGenerator, InstanceSettingsStore, InviteStore, JobQueue, MediaStore, ModerationLogStore,
-    MuteStore, NoteStore, NotificationStore, PageStore, PasswordResetStore, PollStore, ReactionStore, RegistryStore, SigninStore, StreamingSink, UserListStore,
+    MuteStore, NoteStore, NoteThreadMuteStore, NotificationStore, PageStore, PasswordResetStore,
+    PollStore, ReactionStore, RegistryStore, SigninStore, StreamingSink, SystemWebhookStore,
+    UserListStore,
+    UserMemoStore, UserWebhookStore,
 };
 use crate::federation::delivery::SafeHttpClient;
 
@@ -94,6 +99,18 @@ pub struct AppServices {
     pub clips: Arc<dyn ClipStore>,
     /// Pages (federated clips + pages handoff, Phase 3 local).
     pub pages: Arc<dyn PageStore>,
+    /// Drive folders (gaps WP2a; real folder model + `folderId`).
+    pub folders: Arc<dyn DriveFolderStore>,
+    /// System webhooks (gaps WP3; admin-owned instance events).
+    pub system_webhooks: Arc<dyn SystemWebhookStore>,
+    /// Per-user webhooks (gaps WP3; owner-scoped).
+    pub user_webhooks: Arc<dyn UserWebhookStore>,
+    /// Abuse-report notification recipients (gaps WP3; email fan-out).
+    pub abuse_recipients: Arc<dyn AbuseReportRecipientStore>,
+    /// Per-user memos on other users (gaps WP2a; `users/update-memo`).
+    pub memos: Arc<dyn UserMemoStore>,
+    /// Thread mutes (gaps WP2a; `notes/thread-muting/*`).
+    pub thread_mutes: Arc<dyn NoteThreadMuteStore>,
     pub federation_http: SafeHttpClient,
     pub public_url: String,
     pub max_file_size: u64,

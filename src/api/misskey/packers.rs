@@ -14,6 +14,7 @@ use crate::application::ports::PortError;
 use crate::domain::account::{Account, FollowVisibility};
 use crate::domain::blocking::Blocking;
 use crate::domain::draft::NoteDraft;
+use crate::domain::drive_folder::DriveFolder;
 use crate::domain::follow::Follow;
 use crate::domain::instance::InviteCode;
 use crate::domain::muting::{Muting, RenoteMuting};
@@ -23,6 +24,8 @@ use crate::domain::note::{Note, Visibility};
 use crate::domain::notification::{Notification, NotificationKind};
 use crate::domain::reaction::Reaction;
 use crate::domain::visibility::{ViewerContext, is_visible};
+use crate::domain::webhook::SystemWebhook;
+use crate::domain::webhook::UserWebhook;
 
 /// Misskey server version we claim compatibility with.
 pub use crate::activitypub::PACKER_VERSION;
@@ -1465,10 +1468,66 @@ pub fn pack_drive_file(media: &MediaMeta, services: &AppServices) -> Value {
         "url": media.url,
         "thumbnailUrl": media.thumbnail_url,
         "comment": media.comment,
-        "folderId": null,
+        "folderId": drive_file_folder_id(media, services),
         "folder": null,
         "userId": media.owner_id,
         "user": null,
+    })
+}
+
+/// Resolve a file's packed `folderId` through the durable folder mapping
+/// (gaps WP2a final wiring; `None`/unmapped/explicit-root all pack as
+/// null, upstream parity). Fail-open to null: the pack path is infallible
+/// and the arm already validated placement.
+fn drive_file_folder_id(media: &MediaMeta, services: &AppServices) -> Value {
+    match services.folders.file_folder_id(&media.id) {
+        Ok(placement) => match placement.flatten() {
+            Some(folder_id) => Value::String(folder_id),
+            None => Value::Null,
+        },
+        Err(_) => Value::Null,
+    }
+}
+
+/// Pack one drive folder (gaps WP2a; upstream `MiDriveFolder` shape: the
+/// folder rows carry no timestamps, so no `createdAt`).
+pub fn pack_drive_folder(folder: &DriveFolder) -> Value {
+    serde_json::json!({
+        "id": folder.id,
+        "name": folder.name,
+        "parentId": folder.parent_id,
+        "userId": folder.owner_id,
+    })
+}
+
+/// Pack one system webhook (admin view; the secret is included because the
+/// arm is admin-gated, mirroring the owner-view webhook pack below).
+pub fn pack_system_webhook(row: &SystemWebhook) -> Value {
+    serde_json::json!({
+        "id": row.id,
+        "name": row.name,
+        "url": row.url,
+        "secret": row.secret,
+        "trigger": row.trigger,
+        "isActive": row.is_active,
+        "createdAt": format_millis(row.created_at_ms),
+        "updatedAt": format_millis(row.updated_at_ms),
+    })
+}
+
+/// Pack one user webhook (owner view; includes the HMAC secret the owner
+/// needs to verify deliveries).
+pub fn pack_user_webhook(row: &UserWebhook) -> Value {
+    serde_json::json!({
+        "id": row.id,
+        "userId": row.owner_id,
+        "name": row.name,
+        "url": row.url,
+        "secret": row.secret,
+        "trigger": row.trigger,
+        "isActive": row.is_active,
+        "createdAt": format_millis(row.created_at_ms),
+        "updatedAt": format_millis(row.updated_at_ms),
     })
 }
 
@@ -2408,6 +2467,7 @@ pub fn pack_meta(services: &AppServices, detail: bool) -> Result<Value, PortErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::commands::tests::UnavailableStores;
     use std::collections::{BTreeMap, HashMap, HashSet};
     use std::sync::{Arc, Mutex};
 
@@ -3591,6 +3651,12 @@ mod tests {
             registry: mem.clone(),
             clips: mem.clone(),
             pages: mem.clone(),
+            folders: Arc::new(UnavailableStores),
+            system_webhooks: Arc::new(UnavailableStores),
+            user_webhooks: Arc::new(UnavailableStores),
+            abuse_recipients: Arc::new(UnavailableStores),
+            memos: Arc::new(UnavailableStores),
+            thread_mutes: Arc::new(UnavailableStores),
             federation_http: crate::federation::delivery::SafeHttpClient::new(
                 crate::federation::delivery::SafeHttpConfig {
                     allow_private_ips: true,

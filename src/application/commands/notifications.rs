@@ -145,6 +145,8 @@ mod tests {
     use crate::domain::note::Visibility;
     use crate::federation::delivery::{SafeHttpClient, SafeHttpConfig};
     use crate::jobs::worker::JobWorker;
+    use crate::media::transcode::TranscodeConfig;
+    use crate::services::email::{SmtpConfig, SmtpEmailSender};
     use crate::media::storage::FsBlobStore;
     use crate::persistence::redb::RedbStore;
 
@@ -195,6 +197,12 @@ mod tests {
             registry: store.clone(),
             clips: store.clone(),
             pages: store.clone(),
+            folders: store.clone(),
+            system_webhooks: store.clone(),
+            user_webhooks: store.clone(),
+            abuse_recipients: store.clone(),
+            memos: store.clone(),
+            thread_mutes: store.clone(),
             federation_http: SafeHttpClient::new(SafeHttpConfig {
                 allow_private_ips: true,
                 ..Default::default()
@@ -234,6 +242,8 @@ mod tests {
             delivery_tracker: Arc::new(crate::federation::retry::DestinationTracker::new()),
             lease_duration_ms: 30_000,
             base_backoff_ms: 1_000,
+            transcode_config: TranscodeConfig::default(),
+            email_sender: Arc::new(SmtpEmailSender::new(SmtpConfig::default())),
         }
     }
 

@@ -517,6 +517,25 @@ impl AppServices {
             .update_account_logged(account_id, patch, log, Vec::new())
     }
 
+    /// `users/update-memo {userId*, memo?}`: replace the memo the caller
+    /// keeps about `target_id` (`None`/empty clears the row). Both
+    /// accounts must exist (`NO_SUCH_USER` on a missing target; self-memos
+    /// allowed, upstream parity). Returns the stored memo (`None` cleared).
+    pub fn update_memo(
+        &self,
+        owner_id: &str,
+        target_id: &str,
+        memo: Option<String>,
+    ) -> Result<Option<String>, PortError> {
+        self.accounts.get_owner(owner_id)?;
+        self.accounts
+            .find_by_id(target_id)?
+            .ok_or_else(|| PortError::NotFound("NO_SUCH_USER".to_string()))?;
+        let memo = memo.filter(|text| !text.is_empty());
+        self.memos.set_memo(owner_id, target_id, memo.clone())?;
+        Ok(memo)
+    }
+
     /// Re-export for callers that only need token bookkeeping through commands.
     pub fn store_token(&self, record: ApiTokenRecord) -> Result<(), PortError> {
         self.auth.store_token(record)

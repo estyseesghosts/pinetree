@@ -12,11 +12,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use pinetree::application::commands::AppServices;
-use pinetree::application::commands::drive_folders::DriveFolderStore;
 use pinetree::application::commands::pages::PageBody;
 use pinetree::application::ports::{
-    BlobStore, Clock, CreateNoteInput, IdGenerator, NewJob, NoopStreamingSink, PortError,
-    TimelineCursor,
+    BlobStore, Clock, CreateNoteInput, DriveFolderStore, IdGenerator, NewJob, NoopStreamingSink,
+    PortError, TimelineCursor,
 };
 use pinetree::domain::drive_folder::DriveFolder;
 use pinetree::domain::id::{AidxGenerator, ManualClock};
@@ -68,6 +67,12 @@ fn test_services(prefix: &str) -> AppServices {
         registry: store.clone(),
         clips: store.clone(),
         pages: store.clone(),
+        folders: store.clone(),
+        system_webhooks: store.clone(),
+        user_webhooks: store.clone(),
+        abuse_recipients: store.clone(),
+        memos: store.clone(),
+        thread_mutes: store.clone(),
         federation_http: SafeHttpClient::new(SafeHttpConfig {
             allow_private_ips: true,
             ..Default::default()
