@@ -42,6 +42,10 @@ pub enum NotificationKind {
     /// A page received a remote `Like` (pinetree-only wire `pageLiked`).
     /// DIVERGENCE — closes the silent-likes gap.
     PageLiked,
+    /// A poll reached its expiry (Misskey stream `pollEnded` parity: the
+    /// `PollExpiry` worker publishes the streaming event; this kind lets
+    /// `i/notifications` filter it like every other kind).
+    PollEnded,
 }
 
 impl NotificationKind {
@@ -65,6 +69,7 @@ impl NotificationKind {
             NotificationKind::Test => "test",
             NotificationKind::ClipUpdated => "clipUpdated",
             NotificationKind::PageLiked => "pageLiked",
+            NotificationKind::PollEnded => "pollEnded",
         }
     }
 }

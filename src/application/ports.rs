@@ -7,7 +7,11 @@ use crate::domain::account::{
 };
 use crate::domain::blocking::Blocking;
 use crate::domain::draft::NoteDraft;
+use crate::domain::drive_folder::DriveFolder;
 use crate::domain::follow::{Follow, FollowNotify, FollowRequest};
+use crate::domain::webhook::AbuseReportRecipient;
+use crate::domain::webhook::SystemWebhook;
+use crate::domain::webhook::UserWebhook;
 use crate::domain::instance::{InstanceSettings, InviteCode, RegistrationPolicy, UgcVisibilityForVisitor};
 use crate::domain::moderation::{AbuseReport, AbuseReportResolution, ModerationAction, ModerationLogEntry};
 use crate::domain::muting::{Muting, RenoteMuting};
@@ -880,6 +884,34 @@ pub enum JobKind {
     /// [`BackfillDurablePayload`]. Idempotent: setters overwrite with the
     /// recomputed sums; a full batch returns a continuation cursor.
     BackfillDurableAccounting,
+    /// Post-commit media transcode (gaps WP1): finish processing staged
+    /// upload bytes off-request (ffmpeg stills/video, legacy pure-Rust
+    /// dims otherwise) and re-commit the row under the same id. The payload
+    /// is `crate::jobs::transcode::TranscodeJobPayload` (ids only, never
+    /// file content, per the 64KiB cap). Idempotent: a missing row, or a
+    /// row already in target shape with committed dims, converges quietly
+    /// (`Noop`); the idempotency key is `transcode-media:{file_id}` so
+    /// re-enqueues never stack duplicate ffmpeg runs. Reuses the worker's
+    /// standard lease/backoff.
+    TranscodeMedia,
+    /// Outbound webhook delivery (gaps WP3): cooldown-aware signed POST of
+    /// one subscriber event. The payload is
+    /// `crate::application::commands::webhooks::WebhookDeliverPayload`
+    /// (URL + secret ride along so the worker needs no store read; well
+    /// under the 64KiB cap). Idempotent: the idempotency key is the
+    /// per-(webhook, event, dedup) key minted by the `plan_*` helpers, so
+    /// replays dedupe. Transient failures retry with the worker's standard
+    /// backoff; SSRF-blocked URLs quarantine permanently, never retry.
+    WebhookDeliver,
+    /// Outbound email delivery (gaps WP3): plain-text submission through
+    /// the configured SMTP relay. The payload is
+    /// `crate::services::email::EmailSendPayload` (recipients + rendered
+    /// text only, at most one recipient set per job). Idempotent: the
+    /// idempotency key is the caller-supplied `dedup_key` scope (e.g.
+    /// `email:abuse-report:{report}:{email}`), so a replay re-sends the
+    /// same bytes under the same key. Reuses the worker's standard
+    /// lease/backoff.
+    EmailSend,
 }
 
 /// Maximum `fail()` retries before a job is auto-quarantined as
@@ -1018,6 +1050,15 @@ pub trait JobQueue: Send + Sync {
         let _ = draft_id;
         Ok(0)
     }
+    /// True when any pending (claimable or leased, but not quarantined) job
+    /// carries `key` as its idempotency key. Drives the durable replay gate
+    /// for keyed fan-out (e.g. one transcode job per file id): the producer
+    /// checks this before enqueueing so a re-run converges instead of
+    /// stacking duplicates. Defaults to `false` so in-memory test doubles
+    /// keep compiling; durable backends must override it.
+    fn has_pending_with_key(&self, _key: &str) -> Result<bool, PortError> {
+        Ok(false)
+    }
 }
 
 pub trait FollowStore: Send + Sync {
@@ -1116,6 +1157,34 @@ pub trait FollowStore: Send + Sync {
         Err(PortError::StorageUnavailable(
             "FollowStore::remove_follow_request not implemented".to_string(),
         ))
+    }
+    /// Rewrite the `with_replies` flag and notify preference of a live edge
+    /// (`following/update` parity: `withReplies`, `notify`).
+    /// `NotFound(NOT_FOLLOWING)` when no edge exists. `jobs` commit in the
+    /// same transaction (federated `Update(Follow)` fan-out).
+    fn update_follow_options(
+        &self,
+        follower_id: &str,
+        followee_id: &str,
+        with_replies: bool,
+        notify: Option<FollowNotify>,
+        jobs: Vec<NewJob>,
+    ) -> Result<Follow, PortError> {
+        let _ = (follower_id, followee_id, with_replies, notify, jobs);
+        Err(PortError::StorageUnavailable(
+            "FollowStore::update_follow_options not implemented".to_string(),
+        ))
+    }
+    /// Pending requests sent by `follower_id` (`following/requests/sent`
+    /// parity), ordered by followee id. Mirrors [`FollowStore::follow_requests_to`].
+    fn follow_requests_from(
+        &self,
+        follower_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<FollowRequest>, PortError> {
+        let _ = (follower_id, cursor, limit);
+        Ok(Vec::new())
     }
 }
 
@@ -2075,6 +2144,14 @@ pub trait MediaStore: Send + Sync {
     fn durable_bytes(&self, _owner_id: &str) -> Result<u64, PortError> {
         Ok(0)
     }
+    /// Total stored drive-file rows, local and remote (`admin/drive`
+    /// `filesCount` parity). Defaults to `StorageUnavailable` like
+    /// [`NoteStore::count_notes`]; durable backends must override it.
+    fn count_drive_files(&self) -> Result<u64, PortError> {
+        Err(PortError::StorageUnavailable(
+            "MediaStore::count_drive_files not implemented".to_string(),
+        ))
+    }
     /// Live metadata references to `blob_key` (0 ⇒ bytes may be deleted).
     /// Test-double default: unreferenced.
     fn blob_refcount(&self, _blob_key: &str) -> Result<u64, PortError> {
@@ -2613,6 +2690,13 @@ pub trait ClipStore: Send + Sync {
     /// Newest-first note ids of one clip (bounded by the per-clip cap).
     fn clip_note_ids(&self, clip_id: &str) -> Result<Vec<String>, PortError>;
     fn count_clip_notes(&self, clip_id: &str) -> Result<u64, PortError>;
+    /// Clip ids containing `note_id` (`notes/clips` parity: which of the
+    /// caller's clips hold this note). Defaults to empty so in-memory test
+    /// doubles keep compiling; durable backends must override it.
+    fn clip_ids_for_note(&self, note_id: &str) -> Result<Vec<String>, PortError> {
+        let _ = note_id;
+        Ok(Vec::new())
+    }
     /// Favorite one clip (idempotent insert). Returns true when the row
     /// was newly added.
     fn favorite_clip(&self, fav: crate::domain::clip::ClipFavorite) -> Result<bool, PortError>;
@@ -3112,4 +3196,185 @@ pub trait InviteStore: Send + Sync {
         &self,
         input: ConsumeInviteInput,
     ) -> Result<(Account, InviteCode), PortError>;
+}
+
+// ---------------------------------------------------------------------------
+// Gaps WP2a: drive folders (moved verbatim from
+// `src/application/commands/drive_folders.rs`; the original kept working
+// through its explicit `&dyn DriveFolderStore` parameter until the parent
+// wires an `AppServices.folders` field and the redb implementation).
+// ---------------------------------------------------------------------------
+
+/// Drive-folder + file-folder-index store.
+///
+/// One storage transaction commits each mutation with `jobs` (same
+/// discipline as `MediaStore`/`UserListStore`). The file-folder index maps
+/// media rows to folders: files with no mapping row read as drive-root
+/// (`folder_id == None`), matching upstream's nullable `folderId` column.
+pub trait DriveFolderStore: Send + Sync {
+    /// Insert one folder row with `jobs`, one transaction.
+    fn create_folder(
+        &self,
+        folder: DriveFolder,
+        jobs: Vec<NewJob>,
+    ) -> Result<DriveFolder, PortError>;
+    /// The live folder `id`, if any. No ownership check (the op enforces
+    /// it so error precedence matches upstream: miss and foreign both read
+    /// as `NO_SUCH_FOLDER`).
+    fn get_folder(&self, id: &str) -> Result<Option<DriveFolder>, PortError>;
+    /// Rewrite name/parent with `jobs`, one transaction.
+    fn update_folder(
+        &self,
+        folder: DriveFolder,
+        jobs: Vec<NewJob>,
+    ) -> Result<DriveFolder, PortError>;
+    /// Delete the row with `jobs`, one transaction. The op checks
+    /// emptiness first (`HAS_CHILD_FILES_OR_FOLDERS`).
+    fn delete_folder(&self, id: &str, jobs: Vec<NewJob>) -> Result<(), PortError>;
+    /// Owner's folders under `parent_id` (`None` = drive root), id-ordered.
+    fn child_folders(
+        &self,
+        owner_id: &str,
+        parent_id: Option<&str>,
+    ) -> Result<Vec<DriveFolder>, PortError>;
+    /// `drive/folders/find` parity: owner's folders with `name` under
+    /// `parent_id` (`None` = root).
+    fn find_folders_by_name(
+        &self,
+        owner_id: &str,
+        name: &str,
+        parent_id: Option<&str>,
+    ) -> Result<Vec<DriveFolder>, PortError>;
+    /// Number of folders whose parent is `folder_id`.
+    fn count_child_folders(&self, folder_id: &str) -> Result<u64, PortError>;
+    /// Point `file_id` at `folder_id` (`None` = drive root) with `jobs`,
+    /// one transaction.
+    fn set_file_folder(
+        &self,
+        file_id: &str,
+        folder_id: Option<&str>,
+        jobs: Vec<NewJob>,
+    ) -> Result<(), PortError>;
+    /// Current placement: `None` = no mapping row (drive root by default),
+    /// `Some(x)` = mapped (possibly root via `Some(None)`).
+    fn file_folder_id(&self, file_id: &str) -> Result<Option<Option<String>>, PortError>;
+    /// Number of files mapped directly under `folder_id`.
+    fn count_files_in_folder(&self, folder_id: &str) -> Result<u64, PortError>;
+}
+
+// ---------------------------------------------------------------------------
+// Gaps WP2a: follow options, user memos, thread mutes.
+// ---------------------------------------------------------------------------
+
+/// Per-pair memo text (`users/update-memo` parity: one free-form memo the
+/// caller keeps about another account).
+pub trait UserMemoStore: Send + Sync {
+    /// Replace the memo `owner_id` keeps about `target_id` (`None` clears
+    /// it). Upsert in one transaction; missing accounts are validated by
+    /// the caller, not the store.
+    fn set_memo(
+        &self,
+        owner_id: &str,
+        target_id: &str,
+        memo: Option<String>,
+    ) -> Result<(), PortError>;
+    /// The memo `owner_id` keeps about `target_id`, if any.
+    fn get_memo(&self, owner_id: &str, target_id: &str) -> Result<Option<String>, PortError>;
+}
+
+/// Per-user thread mutes (`notes/thread-muting/*` parity: hiding one
+/// reply-tree for the muting user only; never touches follow edges).
+pub trait NoteThreadMuteStore: Send + Sync {
+    /// Mute `note_id`'s thread for `user_id`. Returns true when the row
+    /// was newly added (idempotent: repeats return false).
+    fn mute_thread(&self, user_id: &str, note_id: &str) -> Result<bool, PortError>;
+    /// Unmute `note_id`'s thread for `user_id`. Returns true when a row
+    /// existed (idempotent: repeats return false).
+    fn unmute_thread(&self, user_id: &str, note_id: &str) -> Result<bool, PortError>;
+    /// True when `user_id` muted `note_id`'s thread.
+    fn is_thread_muted(&self, user_id: &str, note_id: &str) -> Result<bool, PortError>;
+}
+
+// ---------------------------------------------------------------------------
+// Gaps WP3: webhooks + abuse-report recipients (moved verbatim from
+// `src/application/commands/webhooks.rs`; the command module keeps its
+// copies working until the parent wires the redb tables and the
+// `AppServices` fields).
+// ---------------------------------------------------------------------------
+
+/// Durable system-webhook rows + trigger index.
+pub trait SystemWebhookStore: Send + Sync {
+    fn insert_system_webhook(&self, row: SystemWebhook) -> Result<SystemWebhook, PortError>;
+    fn get_system_webhook(&self, id: &str) -> Result<Option<SystemWebhook>, PortError>;
+    fn list_system_webhooks(&self) -> Result<Vec<SystemWebhook>, PortError>;
+    fn put_system_webhook(&self, row: SystemWebhook) -> Result<SystemWebhook, PortError>;
+    fn delete_system_webhook(&self, id: &str) -> Result<bool, PortError>;
+    fn active_system_webhooks_for(
+        &self,
+        trigger: &str,
+        limit: usize,
+    ) -> Result<Vec<SystemWebhook>, PortError>;
+}
+
+/// Durable per-user webhook rows + (owner, id) and trigger indexes.
+pub trait UserWebhookStore: Send + Sync {
+    fn insert_user_webhook(&self, row: UserWebhook) -> Result<UserWebhook, PortError>;
+    fn get_user_webhook(&self, id: &str) -> Result<Option<UserWebhook>, PortError>;
+    fn list_user_webhooks(&self, owner_id: &str) -> Result<Vec<UserWebhook>, PortError>;
+    fn count_user_webhooks(&self, owner_id: &str) -> Result<usize, PortError>;
+    fn put_user_webhook(&self, row: UserWebhook) -> Result<UserWebhook, PortError>;
+    fn delete_user_webhook(&self, id: &str) -> Result<bool, PortError>;
+    fn active_user_webhooks_for(
+        &self,
+        owner_id: &str,
+        trigger: &str,
+        limit: usize,
+    ) -> Result<Vec<UserWebhook>, PortError>;
+}
+
+/// Durable abuse-report notification recipients.
+pub trait AbuseReportRecipientStore: Send + Sync {
+    fn insert_recipient(
+        &self,
+        row: AbuseReportRecipient,
+    ) -> Result<AbuseReportRecipient, PortError>;
+    fn get_recipient(&self, id: &str) -> Result<Option<AbuseReportRecipient>, PortError>;
+    fn list_recipients(&self) -> Result<Vec<AbuseReportRecipient>, PortError>;
+    fn put_recipient(
+        &self,
+        row: AbuseReportRecipient,
+    ) -> Result<AbuseReportRecipient, PortError>;
+    fn delete_recipient(&self, id: &str) -> Result<bool, PortError>;
+    fn active_recipient_emails(&self, limit: usize) -> Result<Vec<String>, PortError>;
+}
+
+// ---------------------------------------------------------------------------
+// Gaps WP5: durable `Accept`-activity index (the process-local
+// `ActivityIdIndex` in `crate::federation` closes the single-node gap;
+// this trait is its durable replacement so a restart can still resolve a
+// bare-IRI `Undo{object: <accept-id>}` to the follow pair it revokes).
+// ---------------------------------------------------------------------------
+
+/// Durable `Accept(Follow)` activity index (`Undo(Accept)` by-ID support).
+///
+/// A bare-IRI `Undo{object: <accept-id>}` carries no embedded `Follow`, so
+/// the pair it revokes resolves only through a previously recorded
+/// `Accept`. The inbox records every embedded `Accept(Follow)` here; the
+/// `Undo` path consults it. Bounded by the backend (the process-local map
+/// caps at `ACTIVITY_INDEX_CAP`; the durable table evicts oldest-first
+/// past the same bound).
+pub trait ActivityIndex: Send + Sync {
+    /// Record an `Accept(Follow)` grant. No-op on empty ids.
+    fn record_accept(
+        &self,
+        accept_id: &str,
+        follower_actor_uri: &str,
+        followee_actor_uri: &str,
+    ) -> Result<(), PortError>;
+    /// Look up a previously recorded `Accept(Follow)` by activity id.
+    fn lookup_accept(&self, accept_id: &str) -> Result<Option<(String, String)>, PortError>;
+    /// Forget one entry (used after a successful by-ID undo so a replayed
+    /// `Undo` cannot unfollow a later re-follow: the next embedded
+    /// `Accept` re-seeds when the follow is re-granted).
+    fn forget_accept(&self, accept_id: &str) -> Result<(), PortError>;
 }
