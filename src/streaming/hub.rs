@@ -43,6 +43,23 @@ pub enum HubMessage {
     },
     /// A captured note's poll expired.
     PollEnded { note_id: String },
+    /// A public note entered a role timeline (fanned to `roleTimeline`
+    /// channels subscribed to that role; no producer yet — see
+    /// [`StreamingEvent::RoleTimelineNote`]).
+    RoleTimelineNote { role_id: String, note_id: String },
+    /// A drive file changed (fanned to the owner's `drive` channels;
+    /// packed at socket time, deletes carry only the id).
+    DriveFile { user_id: String, event: DriveFileEvent, file_id: String },
+    /// A drive folder changed (fanned to the owner's `drive` channels;
+    /// bodies are `{id}` until the WP2 folder packer lands).
+    DriveFolder { user_id: String, event: DriveFolderEvent, folder_id: String },
+    /// A clip changed (fanned to `clip` channels for that clip; both
+    /// events carry a null body, upstream parity).
+    Clip { clip_id: String, deleted: bool },
+    /// An abuse report was filed (fanned to every `admin` channel —
+    /// connect already requires moderator powers; packed at socket time
+    /// from the report row).
+    AdminReport { report_id: String },
     /// A captured note was edited: subscribers refetch it.
     NoteUpdated { note_id: String },
     /// An antenna feed gained a note (Batch N WS4).
@@ -61,6 +78,42 @@ pub enum HubMessage {
     /// The account was suspended: connections authenticated as it close
     /// (Batch M WP3). Anonymous sockets and other users' sockets ignore it.
     UserSuspended { account_id: String },
+}
+
+/// One drive-file stream event (Misskey `DriveEventTypes` parity).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriveFileEvent {
+    Created,
+    Updated,
+    Deleted,
+}
+
+impl DriveFileEvent {
+    pub fn wire_name(&self) -> &'static str {
+        match self {
+            DriveFileEvent::Created => "fileCreated",
+            DriveFileEvent::Updated => "fileUpdated",
+            DriveFileEvent::Deleted => "fileDeleted",
+        }
+    }
+}
+
+/// One drive-folder stream event (Misskey `DriveEventTypes` parity).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriveFolderEvent {
+    Created,
+    Updated,
+    Deleted,
+}
+
+impl DriveFolderEvent {
+    pub fn wire_name(&self) -> &'static str {
+        match self {
+            DriveFolderEvent::Created => "folderCreated",
+            DriveFolderEvent::Updated => "folderUpdated",
+            DriveFolderEvent::Deleted => "folderDeleted",
+        }
+    }
 }
 
 /// Process-wide broadcast hub. `send` is synchronous and never blocks a
@@ -188,6 +241,60 @@ impl StreamingSink for BroadcastStreamingSink {
             }),
             StreamingEvent::PollEnded { note_id } => {
                 self.hub.send(HubMessage::PollEnded { note_id });
+            }
+            StreamingEvent::RoleTimelineNote { role_id, note_id } => {
+                self.hub.send(HubMessage::RoleTimelineNote { role_id, note_id });
+            }
+            StreamingEvent::DriveFileCreated { user_id, file_id } => {
+                self.hub.send(HubMessage::DriveFile {
+                    user_id,
+                    event: DriveFileEvent::Created,
+                    file_id,
+                });
+            }
+            StreamingEvent::DriveFileUpdated { user_id, file_id } => {
+                self.hub.send(HubMessage::DriveFile {
+                    user_id,
+                    event: DriveFileEvent::Updated,
+                    file_id,
+                });
+            }
+            StreamingEvent::DriveFileDeleted { user_id, file_id } => {
+                self.hub.send(HubMessage::DriveFile {
+                    user_id,
+                    event: DriveFileEvent::Deleted,
+                    file_id,
+                });
+            }
+            StreamingEvent::DriveFolderCreated { user_id, folder_id } => {
+                self.hub.send(HubMessage::DriveFolder {
+                    user_id,
+                    event: DriveFolderEvent::Created,
+                    folder_id,
+                });
+            }
+            StreamingEvent::DriveFolderUpdated { user_id, folder_id } => {
+                self.hub.send(HubMessage::DriveFolder {
+                    user_id,
+                    event: DriveFolderEvent::Updated,
+                    folder_id,
+                });
+            }
+            StreamingEvent::DriveFolderDeleted { user_id, folder_id } => {
+                self.hub.send(HubMessage::DriveFolder {
+                    user_id,
+                    event: DriveFolderEvent::Deleted,
+                    folder_id,
+                });
+            }
+            StreamingEvent::ClipUpdated { clip_id } => {
+                self.hub.send(HubMessage::Clip { clip_id, deleted: false });
+            }
+            StreamingEvent::ClipDeleted { clip_id } => {
+                self.hub.send(HubMessage::Clip { clip_id, deleted: true });
+            }
+            StreamingEvent::AdminReport { report_id } => {
+                self.hub.send(HubMessage::AdminReport { report_id });
             }
             StreamingEvent::NoteUpdated { note_id } => {
                 self.hub.send(HubMessage::NoteUpdated { note_id });
