@@ -56,6 +56,9 @@ pub struct AppServices {
     pub jobs: Arc<dyn JobQueue>,
     pub media: Arc<dyn MediaStore>,
     pub blobs: Arc<dyn BlobStore>,
+    /// Remote-cache byte pool (`blobs_cache/`); `blobs` is the durable pool
+    /// (`blobs_durable/`, never evicted).
+    pub cache_blobs: Arc<dyn BlobStore>,
     pub notifications: Arc<dyn NotificationStore>,
     pub auth: Arc<dyn AuthStore>,
     pub streaming: Arc<dyn StreamingSink>,
@@ -99,4 +102,15 @@ pub struct AppServices {
     /// Instance-wide default like emoji (`default_like` config key;
     /// Sharkey/Catodon `defaultLike` parity). `None` means ❤.
     pub default_like: Option<String>,
+    /// Durable per-user quota + remote-cache budgets (from Config).
+    pub drive_capacity_per_user_bytes: u64,
+    pub remote_cache_max_bytes: u64,
+    pub remote_cache_avatar_bytes: u64,
+    pub remote_cache_preview_bytes: u64,
+    pub remote_cache_full_bytes: u64,
+    pub remote_cache_mode: crate::config::RemoteCacheMode,
+    pub remote_cache_avatar_ttl_days: u64,
+    pub remote_cache_preview_ttl_days: u64,
+    pub remote_cache_full_ttl_days: u64,
+    pub remote_cache_warming_enabled: bool,
 }

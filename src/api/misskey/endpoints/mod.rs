@@ -1311,12 +1311,40 @@ async fn serve_file(
         .ok_or_else(|| {
             ApiError::from_port_error(PortError::NotFound("NO_SUCH_FILE".to_string()))
         })?;
-    let bytes = state
-        .services
-        .blobs
+    // Durable pool for local uploads, cache pool for remote rows. A remote
+    // row whose bytes are absent (evicted) re-fetches on first request when
+    // the cache mode allows it; metadata + source_url are always retained.
+    let cached = meta.owner_id.is_none();
+    let pool: &Arc<dyn BlobStore> = if cached {
+        &state.services.cache_blobs
+    } else {
+        &state.services.blobs
+    };
+    let mut bytes = pool
         .get(&meta.blob_key)
-        .map_err(ApiError::from_port_error)?
-        .ok_or_else(ApiError::internal)?;
+        .map_err(ApiError::from_port_error)?;
+    if bytes.is_none() && cached {
+        if let Some(url) = meta.source_url.clone() {
+            if state.services.remote_cache_mode != crate::config::RemoteCacheMode::Disabled {
+                match crate::media::remote_cache::fetch_on_first_request(
+                    &state.services,
+                    &url,
+                    "original",
+                ) {
+                    Ok(refreshed) => {
+                        bytes = state
+                            .services
+                            .cache_blobs
+                            .get(&refreshed.blob_key)
+                            .map_err(ApiError::from_port_error)?;
+                    }
+                    Err(PortError::Validation(_)) => {}
+                    Err(e) => return Err(ApiError::from_port_error(e)),
+                }
+            }
+        }
+    }
+    let bytes = bytes.ok_or_else(ApiError::internal)?;
     let mut response = bytes.into_response();
     response.headers_mut().insert(
         CONTENT_TYPE,
@@ -8601,6 +8629,24 @@ fn api_dispatch_blocking(
             Ok(StatusCode::NO_CONTENT.into_response())
         }
 
+        // Storage overhaul: shell-free cache observability
+        // (`docs/remote-media-cache-plan.md` §5.6). Authenticated
+        // `read:drive` callers get totals, per-class breakdown, in-flight
+        // bytes, hits/misses, bytes fetched, evictions, failed origins.
+        "drive/cache/stats" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:drive")?;
+            let stats = state
+                .services
+                .media
+                .cache_stats()
+                .map_err(ApiError::from_port_error)?;
+            let value =
+                serde_json::to_value(&stats).map_err(|_| ApiError::internal())?;
+            Ok(Json(value).into_response())
+        }
+
         "notes/search" => {
             check_allowed_fields(
                 &obj,
@@ -10760,6 +10806,17 @@ mod tests {
             scheduled_note_limit: crate::domain::draft::DEFAULT_SCHEDULED_NOTE_LIMIT,
             pin_limit: crate::domain::pinning::DEFAULT_PIN_LIMIT,
             default_like: None,
+        cache_blobs: blobs.clone(),
+        drive_capacity_per_user_bytes: 1 << 30,
+        remote_cache_max_bytes: 512 << 20,
+        remote_cache_avatar_bytes: 128 << 20,
+        remote_cache_preview_bytes: 256 << 20,
+        remote_cache_full_bytes: 128 << 20,
+        remote_cache_mode: crate::config::RemoteCacheMode::OnDemand,
+        remote_cache_avatar_ttl_days: 30,
+        remote_cache_preview_ttl_days: 7,
+        remote_cache_full_ttl_days: 3,
+        remote_cache_warming_enabled: false,
         });
         let worker = Arc::new(JobWorker {
             clock: clock.clone(),

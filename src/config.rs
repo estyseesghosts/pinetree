@@ -16,6 +16,18 @@ impl Default for DeploymentMode {
     }
 }
 
+/// Remote-media cache operating mode (`docs/remote-media-cache-plan.md`
+/// §5). `Disabled` never fetches remote media, `OnDemand` fetches on first
+/// media request, `Warm` also runs background warming jobs (opt-in,
+/// relay-excluded).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteCacheMode {
+    Disabled,
+    #[default]
+    OnDemand,
+    Warm,
+}
 /// Server configuration. Validated before any services are built.
 ///
 /// JSON keys match the field names. Every key is optional in the file:
@@ -61,6 +73,28 @@ pub struct Config {
     /// local custom `:name:` works; unknown/custom-gated names still fall
     /// back to ❤ through the reaction gate at use time.
     pub default_like: Option<String>,
+    /// Durable (local-upload) bytes each user may hold (1 GiB default).
+    /// Enforced in-txn at `upload_media`/`upload-from-url`; excess fails
+    /// with `DRIVE_CAPACITY_EXCEEDED`. Over-quota rows predating the cap
+    /// stay readable/deletable (grandfathered).
+    pub drive_capacity_per_user_bytes: u64,
+    /// Global remote-cache budget (512 MiB default) covering all cached
+    /// remote bytes plus in-flight reservations.
+    pub remote_cache_max_bytes: u64,
+    /// Reserved class budgets inside the global cap (borrowing allowed):
+    /// avatars/emoji 128 MiB, previews 256 MiB, full originals 128 MiB.
+    pub remote_cache_avatar_bytes: u64,
+    pub remote_cache_preview_bytes: u64,
+    pub remote_cache_full_bytes: u64,
+    /// Fetch policy: `on_demand` (default) fetches on first media request,
+    /// `disabled` never fetches, `warm` also runs background warming jobs.
+    pub remote_cache_mode: RemoteCacheMode,
+    /// Per-class TTLs (days) driving LRU+TTL eviction preference.
+    pub remote_cache_avatar_ttl_days: u64,
+    pub remote_cache_preview_ttl_days: u64,
+    pub remote_cache_full_ttl_days: u64,
+    /// Opt-in background warming (relay-excluded). Off by default.
+    pub remote_cache_warming_enabled: bool,
 }
 
 impl Default for Config {
@@ -84,6 +118,16 @@ impl Default for Config {
             scheduled_note_limit: crate::domain::draft::DEFAULT_SCHEDULED_NOTE_LIMIT,
             pin_limit: crate::domain::pinning::DEFAULT_PIN_LIMIT,
             default_like: None,
+            drive_capacity_per_user_bytes: 1 << 30,
+            remote_cache_max_bytes: 512 << 20,
+            remote_cache_avatar_bytes: 128 << 20,
+            remote_cache_preview_bytes: 256 << 20,
+            remote_cache_full_bytes: 128 << 20,
+            remote_cache_mode: RemoteCacheMode::OnDemand,
+            remote_cache_avatar_ttl_days: 30,
+            remote_cache_preview_ttl_days: 7,
+            remote_cache_full_ttl_days: 3,
+            remote_cache_warming_enabled: false,
         }
     }
 }
@@ -121,6 +165,33 @@ impl Config {
             let n = like.chars().count();
             if n == 0 || n > 260 {
                 return Err("default_like must be 1..=260 chars".to_string());
+            }
+        }
+        if self.drive_capacity_per_user_bytes == 0 {
+            return Err("drive_capacity_per_user_bytes must be > 0".to_string());
+        }
+        if self.remote_cache_max_bytes == 0 {
+            return Err("remote_cache_max_bytes must be > 0".to_string());
+        }
+        for (name, v) in [
+            ("remote_cache_avatar_bytes", self.remote_cache_avatar_bytes),
+            ("remote_cache_preview_bytes", self.remote_cache_preview_bytes),
+            ("remote_cache_full_bytes", self.remote_cache_full_bytes),
+        ] {
+            if v == 0 {
+                return Err(format!("{name} must be > 0"));
+            }
+            if v > self.remote_cache_max_bytes {
+                return Err(format!("{name} must be <= remote_cache_max_bytes"));
+            }
+        }
+        for (name, v) in [
+            ("remote_cache_avatar_ttl_days", self.remote_cache_avatar_ttl_days),
+            ("remote_cache_preview_ttl_days", self.remote_cache_preview_ttl_days),
+            ("remote_cache_full_ttl_days", self.remote_cache_full_ttl_days),
+        ] {
+            if v == 0 {
+                return Err(format!("{name} must be > 0"));
             }
         }
         Ok(())
@@ -174,6 +245,18 @@ mod tests {
         assert_eq!(cfg.listen, Config::default().listen);
         assert_eq!(cfg.note_draft_limit, crate::domain::draft::DEFAULT_NOTE_DRAFT_LIMIT);
         assert!(cfg.trusted_proxies.is_empty());
+        // Storage overhaul defaults: 1 GiB durable quota, 512 MiB global
+        // cache (128/256/128 reserved), on-demand, 30/7/3-day TTLs.
+        assert_eq!(cfg.drive_capacity_per_user_bytes, 1 << 30);
+        assert_eq!(cfg.remote_cache_max_bytes, 512 << 20);
+        assert_eq!(cfg.remote_cache_avatar_bytes, 128 << 20);
+        assert_eq!(cfg.remote_cache_preview_bytes, 256 << 20);
+        assert_eq!(cfg.remote_cache_full_bytes, 128 << 20);
+        assert_eq!(cfg.remote_cache_mode, RemoteCacheMode::OnDemand);
+        assert_eq!(cfg.remote_cache_avatar_ttl_days, 30);
+        assert_eq!(cfg.remote_cache_preview_ttl_days, 7);
+        assert_eq!(cfg.remote_cache_full_ttl_days, 3);
+        assert!(!cfg.remote_cache_warming_enabled);
     }
 
     #[test]
@@ -219,6 +302,69 @@ mod tests {
         assert!(Config { default_like: Some(":blobcat:".to_string()), ..Config::default() }.validate().is_ok());
         assert!(Config { default_like: Some(String::new()), ..Config::default() }.validate().is_err());
         assert!(Config { default_like: Some("r".repeat(261)), ..Config::default() }.validate().is_err());
+    }
+
+    #[test]
+    fn storage_keys_round_trip() {
+        let dir = std::env::temp_dir().join(format!(
+            "pinetree-config-storage-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pinetree.json");
+        let body = r#"{
+            "drive_capacity_per_user_bytes": 1073741824,
+            "remote_cache_max_bytes": 536870912,
+            "remote_cache_avatar_bytes": 134217728,
+            "remote_cache_preview_bytes": 268435456,
+            "remote_cache_full_bytes": 134217728,
+            "remote_cache_mode": "warm",
+            "remote_cache_avatar_ttl_days": 30,
+            "remote_cache_preview_ttl_days": 7,
+            "remote_cache_full_ttl_days": 3,
+            "remote_cache_warming_enabled": true
+        }"#;
+        std::fs::write(&path, body).unwrap();
+        let cfg = Config::load_from_file(&path).expect("load");
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.drive_capacity_per_user_bytes, 1 << 30);
+        assert_eq!(cfg.remote_cache_mode, RemoteCacheMode::Warm);
+        assert!(cfg.remote_cache_warming_enabled);
+        // Serde round-trip keeps the keys (typo safety works both ways).
+        let json = serde_json::to_value(&cfg).expect("serialize");
+        assert_eq!(json["remote_cache_mode"], "warm");
+        assert_eq!(json["remote_cache_max_bytes"], 536870912);
+        let back: Config = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back.remote_cache_mode, RemoteCacheMode::Warm);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn storage_keys_reject_bad_values() {
+        for cfg in [
+            Config { drive_capacity_per_user_bytes: 0, ..Config::default() },
+            Config { remote_cache_max_bytes: 0, ..Config::default() },
+            Config { remote_cache_avatar_bytes: 0, ..Config::default() },
+            Config { remote_cache_preview_bytes: 0, ..Config::default() },
+            Config { remote_cache_full_bytes: 0, ..Config::default() },
+            // Reserved class budgets live inside the global cap.
+            Config { remote_cache_avatar_bytes: (512 << 20) + 1, ..Config::default() },
+            Config { remote_cache_avatar_ttl_days: 0, ..Config::default() },
+            Config { remote_cache_preview_ttl_days: 0, ..Config::default() },
+            Config { remote_cache_full_ttl_days: 0, ..Config::default() },
+        ] {
+            assert!(cfg.validate().is_err(), "{cfg:?}");
+        }
+        // Unknown storage keys stay hard errors.
+        assert!(serde_json::from_str::<Config>(
+            r#"{"remote_cache_max_byte": 1}"#
+        )
+        .is_err());
+        // Mode values are snake_case.
+        let cfg: Config =
+            serde_json::from_str(r#"{"remote_cache_mode": "on_demand"}"#).unwrap();
+        assert_eq!(cfg.remote_cache_mode, RemoteCacheMode::OnDemand);
+        assert!(serde_json::from_str::<Config>(r#"{"remote_cache_mode": "eager"}"#).is_err());
     }
 
     #[test]

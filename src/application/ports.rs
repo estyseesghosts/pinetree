@@ -1928,6 +1928,80 @@ pub struct PollChoiceCount {
     pub votes: u64,
 }
 
+/// Remote-cache media class (`docs/remote-media-cache-plan.md` §5).
+/// Serialized as `avatar` | `preview` | `full` | `audio_video`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaClass {
+    Avatar,
+    #[default]
+    Preview,
+    Full,
+    AudioVideo,
+}
+
+impl MediaClass {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MediaClass::Avatar => "avatar",
+            MediaClass::Preview => "preview",
+            MediaClass::Full => "full",
+            MediaClass::AudioVideo => "audio_video",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "avatar" => Some(MediaClass::Avatar),
+            "preview" => Some(MediaClass::Preview),
+            "full" => Some(MediaClass::Full),
+            "audio_video" => Some(MediaClass::AudioVideo),
+            _ => None,
+        }
+    }
+
+    /// MIME-based default class (avatar/emoji is a caller-context override).
+    pub fn classify_mime(mime: &str) -> Self {
+        if mime.starts_with("audio/") || mime.starts_with("video/") {
+            MediaClass::AudioVideo
+        } else if mime.starts_with("image/") {
+            MediaClass::Preview
+        } else {
+            MediaClass::Full
+        }
+    }
+}
+
+/// One `(source_url, variant)` remote-cache index row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteCacheRecord {
+    pub source_url: String,
+    pub variant: String,
+    pub media_id: String,
+    pub blob_key: String,
+    pub size_bytes: u64,
+    pub class: MediaClass,
+    pub fetched_at_ms: i64,
+    pub last_access_ms: i64,
+    pub access_count: u64,
+}
+
+/// Shell-free observability snapshot (`docs/remote-media-cache-plan.md`
+/// §5.6): totals plus per-class breakdown and hit/miss counters.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct CacheStats {
+    pub total_bytes: u64,
+    pub avatar_bytes: u64,
+    pub preview_bytes: u64,
+    pub full_bytes: u64,
+    pub in_flight_bytes: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub bytes_fetched: u64,
+    pub evictions: u64,
+    pub failed_origins: u64,
+}
+
 pub trait MediaStore: Send + Sync {
     fn insert_metadata(&self, input: InsertMediaInput) -> Result<MediaMeta, PortError>;
     fn get(&self, id: &str) -> Result<Option<MediaMeta>, PortError>;
@@ -1948,12 +2022,98 @@ pub trait MediaStore: Send + Sync {
     /// `admin/drive/files`). Backends return rows in any order; the
     /// application op sorts newest-first and pages.
     fn list_all_media(&self, cursor: &TimelineCursor) -> Result<Vec<MediaMeta>, PortError>;
+    /// Durable bytes currently charged to `owner_id` (sum over owned rows).
+    fn durable_bytes(&self, owner_id: &str) -> Result<u64, PortError>;
+    /// Live metadata references to `blob_key` (0 ⇒ bytes may be deleted).
+    fn blob_refcount(&self, blob_key: &str) -> Result<u64, PortError>;
+    /// Atomic durable insert: quota check + metadata write + refcount inc +
+    /// owner-bytes adjust in one transaction. Breach ⇒
+    /// `Validation("DRIVE_CAPACITY_EXCEEDED")`.
+    fn insert_metadata_with_durable_quota(
+        &self,
+        input: InsertMediaInput,
+        quota_bytes: u64,
+    ) -> Result<MediaMeta, PortError> {
+        let _ = quota_bytes;
+        self.insert_metadata(input)
+    }
+    /// Atomic media delete: remove the row, decrement refcount and durable
+    /// owner bytes in one transaction. Returns the removed row plus the
+    /// remaining reference count for its blob key (`None` when no row).
+    fn delete_media_record(
+        &self,
+        id: &str,
+    ) -> Result<Option<(MediaMeta, u64)>, PortError> {
+        let meta = self.get(id)?;
+        if let Some(meta) = meta {
+            self.delete_metadata(&meta.id)?;
+            let remaining = self.blob_refcount(&meta.blob_key)?;
+            Ok(Some((meta, remaining)))
+        } else {
+            Ok(None)
+        }
+    }
+    /// Remote-cache index lookup by `(source_url, variant)`.
+    fn remote_cache_lookup(
+        &self,
+        source_url: &str,
+        variant: &str,
+    ) -> Result<Option<RemoteCacheRecord>, PortError>;
+    fn remote_cache_insert(&self, rec: &RemoteCacheRecord) -> Result<(), PortError>;
+    fn remote_cache_touch(
+        &self,
+        source_url: &str,
+        variant: &str,
+        now_ms: i64,
+    ) -> Result<(), PortError>;
+    /// LRU-ordered eviction candidates (oldest `last_access_ms` first),
+    /// at most `limit` rows.
+    fn remote_cache_evict_candidates(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<RemoteCacheRecord>, PortError>;
+    fn remote_cache_remove(&self, source_url: &str, variant: &str) -> Result<(), PortError>;
+    fn cache_stats(&self) -> Result<CacheStats, PortError>;
+    /// Apply accounting deltas (all saturating). `total_delta`/`class_delta`
+    /// are signed (eviction/release negative, insert positive).
+    fn cache_accounting_apply(
+        &self,
+        total_delta: i64,
+        class: MediaClass,
+        class_delta: i64,
+        hits: u64,
+        misses: u64,
+        bytes_fetched: u64,
+        evictions: u64,
+        failed_origins: u64,
+    ) -> Result<(), PortError>;
+    /// In-flight byte reservation under the global cap. Returns `false`
+    /// (no reservation made) when `bytes` would exceed the cap.
+    fn reserve_cache_bytes(&self, bytes: u64) -> Result<bool, PortError>;
+    fn release_cache_reservation(&self, bytes: u64) -> Result<(), PortError>;
+    /// Persist the global cache cap consulted by `reserve_cache_bytes`.
+    /// Backends without persistent limits may no-op.
+    fn set_cache_cap(&self, _cap_bytes: u64) -> Result<(), PortError> {
+        Ok(())
+    }
 }
 
 pub trait BlobStore: Send + Sync {
     fn put(&self, hash: &str, bytes: &[u8]) -> Result<(), PortError>;
     fn get(&self, hash: &str) -> Result<Option<Vec<u8>>, PortError>;
     fn delete(&self, hash: &str) -> Result<(), PortError>;
+    /// Byte length without reading content (`None` when absent/corrupt).
+    fn byte_len(&self, hash: &str) -> Result<Option<u64>, PortError> {
+        Ok(self.get(hash)?.map(|b| b.len() as u64))
+    }
+    /// Efficient server-side import of a staged temp file (stream-to-disk
+    /// target). Default reads + `put`; filesystem backends rename.
+    fn import_file(&self, hash: &str, src: &std::path::Path) -> Result<(), PortError> {
+        let bytes = std::fs::read(src).map_err(|e| {
+            PortError::StorageUnavailable(format!("read staged blob file: {e}"))
+        })?;
+        self.put(hash, &bytes)
+    }
 }
 
 pub trait NotificationStore: Send + Sync {

@@ -12,7 +12,7 @@ use crate::application::ports::{
     IdGenerator, InsertMediaInput, InstanceSettingsPatch, InstanceSettingsStore, InviteListFilter,
     InviteSort, InviteStore, InviteTypeFilter,
     AbuseReportFilter, Job, JobQueue, LegacyAuthSessionRecord, MediaStore, MiAuthSessionRecord, ModerationLogFilter,
-    AbuseReportStore, ModerationLogStore, MuteStore, NewJob,
+    AbuseReportStore, ModerationLogStore, MuteStore, NewJob, CacheStats, MediaClass, RemoteCacheRecord,
     NoteStore, NotificationStore, PasswordResetRequest, PasswordResetStore, PollChoiceCount, PollStore, PortError, ReactionStore, FavoriteStore, EmojiStore, AntennaStore, AntennaNoteStore,
     RegistryItem, RegistryStore, ClipStore, PageStore,
     RemotePublicKeyRecord, TimelineCursor, UpdateAccountPatch, SigninRecord, SigninStore, UserListStore, MAX_JOBS_PER_TXN, MAX_JOB_ATTEMPTS, MAX_SIGNIN_ROWS_PER_USER,
@@ -168,6 +168,19 @@ const JOBS: TableDefinition<&str, &[u8]> = TableDefinition::new("jobs");
 const JOBS_DUE_INDEX: TableDefinition<(i64, &str), u8> = TableDefinition::new("jobs_due_index");
 const ACTIVITY_DEDUP: TableDefinition<&str, u8> = TableDefinition::new("activity_dedup");
 const MEDIA_META: TableDefinition<&str, &[u8]> = TableDefinition::new("media_meta");
+/// Storage overhaul: live metadata references per blob key (0 ⇒ bytes may
+/// be deleted). Metadata + accounting commit in-txn; byte deletion happens
+/// outside the txn with reconciler sweep.
+const BLOB_REFCOUNT: TableDefinition<&str, u64> = TableDefinition::new("blob_refcount");
+/// Durable (local-upload) bytes charged per owner (quota enforcement).
+const DURABLE_BYTES_BY_OWNER: TableDefinition<&str, u64> =
+    TableDefinition::new("durable_bytes_by_owner");
+/// Remote-cache index `(source_url, variant)` → JSON [`RemoteCacheRecord`].
+const REMOTE_CACHE: TableDefinition<(&str, &str), &[u8]> =
+    TableDefinition::new("remote_cache");
+/// Cache accounting singleton (`"stats"` → JSON [`CacheStats`],
+/// `"cap"` → u64 le global byte cap for in-flight reservations).
+const CACHE_ACCOUNTING: TableDefinition<&str, &[u8]> = TableDefinition::new("cache_accounting");
 const NOTIFICATIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("notifications");
 /// `(notifiee, order key) -> notification id`. The order key is the time-ordered
 /// suffix of the id (see [`notification_order_key`]). The full id cannot be the key:
@@ -270,6 +283,9 @@ const REPLY_INDEX_PROGRESS_KEY: &str = "migration:notes_by_reply:v1:progress";
 const URI_INDEX_DONE_KEY: &str = "migration:notes_by_uri:v1";
 /// META marker: `NOTIFICATIONS_BY_USER` has been built from `NOTIFICATIONS`.
 const NOTIFICATION_ORDER_DONE_KEY: &str = "migration:notifications_by_user_ordered:v1";
+/// META marker: blob refcounts, durable owner totals, and the remote-cache
+/// index have been rebuilt from `MEDIA_META` (storage overhaul backfill).
+const STORAGE_ACCOUNTING_DONE_KEY: &str = "migration:storage_accounting:v1";
 
 pub struct RedbStore {
     db: Database,
@@ -315,6 +331,7 @@ impl RedbStore {
         store.run_notification_order_backfill()?;
         store.run_reactions_by_note_backfill()?;
         store.run_token_id_backfill()?;
+        store.run_storage_accounting_backfill()?;
         Ok(store)
     }
 
@@ -421,6 +438,14 @@ impl RedbStore {
         let _ = write_txn.open_table(JOBS_DUE_INDEX).map_err(map_redb_err)?;
         let _ = write_txn.open_table(ACTIVITY_DEDUP).map_err(map_redb_err)?;
         let _ = write_txn.open_table(MEDIA_META).map_err(map_redb_err)?;
+        let _ = write_txn.open_table(BLOB_REFCOUNT).map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(DURABLE_BYTES_BY_OWNER)
+            .map_err(map_redb_err)?;
+        let _ = write_txn.open_table(REMOTE_CACHE).map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(CACHE_ACCOUNTING)
+            .map_err(map_redb_err)?;
         let _ = write_txn.open_table(NOTIFICATIONS).map_err(map_redb_err)?;
         let _ = write_txn
             .open_table(NOTIFICATIONS_BY_USER)
@@ -718,6 +743,99 @@ impl RedbStore {
             let mut meta_table = write_txn.open_table(META).map_err(map_redb_err)?;
             meta_table
                 .insert(TOKEN_ID_DONE_KEY, "done")
+                .map_err(map_redb_err)?;
+        }
+        self.commit_write(write_txn)
+    }
+
+    /// Storage-overhaul backfill: rebuild `BLOB_REFCOUNT`,
+    /// `DURABLE_BYTES_BY_OWNER`, the `REMOTE_CACHE` index, and
+    /// `CACHE_ACCOUNTING` totals from `MEDIA_META`. Idempotent; the META
+    /// marker makes later opens a no-op. Grandfathered over-quota durable
+    /// rows are kept as-is (reads/deletes still work; only new uploads are
+    /// quota-checked).
+    pub fn run_storage_accounting_backfill(&self) -> Result<(), PortError> {
+        if self.meta_get(STORAGE_ACCOUNTING_DONE_KEY)?.as_deref() == Some("done") {
+            return Ok(());
+        }
+        let write_txn = self.begin_write()?;
+        {
+            let media_table = write_txn.open_table(MEDIA_META).map_err(map_redb_err)?;
+            let mut refcounts = write_txn.open_table(BLOB_REFCOUNT).map_err(map_redb_err)?;
+            let mut durable = write_txn
+                .open_table(DURABLE_BYTES_BY_OWNER)
+                .map_err(map_redb_err)?;
+            let mut remote_cache = write_txn.open_table(REMOTE_CACHE).map_err(map_redb_err)?;
+            let mut accounting = write_txn
+                .open_table(CACHE_ACCOUNTING)
+                .map_err(map_redb_err)?;
+            let mut stats = CacheStats::default();
+            for entry in media_table.iter().map_err(map_redb_err)? {
+                let (_, v) = entry.map_err(map_redb_err)?;
+                let meta: MediaMeta = decode_json(v.value())?;
+                let count = refcounts
+                    .get(meta.blob_key.as_str())
+                    .map_err(map_redb_err)?
+                    .map(|g| g.value())
+                    .unwrap_or(0);
+                refcounts
+                    .insert(meta.blob_key.as_str(), count.saturating_add(1))
+                    .map_err(map_redb_err)?;
+                if let Some(owner) = meta.owner_id.as_deref() {
+                    let total = durable
+                        .get(owner)
+                        .map_err(map_redb_err)?
+                        .map(|g| g.value())
+                        .unwrap_or(0);
+                    durable
+                        .insert(owner, total.saturating_add(meta.size_bytes))
+                        .map_err(map_redb_err)?;
+                } else {
+                    // Remote row: index by (source_url, variant) for re-fetch
+                    // and count toward cache totals.
+                    let class = MediaClass::classify_mime(meta.mime.as_str());
+                    match class {
+                        MediaClass::Avatar => {
+                            stats.avatar_bytes =
+                                stats.avatar_bytes.saturating_add(meta.size_bytes)
+                        }
+                        MediaClass::Preview => {
+                            stats.preview_bytes =
+                                stats.preview_bytes.saturating_add(meta.size_bytes)
+                        }
+                        MediaClass::Full => {
+                            stats.full_bytes =
+                                stats.full_bytes.saturating_add(meta.size_bytes)
+                        }
+                        MediaClass::AudioVideo => {}
+                    }
+                    stats.total_bytes = stats.total_bytes.saturating_add(meta.size_bytes);
+                    if let Some(url) = meta.source_url.as_deref() {
+                        let rec = RemoteCacheRecord {
+                            source_url: url.to_string(),
+                            variant: "original".to_string(),
+                            media_id: meta.id.clone(),
+                            blob_key: meta.blob_key.clone(),
+                            size_bytes: meta.size_bytes,
+                            class,
+                            fetched_at_ms: 0,
+                            last_access_ms: 0,
+                            access_count: 0,
+                        };
+                        let encoded = encode_json(&rec)?;
+                        remote_cache
+                            .insert((rec.source_url.as_str(), rec.variant.as_str()), encoded.as_slice())
+                            .map_err(map_redb_err)?;
+                    }
+                }
+            }
+            let encoded = encode_json(&stats)?;
+            accounting
+                .insert("stats", encoded.as_slice())
+                .map_err(map_redb_err)?;
+            let mut meta_table = write_txn.open_table(META).map_err(map_redb_err)?;
+            meta_table
+                .insert(STORAGE_ACCOUNTING_DONE_KEY, "done")
                 .map_err(map_redb_err)?;
         }
         self.commit_write(write_txn)
@@ -8884,36 +9002,10 @@ impl ActivityDedup for RedbStore {
 
 impl MediaStore for RedbStore {
     fn insert_metadata(&self, input: InsertMediaInput) -> Result<MediaMeta, PortError> {
-        let id = input.id.unwrap_or_else(|| self.ids.generate());
-        let meta = MediaMeta {
-            id,
-            owner_id: input.owner_id,
-            name: input.name,
-            mime: input.mime,
-            size_bytes: input.size_bytes,
-            hash: input.hash,
-            blob_key: input.blob_key,
-            blurhash: input.blurhash,
-            properties: input.properties,
-            is_sensitive: input.is_sensitive,
-            is_link: input.is_link,
-            url: input.url,
-            thumbnail_url: input.thumbnail_url,
-            comment: input.comment,
-            source_url: input.source_url,
-        };
-        meta.validate(input.max_file_size)?;
-
-        let write_txn = self.begin_write()?;
-        {
-            let mut table = write_txn.open_table(MEDIA_META).map_err(map_redb_err)?;
-            let encoded = encode_json(&meta)?;
-            table
-                .insert(meta.id.as_str(), encoded.as_slice())
-                .map_err(map_redb_err)?;
-        }
-        self.commit_write(write_txn)?;
-        Ok(meta)
+        // Quota-unchecked path (metadata updates, remote-cache rows,
+        // backfills): `u64::MAX` never breaches, but refcounts and
+        // durable totals are still maintained so every writer agrees.
+        self.insert_metadata_with_durable_quota(input, u64::MAX)
     }
 
     fn get(&self, id: &str) -> Result<Option<MediaMeta>, PortError> {
@@ -8963,12 +9055,9 @@ impl MediaStore for RedbStore {
     }
 
     fn delete_metadata(&self, id: &str) -> Result<(), PortError> {
-        let write_txn = self.begin_write()?;
-        {
-            let mut table = write_txn.open_table(MEDIA_META).map_err(map_redb_err)?;
-            table.remove(id).map_err(map_redb_err)?;
-        }
-        self.commit_write(write_txn)
+        // Accounting-consistent delete: the refcount and durable totals move
+        // in the same transaction as the row removal.
+        self.delete_media_record(id).map(|_| ())
     }
 
     fn list_by_owner(&self, owner_id: &str) -> Result<Vec<MediaMeta>, PortError> {
@@ -8999,6 +9088,389 @@ impl MediaStore for RedbStore {
         out.retain(|m| matches_cursor(&m.id, cursor));
         out.truncate(limit);
         Ok(out)
+    }
+
+    fn durable_bytes(&self, owner_id: &str) -> Result<u64, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn
+            .open_table(DURABLE_BYTES_BY_OWNER)
+            .map_err(map_redb_err)?;
+        Ok(table
+            .get(owner_id)
+            .map_err(map_redb_err)?
+            .map(|g| g.value())
+            .unwrap_or(0))
+    }
+
+    fn blob_refcount(&self, blob_key: &str) -> Result<u64, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(BLOB_REFCOUNT).map_err(map_redb_err)?;
+        Ok(table
+            .get(blob_key)
+            .map_err(map_redb_err)?
+            .map(|g| g.value())
+            .unwrap_or(0))
+    }
+
+    fn delete_media_record(
+        &self,
+        id: &str,
+    ) -> Result<Option<(MediaMeta, u64)>, PortError> {
+        let write_txn = self.begin_write()?;
+        let removed = {
+            let mut media = write_txn.open_table(MEDIA_META).map_err(map_redb_err)?;
+            let mut refcounts = write_txn.open_table(BLOB_REFCOUNT).map_err(map_redb_err)?;
+            let mut durable = write_txn
+                .open_table(DURABLE_BYTES_BY_OWNER)
+                .map_err(map_redb_err)?;
+            let Some(g) = media.get(id).map_err(map_redb_err)? else {
+                return Ok(None);
+            };
+            let meta: MediaMeta = decode_json(g.value())?;
+            media.remove(id).map_err(map_redb_err)?;
+            let remaining = refcounts
+                .get(meta.blob_key.as_str())
+                .map_err(map_redb_err)?
+                .map(|g| g.value())
+                .unwrap_or(0);
+            let remaining = remaining.saturating_sub(1);
+            if remaining == 0 {
+                refcounts
+                    .remove(meta.blob_key.as_str())
+                    .map_err(map_redb_err)?;
+            } else {
+                refcounts
+                    .insert(meta.blob_key.as_str(), remaining)
+                    .map_err(map_redb_err)?;
+            }
+            if let Some(owner) = meta.owner_id.as_deref() {
+                let total = durable
+                    .get(owner)
+                    .map_err(map_redb_err)?
+                    .map(|g| g.value())
+                    .unwrap_or(0);
+                durable
+                    .insert(owner, total.saturating_sub(meta.size_bytes))
+                    .map_err(map_redb_err)?;
+            }
+            (meta, remaining)
+        };
+        self.commit_write(write_txn)?;
+        Ok(Some(removed))
+    }
+
+    fn remote_cache_lookup(
+        &self,
+        source_url: &str,
+        variant: &str,
+    ) -> Result<Option<RemoteCacheRecord>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(REMOTE_CACHE).map_err(map_redb_err)?;
+        match table
+            .get((source_url, variant))
+            .map_err(map_redb_err)?
+        {
+            Some(g) => Ok(Some(decode_json(g.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn remote_cache_insert(&self, rec: &RemoteCacheRecord) -> Result<(), PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            let mut table = write_txn.open_table(REMOTE_CACHE).map_err(map_redb_err)?;
+            let encoded = encode_json(rec)?;
+            table
+                .insert(
+                    (rec.source_url.as_str(), rec.variant.as_str()),
+                    encoded.as_slice(),
+                )
+                .map_err(map_redb_err)?;
+        }
+        self.commit_write(write_txn)
+    }
+
+    fn remote_cache_touch(
+        &self,
+        source_url: &str,
+        variant: &str,
+        now_ms: i64,
+    ) -> Result<(), PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            let mut table = write_txn.open_table(REMOTE_CACHE).map_err(map_redb_err)?;
+            let Some(g) = table
+                .get((source_url, variant))
+                .map_err(map_redb_err)?
+            else {
+                return Ok(());
+            };
+            let mut rec: RemoteCacheRecord = decode_json(g.value())?;
+            rec.last_access_ms = now_ms;
+            rec.access_count = rec.access_count.saturating_add(1);
+            let encoded = encode_json(&rec)?;
+            table
+                .insert((source_url, variant), encoded.as_slice())
+                .map_err(map_redb_err)?;
+        }
+        self.commit_write(write_txn)
+    }
+
+    fn remote_cache_evict_candidates(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<RemoteCacheRecord>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(REMOTE_CACHE).map_err(map_redb_err)?;
+        let mut out: Vec<RemoteCacheRecord> = Vec::new();
+        for entry in table.iter().map_err(map_redb_err)? {
+            let (_, v) = entry.map_err(map_redb_err)?;
+            out.push(decode_json(v.value())?);
+        }
+        out.sort_by_key(|r| (r.last_access_ms, r.source_url.clone(), r.variant.clone()));
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    fn remote_cache_remove(&self, source_url: &str, variant: &str) -> Result<(), PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            let mut table = write_txn.open_table(REMOTE_CACHE).map_err(map_redb_err)?;
+            table
+                .remove((source_url, variant))
+                .map_err(map_redb_err)?;
+        }
+        self.commit_write(write_txn)
+    }
+
+    fn cache_stats(&self) -> Result<CacheStats, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn
+            .open_table(CACHE_ACCOUNTING)
+            .map_err(map_redb_err)?;
+        match table.get("stats").map_err(map_redb_err)? {
+            Some(g) => Ok(decode_json(g.value())?),
+            None => Ok(CacheStats::default()),
+        }
+    }
+
+    fn cache_accounting_apply(
+        &self,
+        total_delta: i64,
+        class: MediaClass,
+        class_delta: i64,
+        hits: u64,
+        misses: u64,
+        bytes_fetched: u64,
+        evictions: u64,
+        failed_origins: u64,
+    ) -> Result<(), PortError> {
+        fn apply_signed(base: u64, delta: i64) -> u64 {
+            if delta >= 0 {
+                base.saturating_add(delta as u64)
+            } else {
+                base.saturating_sub(delta.unsigned_abs())
+            }
+        }
+        let write_txn = self.begin_write()?;
+        {
+            let mut table = write_txn
+                .open_table(CACHE_ACCOUNTING)
+                .map_err(map_redb_err)?;
+            let mut stats: CacheStats = match table.get("stats").map_err(map_redb_err)? {
+                Some(g) => decode_json(g.value())?,
+                None => CacheStats::default(),
+            };
+            stats.total_bytes = apply_signed(stats.total_bytes, total_delta);
+            let class_total = match class {
+                MediaClass::Avatar => &mut stats.avatar_bytes,
+                MediaClass::Preview => &mut stats.preview_bytes,
+                MediaClass::Full => &mut stats.full_bytes,
+                MediaClass::AudioVideo => &mut stats.full_bytes,
+            };
+            *class_total = apply_signed(*class_total, class_delta);
+            stats.hits = stats.hits.saturating_add(hits);
+            stats.misses = stats.misses.saturating_add(misses);
+            stats.bytes_fetched = stats.bytes_fetched.saturating_add(bytes_fetched);
+            stats.evictions = stats.evictions.saturating_add(evictions);
+            stats.failed_origins = stats.failed_origins.saturating_add(failed_origins);
+            let encoded = encode_json(&stats)?;
+            table
+                .insert("stats", encoded.as_slice())
+                .map_err(map_redb_err)?;
+        }
+        self.commit_write(write_txn)
+    }
+
+    fn reserve_cache_bytes(&self, bytes: u64) -> Result<bool, PortError> {
+        let write_txn = self.begin_write()?;
+        let reserved = {
+            let mut table = write_txn
+                .open_table(CACHE_ACCOUNTING)
+                .map_err(map_redb_err)?;
+            let cap: u64 = match table.get("cap").map_err(map_redb_err)? {
+                Some(g) => {
+                    let raw: &[u8] = g.value();
+                    if raw.len() == 8 {
+                        u64::from_le_bytes(raw.try_into().unwrap_or([0xFF; 8]))
+                    } else {
+                        u64::MAX
+                    }
+                }
+                None => u64::MAX,
+            };
+            let mut stats: CacheStats = match table.get("stats").map_err(map_redb_err)? {
+                Some(g) => decode_json(g.value())?,
+                None => CacheStats::default(),
+            };
+            let want = stats.total_bytes.saturating_add(stats.in_flight_bytes).saturating_add(bytes);
+            if want > cap {
+                false
+            } else {
+                stats.in_flight_bytes = stats.in_flight_bytes.saturating_add(bytes);
+                let encoded = encode_json(&stats)?;
+                table
+                    .insert("stats", encoded.as_slice())
+                    .map_err(map_redb_err)?;
+                true
+            }
+        };
+        self.commit_write(write_txn)?;
+        Ok(reserved)
+    }
+
+    fn release_cache_reservation(&self, bytes: u64) -> Result<(), PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            let mut table = write_txn
+                .open_table(CACHE_ACCOUNTING)
+                .map_err(map_redb_err)?;
+            let mut stats: CacheStats = match table.get("stats").map_err(map_redb_err)? {
+                Some(g) => decode_json(g.value())?,
+                None => CacheStats::default(),
+            };
+            stats.in_flight_bytes = stats.in_flight_bytes.saturating_sub(bytes);
+            let encoded = encode_json(&stats)?;
+            table
+                .insert("stats", encoded.as_slice())
+                .map_err(map_redb_err)?;
+        }
+        self.commit_write(write_txn)
+    }
+
+    fn set_cache_cap(&self, cap_bytes: u64) -> Result<(), PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            let mut table = write_txn
+                .open_table(CACHE_ACCOUNTING)
+                .map_err(map_redb_err)?;
+            table
+                .insert("cap", cap_bytes.to_le_bytes().as_slice())
+                .map_err(map_redb_err)?;
+        }
+        self.commit_write(write_txn)
+    }
+
+    /// Shared insert core: quota check + metadata write + refcount and
+    /// durable-total maintenance in one transaction. `u64::MAX` disables
+    /// the quota check (metadata updates, remote rows, backfills).
+    fn insert_metadata_with_durable_quota(
+        &self,
+        input: InsertMediaInput,
+        quota_bytes: u64,
+    ) -> Result<MediaMeta, PortError> {
+        let id = input.id.unwrap_or_else(|| self.ids.generate());
+        let meta = MediaMeta {
+            id,
+            owner_id: input.owner_id,
+            name: input.name,
+            mime: input.mime,
+            size_bytes: input.size_bytes,
+            hash: input.hash,
+            blob_key: input.blob_key,
+            blurhash: input.blurhash,
+            properties: input.properties,
+            is_sensitive: input.is_sensitive,
+            is_link: input.is_link,
+            url: input.url,
+            thumbnail_url: input.thumbnail_url,
+            comment: input.comment,
+            source_url: input.source_url,
+        };
+        meta.validate(input.max_file_size)?;
+
+        let write_txn = self.begin_write()?;
+        {
+            let mut media = write_txn.open_table(MEDIA_META).map_err(map_redb_err)?;
+            let mut refcounts = write_txn.open_table(BLOB_REFCOUNT).map_err(map_redb_err)?;
+            let mut durable = write_txn
+                .open_table(DURABLE_BYTES_BY_OWNER)
+                .map_err(map_redb_err)?;
+            // Upsert: back out the old row's accounting before charging the
+            // new one, so metadata-only updates are quota- and count-neutral.
+            let old: Option<MediaMeta> = match media
+                .get(meta.id.as_str())
+                .map_err(map_redb_err)?
+            {
+                Some(g) => Some(decode_json(g.value())?),
+                None => None,
+            };
+            if let Some(old) = old.as_ref() {
+                let old_count = refcounts
+                    .get(old.blob_key.as_str())
+                    .map_err(map_redb_err)?
+                    .map(|g| g.value())
+                    .unwrap_or(0);
+                let left = old_count.saturating_sub(1);
+                if left == 0 {
+                    refcounts
+                        .remove(old.blob_key.as_str())
+                        .map_err(map_redb_err)?;
+                } else {
+                    refcounts
+                        .insert(old.blob_key.as_str(), left)
+                        .map_err(map_redb_err)?;
+                }
+                if let Some(owner) = old.owner_id.as_deref() {
+                    let total = durable
+                        .get(owner)
+                        .map_err(map_redb_err)?
+                        .map(|g| g.value())
+                        .unwrap_or(0);
+                    durable
+                        .insert(owner, total.saturating_sub(old.size_bytes))
+                        .map_err(map_redb_err)?;
+                }
+            }
+            if let Some(owner) = meta.owner_id.as_deref() {
+                let total = durable
+                    .get(owner)
+                    .map_err(map_redb_err)?
+                    .map(|g| g.value())
+                    .unwrap_or(0);
+                let next = total.saturating_add(meta.size_bytes);
+                if next > quota_bytes {
+                    return Err(PortError::Validation(
+                        "DRIVE_CAPACITY_EXCEEDED".to_string(),
+                    ));
+                }
+                durable.insert(owner, next).map_err(map_redb_err)?;
+            }
+            let count = refcounts
+                .get(meta.blob_key.as_str())
+                .map_err(map_redb_err)?
+                .map(|g| g.value())
+                .unwrap_or(0);
+            refcounts
+                .insert(meta.blob_key.as_str(), count.saturating_add(1))
+                .map_err(map_redb_err)?;
+            let encoded = encode_json(&meta)?;
+            media
+                .insert(meta.id.as_str(), encoded.as_slice())
+                .map_err(map_redb_err)?;
+        }
+        self.commit_write(write_txn)?;
+        Ok(meta)
     }
 }
 

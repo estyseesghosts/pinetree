@@ -612,6 +612,17 @@ mod tests {
             scheduled_note_limit: crate::domain::draft::DEFAULT_SCHEDULED_NOTE_LIMIT,
             pin_limit: crate::domain::pinning::DEFAULT_PIN_LIMIT,
             default_like: None,
+        cache_blobs: blobs.clone(),
+        drive_capacity_per_user_bytes: 1 << 30,
+        remote_cache_max_bytes: 512 << 20,
+        remote_cache_avatar_bytes: 128 << 20,
+        remote_cache_preview_bytes: 256 << 20,
+        remote_cache_full_bytes: 128 << 20,
+        remote_cache_mode: crate::config::RemoteCacheMode::OnDemand,
+        remote_cache_avatar_ttl_days: 30,
+        remote_cache_preview_ttl_days: 7,
+        remote_cache_full_ttl_days: 3,
+        remote_cache_warming_enabled: false,
         };
         (services, clock)
     }

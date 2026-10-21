@@ -13,7 +13,7 @@ use pinetree::application::ports::{
 };
 use pinetree::streaming::hub::hub_and_sink;
 use pinetree::application::ports::{Clock, IdGenerator};
-use pinetree::config::{Config, DeploymentMode};
+use pinetree::config::{Config, DeploymentMode, RemoteCacheMode};
 use pinetree::domain::id::{AidxGenerator, SystemClock};
 use pinetree::federation::delivery::{SafeHttpClient, SafeHttpConfig};
 use pinetree::federation::retry::DestinationTracker;
@@ -26,8 +26,21 @@ fn build_services(cfg: &Config) -> Result<(Arc<AppServices>, pinetree::streaming
     let ids: Arc<dyn IdGenerator> = Arc::new(AidxGenerator::new(clock.clone()));
     let store = RedbStore::open(cfg.data_dir.join("pinetree.redb"), clock.clone(), ids.clone())
         .map_err(|err| format!("open redb store: {err}"))?;
+    // Storage overhaul: durable local uploads live in `blobs_durable/`
+    // (never evicted), remote fetches in `blobs_cache/` (LRU+TTL, capped).
+    // A pre-overhaul `blobs/` directory is migrated once via rename.
+    let legacy_blobs = cfg.data_dir.join("blobs");
+    let durable_dir = cfg.data_dir.join("blobs_durable");
+    if !durable_dir.exists() && legacy_blobs.exists() {
+        std::fs::rename(&legacy_blobs, &durable_dir)
+            .map_err(|err| format!("migrate blobs/ to blobs_durable/: {err}"))?;
+    }
     let blobs: Arc<dyn BlobStore> = Arc::new(
-        FsBlobStore::new(cfg.data_dir.join("blobs")).map_err(|err| format!("init blob store: {err}"))?,
+        FsBlobStore::new(&durable_dir).map_err(|err| format!("init blob store: {err}"))?,
+    );
+    let cache_blobs: Arc<dyn BlobStore> = Arc::new(
+        FsBlobStore::new(cfg.data_dir.join("blobs_cache"))
+            .map_err(|err| format!("init cache blob store: {err}"))?,
     );
     let streaming: Arc<dyn StreamingSink>;
     let hub: pinetree::streaming::hub::Hub;
@@ -49,6 +62,7 @@ fn build_services(cfg: &Config) -> Result<(Arc<AppServices>, pinetree::streaming
         jobs: store.clone() as Arc<dyn JobQueue>,
         media: store.clone() as Arc<dyn MediaStore>,
         blobs,
+        cache_blobs,
         notifications: store.clone() as Arc<dyn NotificationStore>,
         auth: store.clone() as Arc<dyn AuthStore>,
         streaming,
@@ -74,6 +88,16 @@ fn build_services(cfg: &Config) -> Result<(Arc<AppServices>, pinetree::streaming
         scheduled_note_limit: cfg.scheduled_note_limit,
         pin_limit: cfg.pin_limit,
         default_like: cfg.default_like.clone(),
+        drive_capacity_per_user_bytes: cfg.drive_capacity_per_user_bytes,
+        remote_cache_max_bytes: cfg.remote_cache_max_bytes,
+        remote_cache_avatar_bytes: cfg.remote_cache_avatar_bytes,
+        remote_cache_preview_bytes: cfg.remote_cache_preview_bytes,
+        remote_cache_full_bytes: cfg.remote_cache_full_bytes,
+        remote_cache_mode: cfg.remote_cache_mode,
+        remote_cache_avatar_ttl_days: cfg.remote_cache_avatar_ttl_days,
+        remote_cache_preview_ttl_days: cfg.remote_cache_preview_ttl_days,
+        remote_cache_full_ttl_days: cfg.remote_cache_full_ttl_days,
+        remote_cache_warming_enabled: cfg.remote_cache_warming_enabled,
     });
     Ok((services, hub))
 }
@@ -272,6 +296,65 @@ async fn main() {
                 std::process::exit(2);
             }
             cfg.default_like = Some(like.to_string());
+        } else if let Some(bytes) = arg.strip_prefix("--drive-capacity-per-user-bytes=") {
+            cfg.drive_capacity_per_user_bytes = bytes.parse().ok().filter(|n| *n > 0).unwrap_or_else(|| {
+                eprintln!("invalid --drive-capacity-per-user-bytes (want an integer > 0): {bytes}");
+                std::process::exit(2);
+            });
+        } else if let Some(bytes) = arg.strip_prefix("--remote-cache-max-bytes=") {
+            cfg.remote_cache_max_bytes = bytes.parse().ok().filter(|n| *n > 0).unwrap_or_else(|| {
+                eprintln!("invalid --remote-cache-max-bytes (want an integer > 0): {bytes}");
+                std::process::exit(2);
+            });
+        } else if let Some(bytes) = arg.strip_prefix("--remote-cache-avatar-bytes=") {
+            cfg.remote_cache_avatar_bytes = bytes.parse().ok().filter(|n| *n > 0).unwrap_or_else(|| {
+                eprintln!("invalid --remote-cache-avatar-bytes (want an integer > 0): {bytes}");
+                std::process::exit(2);
+            });
+        } else if let Some(bytes) = arg.strip_prefix("--remote-cache-preview-bytes=") {
+            cfg.remote_cache_preview_bytes = bytes.parse().ok().filter(|n| *n > 0).unwrap_or_else(|| {
+                eprintln!("invalid --remote-cache-preview-bytes (want an integer > 0): {bytes}");
+                std::process::exit(2);
+            });
+        } else if let Some(bytes) = arg.strip_prefix("--remote-cache-full-bytes=") {
+            cfg.remote_cache_full_bytes = bytes.parse().ok().filter(|n| *n > 0).unwrap_or_else(|| {
+                eprintln!("invalid --remote-cache-full-bytes (want an integer > 0): {bytes}");
+                std::process::exit(2);
+            });
+        } else if let Some(mode) = arg.strip_prefix("--remote-cache-mode=") {
+            cfg.remote_cache_mode = match mode {
+                "disabled" => RemoteCacheMode::Disabled,
+                "on_demand" => RemoteCacheMode::OnDemand,
+                "warm" => RemoteCacheMode::Warm,
+                other => {
+                    eprintln!("unknown remote cache mode (want disabled|on_demand|warm): {other}");
+                    std::process::exit(1);
+                }
+            };
+        } else if let Some(days) = arg.strip_prefix("--remote-cache-avatar-ttl-days=") {
+            cfg.remote_cache_avatar_ttl_days = days.parse().ok().filter(|n| *n > 0).unwrap_or_else(|| {
+                eprintln!("invalid --remote-cache-avatar-ttl-days (want an integer > 0): {days}");
+                std::process::exit(2);
+            });
+        } else if let Some(days) = arg.strip_prefix("--remote-cache-preview-ttl-days=") {
+            cfg.remote_cache_preview_ttl_days = days.parse().ok().filter(|n| *n > 0).unwrap_or_else(|| {
+                eprintln!("invalid --remote-cache-preview-ttl-days (want an integer > 0): {days}");
+                std::process::exit(2);
+            });
+        } else if let Some(days) = arg.strip_prefix("--remote-cache-full-ttl-days=") {
+            cfg.remote_cache_full_ttl_days = days.parse().ok().filter(|n| *n > 0).unwrap_or_else(|| {
+                eprintln!("invalid --remote-cache-full-ttl-days (want an integer > 0): {days}");
+                std::process::exit(2);
+            });
+        } else if let Some(flag) = arg.strip_prefix("--remote-cache-warming-enabled=") {
+            cfg.remote_cache_warming_enabled = match flag {
+                "true" | "1" => true,
+                "false" | "0" => false,
+                other => {
+                    eprintln!("invalid --remote-cache-warming-enabled (want true|false): {other}");
+                    std::process::exit(2);
+                }
+            };
         } else {
             positional.push(arg);
         }
