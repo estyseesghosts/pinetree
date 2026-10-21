@@ -14,5 +14,12 @@ New here? Start with [About](About.md), then [Glossary](Glossary.md) for any unf
 | [Intentional differences](Intentional-Differences.md) | Where pinetree is deliberately different from Misskey, and why |
 | [Glossary](Glossary.md) | Plain meanings of the technical words used across the wiki |
 | [How to read the docs](How-To-Read-The-Docs.md) | Map from wiki pages to the contract documents, and what Draft and Frozen mean |
+| [Architecture](Architecture.md) | How pinetree is built: graph, request path, jobs, storage, database |
+| [Federation](Federation.md) | How pinetree talks to itself, Misskey, Mastodon, and generic ActivityPub |
+| [Client API](Client-API.md) | What apps can call, coverage vs Misskey, Sharkey bits, dead surfaces |
+| [Administration](Administration.md) | Admin tools, JSON config schema, moderation, differences |
+| [Operations](Operations.md) | Run, Docker, health, logs, backups, known gaps |
+| [Security](Security.md) | Auth, signatures, SSRF, abuse controls |
+| [Developer guide](Developer-Guide.md) | Add an endpoint/store/job without breaking federation |
 
 Related documents: `README.md` (repo-root quickstart), `docs/README.md` (contract index with status for each file), `docs/TODOS.md` (the full list of gaps), `docs/phase-2-interop-howto.md` (run Misskey, Sharkey and two pinetrees locally), `state/logs/` (dated work logs), `AGENTS.md` (rules for agents working in this repo).

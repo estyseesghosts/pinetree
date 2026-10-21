@@ -38,9 +38,11 @@ Phase 3 scope (proposal §9): client compatibility and streaming. Gaps carried i
 - FDB limits are hard constraints: ~5s transaction lifetime, ~10 MB transaction size. No media blobs or unbounded fan-out in transactions.
 - Public IDs/URLs must never expose node hostnames. Actor URL form `https://{domain}/users/{account_id}`; renames/moves preserve account ID.
 - Federation input is untrusted: enforce size limits, timeouts, redirect limits, SSRF protections, signature verification. MVP, not polish.
+- All new code must follow the style preferences as specified in rust_style_guide.md. 
 
 ## Verification
 
+- On a Windows host, always prefer native Windows tools (PowerShell, native `cargo`) and never WSL: WSL is slow.
 - Verify by execution: run tests/prototypes and paste or reference real output in the state log. Do not mark work done on reasoning alone. The full gate is `bash scripts/smoke-all.sh` (see `docs/testing.md`); use it before claiming phase-level completion.
 - A live process is not proof of progress. When a compile or test run seems slow, investigate instead of asserting it is fine: identify which target is building/running, compare artifact mtimes against the clock, check per-process CPU, and stream per-test output (never pipe a diagnostic run through `tail` — it hides everything until exit). A test binary burning no CPU for many minutes is hung until proven otherwise; find the stuck test (re-run that target alone, look for `>60s` lines and deadlocks such as double-`Mutex::lock` in one statement), fix or kill it, and report what it was. Added 2026-10-21 after a deadlocked test passed itself off as "still compiling" for hours.
 - A green run is not proof the code under test is fresh. Live-gate scripts resolve the server binary via `cargo metadata` (ext4 target dir); a stale binary passes while the tree is broken — always compare the binary mtime against the last source edit before trusting `SMOKE_OK`. Added 2026-10-21 after phase-1 passed on a pre-storage binary while every `/api` call in the fresh build stack-overflowed.
