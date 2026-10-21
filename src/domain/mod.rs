@@ -26,6 +26,4 @@ pub mod user_list;
 pub mod collection;
 pub mod clip;
 pub mod page;
-pub mod channel;
-pub mod chat_room;
 pub mod webhook;

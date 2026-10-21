@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pinetree::application::commands::channels::IdCursor;
+use pinetree::application::commands::gallery::IdCursor;
 use pinetree::application::commands::gallery::{GalleryStore, MemGalleryStore};
 use pinetree::application::commands::AppServices;
 use pinetree::application::ports::{

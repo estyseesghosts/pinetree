@@ -22,8 +22,28 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 
 use super::AppServices;
-use crate::application::commands::channels::IdCursor;
 use crate::application::ports::{NewJob, PortError};
+
+/// Simple id cursor (`since_id` exclusive lower bound, `until_id`
+/// exclusive upper bound, newest-first, `limit` clamped to 1..=100).
+/// (Relocated from the removed `channels` module, which was its only
+/// other user; gallery lists are the remaining consumer.)
+#[derive(Debug, Clone, Default)]
+pub struct IdCursor {
+    pub since_id: Option<String>,
+    pub until_id: Option<String>,
+    pub limit: usize,
+}
+
+impl IdCursor {
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            since_id: None,
+            until_id: None,
+            limit: limit.clamp(1, 100),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Domain (pure; parent may move to src/domain/gallery.rs verbatim).

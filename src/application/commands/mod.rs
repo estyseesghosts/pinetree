@@ -14,8 +14,6 @@ pub mod announcements;
 pub mod antennas;
 pub mod auth_2fa;
 pub mod blocks;
-pub mod channels;
-pub mod chat;
 pub mod drafts;
 pub mod emoji;
 
