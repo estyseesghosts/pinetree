@@ -12,10 +12,10 @@ case "${1:-show}" in
   add)
     "$0" remove
     cat >>/etc/hosts <<EOT
-127.0.0.1 pt-a.test pt-b.test pt-c.test akkoma.test misskey.test catodon.test $MARK
+127.0.0.1 pt-a.test pt-b.test pt-c.test pt-solo.test akkoma.test misskey.test catodon.test $MARK
 172.28.0.10 mastodon.lab $MARK
 172.28.0.20 birchtree.lab $MARK
-172.28.0.30 bt-a.lab bt-b.lab bt-c.lab $MARK
+172.28.0.30 bt-a.lab bt-b.lab bt-c.lab bt-d.lab bt-e.lab bt-solo.lab mast-b.lab $MARK
 EOT
     ;;
   remove) grep -vF "$MARK" /etc/hosts >/etc/hosts.bench.new; cat /etc/hosts.bench.new >/etc/hosts; rm -f /etc/hosts.bench.new ;;

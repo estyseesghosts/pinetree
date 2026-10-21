@@ -30,7 +30,7 @@ def one(job):
 
 path = os.path.join(BENCH_DIR, "accounts.json")
 acc = json.load(open(path)) if os.path.exists(path) else {}
-nodes = ["pt-a", "pt-b", "pt-c", "bt-a", "bt-b", "bt-c"]
+nodes = ["pt-a", "pt-b", "pt-c", "bt-a", "bt-b", "bt-c", "bt-d", "bt-e"]
 jobs = [(n, f"u{i}") for n in nodes for i in range(N_USERS)]
 res = {n: [] for n in nodes}
 with ThreadPoolExecutor(max_workers=6) as ex:

@@ -47,7 +47,7 @@ TAG = "XF" + str(int(time.time()))[-6:]
 
 # Test pairs: all pinetree <-> birchtree combinations
 PINETREE_NODES = ["pt-a", "pt-b", "pt-c"]
-BIRCHTREE_NODES = ["bt-a", "bt-b", "bt-c"]
+BIRCHTREE_NODES = ["bt-a", "bt-b", "bt-c", "bt-d", "bt-e"]
 
 TEST_PAIRS = [(p, b) for p in PINETREE_NODES for b in BIRCHTREE_NODES] + \
              [(b, p) for b in BIRCHTREE_NODES for p in PINETREE_NODES]

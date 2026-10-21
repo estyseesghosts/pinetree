@@ -564,7 +564,7 @@ def wait(fn, timeout=30, interval=1):
 # documents limit enforcement, not federation.
 S7_FED_CHARS = int(os.environ.get("S7_FED_CHARS", 450))
 S7_OVER_CHARS = int(os.environ.get("S7_OVER_CHARS", 2900))
-S7_LIMIT_500 = {"bt-a", "bt-b", "bt-c", "mastodon"}
+S7_LIMIT_500 = {"bt-a", "bt-b", "bt-c", "bt-d", "bt-e", "bt-solo", "mastodon", "mast-a", "mast-b"}
 def s7():
     fed_blob = "x" * S7_FED_CHARS
     out = {}

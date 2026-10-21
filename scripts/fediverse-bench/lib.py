@@ -23,22 +23,32 @@ HOSTS = {
     "pt-a": "pt-a.test",
     "pt-b": "pt-b.test",
     "pt-c": "pt-c.test",
+    "pt-solo": "pt-solo.test",
     "bt-a": "bt-a.lab",
     "bt-b": "bt-b.lab",
     "bt-c": "bt-c.lab",
+    "bt-d": "bt-d.lab",
+    "bt-e": "bt-e.lab",
+    "bt-solo": "bt-solo.lab",
     "misskey": "misskey.test",
     "catodon": "catodon.test",
     "akkoma": "akkoma.test",
     "mastodon": "mastodon.lab",
+    "mast-a": "mastodon.lab",
+    "mast-b": "mast-b.lab",
 }
 # Pinetree checks the Host header; use 127.0.0.1 + explicit Host header
 NODE_OVERRIDE = {
     "pt-a": ("127.0.0.1:3000", "pt-a.test"),
     "pt-b": ("127.0.0.1:3103", "pt-b.test"),
     "pt-c": ("127.0.0.1:3105", "pt-c.test"),
+    "pt-solo": ("127.0.0.1:3090", "pt-solo.test"),
+    "bt-solo": ("127.0.0.1:8090", "bt-solo.lab"),
+    "bt-d": ("127.0.0.1:8083", "bt-d.lab"),
+    "bt-e": ("127.0.0.1:8084", "bt-e.lab"),
 }
-MISSKEY_FAMILY = {"pt-a", "pt-b", "pt-c", "misskey", "catodon"}
-MASTODON_FAMILY = {"bt-a", "bt-b", "bt-c", "akkoma", "mastodon"}
+MISSKEY_FAMILY = {"pt-a", "pt-b", "pt-c", "pt-solo", "misskey", "catodon"}
+MASTODON_FAMILY = {"bt-a", "bt-b", "bt-c", "bt-d", "bt-e", "bt-solo", "akkoma", "mastodon", "mast-a", "mast-b"}
 NODES = list(HOSTS)
 
 def _req(method, url, body=None, token=None, form=None, headers=None, timeout=30, host_header=None):
@@ -514,7 +524,7 @@ def build_ids():
     out = {}
     try: ss = subprocess.run(["ss", "-ltnpH"], capture_output=True, text=True, timeout=10).stdout
     except Exception: return out
-    ports = {int(addr.split(":")[1]) for addr, _ in NODE_OVERRIDE.values()} | {8080, 8081, 8082}
+    ports = {int(addr.split(":")[1]) for addr, _ in NODE_OVERRIDE.values()} | {8080, 8081, 8082, 8083, 8084}
     for line in ss.splitlines():
         m = re.search(r":(\d+)\s.*pid=(\d+)", line)
         if not m or int(m.group(1)) not in ports: continue

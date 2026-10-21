@@ -30,6 +30,6 @@ rehost() { # container entries...
   docker exec -u 0 "$c" sh -c 'grep -vE "# bench-2026-10-18|[[:space:]]bt-[abc]\.lab([[:space:]]|$)" /etc/hosts > /etc/hosts.new; cat /etc/hosts.new > /etc/hosts; rm /etc/hosts.new'
   for e in "$@"; do docker exec -u 0 "$c" sh -c "echo '$e # bench-2026-10-18' >> /etc/hosts"; done
 }
-rehost "$A" "172.17.0.1 pt-a.test pt-b.test pt-c.test" "$PROXY bt-a.lab bt-b.lab bt-c.lab" "172.28.0.10 mastodon.lab"
-for c in bt-mastodon bt-sidekiq; do rehost "$c" "$PROXY bt-a.lab bt-b.lab bt-c.lab"; done
+rehost "$A" "172.17.0.1 pt-a.test pt-b.test pt-c.test" "$PROXY bt-a.lab bt-b.lab bt-c.lab bt-d.lab bt-e.lab" "172.28.0.10 mastodon.lab"
+for c in bt-mastodon bt-sidekiq bt-mastodon-b bt-sidekiq-b; do rehost "$c" "$PROXY bt-a.lab bt-b.lab bt-c.lab bt-d.lab bt-e.lab mast-b.lab"; done
 echo "lab-net ok"

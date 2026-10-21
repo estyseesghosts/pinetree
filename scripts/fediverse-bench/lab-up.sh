@@ -31,17 +31,28 @@ docker start bt-pg bt-redis bt-proxy-mastodon bt-proxy-birchtree \
 
 # --- bench TLS proxy: cert for every name, signed by the lab CA (openssl is not on the host; the Mastodon image has it)
 mkdir -p "$TLS"
-NAMES="pt-a.test pt-b.test pt-c.test misskey.test catodon.test akkoma.test bt-a.lab bt-b.lab bt-c.lab"
+NAMES="pt-a.test pt-b.test pt-c.test misskey.test catodon.test akkoma.test bt-a.lab bt-b.lab bt-c.lab bt-d.lab bt-e.lab mast-b.lab"
 { printf 'subjectAltName='; first=1; for n in $NAMES; do [ $first = 1 ] || printf ','; printf 'DNS:%s' "$n"; first=0; done; echo
   echo 'extendedKeyUsage=serverAuth'; } >"$TLS/pt.ext"
 # upstream per name: the host's docker-bridge address (172.28.0.1) and the node's port
 declare -A PORT=([pt-a.test]=3000 [pt-b.test]=3103 [pt-c.test]=3105 [misskey.test]=80 [catodon.test]=80 [akkoma.test]=80
-                 [bt-a.lab]=8080 [bt-b.lab]=8081 [bt-c.lab]=8082)
+                 [bt-a.lab]=8080 [bt-b.lab]=8081 [bt-c.lab]=8082 [bt-d.lab]=8083 [bt-e.lab]=8084 [mast-b.lab]=8085)
 { echo 'events {}'; echo 'http {'; echo '  client_max_body_size 64m;'
   for n in $NAMES; do
     echo "  server { listen 80; listen 443 ssl; server_name $n; ssl_certificate /pt/pt.crt; ssl_certificate_key /pt/pt.key;"
-    echo "    location / { proxy_pass http://172.28.0.1:${PORT[$n]}; proxy_set_header Host \$host; proxy_set_header X-Forwarded-For \$remote_addr; proxy_http_version 1.1; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection \"upgrade\"; } }"
+    echo "    location / { proxy_pass http://172.28.0.1:${PORT[$n]}; proxy_set_header Host \$host; proxy_set_header X-Forwarded-Proto \$scheme; proxy_set_header X-Forwarded-For \$remote_addr; proxy_http_version 1.1; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection \"upgrade\"; } }"
   done; echo '}'; } >"$TLS/nginx.conf"
+# mast-b.lab is a second Mastodon: like bt-proxy-mastodon, always claim https
+# (Mastodon redirects plain-http upstreams to https, breaking harness http).
+python3 - "$TLS/nginx.conf" <<'EOF'
+import sys
+p = sys.argv[1]
+t = open(p).read()
+i = t.index("server_name mast-b.lab")
+j = t.index("} }", i)
+seg = t[i:j].replace("X-Forwarded-Proto $scheme", "X-Forwarded-Proto https")
+open(p, "w").write(t[:i] + seg + t[j:])
+EOF
 if [ ! -s "$TLS/pt.crt" ]; then
   cat >"$TLS/sign.sh" <<'EOS'
 set -e

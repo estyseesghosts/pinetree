@@ -8,3 +8,4 @@ MPC68MOKR/
 libfdb_c*.so
 repo.zip
 .claude/settings.local.json
+__pycache__/
