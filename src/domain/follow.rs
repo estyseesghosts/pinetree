@@ -93,7 +93,10 @@ impl FollowRequest {
 /// Accept path (WP6): the pending request must exist; the built edge keeps
 /// the request's `with_replies`/`notify` preferences and the caller's new
 /// edge id. Errors `NotFound(NO_FOLLOW_REQUEST)` when `request` is `None`.
-pub fn build_follow_from_request(request: Option<&FollowRequest>, edge_id: String) -> Result<Follow, DomainError> {
+pub fn build_follow_from_request(
+    request: Option<&FollowRequest>,
+    edge_id: String,
+) -> Result<Follow, DomainError> {
     let req = request.ok_or_else(|| DomainError::NotFound("NO_FOLLOW_REQUEST".to_string()))?;
     req.validate()?;
     Ok(Follow {

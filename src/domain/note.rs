@@ -372,11 +372,11 @@ fn strip_script_blocks(s: &str) -> String {
             out.push_str(rest);
             break;
         };
-        out.push_str(&rest[..start]);
-        let after_open = &rest[start..];
+        out.push_str(rest.get(..start).unwrap_or(""));
+        let after_open = rest.get(start..).unwrap_or("");
         let lower_after = after_open.to_lowercase();
         if let Some(end) = lower_after.find("</script>") {
-            rest = &after_open[end + "</script>".len()..];
+            rest = after_open.get(end + "</script>".len()..).unwrap_or("");
         } else {
             // Unterminated <script: drop to end (fail-closed).
             break;
@@ -433,8 +433,10 @@ fn strip_event_handlers(s: &str) -> String {
                 }
             }
         }
-        out.push(s[i..].chars().next().unwrap());
-        i += s[i..].chars().next().unwrap().len_utf8();
+        let Some(rest) = s.get(i..) else { break };
+        let Some(ch) = rest.chars().next() else { break };
+        out.push(ch);
+        i += ch.len_utf8();
     }
     out
 }
@@ -449,9 +451,9 @@ fn neutralize_scheme_case_insensitive(s: &str, scheme: &str) -> String {
             out.push_str(rest);
             break;
         };
-        out.push_str(&rest[..pos]);
+        out.push_str(rest.get(..pos).unwrap_or(""));
         out.push_str("blocked:");
-        rest = &rest[pos + scheme.len() + 1..];
+        rest = rest.get(pos + scheme.len() + 1..).unwrap_or("");
     }
     out
 }

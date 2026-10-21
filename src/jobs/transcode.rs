@@ -297,7 +297,9 @@ fn run_transcode_plan(
         }
     } else {
         match transcode_bytes(&bytes, input_ext, plan, with_audio, config) {
-            Ok((derived, _stats)) => commit_derived(media, blobs, meta, &derived, None, plan, config),
+            Ok((derived, _stats)) => {
+                commit_derived(media, blobs, meta, &derived, None, plan, config)
+            }
             Err(err) => map_transcode_error(meta, err),
         }
     }
@@ -402,7 +404,8 @@ fn commit_derived(
             Ok(processed) => (processed.width, processed.height, None),
             Err(err) => {
                 return Ok(TranscodeOutcome::FailedDeterministic(format!(
-                    "File type of uploaded media could not be verified: ffmpeg output undecodable: {err}"
+                    "File type of uploaded media could not be verified: \
+                     ffmpeg output undecodable: {err}"
                 )));
             }
         },

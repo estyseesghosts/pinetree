@@ -119,11 +119,13 @@ fn process_image(mime_type: &str, bytes: &[u8]) -> Result<Processed, ProcessErro
             height: Some(height),
             ..Processed::default()
         }),
-        None if matches!(mime_type, "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/bmp") => {
-            Err(ProcessError::Unidentifiable(format!(
+        None
+            if matches!(
+                mime_type,
+                "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/bmp"
+            ) => Err(ProcessError::Unidentifiable(format!(
                 "could not decode {mime_type}"
-            )))
-        }
+            ))),
         None => Err(ProcessError::Unidentifiable(format!(
             "unsupported media type {mime_type}"
         ))),
@@ -195,11 +197,14 @@ fn gif_dims(bytes: &[u8]) -> Option<(u32, u32)> {
     (width > 0 && height > 0).then_some((width, height))
 }
 
-/// WebP: RIFF/WEBP + VP8 (`9D 01 2A` start code, 14-bit dims at +26),
-/// VP8L (`2F` signature byte, 14-bit dims at +21) or VP8X (24-bit canvas at
-/// +24, stored minus one).
+/// WebP: RIFF/WEBP + VP8 (`9D 01 2A` start code, 14-bit dims at +26), VP8L
+/// (`2F` signature byte, 14-bit dims at +21) or VP8X (24-bit canvas at +24,
+/// stored minus one).
 fn webp_dims(bytes: &[u8]) -> Option<(u32, u32)> {
-    if bytes.len() < 30 || !bytes.starts_with(b"RIFF") || bytes.get(8..12) != Some(b"WEBP".as_slice()) {
+    if bytes.len() < 30
+        || !bytes.starts_with(b"RIFF")
+        || bytes.get(8..12) != Some(b"WEBP".as_slice())
+    {
         return None;
     }
     match bytes.get(12..16) {
@@ -272,7 +277,8 @@ pub fn mp4_dimensions(bytes: &[u8]) -> (Option<u32>, Option<u32>) {
 /// Walk the ISO-BMFF box tree for a `tkhd` box with a positive size.
 fn find_tkhd_size(bytes: &[u8]) -> Option<(Option<u32>, Option<u32>)> {
     // Container boxes a `tkhd` can live in (`moov/trak/...`).
-    const CONTAINERS: [&[u8; 4]; 7] = [b"moov", b"trak", b"mdia", b"minf", b"stbl", b"edts", b"udta"];
+    const CONTAINERS: [&[u8; 4]; 7] =
+        [b"moov", b"trak", b"mdia", b"minf", b"stbl", b"edts", b"udta"];
     let mut offset = 0usize;
     while offset + 8 <= bytes.len() {
         let size = u32::from_be_bytes(bytes[offset..offset + 4].try_into().ok()?) as u64;
@@ -328,8 +334,14 @@ fn tkhd_size(content: &[u8]) -> (Option<u32>, Option<u32>) {
         return (None, None);
     }
     let tail = &content[content.len() - 8..];
-    let width = u32::from_be_bytes(tail[0..4].try_into().ok().unwrap()) >> 16;
-    let height = u32::from_be_bytes(tail[4..8].try_into().ok().unwrap()) >> 16;
+    let width_bytes: [u8; 4] = tail[0..4]
+        .try_into()
+        .expect("tkhd tail slice is 8 bytes, so [0..4] converts to [u8; 4]");
+    let height_bytes: [u8; 4] = tail[4..8]
+        .try_into()
+        .expect("tkhd tail slice is 8 bytes, so [4..8] converts to [u8; 4]");
+    let width = u32::from_be_bytes(width_bytes) >> 16;
+    let height = u32::from_be_bytes(height_bytes) >> 16;
     (
         (width > 0).then_some(width),
         (height > 0).then_some(height),

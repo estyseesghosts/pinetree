@@ -233,7 +233,8 @@ impl EmailSender for SmtpEmailSender {
         if !self.config.smtp_username.is_empty() {
             session.command("AUTH LOGIN", 334, "AUTH LOGIN")?;
             session.command(
-                &base64::engine::general_purpose::STANDARD.encode(self.config.smtp_username.as_bytes()),
+                &base64::engine::general_purpose::STANDARD
+                    .encode(self.config.smtp_username.as_bytes()),
                 334,
                 "AUTH username",
             )
