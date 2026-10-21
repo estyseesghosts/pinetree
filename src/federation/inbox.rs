@@ -23,11 +23,13 @@ use crate::activitypub::actor::{parse_remote_actor, parse_url_host};
 use crate::activitypub::objects::{
     ParsedRemoteNote, extract_like_reaction, extract_object_uri, extract_uri_list,
     parse_note_audience, parse_question_poll, parse_remote_note, sanitize_html_to_mfm,
+    tombstone_inner_id,
 };
 use crate::activitypub::signatures::{parse_signature_header, verify_http_signature};
 use crate::application::commands::AppServices;
 use crate::application::ports::{Clock, CreateNoteInput, IdGenerator, PortError, TimelineCursor, UpdateAccountPatch};
 use crate::domain::account::Account;
+use crate::domain::fed_policy;
 use crate::domain::pinning::UserNotePining;
 use crate::domain::poll::PollInput;
 use crate::domain::note::{Note, Visibility};
@@ -35,6 +37,7 @@ use crate::domain::quote::QuoteReference;
 use crate::federation::delivery::{
     MAX_AP_JSON_BYTES, fetch_and_upsert_remote_actor, fetch_remote_note, resolve_remote_public_key,
 };
+use crate::federation::{ActivityIdIndex, ReplyCoalescer, StampNegativeCache};
 use crate::media::remote_cache::build_remote_media_fetch_job;
 
 /// Maximum accepted inbox POST body (64 KiB, same cap as outbound AP JSON).
@@ -174,18 +177,37 @@ fn process_inbox(
 // Authentication
 // ---------------------------------------------------------------------------
 
+/// True when the request carries RFC 9421 (`httpbis`) signature fields.
+/// Pinetree verifies the legacy draft-cavanaugh `Signature` header; RFC 9421
+/// is detected here for permissive-first logging (see [`authenticate`]) and
+/// ignored for auth until the tightener lands (WP5 report proposes the
+/// verifier + strict-mode knob).
+pub fn has_rfc9421_headers(headers: &HeaderMap) -> bool {
+    headers.contains_key("signature-input") || headers.contains_key("signature-agent")
+}
+
 /// Verify the HTTP signature, resolving the signer `keyId` against the cached
 /// remote public key (refreshing once from the network on failure).
 /// Returns the key owner's actor URI on success (from the cache, or from the
 /// freshly fetched document after the same parse checks are re-applied by
 /// the fetch-and-upsert path). Callers must compare `activity.actor` against
 /// this owner, never against a string derived from the keyId (Slice 2, C1).
+///
+/// RFC 9421 permissive-first (WP5): when `Signature-Input`/`Signature`
+/// (httpbis) fields are present they are LOGGED and auth proceeds on the
+/// legacy header. Rationale: Mastodon 4.3+ dual-signs during migration;
+/// rejecting the new fields outright would break interop before any pinetree
+/// verifier exists. The tightener (verify-if-present, then require) is a
+/// proposed follow-up — see the WP5 report.
 fn authenticate(
     services: &AppServices,
     path_and_query: &str,
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<String, Response> {
+    if has_rfc9421_headers(headers) {
+        crate::fed_debug!("in  rfc9421-present permissive-fallback (logged, legacy-verified)");
+    }
     // Parse the Signature header first to learn the keyId (no verification yet).
     let raw = headers
         .get("signature")
@@ -306,6 +328,11 @@ fn check_object_authority(
                 {
                     true
                 }
+                // WP5 string-URI `Update(Note)` fetch-and-apply: a string
+                // object naming a note passes through — dispatch fetches the
+                // document and requires `attributedTo == signer` plus exact
+                // authority before applying anything.
+                Some(Value::String(_)) => true,
                 Some(_) => {
                     let Some(object_id) = extract_object_uri(activity.get("object")) else {
                         return true; // dispatch ignores activities without an object
@@ -347,7 +374,16 @@ fn dispatch(
         "Delete" => handle_delete(services, activity, activity_id, actor_uri),
         "Update" => handle_update(services, activity, activity_id, actor_uri),
         // Clip membership sync (federated clips + pages handoff, Phase 2):
-        // prompt cache invalidation; full-state pulls converge.
+        // prompt cache invalidation; full-state pulls converge. Generic
+        // `Add`/`Remove` for any other target (Misskey dispatches these to
+        // list/clip membership handlers) are transport-accepted and ignored:
+        // pinetree owns no other remotely-mutable collections, and remote
+        // actors never mutate local collections — see
+        // `handle_clip_membership`. Relay receive+forward (Misskey relay
+        // actor + `RelayService.forward`): pinetree runs no relay actor —
+        // `fed_policy::relay_decision()` documents the refusal;
+        // relay-addressed traffic lands here as accept-and-ignore, never
+        // as fan-out.
         "Add" => handle_clip_membership(services, activity, activity_id, actor_uri, true),
         "Remove" => {
             handle_clip_membership(services, activity, activity_id, actor_uri, false)
@@ -937,6 +973,9 @@ fn handle_follow_response(
             &remote_followee.id,
             false,
         )?;
+        // WP5: seed the `Undo(Accept)`-by-ID index so a later bare-IRI
+        // `Undo{object: <this Accept id>}` resolves to this pair.
+        ActivityIdIndex::record_accept(&inner_actor, &inner_object, activity_id);
     } else {
         services.handle_inbound_reject_follow(
             activity_id,
@@ -1131,6 +1170,27 @@ fn handle_undo(
             // Assume an Announce id: our renote notes store the Announce URI.
             let uri = uri.trim();
             if uri.is_empty() {
+                return Ok(accepted());
+            }
+            // WP5 `Undo(Accept)` by-ID: a bare-IRI object that names a
+            // previously seen `Accept(Follow)` revokes that grant. Authority:
+            // only the Accepter (the embedded `Follow.object`) may undo it.
+            // Unknown ids fall through to the Announce path (which converges
+            // quietly when nothing matches).
+            if let Some((follower_uri, followee_uri)) = ActivityIdIndex::lookup_accept(uri) {
+                if followee_uri != actor_uri {
+                    return Ok(accepted());
+                }
+                let Some(follower) = resolve_local_account(services, &follower_uri)? else {
+                    return Ok(accepted());
+                };
+                if !follower.is_local() {
+                    return Ok(accepted());
+                }
+                if let Ok(followee) = resolve_remote_account(services, &followee_uri) {
+                    services.handle_inbound_unfollow(activity_id, &follower.id, &followee.id)?;
+                }
+                ActivityIdIndex::forget(uri);
                 return Ok(accepted());
             }
             let actor_account = resolve_remote_account(services, actor_uri)?;
@@ -1629,6 +1689,15 @@ fn handle_delete(
             // tombstone paths below.
         }
     }
+    // WP5 Tombstone-typed handling (Misskey dispatch parity): a
+    // `Delete` whose embedded object is `Tombstone`-typed names the deleted
+    // note in its `id` (the wrapper carries no other fields). This resolves
+    // through the same Path 1 below — the branch exists so the shape is
+    // recognized explicitly and covered by `tests/gaps_fed_update.rs`
+    // rather than by accident of `extract_object_uri`.
+    if tombstone_inner_id(activity.get("object")).is_some() {
+        crate::fed_debug!("in  tombstone-wrapped delete id={object_uri:?}");
+    }
     // Path 0: `Delete(Person)` inbound (Batch Q Phase 1, item 8c) — a
     // remote server announcing one of its accounts is gone. Applied via
     // the moderation tombstone path (handle stays reserved, follow edges
@@ -1782,6 +1851,16 @@ fn handle_update(
             let uri = uri.trim().to_string();
             if uri.is_empty() {
                 return Ok(accepted());
+            }
+            // WP5 `Update(Note)` string-URI fetch-and-apply (Sharkey parity):
+            // a string object that is NOT the actor's own URI names a note
+            // whose edited document must be fetched (SSRF/size/redirect
+            // guarded inside `fetch_remote_note`) and authority-checked
+            // (fetcher == note author, same exact authority) before the
+            // shared apply path runs. Unresolvable objects accept without
+            // recording so a later retry can succeed.
+            if uri != actor_uri {
+                return handle_update_note_string(services, &uri, activity_id, actor_uri);
             }
             (uri, None)
         }
@@ -1938,18 +2017,54 @@ fn handle_update_question(
     Ok(accepted())
 }
 
-/// Inbound `Update(Note|Article|Page)` (§8; Sharkey
+/// Inbound `Update(Note)` by string URI (WP5 §5; Sharkey
+/// `ApInboxService.update` → `fetchApObject` parity): dereference the named
+/// note over the SSRF/size/redirect-guarded fetcher, then run the shared
+/// apply path.
+///
+/// Authority (all must hold, else accept-without-change):
+/// * the fetched document's `attributedTo` is the signer (the signer may
+///   only edit its own notes);
+/// * the fetched document id stays on the requested URI's exact authority
+///   (no cross-host substitution via redirect/alias);
+/// * the cached copy exists and is remote-authored (never create here —
+///   creation stays on the `Create` path; DIVERGENCE from Sharkey's
+///   create-on-update fallback, matching the embedded arm).
+fn handle_update_note_string(
+    services: &AppServices,
+    note_uri: &str,
+    activity_id: &str,
+    actor_uri: &str,
+) -> Result<Response, PortError> {
+    // Replay gate before any fetch (same discipline as `Create`).
+    if services.dedup.is_recorded(activity_id)? {
+        return Ok(accepted());
+    }
+    let client = &services.federation_http;
+    let parsed = match fetch_remote_note(services, client, note_uri) {
+        Ok(parsed) => parsed,
+        Err(_) => return Ok(accepted()),
+    };
+    if parsed.attributed_to != actor_uri {
+        return Ok(accepted());
+    }
+    if !fed_policy::exact_authority_allows(&parsed.uri, note_uri) {
+        return Ok(accepted());
+    }
+    apply_parsed_note_edit(services, activity_id, actor_uri, &parsed)
+}
+
+/// Inbound `Update(Note|Article|Page)` (embedded; §8 + Sharkey
 /// `ApInboxService.update` → `ApNoteService.updateNote` parity): apply a
-/// remote author's edit to the cached local copy. Embedded documents only
-/// (string-URI objects are accepted without fetching — same divergence as
-/// the `Question` arm). Authority: the signer must be the note's author
-/// (`attributedTo`, defaulting to the signer when absent) and the cached
-/// copy's author; locally authored copies, unknown notes, and suspended
-/// authors converge to accept-without-change. A missing note is NOT
-/// created here (DIVERGENCE from Sharkey, which falls back to create —
-/// pinetree's `Create` path already ingests new notes). Poison-pill
-/// validation failures accept (no retry storm); storage faults propagate
-/// (the delivery retries).
+/// remote author's edit to the cached local copy. Authority: the signer must
+/// be the note's author (`attributedTo`, defaulting to the signer when
+/// absent) and the cached copy's author; locally authored copies, unknown
+/// notes, and suspended authors converge to accept-without-change. A missing
+/// note is NOT created here (DIVERGENCE from Sharkey, which falls back to
+/// create — pinetree's `Create` path already ingests new notes).
+/// Poison-pill validation failures accept (no retry storm); storage faults
+/// propagate (the delivery retries). String-URI objects take the
+/// fetch-and-apply arm ([`handle_update_note_string`]).
 fn handle_update_note(
     services: &AppServices,
     doc: &Value,
@@ -2013,6 +2128,19 @@ fn handle_update_note(
     if parsed.uri.trim().is_empty() || parsed.attributed_to != actor_uri {
         return Ok(accepted());
     }
+    apply_parsed_note_edit(services, activity_id, actor_uri, &parsed)
+}
+
+/// Shared edit-apply tail for embedded and fetched `Update(Note)`
+/// documents: quote-target re-resolution, poll-shape degradation, and the
+/// atomic `handle_inbound_update_note` commit. Poison-pill validation
+/// failures accept (no retry storm); storage faults propagate.
+fn apply_parsed_note_edit(
+    services: &AppServices,
+    activity_id: &str,
+    actor_uri: &str,
+    parsed: &ParsedRemoteNote,
+) -> Result<Response, PortError> {
     // Quote-target (renote) resolution: a present-but-unresolvable quote
     // detaches (Sharkey `quote ?? null` parity); an unchanged target
     // resolves to the same id (no-change, no history row).
@@ -2166,21 +2294,26 @@ fn ingest_remote_note_inner(
     // A pending parent gets its durable resolver job in the same commit as
     // the note below (a replay enqueues nothing — `record_note_activity`
     // stays the atomic authority). No unbounded network I/O happens here;
-    // the worker fetches off-request.
+    // the worker fetches off-request. WP5 coalescing: N waiters for one
+    // parent share a single trigger job inside the coalescing window (the
+    // pending-index entries are still recorded per note — the job only
+    // triggers the worker pass).
     if let Some(pending_uri) = reply_parent_uri.as_deref() {
-        extra_jobs.push(
-            crate::application::commands::inbound::replies::build_reply_parent_resolve_job(
-                services,
-                pending_uri,
-            )?,
-        );
+        if ReplyCoalescer::should_enqueue(pending_uri, services.clock.now_ms()) {
+            extra_jobs.push(
+                crate::application::commands::inbound::replies::build_reply_parent_resolve_job(
+                    services,
+                    pending_uri,
+                )?,
+            );
+        }
     }
     // Arrival-triggered resolution: a newly stored canonical URI may unblock
     // children already waiting on it. One cheap pending-index probe per
-    // inbound note; the resolver job does the bounded batch work.
-    // Arrival-triggered resolution: a newly stored canonical URI may unblock
-    // children already waiting on it. One cheap pending-index probe per
-    // inbound note; the resolver job does the bounded batch work.
+    // inbound note; the resolver job does the bounded batch work. This path
+    // stays UNCONDITIONAL (not coalesced): the parent is already cached, so
+    // the trigger links immediately with zero network I/O, and each parent
+    // URI arrives once — there is no N-waiter fan-out to coalesce here.
     let own_uri = parsed.uri.trim();
     if !own_uri.is_empty()
         && !services
@@ -2338,29 +2471,43 @@ fn resolve_inbound_quote(
             // without the target author: inconclusive, not rejection.
             quote.authorization = Unknown;
         } else {
-            let client = &services.federation_http;
-            match crate::federation::delivery::fetch_quote_stamp_doc(
-                services,
-                client,
-                &stamp_iri,
-            ) {
-                Ok(doc) => {
-                    match crate::activitypub::quotes::verify_stamp_for_quote(
-                        &doc,
-                        &stamp_iri,
-                        &parsed.uri,
-                        &target_uri,
-                        &target_author_uri,
-                    ) {
-                        Ok(()) => {
-                            quote.authorization = Approved;
-                            quote.authorization_uri = Some(stamp_iri);
-                            quote.last_verified_at = Some(services.clock.now_ms());
+            // WP5 negative stamp dedup: a recently failed stamp IRI is not
+            // re-fetched until its backoff elapses (transport failures map
+            // to `Unknown`, never to rejection — same as a fresh failure).
+            let now_ms = services.clock.now_ms();
+            if !StampNegativeCache::should_fetch(&stamp_iri, now_ms) {
+                quote.authorization = Unknown;
+            } else {
+                let client = &services.federation_http;
+                match crate::federation::delivery::fetch_quote_stamp_doc(
+                    services,
+                    client,
+                    &stamp_iri,
+                ) {
+                    Ok(doc) => {
+                        match crate::activitypub::quotes::verify_stamp_for_quote(
+                            &doc,
+                            &stamp_iri,
+                            &parsed.uri,
+                            &target_uri,
+                            &target_author_uri,
+                        ) {
+                            Ok(()) => {
+                                quote.authorization = Approved;
+                                quote.authorization_uri = Some(stamp_iri.clone());
+                                quote.last_verified_at = Some(now_ms);
+                                StampNegativeCache::record(&stamp_iri, now_ms, true);
+                            }
+                            Err(_) => {
+                                StampNegativeCache::record(&stamp_iri, now_ms, false);
+                            }
                         }
-                        Err(_) => {}
+                    }
+                    Err(_) => {
+                        StampNegativeCache::record(&stamp_iri, now_ms, false);
+                        quote.authorization = Unknown;
                     }
                 }
-                Err(_) => quote.authorization = Unknown,
             }
         }
     }
@@ -3925,6 +4072,9 @@ mod reply_resolution_tests {
 
     #[test]
     fn unknown_parent_stays_pending_then_links_on_arrival() {
+        // The reply coalescer is process-global: clear it so parallel tests
+        // sharing PARENT_URI cannot suppress this test's trigger job.
+        crate::federation::clear_ephemeral_caches_for_tests();
         let services = Arc::new(test_services("pending-arrival"));
         let (priv_key, pub_key) = generate_rsa_keypair_2048().unwrap();
         let (private_pem, public_pem) = (

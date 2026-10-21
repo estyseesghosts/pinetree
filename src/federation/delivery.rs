@@ -364,10 +364,9 @@ pub fn resolve_and_validate_url(
 ) -> Result<(ParsedUrl, Vec<SocketAddr>), SendError> {
     let parsed = parse_http_url(url).map_err(|e| SendError::new(SendErrorKind::InvalidUrl, e))?;
     let host_allowed = cfg.allow_private_ips
-        || cfg
-            .allowed_hosts
-            .iter()
-            .any(|h| h.eq_ignore_ascii_case(&parsed.host) || h.eq_ignore_ascii_case(&parsed.host_header));
+        || cfg.allowed_hosts.iter().any(|h| {
+            h.eq_ignore_ascii_case(&parsed.host) || h.eq_ignore_ascii_case(&parsed.host_header)
+        });
 
     // Check literal IP first so we reject private literals before touching DNS.
     if let Ok(ip) = parsed.host.parse::<IpAddr>() {
@@ -631,7 +630,7 @@ impl SafeHttpClient {
             method.to_ascii_uppercase(),
             parsed.path_and_query
         )
-        .unwrap();
+        .expect("writing an HTTP request line into a Vec<u8> never fails");
         let mut has_host = false;
         let mut has_ua = false;
         let mut has_conn = false;
@@ -646,23 +645,26 @@ impl SafeHttpClient {
             } else if k.eq_ignore_ascii_case("content-length") {
                 has_len = true;
             }
-            write!(&mut req_buf, "{k}: {v}\r\n").unwrap();
+            write!(&mut req_buf, "{k}: {v}\r\n").expect("Vec<u8> writes are infallible");
         }
         if !has_host {
-            write!(&mut req_buf, "Host: {}\r\n", parsed.host_header).unwrap();
+            write!(&mut req_buf, "Host: {}\r\n", parsed.host_header)
+                .expect("Vec<u8> writes are infallible");
         }
         if !has_ua {
-            write!(&mut req_buf, "User-Agent: {}\r\n", self.config.user_agent).unwrap();
+            write!(&mut req_buf, "User-Agent: {}\r\n", self.config.user_agent)
+                .expect("Vec<u8> writes are infallible");
         }
         if !has_conn {
-            write!(&mut req_buf, "Connection: close\r\n").unwrap();
+            write!(&mut req_buf, "Connection: close\r\n").expect("Vec<u8> writes are infallible");
         }
         if let Some(b) = body {
             if !has_len {
-                write!(&mut req_buf, "Content-Length: {}\r\n", b.len()).unwrap();
+                write!(&mut req_buf, "Content-Length: {}\r\n", b.len())
+                    .expect("Vec<u8> writes are infallible");
             }
         }
-        write!(&mut req_buf, "\r\n").unwrap();
+        write!(&mut req_buf, "\r\n").expect("Vec<u8> writes are infallible");
         if let Some(b) = body {
             req_buf.extend_from_slice(b);
         }

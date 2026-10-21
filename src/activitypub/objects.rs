@@ -412,7 +412,8 @@ pub fn sanitize_html_to_mfm(input: &str) -> String {
                 continue;
             }
         }
-        let ch = s[i..].chars().next().unwrap();
+        let Some(rest) = s.get(i..) else { break };
+        let Some(ch) = rest.chars().next() else { break };
         out.push(ch);
         i += ch.len_utf8();
     }
@@ -473,7 +474,8 @@ pub fn sanitize_mfm_text(input: &str) -> String {
                 }
             }
         }
-        let ch = s[i..].chars().next().unwrap();
+        let Some(rest) = s.get(i..) else { break };
+        let Some(ch) = rest.chars().next() else { break };
         cleaned.push(ch);
         i += ch.len_utf8();
     }
@@ -494,7 +496,8 @@ pub fn sanitize_mfm_text(input: &str) -> String {
                 continue;
             }
         }
-        let ch = cleaned[pos..].chars().next().unwrap();
+        let Some(rest) = cleaned.get(pos..) else { break };
+        let Some(ch) = rest.chars().next() else { break };
         final_out.push(ch);
         pos += ch.len_utf8();
     }
@@ -983,6 +986,38 @@ pub fn render_featured_change_activity(
         "target": format!("{actor_uri}/collections/featured"),
         "object": note_uri,
     })
+}
+
+/// Render an `EmojiReact` activity for Akkoma/Pleroma-family recipients
+/// (WP5 §5): `type: EmojiReact`, `content` always set to the reaction, plus
+/// a `tag: [{type: Emoji, name}]` entry for custom `:shortcode:` reactions
+/// (Akkoma renders custom emoji from the tag; unicode reactions carry no
+/// tag — a fabricated tag URL would be unverifiable, so only the portable
+/// `name` is emitted). Inbound compatibility is symmetric: see
+/// [`extract_like_reaction`] (prefers `content`, then the `Emoji` tag).
+pub fn render_emoji_react_activity(
+    public_url: &str,
+    reaction_id: &str,
+    actor_uri: &str,
+    target_note_uri: &str,
+    reaction: &str,
+) -> Value {
+    let base = public_url.trim_end_matches('/');
+    let mut activity = json!({
+        "@context": ap_context(),
+        "id": format!("{base}/likes/{reaction_id}"),
+        "type": "EmojiReact",
+        "actor": actor_uri,
+        "object": target_note_uri,
+        "content": reaction,
+    });
+    if crate::domain::fed_policy::is_custom_emoji_reaction(reaction) {
+        activity["tag"] = json!([{
+            "type": "Emoji",
+            "name": reaction,
+        }]);
+    }
+    activity
 }
 
 /// Render a `Like` activity, choosing the emoji-reaction form or the plain
@@ -1639,6 +1674,11 @@ pub struct ParsedPoll {
 /// Extract a [`ParsedPoll`] from a Note/Question object map, or `None`
 /// when the object carries no usable `oneOf`/`anyOf` (fewer than 2 named
 /// choices — the storage invariant minimum).
+///
+/// Option `type` is deliberately unchecked: Mastodon/Glitch-soc serialize
+/// poll options as `{type: "Note", name, replies}` (pinned-revision
+/// fixtures in `tests/gaps_fed_emoji.rs`), Misskey omits `type` entirely.
+/// Both shapes parse identically; only the choice count gates.
 pub fn parse_question_poll(
     obj: &serde_json::Map<String, Value>,
 ) -> Option<ParsedPoll> {
@@ -1756,6 +1796,27 @@ pub fn extract_object_uri(val: Option<&Value>) -> Option<String> {
             .map(ToOwned::to_owned),
         _ => None,
     }
+}
+
+/// Extract the inner note URI from a `Tombstone`-typed embedded object
+/// (`Delete{Tombstone{id}}` per Misskey dispatch, or a bare `Tombstone`
+/// document served at a deleted-note URI). Returns `None` for non-Tombstone
+/// objects — use [`extract_object_uri`] for the general case.
+///
+/// A `type` value is Tombstone-shaped when it is exactly `"Tombstone"` or
+/// ends with `#Tombstone` (compact- vs full-IRI JSON-LD forms).
+pub fn tombstone_inner_id(object: Option<&Value>) -> Option<String> {
+    let map = object?.as_object()?;
+    let obj_type = map.get("type").and_then(Value::as_str).unwrap_or("");
+    let is_tombstone = obj_type == "Tombstone" || obj_type.ends_with("#Tombstone");
+    if !is_tombstone {
+        return None;
+    }
+    map.get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 // ---------------------------------------------------------------------------

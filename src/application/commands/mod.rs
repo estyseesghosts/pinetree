@@ -9,8 +9,13 @@ use crate::federation::delivery::SafeHttpClient;
 
 pub mod accounts;
 pub mod abuse_reports;
+pub mod admin_ext;
+pub mod announcements;
 pub mod antennas;
+pub mod auth_2fa;
 pub mod blocks;
+pub mod channels;
+pub mod chat;
 pub mod drafts;
 pub mod emoji;
 
@@ -18,19 +23,25 @@ pub mod emoji_transfer;
 pub mod exports;
 pub mod favorites;
 pub mod follows;
+pub mod gallery;
+pub mod hashtags;
 pub mod helpers;
 pub mod inbound;
 pub mod invites;
 pub mod keys;
 pub mod media;
+pub mod misc_endpoints;
 pub mod moderation;
 pub mod notifications;
 pub mod notes;
 pub mod pins;
 pub mod polls;
 pub mod clips;
+pub mod drive_bulk;
+pub mod drive_folders;
 pub mod pages;
 pub mod user_lists;
+pub mod webhooks;
 #[cfg(test)]
 pub(crate) mod tests;
 

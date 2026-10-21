@@ -135,7 +135,8 @@ pub fn normalize_inbound_quote(obj: &Value) -> Option<NormalizedQuote> {
     let misskey = first_http_iri(map.get("_misskey_quote"))
         .or_else(|| first_http_iri(map.get(MISSKEY_QUOTE)))
         .or_else(|| first_http_iri(map.get(MISSKEY_QUOTE_SLASH)));
-    let quote_url = first_http_iri(map.get("quoteUrl")).or_else(|| first_http_iri(map.get(QUOTE_URL)));
+    let quote_url = first_http_iri(map.get("quoteUrl"))
+        .or_else(|| first_http_iri(map.get(QUOTE_URL)));
     // Fedibird has shipped both `quoteUri` and the `quoteURL` capitalization;
     // Pleroma normalizes all three spellings.
     let quote_uri = first_http_iri(map.get("quoteUri"))
@@ -443,13 +444,16 @@ pub fn verify_stamp_for_quote(
         quoted_target_uri,
         quoted_author_actor_uri,
     )?;
-    let host_of = |uri: &str| {
-        crate::activitypub::actor::parse_url_host(uri).map(|(_, host)| host.to_ascii_lowercase())
-    };
-    match (host_of(stamp_id), host_of(quoted_author_actor_uri)) {
-        (Some(stamp_host), Some(author_host)) if stamp_host == author_host => Ok(()),
-        _ => Err("stamp authority: stamp must live on the quoted author's host".to_string()),
+    // Authority is EXACT-host (WP5): the stamp IRI must live on the quoted
+    // author's exact `host[:port]` — not a subdomain, not a sibling port,
+    // not a bare-host-vs-port split. Comparison runs through
+    // `fed_policy::exact_authority_allows` (lowercase, trailing-dot
+    // tolerant, scheme- and port-sensitive) rather than a substring or
+    // registrable-domain check.
+    if !crate::domain::fed_policy::exact_authority_allows(stamp_id, quoted_author_actor_uri) {
+        return Err("stamp authority: stamp must live on the quoted author's host".to_string());
     }
+    Ok(())
 }
 
 fn single_iri(val: Option<&Value>) -> Option<String> {
@@ -676,6 +680,42 @@ mod tests {
         let mut bad = good.clone();
         bad.as_object_mut().unwrap().remove("id");
         assert!(verify_stamp(&bad, stamp_id, quote_uri, target_uri, author_uri).is_err());
+    }
+
+    #[test]
+    fn stamp_authority_is_exact_host() {
+        let quote_uri = "https://quoting.example/notes/q";
+        let target_uri = "https://target.example/notes/1";
+        let stamp_id = "https://target.example/stamps/1";
+        let author_uri = "https://target.example/users/bob";
+        let good = json!({
+            "id": stamp_id,
+            "type": "QuoteAuthorization",
+            "attributedTo": author_uri,
+            "interactingObject": quote_uri,
+            "interactionTarget": target_uri,
+        });
+        assert!(verify_stamp_for_quote(&good, stamp_id, quote_uri, target_uri, author_uri).is_ok());
+        // Sibling port: different authority.
+        let elsewhere = "https://target.example:8443/stamps/1";
+        let mut bad = good.clone();
+        bad["id"] = json!(elsewhere);
+        assert!(verify_stamp_for_quote(&bad, elsewhere, quote_uri, target_uri, author_uri).is_err());
+        // Subdomain: different authority.
+        let sub = "https://sub.target.example/stamps/1";
+        let mut bad = good.clone();
+        bad["id"] = json!(sub);
+        assert!(verify_stamp_for_quote(&bad, sub, quote_uri, target_uri, author_uri).is_err());
+        // Trailing dot: same authority (tolerant).
+        let dotted = "https://target.example./stamps/1";
+        let mut ok = good.clone();
+        ok["id"] = json!(dotted);
+        assert!(verify_stamp_for_quote(&ok, dotted, quote_uri, target_uri, author_uri).is_ok());
+        // Scheme downgrade: different authority.
+        let plain = "http://target.example/stamps/1";
+        let mut bad = good.clone();
+        bad["id"] = json!(plain);
+        assert!(verify_stamp_for_quote(&bad, plain, quote_uri, target_uri, author_uri).is_err());
     }
 
     #[test]

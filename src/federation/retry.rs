@@ -126,7 +126,10 @@ impl DestinationTracker {
         let entry = guard.entry(key).or_default();
         entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
         entry.last_failure_ms = Some(now_ms);
-        let backoff = compute_backoff_ms(base_backoff_ms, entry.consecutive_failures.saturating_sub(1));
+        let backoff = compute_backoff_ms(
+            base_backoff_ms,
+            entry.consecutive_failures.saturating_sub(1),
+        );
         let until = now_ms.saturating_add(backoff);
         entry.cooldown_until_ms = Some(until);
         until
