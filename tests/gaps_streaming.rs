@@ -25,17 +25,15 @@ use pinetree::api::misskey::response::{RateLimiter, UploadSlots};
 use pinetree::api::misskey::{ApiState, build_router};
 use pinetree::application::commands::AppServices;
 use pinetree::application::events::{MainEventKind, MainMessage, StreamingEvent};
-use pinetree::application::ports::{
-    ApiTokenRecord, AuthStore, BlobStore, Clock, IdGenerator, InsertMediaInput, PortError,
-};
+use pinetree::application::ports::{BlobStore, Clock, IdGenerator, InsertMediaInput, PortError};
 use pinetree::domain::id::{AidxGenerator, SystemClock};
 use pinetree::domain::media::MediaProperties;
 use pinetree::federation::delivery::{SafeHttpClient, SafeHttpConfig};
 use pinetree::federation::retry::DestinationTracker;
 use pinetree::jobs::worker::JobWorker;
 use pinetree::media::transcode::TranscodeConfig;
-use pinetree::services::email::{SmtpConfig, SmtpEmailSender};
 use pinetree::persistence::redb::RedbStore;
+use pinetree::services::email::{SmtpConfig, SmtpEmailSender};
 use pinetree::streaming::hub::hub_and_sink;
 
 #[derive(Default)]
@@ -45,7 +43,10 @@ struct MemBlobs {
 
 impl BlobStore for MemBlobs {
     fn put(&self, hash: &str, bytes: &[u8]) -> Result<(), PortError> {
-        self.inner.lock().unwrap().insert(hash.to_string(), bytes.to_vec());
+        self.inner
+            .lock()
+            .unwrap()
+            .insert(hash.to_string(), bytes.to_vec());
         Ok(())
     }
     fn get(&self, hash: &str) -> Result<Option<Vec<u8>>, PortError> {
@@ -59,10 +60,10 @@ impl BlobStore for MemBlobs {
 
 /// Minimal 1x1 PNG (only the 8-byte magic matters to the sniffer).
 const TINY_PNG: &[u8] = &[
-    0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13, b'I', b'H', b'D', b'R', 0, 0,
-    0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 0x1f, 0x15, 0xc4, 0x89, 0, 0, 0, 13, b'I', b'D', b'A',
-    b'T', 0x78, 0x9c, 0x63, 0x60, 0x60, 0x60, 0x00, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a,
-    0x2d, 0xb4, 0, 0, 0, 0, b'I', b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82,
+    0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13, b'I', b'H', b'D', b'R', 0, 0, 0,
+    1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 0x1f, 0x15, 0xc4, 0x89, 0, 0, 0, 13, b'I', b'D', b'A', b'T',
+    0x78, 0x9c, 0x63, 0x60, 0x60, 0x60, 0x00, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4,
+    0, 0, 0, 0, b'I', b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82,
 ];
 
 struct LiveServer {
@@ -73,7 +74,8 @@ struct LiveServer {
 
 impl LiveServer {
     async fn start() -> Self {
-        let dir = std::env::temp_dir().join(format!("pinetree-gaps-stream-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("pinetree-gaps-stream-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let ids: Arc<dyn IdGenerator> = Arc::new(AidxGenerator::new(clock.clone()));
@@ -131,17 +133,17 @@ impl LiveServer {
             scheduled_note_limit: pinetree::domain::draft::DEFAULT_SCHEDULED_NOTE_LIMIT,
             pin_limit: pinetree::domain::pinning::DEFAULT_PIN_LIMIT,
             default_like: None,
-        cache_blobs: blobs.clone(),
-        drive_capacity_per_user_bytes: 1 << 30,
-        remote_cache_max_bytes: 512 << 20,
-        remote_cache_avatar_bytes: 128 << 20,
-        remote_cache_preview_bytes: 256 << 20,
-        remote_cache_full_bytes: 128 << 20,
-        remote_cache_mode: pinetree::config::RemoteCacheMode::OnDemand,
-        remote_cache_avatar_ttl_days: 30,
-        remote_cache_preview_ttl_days: 7,
-        remote_cache_full_ttl_days: 3,
-        remote_cache_warming_enabled: false,
+            cache_blobs: blobs.clone(),
+            drive_capacity_per_user_bytes: 1 << 30,
+            remote_cache_max_bytes: 512 << 20,
+            remote_cache_avatar_bytes: 128 << 20,
+            remote_cache_preview_bytes: 256 << 20,
+            remote_cache_full_bytes: 128 << 20,
+            remote_cache_mode: pinetree::config::RemoteCacheMode::OnDemand,
+            remote_cache_avatar_ttl_days: 30,
+            remote_cache_preview_ttl_days: 7,
+            remote_cache_full_ttl_days: 3,
+            remote_cache_warming_enabled: false,
         });
         let worker = Arc::new(JobWorker {
             clock: clock.clone(),
@@ -253,15 +255,20 @@ impl LiveServer {
     }
 }
 
-type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type Ws =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 async fn connect(url: &str) -> Ws {
-    let (ws, _) = tokio_tungstenite::connect_async(url).await.expect("ws connect");
+    let (ws, _) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("ws connect");
     ws
 }
 
 async fn send(ws: &mut Ws, msg: Value) {
-    ws.send(Message::Text(msg.to_string().into())).await.unwrap();
+    ws.send(Message::Text(msg.to_string().into()))
+        .await
+        .unwrap();
 }
 
 async fn recv(ws: &mut Ws) -> Value {
@@ -325,9 +332,7 @@ async fn settle() {
 async fn recv_channel(ws: &mut Ws, id: &str, event: &str) -> Value {
     for _ in 0..8 {
         let frame = recv(ws).await;
-        if frame["type"] == "channel"
-            && frame["body"]["id"] == id
-            && frame["body"]["type"] == event
+        if frame["type"] == "channel" && frame["body"]["id"] == id && frame["body"]["type"] == event
         {
             return frame;
         }
@@ -356,26 +361,42 @@ async fn hashtag_channel_matches_tags_and_rejects_bad_q() {
     let (_, alice_token) = srv.signup("alice").await;
 
     let mut rust_ws = connect(&srv.ws_url("")).await;
-    send(&mut rust_ws, serde_json::json!({
-        "type": "connect",
-        "body": { "channel": "hashtag", "id": "r", "params": { "q": [["rust"]] } },
-    })).await;
+    send(
+        &mut rust_ws,
+        serde_json::json!({
+            "type": "connect",
+            "body": { "channel": "hashtag", "id": "r", "params": { "q": [["rust"]] } },
+        }),
+    )
+    .await;
     // AND-of-ORs: needs both tags.
     let mut both_ws = connect(&srv.ws_url("")).await;
-    send(&mut both_ws, serde_json::json!({
-        "type": "connect",
-        "body": { "channel": "hashtag", "id": "b", "params": { "q": [["rust", "async"]] } },
-    })).await;
+    send(
+        &mut both_ws,
+        serde_json::json!({
+            "type": "connect",
+            "body": { "channel": "hashtag", "id": "b", "params": { "q": [["rust", "async"]] } },
+        }),
+    )
+    .await;
     // Malformed `q` (not an array of string arrays): silently refused —
     // never an `UNSUPPORTED_CHANNEL` (reserved for unknown names).
     let mut bad_ws = connect(&srv.ws_url("")).await;
-    send(&mut bad_ws, serde_json::json!({
-        "type": "connect",
-        "body": { "channel": "hashtag", "id": "x", "params": { "q": "rust" } },
-    })).await;
+    send(
+        &mut bad_ws,
+        serde_json::json!({
+            "type": "connect",
+            "body": { "channel": "hashtag", "id": "x", "params": { "q": "rust" } },
+        }),
+    )
+    .await;
 
     let (status, created) = srv
-        .api("notes/create", serde_json::json!({ "text": "hello #rust world" }), Some(&alice_token))
+        .api(
+            "notes/create",
+            serde_json::json!({ "text": "hello #rust world" }),
+            Some(&alice_token),
+        )
         .await;
     assert_eq!(status, 200);
     let note_id = created["createdNote"]["id"].as_str().unwrap().to_string();
@@ -400,9 +421,13 @@ async fn decision_channels_stay_unsupported() {
         .enumerate()
     {
         let id = format!("u{i}");
-        send(&mut ws, serde_json::json!({
-            "type": "connect", "body": { "channel": channel, "id": id },
-        })).await;
+        send(
+            &mut ws,
+            serde_json::json!({
+                "type": "connect", "body": { "channel": channel, "id": id },
+            }),
+        )
+        .await;
         let frame = recv(&mut ws).await;
         assert_eq!(frame["type"], "error", "{channel}");
         assert_eq!(frame["body"]["code"], "UNSUPPORTED_CHANNEL", "{channel}");
@@ -426,7 +451,11 @@ async fn role_timeline_connects_but_stays_silent_without_roles() {
     assert_eq!(frame["type"], "connected");
 
     let (status, _) = srv
-        .api("notes/create", serde_json::json!({ "text": "public" }), Some(&alice_token))
+        .api(
+            "notes/create",
+            serde_json::json!({ "text": "public" }),
+            Some(&alice_token),
+        )
         .await;
     assert_eq!(status, 200);
     recv_nothing(&mut ws).await;
@@ -439,32 +468,46 @@ async fn drive_channel_delivers_file_events_to_owner() {
     let (_, bob_token) = srv.signup("bob").await;
 
     let mut alice_ws = connect(&srv.ws_url(&format!("?i={alice_token}"))).await;
-    send(&mut alice_ws, serde_json::json!({
-        "type": "connect", "body": { "channel": "drive", "id": "d" },
-    })).await;
+    send(
+        &mut alice_ws,
+        serde_json::json!({
+            "type": "connect", "body": { "channel": "drive", "id": "d" },
+        }),
+    )
+    .await;
     // Anonymous `drive`: a credential channel, silently ignored.
     let mut anon_ws = connect(&srv.ws_url("")).await;
-    send(&mut anon_ws, serde_json::json!({
-        "type": "connect", "body": { "channel": "drive", "id": "a", "pong": true },
-    })).await;
+    send(
+        &mut anon_ws,
+        serde_json::json!({
+            "type": "connect", "body": { "channel": "drive", "id": "a", "pong": true },
+        }),
+    )
+    .await;
     recv_nothing(&mut anon_ws).await;
 
     let file_id = srv.make_file(Some(&alice_id), "pic.png");
     settle().await;
-    publish(&srv.services, &StreamingEvent::DriveFileCreated {
-        user_id: alice_id.clone(),
-        file_id: file_id.clone(),
-    });
+    publish(
+        &srv.services,
+        &StreamingEvent::DriveFileCreated {
+            user_id: alice_id.clone(),
+            file_id: file_id.clone(),
+        },
+    );
     let frame = recv(&mut alice_ws).await;
     let (id, event, body) = channel_body(&frame);
     assert_eq!((id, event), ("d", "fileCreated"));
     assert_eq!(body["id"], file_id);
     recv_nothing(&mut anon_ws).await;
 
-    publish(&srv.services, &StreamingEvent::DriveFileUpdated {
-        user_id: alice_id.clone(),
-        file_id: file_id.clone(),
-    });
+    publish(
+        &srv.services,
+        &StreamingEvent::DriveFileUpdated {
+            user_id: alice_id.clone(),
+            file_id: file_id.clone(),
+        },
+    );
     let frame = recv(&mut alice_ws).await;
     let (_, event, _) = channel_body(&frame);
     assert_eq!(event, "fileUpdated");
@@ -472,16 +515,22 @@ async fn drive_channel_delivers_file_events_to_owner() {
     // Blob rows for another user never reach this socket.
     let bob_file = srv.make_file(Some("someone-else"), "other.png");
     let _ = bob_token;
-    publish(&srv.services, &StreamingEvent::DriveFileCreated {
-        user_id: "someone-else".to_string(),
-        file_id: bob_file.clone(),
-    });
+    publish(
+        &srv.services,
+        &StreamingEvent::DriveFileCreated {
+            user_id: "someone-else".to_string(),
+            file_id: bob_file.clone(),
+        },
+    );
     recv_nothing(&mut alice_ws).await;
 
-    publish(&srv.services, &StreamingEvent::DriveFileDeleted {
-        user_id: alice_id.clone(),
-        file_id: file_id.clone(),
-    });
+    publish(
+        &srv.services,
+        &StreamingEvent::DriveFileDeleted {
+            user_id: alice_id.clone(),
+            file_id: file_id.clone(),
+        },
+    );
     let frame = recv(&mut alice_ws).await;
     let (id, event, body) = channel_body(&frame);
     assert_eq!((id, event), ("d", "fileDeleted"));
@@ -493,9 +542,13 @@ async fn stats_channels_emit_snapshot_and_stats_log() {
     let srv = LiveServer::start().await;
 
     let mut ws = connect(&srv.ws_url("")).await;
-    send(&mut ws, serde_json::json!({
-        "type": "connect", "body": { "channel": "serverStats", "id": "s" },
-    })).await;
+    send(
+        &mut ws,
+        serde_json::json!({
+            "type": "connect", "body": { "channel": "serverStats", "id": "s" },
+        }),
+    )
+    .await;
     let frame = recv(&mut ws).await;
     let (id, event, body) = channel_body(&frame);
     assert_eq!((id, event), ("s", "stats"));
@@ -512,13 +565,20 @@ async fn stats_channels_emit_snapshot_and_stats_log() {
     assert_eq!((id, event), ("s", "statsLog"));
 
     let mut qw = connect(&srv.ws_url("")).await;
-    send(&mut qw, serde_json::json!({
-        "type": "connect", "body": { "channel": "queueStats", "id": "q" },
-    })).await;
+    send(
+        &mut qw,
+        serde_json::json!({
+            "type": "connect", "body": { "channel": "queueStats", "id": "q" },
+        }),
+    )
+    .await;
     let frame = recv(&mut qw).await;
     let (id, event, body) = channel_body(&frame);
     assert_eq!((id, event), ("q", "stats"));
-    assert!(body.get("waiting").and_then(Value::as_u64).is_some(), "{body}");
+    assert!(
+        body.get("waiting").and_then(Value::as_u64).is_some(),
+        "{body}"
+    );
     send(&mut qw, serde_json::json!({
         "type": "ch", "body": { "id": "q", "type": "requestLog", "body": { "id": "log2", "length": 5 } },
     })).await;
@@ -533,19 +593,29 @@ async fn admin_channel_needs_moderator_and_reports_abuse() {
     let (alice_id, alice_token) = srv.signup("alice").await;
     let (bob_id, bob_token) = srv.signup("bob").await;
     let (mod_id, mod_token) = srv.signup("carmod").await;
-    srv.services.set_role(None, &mod_id, false, true).expect("set role");
+    srv.services
+        .set_role(None, &mod_id, false, true)
+        .expect("set role");
 
     // Non-moderator: silently refused even with pong (no `connected`).
     let mut alice_ws = connect(&srv.ws_url(&format!("?i={alice_token}"))).await;
-    send(&mut alice_ws, serde_json::json!({
-        "type": "connect", "body": { "channel": "admin", "id": "a", "pong": true },
-    })).await;
+    send(
+        &mut alice_ws,
+        serde_json::json!({
+            "type": "connect", "body": { "channel": "admin", "id": "a", "pong": true },
+        }),
+    )
+    .await;
     recv_nothing(&mut alice_ws).await;
 
     let mut mod_ws = connect(&srv.ws_url(&format!("?i={mod_token}"))).await;
-    send(&mut mod_ws, serde_json::json!({
-        "type": "connect", "body": { "channel": "admin", "id": "a", "pong": true },
-    })).await;
+    send(
+        &mut mod_ws,
+        serde_json::json!({
+            "type": "connect", "body": { "channel": "admin", "id": "a", "pong": true },
+        }),
+    )
+    .await;
     let frame = recv(&mut mod_ws).await;
     assert_eq!(frame["type"], "connected");
 
@@ -561,7 +631,12 @@ async fn admin_channel_needs_moderator_and_reports_abuse() {
     let report_id = report["id"].as_str().unwrap().to_string();
     let _ = bob_id;
     settle().await;
-    publish(&srv.services, &StreamingEvent::AdminReport { report_id: report_id.clone() });
+    publish(
+        &srv.services,
+        &StreamingEvent::AdminReport {
+            report_id: report_id.clone(),
+        },
+    );
     let frame = recv(&mut mod_ws).await;
     let (id, event, body) = channel_body(&frame);
     assert_eq!((id, event), ("a", "newAbuseUserReport"));
@@ -576,17 +651,25 @@ async fn clip_channel_delivers_updated_deleted_with_null_body() {
     let (_, alice_token) = srv.signup("alice").await;
 
     let (status, clip) = srv
-        .api("clips/create", serde_json::json!({ "name": "pub", "isPublic": true }), Some(&alice_token))
+        .api(
+            "clips/create",
+            serde_json::json!({ "name": "pub", "isPublic": true }),
+            Some(&alice_token),
+        )
         .await;
     assert_eq!(status, 200, "{clip}");
     let clip_id = clip["id"].as_str().unwrap().to_string();
 
     // Anonymous subscribers may watch public clips (upstream parity).
     let mut ws = connect(&srv.ws_url("")).await;
-    send(&mut ws, serde_json::json!({
-        "type": "connect",
-        "body": { "channel": "clip", "id": "c", "params": { "clipId": clip_id }, "pong": true },
-    })).await;
+    send(
+        &mut ws,
+        serde_json::json!({
+            "type": "connect",
+            "body": { "channel": "clip", "id": "c", "params": { "clipId": clip_id }, "pong": true },
+        }),
+    )
+    .await;
     let frame = recv(&mut ws).await;
     assert_eq!(frame["type"], "connected");
 
@@ -599,12 +682,22 @@ async fn clip_channel_delivers_updated_deleted_with_null_body() {
     recv_nothing(&mut gone_ws).await;
 
     settle().await;
-    publish(&srv.services, &StreamingEvent::ClipUpdated { clip_id: clip_id.clone() });
+    publish(
+        &srv.services,
+        &StreamingEvent::ClipUpdated {
+            clip_id: clip_id.clone(),
+        },
+    );
     let frame = recv(&mut ws).await;
     let (id, event, body) = channel_body(&frame);
     assert_eq!((id, event), ("c", "updated"));
     assert_eq!(body, &Value::Null);
-    publish(&srv.services, &StreamingEvent::ClipDeleted { clip_id: clip_id.clone() });
+    publish(
+        &srv.services,
+        &StreamingEvent::ClipDeleted {
+            clip_id: clip_id.clone(),
+        },
+    );
     let frame = recv(&mut ws).await;
     let (id, event, body) = channel_body(&frame);
     assert_eq!((id, event), ("c", "deleted"));
@@ -618,7 +711,11 @@ async fn userlist_channel_applies_with_files_and_with_renotes() {
     let (bob_id, bob_token) = srv.signup("bob").await;
 
     let (status, list) = srv
-        .api("users/lists/create", serde_json::json!({ "name": "l" }), Some(&alice_token))
+        .api(
+            "users/lists/create",
+            serde_json::json!({ "name": "l" }),
+            Some(&alice_token),
+        )
         .await;
     assert_eq!(status, 200);
     let list_id = list["id"].as_str().unwrap().to_string();
@@ -651,7 +748,11 @@ async fn userlist_channel_applies_with_files_and_with_renotes() {
     assert_eq!(frame["body"]["body"]["id"], bob_id);
 
     let (status, created) = srv
-        .api("notes/create", serde_json::json!({ "text": "plain list note" }), Some(&bob_token))
+        .api(
+            "notes/create",
+            serde_json::json!({ "text": "plain list note" }),
+            Some(&bob_token),
+        )
         .await;
     assert_eq!(status, 200);
     let plain_id = created["createdNote"]["id"].as_str().unwrap().to_string();
@@ -682,7 +783,11 @@ async fn userlist_channel_applies_with_files_and_with_renotes() {
     assert_eq!(frame["body"]["body"]["id"], file_note_id);
 
     let (status, _) = srv
-        .api("notes/create", serde_json::json!({ "renoteId": file_note_id }), Some(&bob_token))
+        .api(
+            "notes/create",
+            serde_json::json!({ "renoteId": file_note_id }),
+            Some(&bob_token),
+        )
         .await;
     assert_eq!(status, 200);
     recv_nothing(&mut renotes_ws).await;
@@ -696,13 +801,21 @@ async fn reacted_carries_emoji_detail() {
     let (_, bob_token) = srv.signup("bob").await;
 
     let (status, created) = srv
-        .api("notes/create", serde_json::json!({ "text": "react me" }), Some(&alice_token))
+        .api(
+            "notes/create",
+            serde_json::json!({ "text": "react me" }),
+            Some(&alice_token),
+        )
         .await;
     assert_eq!(status, 200);
     let note_id = created["createdNote"]["id"].as_str().unwrap().to_string();
 
     let mut ws = connect(&srv.ws_url(&format!("?i={bob_token}"))).await;
-    send(&mut ws, serde_json::json!({ "type": "subNote", "body": { "id": note_id } })).await;
+    send(
+        &mut ws,
+        serde_json::json!({ "type": "subNote", "body": { "id": note_id } }),
+    )
+    .await;
 
     // Unicode reaction: `emoji` is null (upstream parity).
     let (status, _) = srv
@@ -722,10 +835,24 @@ async fn reacted_carries_emoji_detail() {
     let file_id = srv.make_file(None, "blobcat.png");
     let emoji = srv
         .services
-        .create_emoji("mod1", "blobcat", &file_id, None, Vec::new(), None, false, false, Vec::new())
+        .create_emoji(
+            "mod1",
+            "blobcat",
+            &file_id,
+            None,
+            Vec::new(),
+            None,
+            false,
+            false,
+            Vec::new(),
+        )
         .unwrap();
     let (status, _) = srv
-        .api("notes/reactions/delete", serde_json::json!({ "noteId": note_id }), Some(&bob_token))
+        .api(
+            "notes/reactions/delete",
+            serde_json::json!({ "noteId": note_id }),
+            Some(&bob_token),
+        )
         .await;
     assert_eq!(status, 204);
     let frame = recv_note_updated(&mut ws, &note_id, "unreacted").await;
@@ -742,7 +869,9 @@ async fn reacted_carries_emoji_detail() {
     assert_eq!(frame["body"]["body"]["reaction"], ":blobcat:");
     assert_eq!(frame["body"]["body"]["emoji"]["name"], "blobcat");
     assert!(
-        frame["body"]["body"]["emoji"]["url"].as_str().is_some_and(|u| !u.is_empty()),
+        frame["body"]["body"]["emoji"]["url"]
+            .as_str()
+            .is_some_and(|u| !u.is_empty()),
         "{frame}"
     );
     let _ = emoji;
@@ -754,15 +883,28 @@ async fn poll_ended_stays_a_compat_note_updated_frame() {
     let (_, alice_token) = srv.signup("alice").await;
 
     let (status, created) = srv
-        .api("notes/create", serde_json::json!({ "text": "poll note" }), Some(&alice_token))
+        .api(
+            "notes/create",
+            serde_json::json!({ "text": "poll note" }),
+            Some(&alice_token),
+        )
         .await;
     assert_eq!(status, 200);
     let note_id = created["createdNote"]["id"].as_str().unwrap().to_string();
 
     let mut ws = connect(&srv.ws_url(&format!("?i={alice_token}"))).await;
-    send(&mut ws, serde_json::json!({ "type": "subNote", "body": { "id": note_id } })).await;
+    send(
+        &mut ws,
+        serde_json::json!({ "type": "subNote", "body": { "id": note_id } }),
+    )
+    .await;
     settle().await;
-    publish(&srv.services, &StreamingEvent::PollEnded { note_id: note_id.clone() });
+    publish(
+        &srv.services,
+        &StreamingEvent::PollEnded {
+            note_id: note_id.clone(),
+        },
+    );
     // The hub still emits `pollEnded` as a `noteUpdated` frame (compat
     // extra); the real notification is a worker change (see WP4 report).
     let frame = recv_note_updated(&mut ws, &note_id, "pollEnded").await;
@@ -773,14 +915,20 @@ async fn poll_ended_stays_a_compat_note_updated_frame() {
 async fn main_channel_forwards_all_new_event_kinds() {
     let srv = LiveServer::start().await;
     let (_, alice_token) = srv.signup("alice").await;
-    let (status, me) = srv.api("i", serde_json::json!({}), Some(&alice_token)).await;
+    let (status, me) = srv
+        .api("i", serde_json::json!({}), Some(&alice_token))
+        .await;
     assert_eq!(status, 200);
     let me_id = me["id"].as_str().unwrap().to_string();
 
     let mut ws = connect(&srv.ws_url(&format!("?i={alice_token}"))).await;
-    send(&mut ws, serde_json::json!({
-        "type": "connect", "body": { "channel": "main", "id": "m" },
-    })).await;
+    send(
+        &mut ws,
+        serde_json::json!({
+            "type": "connect", "body": { "channel": "main", "id": "m" },
+        }),
+    )
+    .await;
     settle().await;
 
     // Every WP4 `MainEventKind` (Misskey `MainEventTypes` parity) is
@@ -816,6 +964,9 @@ async fn main_channel_forwards_all_new_event_kinds() {
         seen.push(event.to_string());
     }
     for (_, wire) in cases {
-        assert!(seen.contains(&wire.to_string()), "missing {wire} in {seen:?}");
+        assert!(
+            seen.contains(&wire.to_string()),
+            "missing {wire} in {seen:?}"
+        );
     }
 }

@@ -162,11 +162,7 @@ impl AnnouncementStore for MemAnnouncementStore {
     fn all_announcements(&self) -> Result<Vec<Announcement>, PortError> {
         let st = self.state.read().expect("mem announcement store poisoned");
         let mut out: Vec<Announcement> = st.announcements.values().cloned().collect();
-        out.sort_by(|a, b| {
-            b.created_at_ms
-                .cmp(&a.created_at_ms)
-                .then(b.id.cmp(&a.id))
-        });
+        out.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms).then(b.id.cmp(&a.id)));
         Ok(out)
     }
 
@@ -294,7 +290,9 @@ impl AppServices {
             .get_announcement(announcement_id)?
             .ok_or_else(|| PortError::NotFound("NO_SUCH_ANNOUNCEMENT".to_string()))?;
         let is_read = match viewer_id {
-            Some(viewer) => store.read_announcement_ids(viewer)?.contains(announcement_id),
+            Some(viewer) => store
+                .read_announcement_ids(viewer)?
+                .contains(announcement_id),
             None => false,
         };
         Ok(AnnouncementView {

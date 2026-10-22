@@ -3,10 +3,10 @@
 
 use super::AppServices;
 
-use crate::application::ports::{
-    AbuseReportFilter, PortError, TimelineCursor,
+use crate::application::ports::{AbuseReportFilter, PortError, TimelineCursor};
+use crate::domain::moderation::{
+    AbuseReport, AbuseReportResolution, ModerationAction, ModerationLogEntry,
 };
-use crate::domain::moderation::{AbuseReport, AbuseReportResolution, ModerationAction, ModerationLogEntry};
 use crate::federation::outbox::FederateDeliverPayload;
 
 impl AppServices {
@@ -112,7 +112,8 @@ impl AppServices {
         } else {
             None
         };
-        self.abuse_reports.set_note(report_id, note, log, Vec::new())
+        self.abuse_reports
+            .set_note(report_id, note, log, Vec::new())
     }
 
     /// Inbound `Flag` (upstream `ApInboxService.flag` parity): the first
@@ -160,7 +161,8 @@ impl AppServices {
         };
         let comment = match content.map(str::trim).filter(|s| !s.is_empty()) {
             Some(content) => {
-                let uris = serde_json::to_string_pretty(object_uris).unwrap_or_else(|_| "[]".to_string());
+                let uris =
+                    serde_json::to_string_pretty(object_uris).unwrap_or_else(|_| "[]".to_string());
                 format!("{content}\n{uris}")
             }
             None => serde_json::to_string_pretty(object_uris).unwrap_or_else(|_| "[]".to_string()),

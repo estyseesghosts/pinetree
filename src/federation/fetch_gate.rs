@@ -32,8 +32,8 @@
 use axum::http::{HeaderMap, StatusCode};
 
 use crate::activitypub::signatures::{
-    apply_sig_mode, parse_first_legacy_signature, parse_signature_input, rfc9421_mode,
-    scheme_of_public_url, verify_http_signature, verify_rfc9421_signature, VerifyOutcome,
+    VerifyOutcome, apply_sig_mode, parse_first_legacy_signature, parse_signature_input,
+    rfc9421_mode, scheme_of_public_url, verify_http_signature, verify_rfc9421_signature,
 };
 use crate::application::commands::AppServices;
 use crate::federation::delivery::resolve_remote_public_key;
@@ -129,15 +129,13 @@ fn resolve_and_verify_fetch(
     match resolve_remote_public_key(services, client, key_id, false) {
         Ok((owner, pem)) => match verify(&pem) {
             Ok(()) => VerifyOutcome::Verified(owner),
-            Err(_) => {
-                match resolve_remote_public_key(services, client, key_id, true) {
-                    Ok((fresh_owner, fresh_pem)) => match verify(&fresh_pem) {
-                        Ok(()) => VerifyOutcome::Verified(fresh_owner),
-                        Err(detail) => VerifyOutcome::Failed(detail),
-                    },
-                    Err(_) => VerifyOutcome::Failed(format!("key unresolvable: {key_id}")),
-                }
-            }
+            Err(_) => match resolve_remote_public_key(services, client, key_id, true) {
+                Ok((fresh_owner, fresh_pem)) => match verify(&fresh_pem) {
+                    Ok(()) => VerifyOutcome::Verified(fresh_owner),
+                    Err(detail) => VerifyOutcome::Failed(detail),
+                },
+                Err(_) => VerifyOutcome::Failed(format!("key unresolvable: {key_id}")),
+            },
         },
         Err(_) => VerifyOutcome::Failed(format!("key unresolvable: {key_id}")),
     }
@@ -212,15 +210,10 @@ fn attempt_rfc9421_fetch_signature(
 /// means "serve the object", `Err(status)` is the status to return
 /// otherwise. The `Forbidden`-from-anonymous collapse to 404 is generic
 /// existence-hiding policy, not object-type logic.
-pub fn decide_fetch(
-    viewer: &FetchViewer,
-    decision: FetchDecision,
-) -> Result<(), StatusCode> {
+pub fn decide_fetch(viewer: &FetchViewer, decision: FetchDecision) -> Result<(), StatusCode> {
     match decision {
         FetchDecision::Serve => Ok(()),
-        FetchDecision::Forbidden if !viewer.is_anonymous() => {
-            Err(StatusCode::FORBIDDEN)
-        }
+        FetchDecision::Forbidden if !viewer.is_anonymous() => Err(StatusCode::FORBIDDEN),
         FetchDecision::Forbidden => Err(StatusCode::NOT_FOUND),
         FetchDecision::Hidden => Err(StatusCode::NOT_FOUND),
     }
@@ -256,8 +249,7 @@ mod tests {
         date: &str,
     ) -> HeaderMap {
         let signed =
-            sign_request_headers("GET", path, host, date, None, key_id, private_key_pem)
-                .unwrap();
+            sign_request_headers("GET", path, host, date, None, key_id, private_key_pem).unwrap();
         let mut map = HeaderMap::new();
         map.insert("date", date.parse().unwrap());
         map.insert("host", host.parse().unwrap());
@@ -295,7 +287,10 @@ mod tests {
             Err(StatusCode::NOT_FOUND)
         );
         // Public objects still serve anonymous fetchers.
-        assert_eq!(decide_fetch(&viewer, stub_authorize("public", &viewer)), Ok(()));
+        assert_eq!(
+            decide_fetch(&viewer, stub_authorize("public", &viewer)),
+            Ok(())
+        );
     }
 
     #[test]
@@ -338,9 +333,20 @@ mod tests {
             .cache_remote_public_key(&key_id, actor_uri, None, &pub_pem)
             .unwrap();
         let now_ms = services.clock.now_ms();
-        let headers = signed_get_headers("/x/1", "example.local", &key_id, &priv_pem, &http_date(now_ms));
+        let headers = signed_get_headers(
+            "/x/1",
+            "example.local",
+            &key_id,
+            &priv_pem,
+            &http_date(now_ms),
+        );
         // Permissive (the process default): the legacy signature identifies.
-        let viewer = authenticate_fetch_viewer_with_mode(&services, "/x/1", &headers, Rfc9421Mode::Permissive);
+        let viewer = authenticate_fetch_viewer_with_mode(
+            &services,
+            "/x/1",
+            &headers,
+            Rfc9421Mode::Permissive,
+        );
         assert_eq!(viewer.actor_uri.as_deref(), Some(actor_uri));
         assert_eq!(
             decide_fetch(&viewer, stub_authorize("approved", &viewer)),
@@ -371,8 +377,19 @@ mod tests {
         let now_ms = services.clock.now_ms();
         // Signed for /x/1, fetched as /x/2: the signature must not verify
         // (fail closed → anonymous → gated objects 404).
-        let headers = signed_get_headers("/x/1", "example.local", &key_id, &priv_pem, &http_date(now_ms));
-        let viewer = authenticate_fetch_viewer_with_mode(&services, "/x/2", &headers, Rfc9421Mode::Permissive);
+        let headers = signed_get_headers(
+            "/x/1",
+            "example.local",
+            &key_id,
+            &priv_pem,
+            &http_date(now_ms),
+        );
+        let viewer = authenticate_fetch_viewer_with_mode(
+            &services,
+            "/x/2",
+            &headers,
+            Rfc9421Mode::Permissive,
+        );
         assert!(viewer.is_anonymous());
         assert_eq!(
             decide_fetch(&viewer, stub_authorize("approved", &viewer)),
@@ -428,7 +445,8 @@ mod tests {
         services
             .cache_remote_public_key(&key_id, actor_uri, None, &pub_pem)
             .unwrap();
-        let headers = signed_rfc9421_get_headers(&services, "/x/1", "example.local", &key_id, &priv_pem);
+        let headers =
+            signed_rfc9421_get_headers(&services, "/x/1", "example.local", &key_id, &priv_pem);
         // RFC 9421-only identifies under both modes.
         for mode in [Rfc9421Mode::Permissive, Rfc9421Mode::Enforce] {
             let viewer = authenticate_fetch_viewer_with_mode(&services, "/x/1", &headers, mode);

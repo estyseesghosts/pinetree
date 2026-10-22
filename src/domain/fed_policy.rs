@@ -286,8 +286,14 @@ mod tests {
             "https://example.com/y"
         ));
         // Non-http(s) never matches.
-        assert!(!exact_authority_allows("gopher://example.com/x", "https://example.com/y"));
-        assert!(!exact_authority_allows("not a uri", "https://example.com/y"));
+        assert!(!exact_authority_allows(
+            "gopher://example.com/x",
+            "https://example.com/y"
+        ));
+        assert!(!exact_authority_allows(
+            "not a uri",
+            "https://example.com/y"
+        ));
         assert!(!exact_authority_allows("", ""));
     }
 

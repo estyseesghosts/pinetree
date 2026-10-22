@@ -65,7 +65,10 @@ impl FeaturedCache {
 
 /// Score of one candidate note: reaction total + renote total.
 pub fn featured_score(note: &Note) -> u64 {
-    note.reactions.values().sum::<u64>().saturating_add(note.renote_count)
+    note.reactions
+        .values()
+        .sum::<u64>()
+        .saturating_add(note.renote_count)
 }
 
 /// Order ranked ids newest-first (upstream `noteIds.sort((a, b) => a > b ?
@@ -106,9 +109,7 @@ impl AppServices {
             .map_err(|e| PortError::Validation(format!("{e:?}")))?;
         match self.notes.add_pinning(pinning, jobs) {
             Ok(pinning) => Ok(pinning),
-            Err(PortError::Conflict(_)) => {
-                Err(PortError::Conflict("ALREADY_PINNED".to_string()))
-            }
+            Err(PortError::Conflict(_)) => Err(PortError::Conflict("ALREADY_PINNED".to_string())),
             Err(e) => Err(e),
         }
     }
@@ -263,10 +264,7 @@ impl AppServices {
                 return Ok(false);
             }
         }
-        let created_at = self
-            .ids
-            .parse_time(&note.id)
-            .unwrap_or(now_ms);
+        let created_at = self.ids.parse_time(&note.id).unwrap_or(now_ms);
         if now_ms.saturating_sub(created_at) > window_ms {
             return Ok(false);
         }
@@ -316,17 +314,13 @@ impl AppServices {
         Ok(out)
     }
 
-    fn featured_visible_to(
-        &self,
-        note: &Note,
-        viewer_id: Option<&str>,
-    ) -> Result<bool, PortError> {
+    fn featured_visible_to(&self, note: &Note, viewer_id: Option<&str>) -> Result<bool, PortError> {
         let Some(viewer) = viewer_id else {
             let viewer = crate::domain::policy::ViewerContext::anonymous();
             return Ok(crate::domain::policy::is_visible(note, &viewer));
         };
-        let follows_author = viewer == note.author_id
-            || self.follows.is_following(viewer, &note.author_id)?;
+        let follows_author =
+            viewer == note.author_id || self.follows.is_following(viewer, &note.author_id)?;
         let context = crate::domain::policy::ViewerContext::local_user(viewer, follows_author);
         if !crate::domain::policy::is_visible(note, &context) {
             return Ok(false);
@@ -436,17 +430,17 @@ mod tests {
             scheduled_note_limit: crate::domain::draft::DEFAULT_SCHEDULED_NOTE_LIMIT,
             pin_limit: crate::domain::pinning::DEFAULT_PIN_LIMIT,
             default_like: None,
-        cache_blobs: blobs.clone(),
-        drive_capacity_per_user_bytes: 1 << 30,
-        remote_cache_max_bytes: 512 << 20,
-        remote_cache_avatar_bytes: 128 << 20,
-        remote_cache_preview_bytes: 256 << 20,
-        remote_cache_full_bytes: 128 << 20,
-        remote_cache_mode: crate::config::RemoteCacheMode::OnDemand,
-        remote_cache_avatar_ttl_days: 30,
-        remote_cache_preview_ttl_days: 7,
-        remote_cache_full_ttl_days: 3,
-        remote_cache_warming_enabled: false,
+            cache_blobs: blobs.clone(),
+            drive_capacity_per_user_bytes: 1 << 30,
+            remote_cache_max_bytes: 512 << 20,
+            remote_cache_avatar_bytes: 128 << 20,
+            remote_cache_preview_bytes: 256 << 20,
+            remote_cache_full_bytes: 128 << 20,
+            remote_cache_mode: crate::config::RemoteCacheMode::OnDemand,
+            remote_cache_avatar_ttl_days: 30,
+            remote_cache_preview_ttl_days: 7,
+            remote_cache_full_ttl_days: 3,
+            remote_cache_warming_enabled: false,
         };
         (services, clock)
     }
@@ -477,7 +471,9 @@ mod tests {
         let err = services.pin_note(&alice.id, &foreign.id).unwrap_err();
         assert_eq!(port_code(err), "NO_SUCH_NOTE");
         // Unknown ids too.
-        let err = services.pin_note(&alice.id, "nid00000000000001").unwrap_err();
+        let err = services
+            .pin_note(&alice.id, "nid00000000000001")
+            .unwrap_err();
         assert_eq!(port_code(err), "NO_SUCH_NOTE");
 
         services.pin_note(&alice.id, &n1.id).unwrap();
@@ -616,7 +612,9 @@ mod tests {
         let ranked = services.rank_featured_for_user(&bob.id).unwrap();
         assert_eq!(ranked, vec![b_note.id.clone()]);
         // Unknown authors rank empty (no NO_SUCH_USER on this endpoint).
-        let ranked = services.rank_featured_for_user("aid00000000000099").unwrap();
+        let ranked = services
+            .rank_featured_for_user("aid00000000000099")
+            .unwrap();
         assert!(ranked.is_empty());
     }
 
@@ -625,7 +623,10 @@ mod tests {
         let cache = FeaturedCache::default();
         assert_eq!(cache.get("global", 1_000), None);
         cache.put("global", vec!["a".to_string()], 1_000);
-        assert_eq!(cache.get("global", 1_000 + FEATURED_CACHE_TTL_MS - 1), Some(vec!["a".to_string()]));
+        assert_eq!(
+            cache.get("global", 1_000 + FEATURED_CACHE_TTL_MS - 1),
+            Some(vec!["a".to_string()])
+        );
         assert_eq!(cache.get("global", 1_000 + FEATURED_CACHE_TTL_MS), None);
         cache.put("global", vec!["b".to_string()], 2_000);
         assert_eq!(cache.get("global", 2_000), Some(vec!["b".to_string()]));
@@ -659,7 +660,10 @@ mod tests {
         let visible = services
             .featured_notes_visible(&ranked, Some(&carol.id), None, 10)
             .unwrap();
-        assert!(visible.is_empty(), "authors blocking the viewer are withheld");
+        assert!(
+            visible.is_empty(),
+            "authors blocking the viewer are withheld"
+        );
 
         // `untilId` pages newest-first.
         let visible = services

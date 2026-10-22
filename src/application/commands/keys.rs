@@ -11,10 +11,7 @@ use crate::domain::account::Account;
 impl AppServices {
     /// Return the RSA-2048 keypair for a local account, lazily generating and
     /// persisting one if none exists yet.
-    pub fn ensure_actor_keypair(
-        &self,
-        account_id: &str,
-    ) -> Result<ActorKeypairRecord, PortError> {
+    pub fn ensure_actor_keypair(&self, account_id: &str) -> Result<ActorKeypairRecord, PortError> {
         if let Some(existing) = self.auth.get_actor_keypair(account_id)? {
             return Ok(existing);
         }
@@ -27,10 +24,7 @@ impl AppServices {
 
     /// Generate and store a fresh RSA-2048 keypair for `account_id` (key
     /// rotation or initial provisioning).
-    pub fn rotate_actor_keypair(
-        &self,
-        account_id: &str,
-    ) -> Result<ActorKeypairRecord, PortError> {
+    pub fn rotate_actor_keypair(&self, account_id: &str) -> Result<ActorKeypairRecord, PortError> {
         let record = self.new_actor_keypair_record(account_id)?;
         self.auth.save_actor_keypair(record.clone())?;
         Ok(record)
@@ -59,7 +53,10 @@ impl AppServices {
     /// Ensure the local `system_actor` service account and its RSA-2048 keypair
     /// exist (used for instance-signed ActivityPub GETs).
     pub fn ensure_system_actor(&self) -> Result<(Account, ActorKeypairRecord), PortError> {
-        let account = match self.accounts.find_by_username_and_host("system_actor", None)? {
+        let account = match self
+            .accounts
+            .find_by_username_and_host("system_actor", None)?
+        {
             Some(acc) => acc,
             None => {
                 let mut input = CreateAccountInput::local("system_actor");

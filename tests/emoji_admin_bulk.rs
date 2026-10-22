@@ -106,10 +106,10 @@ fn test_services(prefix: &str) -> AppServices {
 
 /// Minimal 1x1 PNG (only the 8-byte magic matters to the sniffer).
 const TINY_PNG: &[u8] = &[
-    0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13, b'I', b'H', b'D', b'R', 0, 0,
-    0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 0x1f, 0x15, 0xc4, 0x89, 0, 0, 0, 13, b'I', b'D', b'A',
-    b'T', 0x78, 0x9c, 0x63, 0x60, 0x60, 0x60, 0x00, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a,
-    0x2d, 0xb4, 0, 0, 0, 0, b'I', b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82,
+    0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13, b'I', b'H', b'D', b'R', 0, 0, 0,
+    1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 0x1f, 0x15, 0xc4, 0x89, 0, 0, 0, 13, b'I', b'D', b'A', b'T',
+    0x78, 0x9c, 0x63, 0x60, 0x60, 0x60, 0x00, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4,
+    0, 0, 0, 0, b'I', b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82,
 ];
 
 fn make_file(services: &AppServices, name: &str) -> String {
@@ -143,7 +143,17 @@ fn make_emoji(services: &AppServices, name: &str) -> String {
     let file_id = make_file(services, name);
     // Drain the Added broadcast job so later tests see only their own jobs.
     let emoji = services
-        .create_emoji("mod1", name, &file_id, None, Vec::new(), None, false, false, Vec::new())
+        .create_emoji(
+            "mod1",
+            name,
+            &file_id,
+            None,
+            Vec::new(),
+            None,
+            false,
+            false,
+            Vec::new(),
+        )
         .unwrap();
     drain_broadcasts(services);
     emoji.id
@@ -182,7 +192,17 @@ fn single_ops_emit_added_updated_deleted_broadcasts() {
     let file_id = make_file(&services, "blobcat");
 
     let emoji = services
-        .create_emoji("mod1", "blobcat", &file_id, None, Vec::new(), None, false, false, Vec::new())
+        .create_emoji(
+            "mod1",
+            "blobcat",
+            &file_id,
+            None,
+            Vec::new(),
+            None,
+            false,
+            false,
+            Vec::new(),
+        )
         .unwrap();
     assert_eq!(
         broadcast_ops(&drain_broadcasts(&services)),
@@ -236,10 +256,11 @@ fn add_aliases_bulk_unions_and_skips_unknown() {
     let b = make_emoji(&services, "beta");
 
     let out = services
-        .add_emoji_aliases_bulk("mod1", &[a.clone(), "missing".to_string(), b.clone()], &[
-            "x".to_string(),
-            "y".to_string(),
-        ])
+        .add_emoji_aliases_bulk(
+            "mod1",
+            &[a.clone(), "missing".to_string(), b.clone()],
+            &["x".to_string(), "y".to_string()],
+        )
         .unwrap();
     assert_eq!(out.len(), 2);
     assert_eq!(out[0].aliases, vec!["x".to_string(), "y".to_string()]);
@@ -320,18 +341,20 @@ fn remove_aliases_bulk_subtracts() {
     let services = test_services("remove-aliases");
     let a = make_emoji(&services, "sub");
     services
-        .set_emoji_aliases_bulk("mod1", &[a.clone()], &[
-            "x".to_string(),
-            "y".to_string(),
-            "z".to_string(),
-        ])
+        .set_emoji_aliases_bulk(
+            "mod1",
+            &[a.clone()],
+            &["x".to_string(), "y".to_string(), "z".to_string()],
+        )
         .unwrap();
     drain_broadcasts(&services);
 
     let out = services
-        .remove_emoji_aliases_bulk("mod1", &[a.clone(), "missing".to_string()], &[
-            "y".to_string(),
-        ])
+        .remove_emoji_aliases_bulk(
+            "mod1",
+            &[a.clone(), "missing".to_string()],
+            &["y".to_string()],
+        )
         .unwrap();
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].aliases, vec!["x".to_string(), "z".to_string()]);
@@ -376,7 +399,13 @@ fn set_category_bulk_sets_and_null_resets() {
     assert_eq!(out[0].category, None);
     // The untouched row keeps its category.
     assert_eq!(
-        services.emojis.get_emoji(&b).unwrap().unwrap().category.as_deref(),
+        services
+            .emojis
+            .get_emoji(&b)
+            .unwrap()
+            .unwrap()
+            .category
+            .as_deref(),
         Some("fun")
     );
 
@@ -397,7 +426,9 @@ fn set_license_bulk_sets_and_null_resets() {
         .unwrap();
     assert_eq!(out[0].license.as_deref(), Some("CC0"));
 
-    let out = services.set_emoji_license_bulk("mod1", &[a.clone()], None).unwrap();
+    let out = services
+        .set_emoji_license_bulk("mod1", &[a.clone()], None)
+        .unwrap();
     assert_eq!(out[0].license, None);
 }
 
@@ -429,11 +460,18 @@ fn delete_bulk_deletes_skips_unknown_and_logs() {
     let logs = services
         .moderation
         .list_logs(
-            &ModerationLogFilter { action: Some(ModerationAction::DeleteCustomEmoji), ..Default::default() },
+            &ModerationLogFilter {
+                action: Some(ModerationAction::DeleteCustomEmoji),
+                ..Default::default()
+            },
             &TimelineCursor::with_limit(100),
         )
         .unwrap();
-    assert!(logs.len() >= 2, "expected bulk delete log rows, got {}", logs.len());
+    assert!(
+        logs.len() >= 2,
+        "expected bulk delete log rows, got {}",
+        logs.len()
+    );
 }
 
 // --- copy ------------------------------------------------------------------------
@@ -462,7 +500,9 @@ fn serve_png() -> String {
 #[test]
 fn copy_missing_remote_row_is_no_such_emoji() {
     let services = test_services("copy-missing");
-    let err = services.copy_remote_emoji("mod1", "remote.example", "nope").unwrap_err();
+    let err = services
+        .copy_remote_emoji("mod1", "remote.example", "nope")
+        .unwrap_err();
     assert!(
         matches!(err, PortError::NotFound(ref code) if code == "NO_SUCH_EMOJI"),
         "got {err:?}"
@@ -475,15 +515,23 @@ fn copy_downloads_caches_and_adds_with_broadcast() {
     let url = serve_png();
     services
         .emojis
-        .upsert_remote_emoji(RemoteEmoji::new("remote.example", "blobcat", &url, 1_760_400_000_000).unwrap())
+        .upsert_remote_emoji(
+            RemoteEmoji::new("remote.example", "blobcat", &url, 1_760_400_000_000).unwrap(),
+        )
         .unwrap();
 
-    let emoji = services.copy_remote_emoji("mod1", "remote.example", "blobcat").unwrap();
+    let emoji = services
+        .copy_remote_emoji("mod1", "remote.example", "blobcat")
+        .unwrap();
     assert_eq!(emoji.shortcode, "blobcat");
     assert!(emoji.media_id.is_some());
 
     // The stored bytes are the downloaded PNG behind the emoji's file row.
-    let meta = services.media.get(emoji.media_id.as_deref().unwrap()).unwrap().unwrap();
+    let meta = services
+        .media
+        .get(emoji.media_id.as_deref().unwrap())
+        .unwrap()
+        .unwrap();
     assert_eq!(meta.url, format!("https://example.local/files/{}", meta.id));
 
     // Added broadcast + AddCustomEmoji mod log (via create_emoji).
@@ -494,7 +542,10 @@ fn copy_downloads_caches_and_adds_with_broadcast() {
     let logs = services
         .moderation
         .list_logs(
-            &ModerationLogFilter { action: Some(ModerationAction::AddCustomEmoji), ..Default::default() },
+            &ModerationLogFilter {
+                action: Some(ModerationAction::AddCustomEmoji),
+                ..Default::default()
+            },
             &TimelineCursor::with_limit(100),
         )
         .unwrap();
@@ -508,10 +559,14 @@ fn copy_duplicate_local_name_is_duplicate_name() {
     let url = serve_png();
     services
         .emojis
-        .upsert_remote_emoji(RemoteEmoji::new("remote.example", "taken", &url, 1_760_400_000_000).unwrap())
+        .upsert_remote_emoji(
+            RemoteEmoji::new("remote.example", "taken", &url, 1_760_400_000_000).unwrap(),
+        )
         .unwrap();
 
-    let err = services.copy_remote_emoji("mod1", "remote.example", "taken").unwrap_err();
+    let err = services
+        .copy_remote_emoji("mod1", "remote.example", "taken")
+        .unwrap_err();
     assert!(
         matches!(err, PortError::Conflict(ref code) if code == "DUPLICATE_NAME"),
         "got {err:?}"
@@ -531,30 +586,49 @@ fn list_remote_filters_by_host_query_and_date() {
         services
             .emojis
             .upsert_remote_emoji(
-                RemoteEmoji::new(host, name, &format!("https://{host}/e/{name}.png"), seen).unwrap(),
+                RemoteEmoji::new(host, name, &format!("https://{host}/e/{name}.png"), seen)
+                    .unwrap(),
             )
             .unwrap();
     }
     let cursor = TimelineCursor::with_limit(10);
 
     // No host = every remote row (upstream `host: null` parity).
-    assert_eq!(services.list_remote_emojis(None, None, &cursor).unwrap().len(), 3);
     assert_eq!(
-        services.list_remote_emojis(None, Some("a.example"), &cursor).unwrap().len(),
+        services
+            .list_remote_emojis(None, None, &cursor)
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(
+        services
+            .list_remote_emojis(None, Some("a.example"), &cursor)
+            .unwrap()
+            .len(),
         2
     );
     // Host match is case-insensitive.
     assert_eq!(
-        services.list_remote_emojis(None, Some("A.EXAMPLE"), &cursor).unwrap().len(),
+        services
+            .list_remote_emojis(None, Some("A.EXAMPLE"), &cursor)
+            .unwrap()
+            .len(),
         2
     );
     // Name-or-`:name:` query over the shortcode.
     assert_eq!(
-        services.list_remote_emojis(Some("blobcat"), None, &cursor).unwrap().len(),
+        services
+            .list_remote_emojis(Some("blobcat"), None, &cursor)
+            .unwrap()
+            .len(),
         2
     );
     assert_eq!(
-        services.list_remote_emojis(Some(":blobdog:"), None, &cursor).unwrap().len(),
+        services
+            .list_remote_emojis(Some(":blobdog:"), None, &cursor)
+            .unwrap()
+            .len(),
         1
     );
     // Date bounds apply; since/until ids are accepted and ignored.
@@ -564,14 +638,26 @@ fn list_remote_filters_by_host_query_and_date() {
         limit: 10,
         ..Default::default()
     };
-    assert_eq!(services.list_remote_emojis(None, None, &dated).unwrap().len(), 2);
+    assert_eq!(
+        services
+            .list_remote_emojis(None, None, &dated)
+            .unwrap()
+            .len(),
+        2
+    );
     let with_ids = TimelineCursor {
         since_id: Some("x".to_string()),
         until_id: Some("y".to_string()),
         limit: 10,
         ..Default::default()
     };
-    assert_eq!(services.list_remote_emojis(None, None, &with_ids).unwrap().len(), 3);
+    assert_eq!(
+        services
+            .list_remote_emojis(None, None, &with_ids)
+            .unwrap()
+            .len(),
+        3
+    );
 }
 
 // --- pack_remote_emoji_detailed ------------------------------------------------------
@@ -595,8 +681,15 @@ fn pack_remote_emoji_detailed_shape() {
 
     // Cached: url prefers the drive copy (same rule as the note registry).
     let file_id = make_file(&services, "cached");
-    services.emojis.set_remote_emoji_media("remote.example", "blobcat", &file_id).unwrap();
-    let row = services.emojis.get_remote_emoji("remote.example", "blobcat").unwrap().unwrap();
+    services
+        .emojis
+        .set_remote_emoji_media("remote.example", "blobcat", &file_id)
+        .unwrap();
+    let row = services
+        .emojis
+        .get_remote_emoji("remote.example", "blobcat")
+        .unwrap()
+        .unwrap();
     let packed = pack_remote_emoji_detailed(&row, &services);
     assert_eq!(packed["url"], "https://example.local/files/cached");
     assert_eq!(packed["host"], "remote.example");

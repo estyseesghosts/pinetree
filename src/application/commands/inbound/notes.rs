@@ -78,8 +78,7 @@ impl AppServices {
                     continue;
                 }
                 if let Ok(Some(mentioned)) = self.accounts.find_by_handle(&lower) {
-                    if mentioned.id != input.author_id
-                        && !already_notified.contains(&mentioned.id)
+                    if mentioned.id != input.author_id && !already_notified.contains(&mentioned.id)
                     {
                         already_notified.insert(mentioned.id.clone());
                         if let Ok(job) = self.notify_job(
@@ -127,10 +126,7 @@ impl AppServices {
             &StreamingEvent::NoteDeleted {
                 note_id: note_id.to_string(),
             },
-            format!(
-                "inbound-note-delete:{note_id}:{}",
-                self.ids.generate()
-            ),
+            format!("inbound-note-delete:{note_id}:{}", self.ids.generate()),
         )?;
         match self
             .dedup
@@ -224,13 +220,8 @@ impl AppServices {
             sensitive_words: self.sensitive_words.clone(),
             uri_base: base.to_string(),
         };
-        let jobs = self.edit_side_effect_jobs(
-            &cached,
-            &author.id,
-            &input.poll,
-            old_poll.as_ref(),
-            false,
-        )?;
+        let jobs =
+            self.edit_side_effect_jobs(&cached, &author.id, &input.poll, old_poll.as_ref(), false)?;
         match self
             .dedup
             .record_note_edit_activity(activity_id, input, jobs)
@@ -265,10 +256,7 @@ impl AppServices {
                 user_id: user_id.to_string(),
                 reaction: coerced.clone(),
             },
-            format!(
-                "inbound-react:{user_id}:{note_id}:{}",
-                self.ids.generate()
-            ),
+            format!("inbound-react:{user_id}:{note_id}:{}", self.ids.generate()),
         )?);
         if note.author_id != user_id {
             jobs.push(self.notify_job(
@@ -280,14 +268,10 @@ impl AppServices {
                 "inbound-reaction",
             )?);
         }
-        match self.dedup.record_react_activity(
-            activity_id,
-            user_id,
-            note_id,
-            &coerced,
-            true,
-            jobs,
-        ) {
+        match self
+            .dedup
+            .record_react_activity(activity_id, user_id, note_id, &coerced, true, jobs)
+        {
             Ok(v) => Ok(v),
             Err(PortError::Conflict(_)) => Ok(None),
             // §0A: the note author blocks the reactor — skip instead of

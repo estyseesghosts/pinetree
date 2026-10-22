@@ -61,8 +61,7 @@ impl AppServices {
                 None
             };
             if let Some(remote_account) = remote {
-                if let Some(inbox_url) =
-                    crate::federation::outbox::preferred_inbox(remote_account)
+                if let Some(inbox_url) = crate::federation::outbox::preferred_inbox(remote_account)
                 {
                     let follow_id = self.ids.generate();
                     jobs.push(
@@ -73,9 +72,7 @@ impl AppServices {
                             inbox_url,
                         }
                         .into_job(
-                            format!(
-                                "federate:follow:{follower_id}:{followee_id}:{follow_id}"
-                            ),
+                            format!("federate:follow:{follower_id}:{followee_id}:{follow_id}"),
                             self.now_ms(),
                         )?,
                     );
@@ -110,7 +107,10 @@ impl AppServices {
             &StreamingEvent::MeUpdated {
                 account_id: followee_id.to_string(),
             },
-            format!("accept-request:{follower_id}:{followee_id}:{}", self.ids.generate()),
+            format!(
+                "accept-request:{follower_id}:{followee_id}:{}",
+                self.ids.generate()
+            ),
         )?);
         // Batch N WS3: the requester learns its request was accepted
         // (Misskey `UserFollowingService.acceptFollowRequest` parity:
@@ -152,7 +152,8 @@ impl AppServices {
                 }
             }
         }
-        self.follows.accept_follow_request(follower_id, followee_id, jobs)
+        self.follows
+            .accept_follow_request(follower_id, followee_id, jobs)
     }
 
     /// Followee rejects a pending request (sends AP `Reject` to a remote follower).
@@ -196,7 +197,8 @@ impl AppServices {
                 }
             }
         }
-        self.follows.remove_follow_request(follower_id, followee_id, jobs)
+        self.follows
+            .remove_follow_request(follower_id, followee_id, jobs)
     }
 
     /// Follower withdraws its own pending request. `unfollow` already removes
@@ -223,7 +225,10 @@ impl AppServices {
                 follower_id: follower_id.to_string(),
                 followee_id: followee_id.to_string(),
             },
-            format!("unfollow:{follower_id}:{followee_id}:{}", self.ids.generate()),
+            format!(
+                "unfollow:{follower_id}:{followee_id}:{}",
+                self.ids.generate()
+            ),
         )?];
         if let (Some(follower), Some(followee)) = (
             self.accounts.find_by_id(follower_id)?,
@@ -237,8 +242,7 @@ impl AppServices {
                 None
             };
             if let Some(remote_account) = remote {
-                if let Some(inbox_url) =
-                    crate::federation::outbox::preferred_inbox(remote_account)
+                if let Some(inbox_url) = crate::federation::outbox::preferred_inbox(remote_account)
                 {
                     let follow_id = self
                         .follows
@@ -272,11 +276,7 @@ impl AppServices {
     /// `UserFollowingService.unfollow` for the followee-local case) instead
     /// of forging an `Undo` in the remote follower's name. A local follower
     /// keeps the `Undo` path (defensive; same shape as `unfollow`).
-    pub fn remove_follower(
-        &self,
-        followee_id: &str,
-        follower_id: &str,
-    ) -> Result<(), PortError> {
+    pub fn remove_follower(&self, followee_id: &str, follower_id: &str) -> Result<(), PortError> {
         self.accounts.get_owner(followee_id)?;
         if self.follows.get_follow(follower_id, followee_id)?.is_none() {
             return Err(PortError::NotFound("NOT_FOLLOWING".to_string()));
@@ -286,7 +286,10 @@ impl AppServices {
                 follower_id: follower_id.to_string(),
                 followee_id: followee_id.to_string(),
             },
-            format!("invalidate:{followee_id}:{follower_id}:{}", self.ids.generate()),
+            format!(
+                "invalidate:{followee_id}:{follower_id}:{}",
+                self.ids.generate()
+            ),
         )?];
         if let (Some(follower), Some(followee)) = (
             self.accounts.find_by_id(follower_id)?,

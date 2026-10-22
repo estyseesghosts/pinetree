@@ -9,9 +9,9 @@ use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 
 use pinetree::services::email::{
+    EmailMessage, EmailSendPayload, EmailSender, MAX_EMAIL_BODY_BYTES, SmtpConfig, SmtpEmailSender,
     abuse_report_email, encode_subject, execute_email_send, password_reset_email,
-    signup_email_gate, verification_email, EmailMessage, EmailSender, EmailSendPayload,
-    SmtpConfig, SmtpEmailSender, MAX_EMAIL_BODY_BYTES,
+    signup_email_gate, verification_email,
 };
 
 // --- config ---------------------------------------------------------------------
@@ -37,18 +37,23 @@ fn smtp_config_serde_round_trip_and_defaults() {
     assert!(cfg.validate().is_ok());
     assert!(cfg.is_configured());
     assert!(cfg.email_required_for_signup);
-    let back: SmtpConfig =
-        serde_json::from_value(serde_json::to_value(&cfg).unwrap()).unwrap();
+    let back: SmtpConfig = serde_json::from_value(serde_json::to_value(&cfg).unwrap()).unwrap();
     assert_eq!(back, cfg);
 }
 
 #[test]
 fn smtp_config_rejects_half_filled_blocks() {
     // Host without from.
-    let cfg = SmtpConfig { smtp_host: "relay.example".into(), ..Default::default() };
+    let cfg = SmtpConfig {
+        smtp_host: "relay.example".into(),
+        ..Default::default()
+    };
     assert!(cfg.validate().is_err());
     // From without host.
-    let cfg = SmtpConfig { smtp_from: "noreply@example.com".into(), ..Default::default() };
+    let cfg = SmtpConfig {
+        smtp_from: "noreply@example.com".into(),
+        ..Default::default()
+    };
     assert!(cfg.validate().is_err());
     // Zero port.
     let cfg = SmtpConfig {
@@ -87,21 +92,37 @@ fn message_validation_gates() {
         text_body: "body".to_string(),
     };
     assert!(good.validate().is_ok());
-    assert!(EmailMessage { to: vec![], ..good.clone() }.validate().is_err());
     assert!(
-        EmailMessage { to: vec!["bad".to_string()], ..good.clone() }
-            .validate()
-            .is_err()
+        EmailMessage {
+            to: vec![],
+            ..good.clone()
+        }
+        .validate()
+        .is_err()
     );
     assert!(
-        EmailMessage { subject: "  ".to_string(), ..good.clone() }
-            .validate()
-            .is_err()
+        EmailMessage {
+            to: vec!["bad".to_string()],
+            ..good.clone()
+        }
+        .validate()
+        .is_err()
     );
     assert!(
-        EmailMessage { text_body: "x".repeat(MAX_EMAIL_BODY_BYTES + 1), ..good.clone() }
-            .validate()
-            .is_err()
+        EmailMessage {
+            subject: "  ".to_string(),
+            ..good.clone()
+        }
+        .validate()
+        .is_err()
+    );
+    assert!(
+        EmailMessage {
+            text_body: "x".repeat(MAX_EMAIL_BODY_BYTES + 1),
+            ..good.clone()
+        }
+        .validate()
+        .is_err()
     );
 }
 
@@ -113,7 +134,10 @@ fn subject_encoding_and_signup_gate() {
     assert!(!enc.contains('\n'));
 
     assert!(signup_email_gate(false, None).is_ok());
-    assert!(signup_email_gate(true, None).is_err(), "required email missing");
+    assert!(
+        signup_email_gate(true, None).is_err(),
+        "required email missing"
+    );
     assert!(signup_email_gate(true, Some("bad")).is_err());
     assert!(signup_email_gate(true, Some("new@example.com")).is_ok());
 }
@@ -123,11 +147,17 @@ fn builders_carry_codes_and_links() {
     let v = verification_email("u@example.com", "https://srv.example/", "CODE123");
     assert_eq!(v.to, vec!["u@example.com".to_string()]);
     assert!(v.text_body.contains("CODE123"));
-    assert!(v.text_body.contains("https://srv.example/verify-email/CODE123"));
+    assert!(
+        v.text_body
+            .contains("https://srv.example/verify-email/CODE123")
+    );
 
     let r = password_reset_email("u@example.com", "https://srv.example", "TOKEN9");
     assert!(r.subject.contains("password"));
-    assert!(r.text_body.contains("https://srv.example/reset-password/TOKEN9"));
+    assert!(
+        r.text_body
+            .contains("https://srv.example/reset-password/TOKEN9")
+    );
     assert!(r.text_body.contains("30 minutes"));
 
     let a = abuse_report_email(&["m@example.com".to_string()], "rep7", "spam wave");
@@ -171,10 +201,18 @@ fn execute_email_send_validates_before_sending() {
     // Invalid payload never reaches the sender.
     let err = execute_email_send(
         &recorder,
-        &EmailSendPayload { to: vec![], subject: "s".to_string(), body: "b".to_string(), dedup_key: "k2".to_string() },
+        &EmailSendPayload {
+            to: vec![],
+            subject: "s".to_string(),
+            body: "b".to_string(),
+            dedup_key: "k2".to_string(),
+        },
     )
     .expect_err("empty recipients");
-    assert!(matches!(err, pinetree::services::email::EmailError::InvalidMessage(_)));
+    assert!(matches!(
+        err,
+        pinetree::services::email::EmailError::InvalidMessage(_)
+    ));
     assert_eq!(recorder.sent.lock().unwrap().len(), 1);
 }
 
@@ -204,7 +242,9 @@ impl FakeSmtp {
         let out = Arc::clone(&capture);
         let handle = std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accept");
-            stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut writer = stream;
             let mut cap = out.lock().unwrap();
@@ -248,7 +288,10 @@ impl FakeSmtp {
                 }
                 assert!(rcpt.to_uppercase().starts_with("RCPT TO:"), "{rcpt}");
                 cap.rcpts.push(rcpt);
-                say(&format!("{rcpt_code} {}\r\n", if rcpt_code == 250 { "ok" } else { "nope" }));
+                say(&format!(
+                    "{rcpt_code} {}\r\n",
+                    if rcpt_code == 250 { "ok" } else { "nope" }
+                ));
                 if rcpt_code != 250 {
                     return;
                 }
@@ -270,7 +313,11 @@ impl FakeSmtp {
             assert_eq!(quit.to_uppercase(), "QUIT");
             say("221 bye\r\n");
         });
-        Self { addr, capture, handle: Some(handle) }
+        Self {
+            addr,
+            capture,
+            handle: Some(handle),
+        }
     }
 
     fn config(&self, from: &str, user: &str, pass: &str) -> SmtpConfig {
@@ -315,19 +362,31 @@ fn real_client_completes_auth_dialogue_against_fake_smtp() {
     let cap = server.finish();
     assert!(cap.saw_auth);
     assert_eq!(
-        cap.auth_user.as_deref().map(|s| base64::engine::general_purpose::STANDARD.decode(s).unwrap()),
+        cap.auth_user
+            .as_deref()
+            .map(|s| base64::engine::general_purpose::STANDARD.decode(s).unwrap()),
         Some(b"user".to_vec())
     );
     assert_eq!(
-        cap.auth_pass.as_deref().map(|s| base64::engine::general_purpose::STANDARD.decode(s).unwrap()),
+        cap.auth_pass
+            .as_deref()
+            .map(|s| base64::engine::general_purpose::STANDARD.decode(s).unwrap()),
         Some(b"pass".to_vec())
     );
-    assert!(cap.mail_from.as_deref().unwrap().contains("noreply@example.com"));
+    assert!(
+        cap.mail_from
+            .as_deref()
+            .unwrap()
+            .contains("noreply@example.com")
+    );
     assert_eq!(cap.rcpts.len(), 2);
     let data = String::from_utf8(cap.data).expect("data is text");
     assert!(data.contains("Subject: hello"));
     assert!(data.contains("To: a@example.com, b@example.com"));
-    assert!(data.contains("first\r\n..line\r\nlast"), "dot-stuffed: {data:?}");
+    assert!(
+        data.contains("first\r\n..line\r\nlast"),
+        "dot-stuffed: {data:?}"
+    );
 }
 
 #[test]
@@ -356,7 +415,10 @@ fn real_client_surfaces_rcpt_rejection() {
             text_body: "b".to_string(),
         })
         .expect_err("550 must fail");
-    assert!(matches!(err, pinetree::services::email::EmailError::Rejected(_)), "{err:?}");
+    assert!(
+        matches!(err, pinetree::services::email::EmailError::Rejected(_)),
+        "{err:?}"
+    );
     server.finish();
 }
 
@@ -370,5 +432,8 @@ fn unconfigured_sender_fails_without_connecting() {
             text_body: "b".to_string(),
         })
         .expect_err("dormant transport");
-    assert!(matches!(err, pinetree::services::email::EmailError::NotConfigured), "{err:?}");
+    assert!(
+        matches!(err, pinetree::services::email::EmailError::NotConfigured),
+        "{err:?}"
+    );
 }

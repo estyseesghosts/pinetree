@@ -48,7 +48,9 @@ fn now_ms() -> i64 {
 pub fn fetch_preview(client: &SafeHttpClient, url: &str) -> Result<Value, String> {
     let key = url.trim().to_string();
     {
-        let guard = cache().lock().map_err(|_| "preview cache poisoned".to_string())?;
+        let guard = cache()
+            .lock()
+            .map_err(|_| "preview cache poisoned".to_string())?;
         if let Some((value, at)) = guard.rows.get(&key) {
             if now_ms().saturating_sub(*at) <= PREVIEW_CACHE_TTL_MS {
                 return Ok(value.clone());
@@ -82,9 +84,7 @@ fn fetch_preview_uncached(client: &SafeHttpClient, url: &str) -> Result<Value, S
     }
     let content_type = resp.header("content-type").unwrap_or("").to_lowercase();
     // HTML only: never proxy arbitrary content types or full bodies.
-    if !content_type.is_empty()
-        && !content_type.contains("html")
-        && !content_type.contains("xhtml")
+    if !content_type.is_empty() && !content_type.contains("html") && !content_type.contains("xhtml")
     {
         return Ok(Value::Object(Default::default()));
     }
@@ -201,7 +201,10 @@ fn attr(tag: &str, name: &str) -> Option<String> {
             let raw = tag[after + 1..].trim_start();
             let quote = raw.as_bytes().first().copied().unwrap_or(b' ');
             if quote == b'"' || quote == b'\'' {
-                let end = raw[1..].find(quote as char).map(|i| i + 1).unwrap_or(raw.len());
+                let end = raw[1..]
+                    .find(quote as char)
+                    .map(|i| i + 1)
+                    .unwrap_or(raw.len());
                 return Some(raw[1..end.min(raw.len())].to_string());
             }
             let end = raw

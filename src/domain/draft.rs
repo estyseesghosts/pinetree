@@ -11,7 +11,7 @@
 //! on the draft itself.
 
 use crate::domain::id::DomainError;
-use crate::domain::note::{ReactionAcceptance, Visibility, MAX_FILE_IDS, MAX_NOTE_TEXT_CHARS};
+use crate::domain::note::{MAX_FILE_IDS, MAX_NOTE_TEXT_CHARS, ReactionAcceptance, Visibility};
 
 fn invalid(msg: String) -> DomainError {
     DomainError::Validation(msg)
@@ -77,9 +77,7 @@ impl NoteDraft {
             }
         }
         if self.file_ids.len() > MAX_FILE_IDS {
-            return Err(invalid(format!(
-                "file_ids exceeds {MAX_FILE_IDS} items"
-            )));
+            return Err(invalid(format!("file_ids exceeds {MAX_FILE_IDS} items")));
         }
         {
             let mut seen = std::collections::HashSet::new();
@@ -145,9 +143,7 @@ pub fn validate_draft_poll_expiry(
     if has_poll {
         if let Some(expires_at) = poll_expires_at_ms {
             if expires_at <= now_ms {
-                return Err(invalid(
-                    "CANNOT_CREATE_ALREADY_EXPIRED_POLL".to_string(),
-                ));
+                return Err(invalid("CANNOT_CREATE_ALREADY_EXPIRED_POLL".to_string()));
             }
         }
     }
@@ -232,7 +228,10 @@ mod tests {
         assert!(validate_draft_schedule(Some(50), false, 100).is_ok());
         // Scheduled without a time.
         let err = validate_draft_schedule(None, true, 100).unwrap_err();
-        assert_eq!(err, DomainError::Validation("SCHEDULED_AT_REQUIRED".to_string()));
+        assert_eq!(
+            err,
+            DomainError::Validation("SCHEDULED_AT_REQUIRED".to_string())
+        );
         // Non-future times (past and exactly-now) are rejected.
         for at in [99, 100] {
             let err = validate_draft_schedule(Some(at), true, 100).unwrap_err();

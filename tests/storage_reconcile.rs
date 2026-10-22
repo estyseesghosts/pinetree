@@ -7,8 +7,8 @@
 //! `JobKind::BackfillDurableAccounting`.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use pinetree::application::commands::AppServices;
 use pinetree::application::ports::{
@@ -21,12 +21,12 @@ use pinetree::domain::media::MediaProperties;
 use pinetree::federation::delivery::{SafeHttpClient, SafeHttpConfig};
 use pinetree::federation::retry::DestinationTracker;
 use pinetree::jobs::worker::JobWorker;
-use pinetree::media::transcode::TranscodeConfig;
-use pinetree::services::email::{SmtpConfig, SmtpEmailSender};
 use pinetree::media::ingest::{md5_hex, sha256_hex};
 use pinetree::media::reconciler;
 use pinetree::media::storage::FsBlobStore;
+use pinetree::media::transcode::TranscodeConfig;
 use pinetree::persistence::redb::RedbStore;
+use pinetree::services::email::{SmtpConfig, SmtpEmailSender};
 
 const BASE_MS: i64 = 1_760_400_000_000;
 static RECON_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -42,10 +42,7 @@ struct ReconHarness {
 
 fn recon_harness() -> (ReconHarness, String) {
     let n = RECON_SEQ.fetch_add(1, Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!(
-        "pinetree-reconcile-{}-{n}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("pinetree-reconcile-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let clock: Arc<ManualClock> = Arc::new(ManualClock::new(BASE_MS));
     let clock_port: Arc<dyn Clock> = clock.clone();
@@ -261,11 +258,12 @@ fn missing_cache_bytes_marked_and_legacy_rows_flagged_not_purged() {
     // Neither metadata row is deleted; the torn index row stays for re-fetch.
     assert!(h.store.get(&torn.id).unwrap().is_some());
     assert!(h.store.get(&legacy.id).unwrap().is_some());
-    assert!(h
-        .store
-        .remote_cache_lookup("https://cdn.example/torn.png", "original")
-        .unwrap()
-        .is_some());
+    assert!(
+        h.store
+            .remote_cache_lookup("https://cdn.example/torn.png", "original")
+            .unwrap()
+            .is_some()
+    );
     // Re-running converges (the torn row stays byte-less, counted again but
     // never deleted).
     let again = reconciler::reconcile_media(&h.services).unwrap();
@@ -289,8 +287,7 @@ fn backfill_restores_zeroed_counters() {
     assert_eq!(h.store.durable_bytes(&owner).unwrap(), 5);
     h.store.set_durable_bytes(&owner, 0).unwrap();
     h.store.set_blob_refcount(&a.blob_key, 0).unwrap();
-    let (report, done) =
-        reconciler::backfill_durable_accounting(&h.services, None, 500).unwrap();
+    let (report, done) = reconciler::backfill_durable_accounting(&h.services, None, 500).unwrap();
     assert!(done.is_none());
     assert_eq!(report.media_scanned, 2, "{report:?}");
     assert_eq!(h.store.durable_bytes(&owner).unwrap(), 5);

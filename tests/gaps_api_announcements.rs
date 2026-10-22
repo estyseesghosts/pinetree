@@ -8,11 +8,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pinetree::application::commands::announcements::{AnnouncementStore, MemAnnouncementStore};
 use pinetree::application::commands::AppServices;
-use pinetree::application::ports::{
-    BlobStore, Clock, IdGenerator, NoopStreamingSink, PortError,
-};
+use pinetree::application::commands::announcements::{AnnouncementStore, MemAnnouncementStore};
+use pinetree::application::ports::{BlobStore, Clock, IdGenerator, NoopStreamingSink, PortError};
 use pinetree::domain::id::{AidxGenerator, ManualClock};
 use pinetree::federation::delivery::{SafeHttpClient, SafeHttpConfig};
 use pinetree::media::storage::FsBlobStore;
@@ -101,16 +99,30 @@ fn announcements_list_show_and_badge_clears() {
     let store = MemAnnouncementStore::new();
     let alice = services.create_account("alice", None).unwrap();
 
-    assert!(services.announcements_list(&store, Some(&alice.id)).unwrap().is_empty());
-    assert_eq!(services.announcements_unread_count(&store, &alice.id).unwrap(), 0);
+    assert!(
+        services
+            .announcements_list(&store, Some(&alice.id))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        services
+            .announcements_unread_count(&store, &alice.id)
+            .unwrap(),
+        0
+    );
 
     // Validation: blank title / blank text rejected.
-    assert!(services
-        .announcement_create(&store, "  ", "body", None, false, false)
-        .is_err());
-    assert!(services
-        .announcement_create(&store, "title", "", None, false, false)
-        .is_err());
+    assert!(
+        services
+            .announcement_create(&store, "  ", "body", None, false, false)
+            .is_err()
+    );
+    assert!(
+        services
+            .announcement_create(&store, "title", "", None, false, false)
+            .is_err()
+    );
 
     let first = services
         .announcement_create(&store, "welcome", "hello everyone", None, true, true)
@@ -120,7 +132,9 @@ fn announcements_list_show_and_badge_clears() {
         .unwrap();
 
     // Newest-first with unread flags.
-    let list = services.announcements_list(&store, Some(&alice.id)).unwrap();
+    let list = services
+        .announcements_list(&store, Some(&alice.id))
+        .unwrap();
     assert_eq!(list.len(), 2);
     assert_eq!(list[0].announcement.id, second.id);
     assert!(!list[0].is_read);
@@ -133,23 +147,50 @@ fn announcements_list_show_and_badge_clears() {
         .unwrap();
     assert!(!shown.is_read);
     assert_eq!(
-        services.announcement_show(&store, "missing", Some(&alice.id)).unwrap_err(),
+        services
+            .announcement_show(&store, "missing", Some(&alice.id))
+            .unwrap_err(),
         PortError::NotFound("NO_SUCH_ANNOUNCEMENT".to_string())
     );
     assert_eq!(
-        services.announcement_read(&store, &alice.id, "missing").unwrap_err(),
+        services
+            .announcement_read(&store, &alice.id, "missing")
+            .unwrap_err(),
         PortError::NotFound("NO_SUCH_ANNOUNCEMENT".to_string())
     );
 
     // Badge: 2 unread -> read one -> 1 -> read other -> 0 (idempotent).
-    assert_eq!(services.announcements_unread_count(&store, &alice.id).unwrap(), 2);
-    services.announcement_read(&store, &alice.id, &first.id).unwrap();
-    services.announcement_read(&store, &alice.id, &first.id).unwrap();
-    assert_eq!(services.announcements_unread_count(&store, &alice.id).unwrap(), 1);
-    services.announcement_read(&store, &alice.id, &second.id).unwrap();
-    assert_eq!(services.announcements_unread_count(&store, &alice.id).unwrap(), 0);
+    assert_eq!(
+        services
+            .announcements_unread_count(&store, &alice.id)
+            .unwrap(),
+        2
+    );
+    services
+        .announcement_read(&store, &alice.id, &first.id)
+        .unwrap();
+    services
+        .announcement_read(&store, &alice.id, &first.id)
+        .unwrap();
+    assert_eq!(
+        services
+            .announcements_unread_count(&store, &alice.id)
+            .unwrap(),
+        1
+    );
+    services
+        .announcement_read(&store, &alice.id, &second.id)
+        .unwrap();
+    assert_eq!(
+        services
+            .announcements_unread_count(&store, &alice.id)
+            .unwrap(),
+        0
+    );
 
-    let list = services.announcements_list(&store, Some(&alice.id)).unwrap();
+    let list = services
+        .announcements_list(&store, Some(&alice.id))
+        .unwrap();
     assert!(list.iter().all(|v| v.is_read));
     assert!(store.drain_jobs().is_empty());
 }

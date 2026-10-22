@@ -6,8 +6,8 @@
 //! drives a local `evict_reconcile_orphan_blobs` over the `MediaStore` API.
 //! Switch to it at the `// TODO(parent)` site once it lands.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use pinetree::activitypub::objects::ParsedAttachment;
 use pinetree::application::commands::AppServices;
@@ -23,8 +23,8 @@ use pinetree::domain::note::MAX_FILE_IDS;
 use pinetree::federation::delivery::{SafeHttpClient, SafeHttpConfig};
 use pinetree::media::ingest::{md5_hex, sha256_hex};
 use pinetree::media::remote_cache::{
-    build_remote_media_fetch_job, MAX_REMOTE_ATTACHMENTS_PER_NOTE,
-    MAX_REMOTE_MEDIA_TOTAL_BYTES_PER_NOTE,
+    MAX_REMOTE_ATTACHMENTS_PER_NOTE, MAX_REMOTE_MEDIA_TOTAL_BYTES_PER_NOTE,
+    build_remote_media_fetch_job,
 };
 use pinetree::media::storage::FsBlobStore;
 use pinetree::persistence::redb::RedbStore;
@@ -201,11 +201,12 @@ fn eviction_bytes_only_metadata_and_source_url_survive_refetch_heals() {
         Some("https://remote.example/a.png"),
         "source_url retained after byte eviction"
     );
-    assert!(!h
-        .store
-        .find_by_source_url("https://remote.example/a.png")
-        .unwrap()
-        .is_empty());
+    assert!(
+        !h.store
+            .find_by_source_url("https://remote.example/a.png")
+            .unwrap()
+            .is_empty()
+    );
 
     // Re-fetch heals: re-put the same content-addressed bytes, upsert the
     // row under the same id (the `evicted` flag flip once that path lands).
@@ -280,17 +281,20 @@ fn eviction_bytes_only_metadata_and_source_url_survive_refetch_heals() {
         .store
         .remote_cache_evict_candidates(10)
         .expect("candidates");
-    assert!(candidates
-        .iter()
-        .any(|r| r.source_url == "https://remote.example/a.png"));
+    assert!(
+        candidates
+            .iter()
+            .any(|r| r.source_url == "https://remote.example/a.png")
+    );
     h.store
         .remote_cache_remove("https://remote.example/a.png", "original")
         .expect("remove");
-    assert!(h
-        .store
-        .remote_cache_lookup("https://remote.example/a.png", "original")
-        .expect("lookup")
-        .is_none());
+    assert!(
+        h.store
+            .remote_cache_lookup("https://remote.example/a.png", "original")
+            .expect("lookup")
+            .is_none()
+    );
 }
 
 #[test]
@@ -361,9 +365,11 @@ fn eviction_per_note_budget_pins_hold() {
 
     let (h, author) = evict_harness();
     // Job builder: empty → None; 20 → truncated to 16 in document order.
-    assert!(build_remote_media_fetch_job(&h.services, "act:empty", &[])
-        .unwrap()
-        .is_none());
+    assert!(
+        build_remote_media_fetch_job(&h.services, "act:empty", &[])
+            .unwrap()
+            .is_none()
+    );
     let attachments: Vec<ParsedAttachment> = (0..20)
         .map(|i| ParsedAttachment {
             url: format!("https://remote.example/{i}.png"),

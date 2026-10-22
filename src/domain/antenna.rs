@@ -107,7 +107,9 @@ impl Antenna {
 /// True when at least one keyword group holds a non-blank entry (empties
 /// are stripped at match time). Upstream `create.ts` EMPTY_KEYWORD rule.
 pub fn has_keyword(groups: &[Vec<String>]) -> bool {
-    groups.iter().any(|g| g.iter().any(|k| !k.trim().is_empty()))
+    groups
+        .iter()
+        .any(|g| g.iter().any(|k| !k.trim().is_empty()))
 }
 
 /// Default antenna cap per instance (upstream `antennaLimit: 5`,
@@ -290,7 +292,13 @@ fn matches_keywords(groups: &[Vec<String>], haystack: &str, case_sensitive: bool
     groups.iter().any(|group| {
         let terms: Vec<String> = group
             .iter()
-            .map(|k| if case_sensitive { k.clone() } else { k.to_lowercase() })
+            .map(|k| {
+                if case_sensitive {
+                    k.clone()
+                } else {
+                    k.to_lowercase()
+                }
+            })
             .filter(|k| !k.trim().is_empty())
             .collect();
         !terms.is_empty() && terms.iter().all(|t| hay.contains(t))
@@ -381,7 +389,10 @@ mod tests {
     #[test]
     fn keyword_and_or_and_case_rules() {
         let mut a = antenna();
-        a.keywords = vec![vec!["foo".to_string(), "bar".to_string()], vec!["baz".to_string()]];
+        a.keywords = vec![
+            vec!["foo".to_string(), "bar".to_string()],
+            vec!["baz".to_string()],
+        ];
         let both = note("n1", "u1", Some("foo and bar"));
         assert!(antenna_matches(&a, &view(&both, "u1")));
         let second = note("n2", "u1", Some("a BAZ here"));
@@ -477,10 +488,30 @@ mod tests {
         // exclude_sensitive drops sensitive notes only when armed.
         // (Flag + sensitivity resolve outside the stored row until the
         // parent-owned endpoint/persistence/store change lands.)
-        assert!(antenna_matches_with_sensitivity(&a, &view(&n, "u1"), false, false));
-        assert!(antenna_matches_with_sensitivity(&a, &view(&n, "u1"), true, false));
-        assert!(!antenna_matches_with_sensitivity(&a, &view(&n, "u1"), true, true));
-        assert!(antenna_matches_with_sensitivity(&a, &view(&n, "u1"), false, true));
+        assert!(antenna_matches_with_sensitivity(
+            &a,
+            &view(&n, "u1"),
+            false,
+            false
+        ));
+        assert!(antenna_matches_with_sensitivity(
+            &a,
+            &view(&n, "u1"),
+            true,
+            false
+        ));
+        assert!(!antenna_matches_with_sensitivity(
+            &a,
+            &view(&n, "u1"),
+            true,
+            true
+        ));
+        assert!(antenna_matches_with_sensitivity(
+            &a,
+            &view(&n, "u1"),
+            false,
+            true
+        ));
     }
 
     #[test]

@@ -94,8 +94,9 @@ pub fn handle_custom_emoji_transfer(
     kind: &JobKind,
     payload: &[u8],
 ) -> Result<Option<NewJob>, PortError> {
-    let parsed: CustomEmojiTransferPayload = serde_json::from_slice(payload)
-        .map_err(|e| PortError::Validation(format!("custom emoji transfer payload invalid: {e}")))?;
+    let parsed: CustomEmojiTransferPayload = serde_json::from_slice(payload).map_err(|e| {
+        PortError::Validation(format!("custom emoji transfer payload invalid: {e}"))
+    })?;
     match kind {
         JobKind::ExportCustomEmojis => export_custom_emojis(services, &parsed),
         JobKind::ImportCustomEmojis => {
@@ -173,8 +174,8 @@ fn export_custom_emojis(
         PortError::StorageUnavailable(format!("emoji export meta serialize failed: {e}"))
     })?;
     // Stored (level-0) compression — upstream zip parity.
-    let options = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Stored);
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     writer
         .start_file("meta.json", options)
@@ -269,8 +270,11 @@ fn import_custom_emojis(
 
     // Locate + read `meta.json` (missing meta fails the job — upstream
     // parity). The size is checked BEFORE extraction (hardening cap).
-    let meta_index = (0..archive.len())
-        .find(|&i| archive.name_for_index(i).is_some_and(|name| name == "meta.json"));
+    let meta_index = (0..archive.len()).find(|&i| {
+        archive
+            .name_for_index(i)
+            .is_some_and(|name| name == "meta.json")
+    });
     let Some(meta_index) = meta_index else {
         return Err(PortError::Validation("META_JSON_MISSING".to_string()));
     };
@@ -320,7 +324,10 @@ fn import_custom_emojis(
             continue;
         }
         if !valid_import_file_name(&row.file_name) {
-            eprintln!("import-custom-emojis: skipping bad fileName {:?}", row.file_name);
+            eprintln!(
+                "import-custom-emojis: skipping bad fileName {:?}",
+                row.file_name
+            );
             skipped += 1;
             continue;
         }
@@ -360,9 +367,7 @@ fn import_custom_emojis(
             // already forbids `/`, so this only fires on hostile archives
             // whose names alias a referenced one).
             if file.enclosed_name().is_none() {
-                eprintln!(
-                    "import-custom-emojis: skipping {name:?}: unenclosed entry name"
-                );
+                eprintln!("import-custom-emojis: skipping {name:?}: unenclosed entry name");
                 skipped += 1;
                 continue;
             }
@@ -392,22 +397,17 @@ fn import_custom_emojis(
         // content-deduped, so a retried job converges instead of
         // orphaning duplicates). Oversize-for-drive rows skip (the drive
         // cap is per-instance and smaller than the zip caps).
-        let drive_file = match services.upload_media(
-            &user.id,
-            row.file_name.clone(),
-            &data,
-            None,
-            false,
-            false,
-        ) {
-            Ok(file) => file,
-            Err(e @ PortError::StorageUnavailable(_)) => return Err(e),
-            Err(e) => {
-                eprintln!("import-custom-emojis: skipping {name:?}: drive store failed: {e:?}");
-                skipped += 1;
-                continue;
-            }
-        };
+        let drive_file =
+            match services.upload_media(&user.id, row.file_name.clone(), &data, None, false, false)
+            {
+                Ok(file) => file,
+                Err(e @ PortError::StorageUnavailable(_)) => return Err(e),
+                Err(e) => {
+                    eprintln!("import-custom-emojis: skipping {name:?}: drive store failed: {e:?}");
+                    skipped += 1;
+                    continue;
+                }
+            };
         // Delete-then-add (upstream parity: name collisions replace).
         // The importing user acts as moderator for both rows (DIVERGENCE:
         // upstream adds with no moderator; pinetree always logs — see
@@ -461,11 +461,7 @@ fn valid_import_file_name(name: &str) -> bool {
     let Some(stem) = parts.next() else {
         return false;
     };
-    if stem.is_empty()
-        || !stem
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
-    {
+    if stem.is_empty() || !stem.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
         return false;
     }
     for ext in parts {

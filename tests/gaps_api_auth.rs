@@ -125,7 +125,11 @@ fn totp_register_and_done_flow() {
     let now_secs = clock.now_ms().div_euclid(1000) as u64;
     let token = totp_token(&enrol.secret, now_secs).unwrap();
     assert!(token.len() == 6 && token.bytes().all(|b| b.is_ascii_digit()));
-    let bad = if token == "000000" { "000001" } else { "000000" };
+    let bad = if token == "000000" {
+        "000001"
+    } else {
+        "000000"
+    };
     assert_eq!(
         code_of(services.done_2fa(&alice, bad).unwrap_err()),
         "INVALID_TOKEN"
@@ -153,7 +157,9 @@ fn totp_key_done_passwordless_unregister_rotate() {
 
     // key-done needs the password AND a valid token.
     let enrol = services.register_2fa(&bob, "s3cret!").unwrap();
-    let err = services.confirm_2fa_key(&bob, "nope", "000000").unwrap_err();
+    let err = services
+        .confirm_2fa_key(&bob, "nope", "000000")
+        .unwrap_err();
     assert_eq!(code_of(err), "INCORRECT_PASSWORD");
     let now_secs = clock.now_ms().div_euclid(1000) as u64;
     let token = totp_token(&enrol.secret, now_secs).unwrap();
@@ -201,7 +207,9 @@ fn totp_rfc6238_vector_and_base32_roundtrip() {
 fn webauthn_stays_400_with_documented_reason() {
     let (services, _) = test_services();
     let carol = make_user(&services, "carol", "pw123456");
-    let err = services.remove_2fa_security_key(&carol, "cred-1").unwrap_err();
+    let err = services
+        .remove_2fa_security_key(&carol, "cred-1")
+        .unwrap_err();
     let msg = match err {
         PortError::Validation(m) => m,
         other => panic!("unexpected: {other:?}"),

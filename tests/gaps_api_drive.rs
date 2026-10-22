@@ -8,8 +8,8 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use pinetree::application::commands::AppServices;
 use pinetree::application::commands::pages::PageBody;
@@ -115,7 +115,10 @@ impl DriveFolderStore for MemFolderStore {
         folder: DriveFolder,
         _jobs: Vec<NewJob>,
     ) -> Result<DriveFolder, PortError> {
-        self.folders.lock().unwrap().insert(folder.id.clone(), folder.clone());
+        self.folders
+            .lock()
+            .unwrap()
+            .insert(folder.id.clone(), folder.clone());
         Ok(folder)
     }
     fn get_folder(&self, id: &str) -> Result<Option<DriveFolder>, PortError> {
@@ -126,7 +129,10 @@ impl DriveFolderStore for MemFolderStore {
         folder: DriveFolder,
         _jobs: Vec<NewJob>,
     ) -> Result<DriveFolder, PortError> {
-        self.folders.lock().unwrap().insert(folder.id.clone(), folder.clone());
+        self.folders
+            .lock()
+            .unwrap()
+            .insert(folder.id.clone(), folder.clone());
         Ok(folder)
     }
     fn delete_folder(&self, id: &str, _jobs: Vec<NewJob>) -> Result<(), PortError> {
@@ -246,7 +252,9 @@ fn folders_crud_nested_and_guards() {
 
     // show + find (folderId null = root) + child listing.
     assert_eq!(
-        services.show_drive_folder(&store, &alice.id, &child.id).unwrap(),
+        services
+            .show_drive_folder(&store, &alice.id, &child.id)
+            .unwrap(),
         child
     );
     let found = services
@@ -259,7 +267,9 @@ fn folders_crud_nested_and_guards() {
             .unwrap()
             .is_empty()
     );
-    let kids = services.child_drive_folders(&store, &alice.id, None).unwrap();
+    let kids = services
+        .child_drive_folders(&store, &alice.id, None)
+        .unwrap();
     assert_eq!(kids.len(), 2); // Untitled + docs
     let sub = services
         .child_drive_folders(&store, &alice.id, Some(&root.id))
@@ -277,7 +287,12 @@ fn folders_crud_nested_and_guards() {
     );
     // Foreign parent on create.
     assert_eq!(
-        services.create_drive_folder(&store, &bob.id, Some("x".to_string()), Some(root.id.clone())),
+        services.create_drive_folder(
+            &store,
+            &bob.id,
+            Some("x".to_string()),
+            Some(root.id.clone())
+        ),
         Err(PortError::NotFound("NO_SUCH_FOLDER".to_string()))
     );
 
@@ -336,8 +351,12 @@ fn folders_crud_nested_and_guards() {
             "HAS_CHILD_FILES_OR_FOLDERS".to_string()
         ))
     );
-    services.delete_drive_folder(&store, &alice.id, &grandchild.id).unwrap();
-    services.delete_drive_folder(&store, &alice.id, &child.id).unwrap();
+    services
+        .delete_drive_folder(&store, &alice.id, &grandchild.id)
+        .unwrap();
+    services
+        .delete_drive_folder(&store, &alice.id, &child.id)
+        .unwrap();
     assert_eq!(
         services.show_drive_folder(&store, &alice.id, &child.id),
         Err(PortError::NotFound("NO_SUCH_FOLDER".to_string()))
@@ -364,7 +383,10 @@ fn files_move_find_existence_and_folder_leg() {
 
     // find before the move: both at root.
     assert_eq!(
-        services.find_drive_files(&store, &alice.id, "a.txt", None).unwrap().len(),
+        services
+            .find_drive_files(&store, &alice.id, "a.txt", None)
+            .unwrap()
+            .len(),
         2
     );
     // move-bulk one file into the folder.
@@ -384,7 +406,12 @@ fn files_move_find_existence_and_folder_leg() {
 
     // move-bulk skips missing/unowned ids; bogus folder errors.
     services
-        .move_drive_files(&store, &alice.id, &[b.clone(), "ghost".to_string(), a.clone()], None)
+        .move_drive_files(
+            &store,
+            &alice.id,
+            &[b.clone(), "ghost".to_string(), a.clone()],
+            None,
+        )
         .unwrap();
     assert!(
         services
@@ -408,7 +435,11 @@ fn files_move_find_existence_and_folder_leg() {
     // check-existence is owner-scoped md5.
     let md5_a = services.media.get(&a).unwrap().unwrap().hash;
     assert!(services.drive_file_exists(&alice.id, &md5_a).unwrap());
-    assert!(!services.drive_file_exists(&alice.id, "0".repeat(32).as_str()).unwrap());
+    assert!(
+        !services
+            .drive_file_exists(&alice.id, "0".repeat(32).as_str())
+            .unwrap()
+    );
     assert!(!services.drive_file_exists(&bob.id, &md5_a).unwrap());
 
     // drive/files/update folder leg.
@@ -454,7 +485,9 @@ fn attached_notes_lists_referencing_notes() {
         limit: 10,
         ..Default::default()
     };
-    let notes = services.attached_notes(&alice.id, &file, false, &cursor).unwrap();
+    let notes = services
+        .attached_notes(&alice.id, &file, false, &cursor)
+        .unwrap();
     assert_eq!(notes.len(), 1);
     assert_eq!(notes[0].id, note.id);
 
@@ -468,7 +501,9 @@ fn attached_notes_lists_referencing_notes() {
         Err(PortError::NotFound("NO_SUCH_FILE".to_string()))
     );
     // Moderator sees the foreign file's notes.
-    let mod_notes = services.attached_notes(&bob.id, &file, true, &cursor).unwrap();
+    let mod_notes = services
+        .attached_notes(&bob.id, &file, true, &cursor)
+        .unwrap();
     assert_eq!(mod_notes.len(), 1);
 
     // untilId cursor truncates.
@@ -500,7 +535,9 @@ fn drive_stream_filters_by_type() {
         limit: 10,
         ..Default::default()
     };
-    let all = services.stream_drive_files(&alice.id, &cursor, None, None).unwrap();
+    let all = services
+        .stream_drive_files(&alice.id, &cursor, None, None)
+        .unwrap();
     assert_eq!(all.len(), 2);
     let images = services
         .stream_drive_files(&alice.id, &cursor, Some("image/"), None)
@@ -525,7 +562,12 @@ fn following_list_returns_own_edges() {
     let edges = services.following_list(&alice.id, false, &cursor).unwrap();
     assert_eq!(edges.len(), 2);
     // No notify preferences set on these edges.
-    assert!(services.following_list(&alice.id, true, &cursor).unwrap().is_empty());
+    assert!(
+        services
+            .following_list(&alice.id, true, &cursor)
+            .unwrap()
+            .is_empty()
+    );
     // Limit applies.
     let one = services
         .following_list(
@@ -539,7 +581,12 @@ fn following_list_returns_own_edges() {
         .unwrap();
     assert_eq!(one.len(), 1);
     // Empty for a non-follower.
-    assert!(services.following_list(&bob.id, false, &cursor).unwrap().is_empty());
+    assert!(
+        services
+            .following_list(&bob.id, false, &cursor)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -549,8 +596,12 @@ fn create_list_from_public_copies_members() {
     let bob = services.create_account("bob", None).unwrap();
     let carol = services.create_account("carol", None).unwrap();
 
-    let source = services.create_user_list(&alice.id, "pub".to_string()).unwrap();
-    services.push_list_member(&alice.id, &source.id, &carol.id).unwrap();
+    let source = services
+        .create_user_list(&alice.id, "pub".to_string())
+        .unwrap();
+    services
+        .push_list_member(&alice.id, &source.id, &carol.id)
+        .unwrap();
     services
         .update_user_list(&alice.id, &source.id, None, Some(true))
         .unwrap();
@@ -565,7 +616,9 @@ fn create_list_from_public_copies_members() {
     assert_eq!(members[0].member_id, carol.id);
 
     // Private source lists 404.
-    let priv_list = services.create_user_list(&alice.id, "priv".to_string()).unwrap();
+    let priv_list = services
+        .create_user_list(&alice.id, "priv".to_string())
+        .unwrap();
     assert_eq!(
         services.create_list_from_public(&bob.id, "x".to_string(), &priv_list.id),
         Err(PortError::NotFound("NO_SUCH_LIST".to_string()))

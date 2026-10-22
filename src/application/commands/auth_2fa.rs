@@ -18,8 +18,7 @@ use super::AppServices;
 
 use crate::application::ports::{PortError, RegistryItem};
 use crate::domain::admin::{
-    AppRecord, TotpState, SCOPE_2FA, SCOPE_APPS, KEY_TOTP,
-    SECURITY_KEY_UNSUPPORTED_REASON,
+    AppRecord, KEY_TOTP, SCOPE_2FA, SCOPE_APPS, SECURITY_KEY_UNSUPPORTED_REASON, TotpState,
     validate_app_callback, validate_app_name, validate_totp_token_format,
 };
 
@@ -42,12 +41,9 @@ impl AppServices {
     // --- TOTP helpers ----------------------------------------------------
 
     fn totp_row(&self, account_id: &str) -> Result<Option<TotpState>, PortError> {
-        let item = self.registry.registry_get(
-            account_id,
-            None,
-            &vec![SCOPE_2FA.to_string()],
-            KEY_TOTP,
-        )?;
+        let item =
+            self.registry
+                .registry_get(account_id, None, &vec![SCOPE_2FA.to_string()], KEY_TOTP)?;
         match item {
             None => Ok(None),
             Some(item) => serde_json::from_value(item.value)
@@ -70,12 +66,8 @@ impl AppServices {
     }
 
     fn remove_totp_row(&self, account_id: &str) -> Result<(), PortError> {
-        self.registry.registry_remove(
-            account_id,
-            None,
-            &vec![SCOPE_2FA.to_string()],
-            KEY_TOTP,
-        )
+        self.registry
+            .registry_remove(account_id, None, &vec![SCOPE_2FA.to_string()], KEY_TOTP)
     }
 
     fn check_password(&self, account_id: &str, password: &str) -> Result<(), PortError> {
@@ -120,7 +112,11 @@ impl AppServices {
 
     /// `i/2fa/register` (upstream `register.ts`): password check, then mint
     /// a pending secret. Refused when a verified secret already exists.
-    pub fn register_2fa(&self, account_id: &str, password: &str) -> Result<TotpEnrolment, PortError> {
+    pub fn register_2fa(
+        &self,
+        account_id: &str,
+        password: &str,
+    ) -> Result<TotpEnrolment, PortError> {
         self.check_password(account_id, password)?;
         if self.totp_row(account_id)?.is_some_and(|s| s.verified) {
             return Err(PortError::Validation(
@@ -133,7 +129,12 @@ impl AppServices {
 
     /// `i/2fa/key-done` (upstream `key-done.ts`): password + token verify,
     /// marks the pending secret verified.
-    pub fn confirm_2fa_key(&self, account_id: &str, password: &str, token: &str) -> Result<(), PortError> {
+    pub fn confirm_2fa_key(
+        &self,
+        account_id: &str,
+        password: &str,
+        token: &str,
+    ) -> Result<(), PortError> {
         self.check_password(account_id, password)?;
         validate_totp_token_format(token)?;
         let mut state = self
@@ -291,9 +292,9 @@ impl AppServices {
 
     /// `my/apps` (upstream `my/apps.ts`): the caller's own app rows.
     pub fn list_my_apps(&self, account_id: &str) -> Result<Vec<AppRecord>, PortError> {
-        let items =
-            self.registry
-                .registry_list(account_id, None, &vec![SCOPE_APPS.to_string()])?;
+        let items = self
+            .registry
+            .registry_list(account_id, None, &vec![SCOPE_APPS.to_string()])?;
         let mut out = Vec::with_capacity(items.len());
         for item in items {
             if let Ok(record) = serde_json::from_value::<AppRecord>(item.value) {
@@ -310,7 +311,10 @@ impl AppServices {
 }
 
 fn host_of_public_url(public_url: &str) -> String {
-    let after_scheme = public_url.split_once("://").map(|(_, rest)| rest).unwrap_or(public_url);
+    let after_scheme = public_url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(public_url);
     let host = after_scheme
         .split('/')
         .next()
@@ -329,7 +333,9 @@ fn host_of_public_url(public_url: &str) -> String {
 fn random_secret(len: usize) -> String {
     const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let buf: Vec<u8> = (0..len).map(|_| rand::random::<u8>()).collect();
-    buf.iter().map(|b| CHARS[(*b as usize) % CHARS.len()] as char).collect()
+    buf.iter()
+        .map(|b| CHARS[(*b as usize) % CHARS.len()] as char)
+        .collect()
 }
 
 /// RFC 4648 base32 encode (no padding), used for TOTP secrets.
@@ -380,7 +386,9 @@ pub fn base32_decode(input: &str) -> Result<Vec<u8>, PortError> {
 pub fn totp_token(secret_b32: &str, unix_secs: u64) -> Result<String, PortError> {
     let key_bytes = base32_decode(secret_b32)?;
     if key_bytes.is_empty() {
-        return Err(PortError::Validation("INVALID_PARAM empty totp secret".to_string()));
+        return Err(PortError::Validation(
+            "INVALID_PARAM empty totp secret".to_string(),
+        ));
     }
     let step = unix_secs / u64::from(TOTP_STEP_SECS);
     Ok(hotp(&key_bytes, step))

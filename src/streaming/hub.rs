@@ -49,10 +49,18 @@ pub enum HubMessage {
     RoleTimelineNote { role_id: String, note_id: String },
     /// A drive file changed (fanned to the owner's `drive` channels;
     /// packed at socket time, deletes carry only the id).
-    DriveFile { user_id: String, event: DriveFileEvent, file_id: String },
+    DriveFile {
+        user_id: String,
+        event: DriveFileEvent,
+        file_id: String,
+    },
     /// A drive folder changed (fanned to the owner's `drive` channels;
     /// bodies are `{id}` until the WP2 folder packer lands).
-    DriveFolder { user_id: String, event: DriveFolderEvent, folder_id: String },
+    DriveFolder {
+        user_id: String,
+        event: DriveFolderEvent,
+        folder_id: String,
+    },
     /// A clip changed (fanned to `clip` channels for that clip; both
     /// events carry a null body, upstream parity).
     Clip { clip_id: String, deleted: bool },
@@ -66,7 +74,11 @@ pub enum HubMessage {
     AntennaNote { antenna_id: String, note_id: String },
     /// A user-list member was added/removed (Batch O WP16): the `userList`
     /// channel emits `userAdded`/`userRemoved` with the packed member.
-    UserListMember { list_id: String, member_id: String, added: bool },
+    UserListMember {
+        list_id: String,
+        member_id: String,
+        added: bool,
+    },
     /// A note was deleted.
     NoteDeleted { note_id: String },
     /// A `main`-channel event for one user.
@@ -243,7 +255,8 @@ impl StreamingSink for BroadcastStreamingSink {
                 self.hub.send(HubMessage::PollEnded { note_id });
             }
             StreamingEvent::RoleTimelineNote { role_id, note_id } => {
-                self.hub.send(HubMessage::RoleTimelineNote { role_id, note_id });
+                self.hub
+                    .send(HubMessage::RoleTimelineNote { role_id, note_id });
             }
             StreamingEvent::DriveFileCreated { user_id, file_id } => {
                 self.hub.send(HubMessage::DriveFile {
@@ -288,10 +301,16 @@ impl StreamingSink for BroadcastStreamingSink {
                 });
             }
             StreamingEvent::ClipUpdated { clip_id } => {
-                self.hub.send(HubMessage::Clip { clip_id, deleted: false });
+                self.hub.send(HubMessage::Clip {
+                    clip_id,
+                    deleted: false,
+                });
             }
             StreamingEvent::ClipDeleted { clip_id } => {
-                self.hub.send(HubMessage::Clip { clip_id, deleted: true });
+                self.hub.send(HubMessage::Clip {
+                    clip_id,
+                    deleted: true,
+                });
             }
             StreamingEvent::AdminReport { report_id } => {
                 self.hub.send(HubMessage::AdminReport { report_id });
@@ -301,8 +320,14 @@ impl StreamingSink for BroadcastStreamingSink {
             }
             // Batch N WS4: an antenna feed gained a note (published
             // post-commit by the match worker, one per match).
-            StreamingEvent::AntennaNote { antenna_id, note_id } => {
-                self.hub.send(HubMessage::AntennaNote { antenna_id, note_id });
+            StreamingEvent::AntennaNote {
+                antenna_id,
+                note_id,
+            } => {
+                self.hub.send(HubMessage::AntennaNote {
+                    antenna_id,
+                    note_id,
+                });
             }
             // Batch O WP16: list membership changes fan out to the
             // `userList` channel post-commit (`userAdded`/`userRemoved`).

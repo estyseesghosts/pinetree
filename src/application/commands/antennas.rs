@@ -14,7 +14,7 @@ use super::AppServices;
 
 use crate::application::ports::{NewJob, PortError, TimelineCursor};
 use crate::domain::antenna::{
-    antenna_matches, has_keyword, Antenna, AntennaSrc, AntennaNoteView, DEFAULT_ANTENNA_LIMIT,
+    Antenna, AntennaNoteView, AntennaSrc, DEFAULT_ANTENNA_LIMIT, antenna_matches, has_keyword,
 };
 use crate::domain::note::Note;
 
@@ -89,16 +89,14 @@ impl AppServices {
         if !has_keyword(&antenna.keywords) && !has_keyword(&antenna.exclude_keywords) {
             return Err(PortError::Validation("EMPTY_KEYWORD".to_string()));
         }
-        antenna
-            .validate()
-            .map_err(|e| match e {
-                crate::domain::id::DomainError::Validation(msg) => PortError::Validation(msg),
-                crate::domain::id::DomainError::Conflict(msg) => PortError::Conflict(msg),
-                crate::domain::id::DomainError::NotFound(msg) => PortError::NotFound(msg),
-                crate::domain::id::DomainError::StorageUnavailable(msg) => {
-                    PortError::StorageUnavailable(msg)
-                }
-            })?;
+        antenna.validate().map_err(|e| match e {
+            crate::domain::id::DomainError::Validation(msg) => PortError::Validation(msg),
+            crate::domain::id::DomainError::Conflict(msg) => PortError::Conflict(msg),
+            crate::domain::id::DomainError::NotFound(msg) => PortError::NotFound(msg),
+            crate::domain::id::DomainError::StorageUnavailable(msg) => {
+                PortError::StorageUnavailable(msg)
+            }
+        })?;
         self.antennas.create_antenna(antenna, Vec::new())
     }
 
@@ -185,21 +183,18 @@ impl AppServices {
         antenna.last_used_at_ms = self.now_ms();
         // Upstream `update.ts` checks EMPTY_KEYWORD only when both lists
         // ride the same call (verbatim code on violation).
-        if check_empty
-            && !has_keyword(&antenna.keywords) && !has_keyword(&antenna.exclude_keywords)
+        if check_empty && !has_keyword(&antenna.keywords) && !has_keyword(&antenna.exclude_keywords)
         {
             return Err(PortError::Validation("EMPTY_KEYWORD".to_string()));
         }
-        antenna
-            .validate()
-            .map_err(|e| match e {
-                crate::domain::id::DomainError::Validation(msg) => PortError::Validation(msg),
-                crate::domain::id::DomainError::Conflict(msg) => PortError::Conflict(msg),
-                crate::domain::id::DomainError::NotFound(msg) => PortError::NotFound(msg),
-                crate::domain::id::DomainError::StorageUnavailable(msg) => {
-                    PortError::StorageUnavailable(msg)
-                }
-            })?;
+        antenna.validate().map_err(|e| match e {
+            crate::domain::id::DomainError::Validation(msg) => PortError::Validation(msg),
+            crate::domain::id::DomainError::Conflict(msg) => PortError::Conflict(msg),
+            crate::domain::id::DomainError::NotFound(msg) => PortError::NotFound(msg),
+            crate::domain::id::DomainError::StorageUnavailable(msg) => {
+                PortError::StorageUnavailable(msg)
+            }
+        })?;
         self.antennas.update_antenna(antenna, Vec::new())
     }
 
@@ -227,7 +222,8 @@ impl AppServices {
         let Some(_) = self.antennas.get_antenna(owner_id, antenna_id)? else {
             return Err(PortError::NotFound("NO_SUCH_ANTENNA".to_string()));
         };
-        self.antennas.touch_antenna(owner_id, antenna_id, self.now_ms())?;
+        self.antennas
+            .touch_antenna(owner_id, antenna_id, self.now_ms())?;
         let ids = self.antenna_notes.antenna_notes(antenna_id, cursor)?;
         let filter = self.feed_filter(Some(owner_id))?;
         let mut account_cache = std::collections::HashMap::new();
@@ -291,8 +287,11 @@ impl AppServices {
                     .follows
                     .is_following(&antenna.owner_id, &note.author_id)
                     .unwrap_or(false);
-            let owner_in_visible_ids =
-                owner_is_author || note.visible_user_ids.iter().any(|id| id == &antenna.owner_id);
+            let owner_in_visible_ids = owner_is_author
+                || note
+                    .visible_user_ids
+                    .iter()
+                    .any(|id| id == &antenna.owner_id);
             let author_in_list = match (antenna.src, antenna.user_list_id.as_deref()) {
                 (AntennaSrc::List, Some(list_id)) => self
                     .lists
@@ -312,7 +311,8 @@ impl AppServices {
                 author_in_list,
             };
             if antenna_matches(antenna, &view) {
-                self.antenna_notes.append_antenna_note(&antenna.id, &note.id)?;
+                self.antenna_notes
+                    .append_antenna_note(&antenna.id, &note.id)?;
                 // Post-commit fan-out (the append above is its own
                 // transaction): publish the `antenna` stream event through
                 // the sink, like the worker's `StreamingPublish` expansion.
@@ -335,7 +335,9 @@ impl AppServices {
         use crate::application::ports::{AntennaMatchPayload, JobKind};
         NewJob::new_json(
             JobKind::AntennaMatch,
-            &AntennaMatchPayload { note_id: note_id.to_string() },
+            &AntennaMatchPayload {
+                note_id: note_id.to_string(),
+            },
             format!("antenna-match:{note_id}:{}", self.ids.generate()),
             self.now_ms(),
         )

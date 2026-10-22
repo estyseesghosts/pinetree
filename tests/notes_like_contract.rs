@@ -130,7 +130,10 @@ fn like_defaults_to_bare_heart() {
     let user = make_user(&services, "user");
     let note = make_note(&services, &author);
     assert_eq!(services.like_note(&user, &note, None).unwrap(), true);
-    assert_eq!(stored_reaction(&services, &user, &note).as_deref(), Some("❤"));
+    assert_eq!(
+        stored_reaction(&services, &user, &note).as_deref(),
+        Some("❤")
+    );
 }
 
 #[test]
@@ -141,12 +144,18 @@ fn like_prefers_override_then_user_default_then_instance() {
     let user = make_user(&services, "user");
     let note = make_note(&services, &author);
     services.like_note(&user, &note, None).unwrap();
-    assert_eq!(stored_reaction(&services, &user, &note).as_deref(), Some("👍"));
+    assert_eq!(
+        stored_reaction(&services, &user, &note).as_deref(),
+        Some("👍")
+    );
 
     // Explicit override wins over the instance default.
     let note2 = make_note(&services, &author);
     services.like_note(&user, &note2, Some("🎉")).unwrap();
-    assert_eq!(stored_reaction(&services, &user, &note2).as_deref(), Some("🎉"));
+    assert_eq!(
+        stored_reaction(&services, &user, &note2).as_deref(),
+        Some("🎉")
+    );
 
     // User defaultReaction wins over the instance default.
     let user2 = make_user(&services, "user2");
@@ -161,7 +170,10 @@ fn like_prefers_override_then_user_default_then_instance() {
         .unwrap();
     let note3 = make_note(&services, &author);
     services.like_note(&user2, &note3, None).unwrap();
-    assert_eq!(stored_reaction(&services, &user2, &note3).as_deref(), Some("⭐"));
+    assert_eq!(
+        stored_reaction(&services, &user2, &note3).as_deref(),
+        Some("⭐")
+    );
 }
 
 #[test]
@@ -171,7 +183,10 @@ fn relike_with_same_emoji_toggles_off() {
     let user = make_user(&services, "user");
     let note = make_note(&services, &author);
     assert_eq!(services.like_note(&user, &note, Some("👍")).unwrap(), true);
-    assert_eq!(stored_reaction(&services, &user, &note).as_deref(), Some("👍"));
+    assert_eq!(
+        stored_reaction(&services, &user, &note).as_deref(),
+        Some("👍")
+    );
     // Same emoji again → unliked, never ALREADY_REACTED.
     assert_eq!(services.like_note(&user, &note, Some("👍")).unwrap(), false);
     assert_eq!(stored_reaction(&services, &user, &note), None);
@@ -185,7 +200,10 @@ fn like_with_different_emoji_replaces() {
     let note = make_note(&services, &author);
     services.like_note(&user, &note, Some("👍")).unwrap();
     assert_eq!(services.like_note(&user, &note, Some("🎉")).unwrap(), true);
-    assert_eq!(stored_reaction(&services, &user, &note).as_deref(), Some("🎉"));
+    assert_eq!(
+        stored_reaction(&services, &user, &note).as_deref(),
+        Some("🎉")
+    );
 }
 
 #[test]
@@ -195,13 +213,21 @@ fn like_with_unknown_custom_emoji_falls_back_to_heart() {
     let user = make_user(&services, "user");
     let note = make_note(&services, &author);
     services.like_note(&user, &note, Some(":nope:")).unwrap();
-    assert_eq!(stored_reaction(&services, &user, &note).as_deref(), Some("❤"));
+    assert_eq!(
+        stored_reaction(&services, &user, &note).as_deref(),
+        Some("❤")
+    );
 }
 
 #[test]
 fn like_on_missing_note_is_no_such_note() {
     let services = test_services("missing");
     let user = make_user(&services, "user");
-    let err = services.like_note(&user, "n00000000000000", None).unwrap_err();
-    assert!(matches!(err, PortError::NotFound(ref code) if code == "NO_SUCH_NOTE"), "got {err:?}");
+    let err = services
+        .like_note(&user, "n00000000000000", None)
+        .unwrap_err();
+    assert!(
+        matches!(err, PortError::NotFound(ref code) if code == "NO_SUCH_NOTE"),
+        "got {err:?}"
+    );
 }

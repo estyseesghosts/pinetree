@@ -18,8 +18,8 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use pinetree::application::commands::AppServices;
@@ -32,10 +32,10 @@ use pinetree::domain::notification::NotificationKind;
 use pinetree::federation::delivery::{SafeHttpClient, SafeHttpConfig};
 use pinetree::federation::retry::DestinationTracker;
 use pinetree::jobs::worker::JobWorker;
-use pinetree::media::transcode::TranscodeConfig;
-use pinetree::services::email::{SmtpConfig, SmtpEmailSender};
 use pinetree::media::storage::FsBlobStore;
+use pinetree::media::transcode::TranscodeConfig;
 use pinetree::persistence::redb::RedbStore;
+use pinetree::services::email::{SmtpConfig, SmtpEmailSender};
 
 // ---------------------------------------------------------------------------
 // Shared harness
@@ -102,19 +102,19 @@ fn open_stack(dir: &Path) -> (Arc<RedbStore>, Arc<FsBlobStore>, Arc<AppServices>
         moderation: store.clone(),
         instance_settings: store.clone(),
         invites: store.clone(),
-            abuse_reports: store.clone(),
-            lists: store.clone(),
-            signin: store.clone(),
-            password_resets: store.clone(),
-            registry: store.clone(),
-            clips: store.clone(),
-            pages: store.clone(),
-            folders: store.clone(),
-            system_webhooks: store.clone(),
-            user_webhooks: store.clone(),
-            abuse_recipients: store.clone(),
-            memos: store.clone(),
-            thread_mutes: store.clone(),
+        abuse_reports: store.clone(),
+        lists: store.clone(),
+        signin: store.clone(),
+        password_resets: store.clone(),
+        registry: store.clone(),
+        clips: store.clone(),
+        pages: store.clone(),
+        folders: store.clone(),
+        system_webhooks: store.clone(),
+        user_webhooks: store.clone(),
+        abuse_recipients: store.clone(),
+        memos: store.clone(),
+        thread_mutes: store.clone(),
         streaming: Arc::new(NoopStreamingSink),
         dedup: store.clone() as Arc<dyn ActivityDedup>,
         federation_http: SafeHttpClient::new(SafeHttpConfig {
@@ -257,7 +257,8 @@ fn child_c4kill() -> ! {
     let bob = svc.create_account("bob", None).expect("create bob");
     let carol = svc.create_account("carol", None).expect("create carol");
     // alice -> bob produces the Follow notification for bob.
-    svc.follow(&alice.id, &bob.id, false).expect("alice follows bob");
+    svc.follow(&alice.id, &bob.id, false)
+        .expect("alice follows bob");
 
     // Anchors: bob's anchor collects alice's replies + reactions (Reply and
     // Reaction notifications for bob); alice's anchor is the renote target.
@@ -266,7 +267,10 @@ fn child_c4kill() -> ! {
         .expect("bob anchor");
     ledger.record(&bob_anchor.id);
     let alice_anchor = svc
-        .create_note(CreateNoteInput::simple_public(&alice.id, "c4kill alice anchor"))
+        .create_note(CreateNoteInput::simple_public(
+            &alice.id,
+            "c4kill alice anchor",
+        ))
         .expect("alice anchor");
     ledger.record(&alice_anchor.id);
 
@@ -291,10 +295,8 @@ fn child_c4kill() -> ! {
                 format!("@bob c4kill mention {i} from alice"),
             )),
             2 => {
-                let mut input = CreateNoteInput::simple_public(
-                    &alice.id,
-                    format!("c4kill reply {i} to bob"),
-                );
+                let mut input =
+                    CreateNoteInput::simple_public(&alice.id, format!("c4kill reply {i} to bob"));
                 input.reply_to = Some(bob_anchor.id.clone());
                 svc.create_note(input)
             }
@@ -361,8 +363,7 @@ fn c4_kill_mid_traffic_and_recover() {
     let (store, _blobs, svc) = open_stack(&dir);
 
     // 1. Every acknowledged note survived: 0 lost notes.
-    let ledger_raw =
-        fs::read_to_string(dir.join("acknowledged_notes.log")).expect("read ledger");
+    let ledger_raw = fs::read_to_string(dir.join("acknowledged_notes.log")).expect("read ledger");
     let acked: Vec<String> = ledger_raw
         .lines()
         .map(str::trim)
@@ -451,7 +452,8 @@ fn child_c4restart() -> ! {
 
     let alice = svc.create_account("alice", None).expect("create alice");
     let bob = svc.create_account("bob", None).expect("create bob");
-    svc.follow(&alice.id, &bob.id, false).expect("alice follows bob");
+    svc.follow(&alice.id, &bob.id, false)
+        .expect("alice follows bob");
 
     let media = svc
         .upload_media(
@@ -467,22 +469,29 @@ fn child_c4restart() -> ! {
     let n1 = svc
         .create_note(CreateNoteInput::simple_public(&alice.id, "c4restart hello"))
         .expect("n1");
-    let mut reply_input =
-        CreateNoteInput::simple_public(&bob.id, "c4restart replying to alice");
+    let mut reply_input = CreateNoteInput::simple_public(&bob.id, "c4restart replying to alice");
     reply_input.reply_to = Some(n1.id.clone());
     let n2 = svc.create_note(reply_input).expect("n2");
     let n3 = svc
-        .create_note(CreateNoteInput::simple_public(&alice.id, "@bob c4restart hi"))
+        .create_note(CreateNoteInput::simple_public(
+            &alice.id,
+            "@bob c4restart hi",
+        ))
         .expect("n3");
     let mut renote_input = CreateNoteInput::simple_public(&bob.id, "placeholder");
     renote_input.text = None;
     renote_input.renote_of = Some(n1.id.clone());
     let n4 = svc.create_note(renote_input).expect("n4");
     let n5 = svc
-        .create_note(CreateNoteInput::simple_public(&bob.id, "c4restart bob note"))
+        .create_note(CreateNoteInput::simple_public(
+            &bob.id,
+            "c4restart bob note",
+        ))
         .expect("n5");
 
-    let r1 = svc.react(&bob.id, &n1.id, "👍", false).expect("bob reacts to n1");
+    let r1 = svc
+        .react(&bob.id, &n1.id, "👍", false)
+        .expect("bob reacts to n1");
     let r2 = svc
         .react(&alice.id, &n5.id, "🎉", false)
         .expect("alice reacts to n5");
@@ -506,8 +515,12 @@ fn child_c4restart() -> ! {
         .truncate(true)
         .open(&manifest_path)
         .expect("open manifest");
-    f.write_all(serde_json::to_vec_pretty(&manifest).expect("encode manifest").as_slice())
-        .expect("write manifest");
+    f.write_all(
+        serde_json::to_vec_pretty(&manifest)
+            .expect("encode manifest")
+            .as_slice(),
+    )
+    .expect("write manifest");
     f.flush().expect("flush manifest");
     f.sync_all().expect("sync manifest");
     drop(f);
@@ -531,10 +544,9 @@ fn c4_restart_preserves_accounts_follows_reactions_and_timelines() {
     );
 
     let (store, blobs, svc) = open_stack(&dir);
-    let manifest: serde_json::Value = serde_json::from_slice(
-        &fs::read(dir.join("restart_state.json")).expect("read manifest"),
-    )
-    .expect("parse manifest");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.join("restart_state.json")).expect("read manifest"))
+            .expect("parse manifest");
     let str_field = |key: &str| {
         manifest[key]
             .as_str()

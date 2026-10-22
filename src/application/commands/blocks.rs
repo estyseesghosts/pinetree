@@ -48,10 +48,7 @@ impl AppServices {
                             inbox_url,
                         }
                         .into_job(
-                            format!(
-                                "federate:block:{blocker_id}:{blockee_id}:{}",
-                                blocking.id
-                            ),
+                            format!("federate:block:{blocker_id}:{blockee_id}:{}", blocking.id),
                             self.now_ms(),
                         )?,
                     );
@@ -111,7 +108,8 @@ impl AppServices {
         expires_at_ms: Option<i64>,
     ) -> Result<Option<Muting>, PortError> {
         self.accounts.get_owner(muter_id)?;
-        self.mutes.mute(muter_id, mutee_id, expires_at_ms, Vec::new())
+        self.mutes
+            .mute(muter_id, mutee_id, expires_at_ms, Vec::new())
     }
 
     pub fn unmute(&self, muter_id: &str, mutee_id: &str) -> Result<(), PortError> {
@@ -119,11 +117,7 @@ impl AppServices {
         self.mutes.unmute(muter_id, mutee_id, Vec::new())
     }
 
-    pub fn renote_mute(
-        &self,
-        muter_id: &str,
-        mutee_id: &str,
-    ) -> Result<RenoteMuting, PortError> {
+    pub fn renote_mute(&self, muter_id: &str, mutee_id: &str) -> Result<RenoteMuting, PortError> {
         self.accounts.get_owner(muter_id)?;
         self.mutes.renote_mute(muter_id, mutee_id, Vec::new())
     }
@@ -136,21 +130,13 @@ impl AppServices {
     /// §4 hook: the Misskey `notes/polls/vote` `YOU_HAVE_BEEN_BLOCKED` gate.
     /// Called by `vote_on_poll` before recording a vote (and re-checked
     /// atomically inside the storage transaction).
-    pub fn check_poll_vote_block(
-        &self,
-        voter_id: &str,
-        note_id: &str,
-    ) -> Result<Note, PortError> {
+    pub fn check_poll_vote_block(&self, voter_id: &str, note_id: &str) -> Result<Note, PortError> {
         let note = match self.notes.get_note(note_id)? {
             None => return Err(PortError::NotFound("NO_SUCH_NOTE".to_string())),
             Some(note) => note,
         };
-        if note.author_id != voter_id
-            && self.blocks.is_blocking(&note.author_id, voter_id)?
-        {
-            return Err(PortError::Validation(
-                "YOU_HAVE_BEEN_BLOCKED".to_string(),
-            ));
+        if note.author_id != voter_id && self.blocks.is_blocking(&note.author_id, voter_id)? {
+            return Err(PortError::Validation("YOU_HAVE_BEEN_BLOCKED".to_string()));
         }
         Ok(note)
     }
@@ -219,8 +205,7 @@ mod tests {
 
     use crate::application::commands::tests::test_services;
     use crate::application::ports::{
-        ActivityDedup, BlobStore, CreateNoteInput, NoopStreamingSink, StreamingSink,
-        TimelineCursor,
+        ActivityDedup, BlobStore, CreateNoteInput, NoopStreamingSink, StreamingSink, TimelineCursor,
     };
     use crate::domain::id::{AidxGenerator, Clock, ManualClock};
     use crate::federation::delivery::{SafeHttpClient, SafeHttpConfig};
@@ -294,17 +279,17 @@ mod tests {
             scheduled_note_limit: crate::domain::draft::DEFAULT_SCHEDULED_NOTE_LIMIT,
             pin_limit: crate::domain::pinning::DEFAULT_PIN_LIMIT,
             default_like: None,
-        cache_blobs: blobs.clone(),
-        drive_capacity_per_user_bytes: 1 << 30,
-        remote_cache_max_bytes: 512 << 20,
-        remote_cache_avatar_bytes: 128 << 20,
-        remote_cache_preview_bytes: 256 << 20,
-        remote_cache_full_bytes: 128 << 20,
-        remote_cache_mode: crate::config::RemoteCacheMode::OnDemand,
-        remote_cache_avatar_ttl_days: 30,
-        remote_cache_preview_ttl_days: 7,
-        remote_cache_full_ttl_days: 3,
-        remote_cache_warming_enabled: false,
+            cache_blobs: blobs.clone(),
+            drive_capacity_per_user_bytes: 1 << 30,
+            remote_cache_max_bytes: 512 << 20,
+            remote_cache_avatar_bytes: 128 << 20,
+            remote_cache_preview_bytes: 256 << 20,
+            remote_cache_full_bytes: 128 << 20,
+            remote_cache_mode: crate::config::RemoteCacheMode::OnDemand,
+            remote_cache_avatar_ttl_days: 30,
+            remote_cache_preview_ttl_days: 7,
+            remote_cache_full_ttl_days: 3,
+            remote_cache_warming_enabled: false,
         };
         (services, clock)
     }
@@ -320,7 +305,10 @@ mod tests {
     fn block_self_and_unknown() {
         let (services, alice, _) = accounts();
         let err = services.block(&alice, &alice).unwrap_err();
-        assert_eq!(err, PortError::Validation("BLOCKEE_IS_YOURSELF".to_string()));
+        assert_eq!(
+            err,
+            PortError::Validation("BLOCKEE_IS_YOURSELF".to_string())
+        );
         let err = services.block(&alice, "aid00000000009999").unwrap_err();
         assert_eq!(err, PortError::NotFound("NO_SUCH_USER".to_string()));
     }
@@ -355,15 +343,31 @@ mod tests {
         let (services, alice, bob) = accounts();
         services
             .accounts
-            .update_account(&bob, crate::application::ports::UpdateAccountPatch {
-                is_locked: Some(true),
-                ..Default::default()
-            }, Vec::new())
+            .update_account(
+                &bob,
+                crate::application::ports::UpdateAccountPatch {
+                    is_locked: Some(true),
+                    ..Default::default()
+                },
+                Vec::new(),
+            )
             .unwrap();
         services.follow(&alice, &bob, false).unwrap();
-        assert!(services.follows.get_follow_request(&alice, &bob).unwrap().is_some());
+        assert!(
+            services
+                .follows
+                .get_follow_request(&alice, &bob)
+                .unwrap()
+                .is_some()
+        );
         services.block(&bob, &alice).unwrap();
-        assert!(services.follows.get_follow_request(&alice, &bob).unwrap().is_none());
+        assert!(
+            services
+                .follows
+                .get_follow_request(&alice, &bob)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -469,9 +473,20 @@ mod tests {
             .create_note(CreateNoteInput::simple_public(&bob, "hello"))
             .unwrap();
         let cursor = TimelineCursor::with_limit(10);
-        assert_eq!(services.home_timeline(&alice, &cursor, false, true).unwrap().len(), 1);
+        assert_eq!(
+            services
+                .home_timeline(&alice, &cursor, false, true)
+                .unwrap()
+                .len(),
+            1
+        );
         services.mute(&alice, &bob, None).unwrap();
-        assert!(services.home_timeline(&alice, &cursor, false, true).unwrap().is_empty());
+        assert!(
+            services
+                .home_timeline(&alice, &cursor, false, true)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -481,10 +496,21 @@ mod tests {
             .create_note(CreateNoteInput::simple_public(&bob, "hello"))
             .unwrap();
         let cursor = TimelineCursor::with_limit(10);
-        assert_eq!(services.local_timeline(Some(&alice), &cursor, false, true, true).unwrap().len(), 1);
+        assert_eq!(
+            services
+                .local_timeline(Some(&alice), &cursor, false, true, true)
+                .unwrap()
+                .len(),
+            1
+        );
         services.notes_show(&note.id, Some(&alice)).unwrap();
         services.block(&alice, &bob).unwrap();
-        assert!(services.local_timeline(Some(&alice), &cursor, false, true, true).unwrap().is_empty());
+        assert!(
+            services
+                .local_timeline(Some(&alice), &cursor, false, true, true)
+                .unwrap()
+                .is_empty()
+        );
         let err = services.notes_show(&note.id, Some(&alice)).unwrap_err();
         assert_eq!(err, PortError::NotFound("NO_SUCH_NOTE".to_string()));
     }
@@ -504,9 +530,17 @@ mod tests {
         quote.renote_of = Some(target.id.clone());
         services.create_note(quote).unwrap();
         let cursor = TimelineCursor::with_limit(10);
-        assert_eq!(services.home_timeline(&alice, &cursor, false, true).unwrap().len(), 3);
+        assert_eq!(
+            services
+                .home_timeline(&alice, &cursor, false, true)
+                .unwrap()
+                .len(),
+            3
+        );
         services.renote_mute(&alice, &bob).unwrap();
-        let notes = services.home_timeline(&alice, &cursor, false, true).unwrap();
+        let notes = services
+            .home_timeline(&alice, &cursor, false, true)
+            .unwrap();
         assert_eq!(notes.len(), 2);
         assert!(notes.iter().all(|n| n.text.is_some()));
     }
@@ -518,9 +552,14 @@ mod tests {
             .create_note(CreateNoteInput::simple_public(&bob, "with poll"))
             .unwrap();
         // No block: returns the note for §4 to proceed with.
-        assert_eq!(services.check_poll_vote_block(&alice, &note.id).unwrap().id, note.id);
+        assert_eq!(
+            services.check_poll_vote_block(&alice, &note.id).unwrap().id,
+            note.id
+        );
         services.block(&bob, &alice).unwrap();
-        let err = services.check_poll_vote_block(&alice, &note.id).unwrap_err();
+        let err = services
+            .check_poll_vote_block(&alice, &note.id)
+            .unwrap_err();
         assert_eq!(
             err,
             PortError::Validation("YOU_HAVE_BEEN_BLOCKED".to_string())
@@ -534,19 +573,43 @@ mod tests {
     fn inbound_block_roundtrip_converges() {
         let (services, alice, bob) = accounts();
         services.follow(&alice, &bob, false).unwrap();
-        let first = services.handle_inbound_block("act-1", &bob, &alice).unwrap();
+        let first = services
+            .handle_inbound_block("act-1", &bob, &alice)
+            .unwrap();
         assert!(first.is_some());
         assert!(services.blocks.is_blocking(&bob, &alice).unwrap());
         assert!(!services.follows.is_following(&alice, &bob).unwrap());
         // Replay converges.
-        assert_eq!(services.handle_inbound_block("act-1", &bob, &alice).unwrap(), None);
+        assert_eq!(
+            services
+                .handle_inbound_block("act-1", &bob, &alice)
+                .unwrap(),
+            None
+        );
         // Different activity, same pair converges too.
-        assert_eq!(services.handle_inbound_block("act-2", &bob, &alice).unwrap(), None);
-        assert!(services.handle_inbound_unblock("act-3", &bob, &alice).unwrap());
+        assert_eq!(
+            services
+                .handle_inbound_block("act-2", &bob, &alice)
+                .unwrap(),
+            None
+        );
+        assert!(
+            services
+                .handle_inbound_unblock("act-3", &bob, &alice)
+                .unwrap()
+        );
         assert!(!services.blocks.is_blocking(&bob, &alice).unwrap());
         // Replay + missing converge to false.
-        assert!(!services.handle_inbound_unblock("act-3", &bob, &alice).unwrap());
-        assert!(!services.handle_inbound_unblock("act-4", &bob, &alice).unwrap());
+        assert!(
+            !services
+                .handle_inbound_unblock("act-3", &bob, &alice)
+                .unwrap()
+        );
+        assert!(
+            !services
+                .handle_inbound_unblock("act-4", &bob, &alice)
+                .unwrap()
+        );
     }
 }
 
@@ -589,21 +652,24 @@ mod federation_tests {
     fn remote_account(services: &AppServices, handle: &str) -> String {
         services
             .accounts
-            .create_account(CreateAccountInput {
-                handle: handle.to_string(),
-                host: Some("remote.example".to_string()),
-                display_name: None,
-                description: None,
-                location: None,
-                birthday: None,
-                uri: Some(format!("https://remote.example/users/{handle}")),
-                inbox: Some("https://remote.example/inbox".to_string()),
-                shared_inbox: None,
-                is_bot: false,
-                is_cat: false,
-                is_locked: false,
-                preserved_usernames: Vec::new(),
-            }, None)
+            .create_account(
+                CreateAccountInput {
+                    handle: handle.to_string(),
+                    host: Some("remote.example".to_string()),
+                    display_name: None,
+                    description: None,
+                    location: None,
+                    birthday: None,
+                    uri: Some(format!("https://remote.example/users/{handle}")),
+                    inbox: Some("https://remote.example/inbox".to_string()),
+                    shared_inbox: None,
+                    is_bot: false,
+                    is_cat: false,
+                    is_locked: false,
+                    preserved_usernames: Vec::new(),
+                },
+                None,
+            )
             .unwrap()
             .id
     }
@@ -630,7 +696,12 @@ mod federation_tests {
         let jobs = federate_jobs(&services);
         assert_eq!(jobs.len(), 1);
         let block_id = match &jobs[0] {
-            FederateDeliverPayload::Block { block_id, blocker_id, blockee_id, inbox_url } => {
+            FederateDeliverPayload::Block {
+                block_id,
+                blocker_id,
+                blockee_id,
+                inbox_url,
+            } => {
                 assert_eq!(blocker_id, &alice);
                 assert_eq!(blockee_id, &rina);
                 assert_eq!(inbox_url, "https://remote.example/inbox");
@@ -642,7 +713,12 @@ mod federation_tests {
         let jobs = federate_jobs(&services);
         assert_eq!(jobs.len(), 1);
         match &jobs[0] {
-            FederateDeliverPayload::UndoBlock { block_id: inner, blocker_id, blockee_id, .. } => {
+            FederateDeliverPayload::UndoBlock {
+                block_id: inner,
+                blocker_id,
+                blockee_id,
+                ..
+            } => {
                 // Undo wraps the original Block id (Misskey renderUndo parity).
                 assert_eq!(inner, &block_id);
                 assert_eq!(blocker_id, &alice);
@@ -657,7 +733,9 @@ mod federation_tests {
         let services = test_services("blocks-fed-in");
         let alice = services.create_account("alice", None).unwrap().id;
         let rina = remote_account(&services, "rina");
-        services.handle_inbound_block("act-1", &rina, &alice).unwrap();
+        services
+            .handle_inbound_block("act-1", &rina, &alice)
+            .unwrap();
         assert!(federate_jobs(&services).is_empty());
     }
 }

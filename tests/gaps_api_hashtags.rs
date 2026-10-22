@@ -119,7 +119,12 @@ fn hashtag_list_search_show_trend_users() {
     let search = services.hashtags_search(None, "rus", 10).unwrap();
     assert_eq!(search.len(), 1);
     assert_eq!(search[0].tag, "rust");
-    assert!(services.hashtags_search(None, "zzz", 10).unwrap().is_empty());
+    assert!(
+        services
+            .hashtags_search(None, "zzz", 10)
+            .unwrap()
+            .is_empty()
+    );
 
     let show = services.hashtag_show(None, "Rust").unwrap();
     assert_eq!(show.tag, "rust");
@@ -142,7 +147,10 @@ fn hashtag_list_search_show_trend_users() {
 
     // Case-insensitive lookup matches the same tag.
     assert_eq!(
-        services.hashtag_show(None, "MISSKEY").unwrap().mentioned_notes_count,
+        services
+            .hashtag_show(None, "MISSKEY")
+            .unwrap()
+            .mentioned_notes_count,
         2
     );
 }

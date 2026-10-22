@@ -124,9 +124,7 @@ pub fn coerce_reaction(
 ) -> String {
     match acceptance {
         Some(ReactionAcceptance::LikeOnly) => FALLBACK_REACTION.to_string(),
-        Some(ReactionAcceptance::LikeOnlyForRemote) if is_remote => {
-            FALLBACK_REACTION.to_string()
-        }
+        Some(ReactionAcceptance::LikeOnlyForRemote) if is_remote => FALLBACK_REACTION.to_string(),
         _ => reaction.to_string(),
     }
 }
@@ -201,19 +199,11 @@ mod tests {
             FALLBACK_REACTION
         );
         assert_eq!(
-            coerce_reaction(
-                "👍",
-                Some(ReactionAcceptance::LikeOnlyForRemote),
-                true
-            ),
+            coerce_reaction("👍", Some(ReactionAcceptance::LikeOnlyForRemote), true),
             FALLBACK_REACTION
         );
         assert_eq!(
-            coerce_reaction(
-                "👍",
-                Some(ReactionAcceptance::LikeOnlyForRemote),
-                false
-            ),
+            coerce_reaction("👍", Some(ReactionAcceptance::LikeOnlyForRemote), false),
             "👍"
         );
         assert_eq!(
@@ -250,10 +240,7 @@ mod tests {
     fn normalize_strips_fe0f_unless_zwj() {
         // U+2764 U+FE0F → bare heart; ZWJ sequences keep their selectors.
         assert_eq!(normalize_reaction(Some("❤️")), "❤");
-        assert_eq!(
-            normalize_reaction(Some("👨‍👩‍👧")),
-            "👨‍👩‍👧"
-        );
+        assert_eq!(normalize_reaction(Some("👨‍👩‍👧")), "👨‍👩‍👧");
         // Plain emoji pass through; trailing text is cut to one grapheme.
         assert_eq!(normalize_reaction(Some("👍")), "👍");
         // Non-emoji text falls back.
@@ -269,10 +256,7 @@ mod tests {
     #[test]
     fn react_idempotency_and_replace() {
         assert_eq!(decide_react(None, "👍"), ReactOutcome::Created);
-        assert_eq!(
-            decide_react(Some("👍"), "👍"),
-            ReactOutcome::Idempotent
-        );
+        assert_eq!(decide_react(Some("👍"), "👍"), ReactOutcome::Idempotent);
         assert_eq!(decide_react(Some("❤"), "👍"), ReactOutcome::Replaced);
     }
 

@@ -122,9 +122,7 @@ mod tests {
     #[test]
     fn poll_already_expired_rejected_with_exact_code() {
         let now = 1_760_400_000_000;
-        let err = input(&["a", "b"], Some(now - 1))
-            .validate(now)
-            .unwrap_err();
+        let err = input(&["a", "b"], Some(now - 1)).validate(now).unwrap_err();
         assert_eq!(
             err.to_string(),
             "validation error: CANNOT_CREATE_ALREADY_EXPIRED_POLL"

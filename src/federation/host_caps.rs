@@ -27,7 +27,7 @@ use serde_json::Value;
 use crate::application::commands::AppServices;
 use crate::application::ports::HostSoftware;
 use crate::domain::fed_policy::{ReactionStyle, reaction_style_for_software};
-use crate::federation::delivery::{SafeHttpClient, MAX_AP_JSON_BYTES};
+use crate::federation::delivery::{MAX_AP_JSON_BYTES, SafeHttpClient};
 
 /// Cache TTL for a probed host software name: ~7 days in millis.
 pub const HOST_SOFTWARE_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
@@ -40,8 +40,9 @@ const NODEINFO_PATHS: [&str; 2] = ["/nodeinfo/2.1", "/nodeinfo/2.0"];
 /// itself is deny-list based (only [`PLAIN_LIKE_SOFTWARE`] and the
 /// Akkoma/Pleroma `EmojiReact` set divert) so unlisted software defaults to
 /// emoji-aware.
-pub const EMOJI_CAPABLE_SOFTWARE: &[&str] =
-    &["misskey", "sharkey", "foundkey", "calckey", "pinetree", "akkoma", "pleroma"];
+pub const EMOJI_CAPABLE_SOFTWARE: &[&str] = &[
+    "misskey", "sharkey", "foundkey", "calckey", "pinetree", "akkoma", "pleroma",
+];
 
 /// Lowercased software names whose `Like` handling has no emoji-reaction
 /// support: recipients on these hosts get a plain Mastodon-favourite `Like`.
@@ -84,11 +85,7 @@ pub fn host_of_url(url: &str) -> Option<String> {
     // probe the wrong origin). Bracketed IPv6 keeps its colons.
     let host = authority.rsplit('@').next().unwrap_or("");
     let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
-    if host.is_empty() {
-        None
-    } else {
-        Some(host)
-    }
+    if host.is_empty() { None } else { Some(host) }
 }
 
 /// Parse a NodeInfo document's `software.name` (both 2.0 and 2.1 carry it at
@@ -300,7 +297,10 @@ mod tests {
             host_of_url("https://Mastodon.Example:8443/users/x/inbox").as_deref(),
             Some("mastodon.example:8443")
         );
-        assert_eq!(host_of_url("https://example./inbox").as_deref(), Some("example"));
+        assert_eq!(
+            host_of_url("https://example./inbox").as_deref(),
+            Some("example")
+        );
         assert_eq!(host_of_url(""), None);
         assert_eq!(host_of_url("https:///"), None);
     }
@@ -340,7 +340,12 @@ mod tests {
             .unwrap();
         // A probing fetch must never run on a fresh hit.
         let fetch = |_: &str| -> Option<String> { panic!("probe on fresh cache hit") };
-        assert!(!resolve_emoji_capable(&services, "mastodon.example", now, &fetch));
+        assert!(!resolve_emoji_capable(
+            &services,
+            "mastodon.example",
+            now,
+            &fetch
+        ));
         assert!(!resolve_emoji_capable(
             &services,
             "MASTODON.EXAMPLE",
@@ -369,7 +374,12 @@ mod tests {
         // WP5: Akkoma is emoji-aware (via `EmojiReact`), so the re-probed
         // value reads as emoji-capable. The test's subject — stale entries
         // are re-probed and recached — is unchanged.
-        assert!(resolve_emoji_capable(&services, "peer.example", now, &fetch));
+        assert!(resolve_emoji_capable(
+            &services,
+            "peer.example",
+            now,
+            &fetch
+        ));
         assert_eq!(*probed.borrow(), vec!["peer.example".to_string()]);
         // The fresh re-probed value now serves without probing.
         let stored = services
@@ -386,9 +396,17 @@ mod tests {
         let services = services();
         let now = 1_760_400_000_000;
         let fetch = |_: &str| -> Option<String> { None };
-        assert!(resolve_emoji_capable(&services, "down.example", now, &fetch));
+        assert!(resolve_emoji_capable(
+            &services,
+            "down.example",
+            now,
+            &fetch
+        ));
         assert_eq!(
-            services.host_caps.get_host_software("down.example").unwrap(),
+            services
+                .host_caps
+                .get_host_software("down.example")
+                .unwrap(),
             None,
             "probe failures are never cached"
         );

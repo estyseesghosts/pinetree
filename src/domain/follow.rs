@@ -77,9 +77,7 @@ pub fn validate_follow_request_params(
         ));
     }
     if follower_id == followee_id {
-        return Err(DomainError::Validation(
-            "FOLLOWEE_IS_YOURSELF".to_string(),
-        ));
+        return Err(DomainError::Validation("FOLLOWEE_IS_YOURSELF".to_string()));
     }
     Ok(())
 }
@@ -155,10 +153,7 @@ mod tests {
 
     #[test]
     fn locked_branching_forces_request_path() {
-        assert_eq!(
-            super::decide_follow_path(true),
-            super::FollowPath::Request
-        );
+        assert_eq!(super::decide_follow_path(true), super::FollowPath::Request);
         assert_eq!(super::decide_follow_path(false), super::FollowPath::Direct);
     }
 

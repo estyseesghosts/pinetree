@@ -171,10 +171,7 @@ impl AppServices {
     }
 
     /// `hashtags/trend` (top tags in the bounded window, most-used first).
-    pub fn hashtags_trend(
-        &self,
-        viewer_id: Option<&str>,
-    ) -> Result<Vec<HashtagEntry>, PortError> {
+    pub fn hashtags_trend(&self, viewer_id: Option<&str>) -> Result<Vec<HashtagEntry>, PortError> {
         self.hashtags_list(viewer_id, HASHTAG_TREND_LIMIT)
     }
 

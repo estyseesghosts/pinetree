@@ -23,9 +23,9 @@ use pinetree::domain::media::{MediaMeta, MediaProperties};
 use pinetree::jobs::transcode::{TranscodeJobPayload, TranscodeOutcome, run_transcode_job};
 use pinetree::media::ingest::{md5_hex, sha256_hex};
 use pinetree::media::transcode::{
-    TranscodeConfig, TranscodeError, TranscodePlan, build_argv, derived_extension, derived_mime,
-    needs_transcode, parse_duration_ms, parse_probe_stderr, plan_for_mime, probe_is_passthrough,
-    transcode_bytes, validate_toolchain, Probe, DEFAULT_MAX_FILE_SIZE,
+    DEFAULT_MAX_FILE_SIZE, Probe, TranscodeConfig, TranscodeError, TranscodePlan, build_argv,
+    derived_extension, derived_mime, needs_transcode, parse_duration_ms, parse_probe_stderr,
+    plan_for_mime, probe_is_passthrough, transcode_bytes, validate_toolchain,
 };
 
 // ---------------------------------------------------------------------------
@@ -250,7 +250,10 @@ fn gaps_transcode_passthrough_bound_is_codec_based() {
     assert!(!mp4.container_is_webm());
     // Silent is fine; h264/aac/oversize transcode.
     assert!(probe_is_passthrough(
-        &Probe { audio_codec: None, ..base.clone() },
+        &Probe {
+            audio_codec: None,
+            ..base.clone()
+        },
         1024,
         DEFAULT_MAX_FILE_SIZE
     ));
@@ -262,7 +265,11 @@ fn gaps_transcode_passthrough_bound_is_codec_based() {
         1024,
         DEFAULT_MAX_FILE_SIZE
     ));
-    assert!(!probe_is_passthrough(&base, DEFAULT_MAX_FILE_SIZE + 1, DEFAULT_MAX_FILE_SIZE));
+    assert!(!probe_is_passthrough(
+        &base,
+        DEFAULT_MAX_FILE_SIZE + 1,
+        DEFAULT_MAX_FILE_SIZE
+    ));
 }
 
 #[test]
@@ -279,7 +286,10 @@ fn gaps_transcode_probe_parses_ffmpeg_stderr() {
     assert_eq!((probe.width, probe.height), (Some(640), Some(480)));
     assert_eq!(probe.duration_ms, Some(2_500));
     assert_eq!(parse_probe_stderr(""), Probe::default());
-    assert_eq!(parse_duration_ms("01:02:03.456, bitrate: 1"), Some(3_723_456));
+    assert_eq!(
+        parse_duration_ms("01:02:03.456, bitrate: 1"),
+        Some(3_723_456)
+    );
     assert_eq!(parse_duration_ms("N/A,"), None);
 }
 
@@ -374,7 +384,10 @@ fn gaps_transcode_job_payload_round_trip() {
     let p = TranscodeJobPayload::new("file01");
     assert_eq!(p.idempotency_key(), "transcode-media:file01");
     let bytes = p.to_bytes().unwrap();
-    assert_eq!(TranscodeJobPayload::file_id_from_bytes(&bytes).unwrap(), "file01");
+    assert_eq!(
+        TranscodeJobPayload::file_id_from_bytes(&bytes).unwrap(),
+        "file01"
+    );
     assert!(TranscodeJobPayload::file_id_from_bytes(b"{}").is_err());
     assert!(TranscodeJobPayload::file_id_from_bytes(b"not json").is_err());
 }
@@ -453,8 +466,8 @@ fn gaps_transcode_disabled_toolchain_is_loud_error() {
         &drive_row("image/gif", b"GIF89a\x01\x00\x01\x00\x00\x00\x00;", &blobs),
     );
     // `--no-transcode` routes around the module; a stray job errors loudly.
-    let err = run_transcode_job(&media, &blobs, "file01", &test_config("ffmpeg", false))
-        .unwrap_err();
+    let err =
+        run_transcode_job(&media, &blobs, "file01", &test_config("ffmpeg", false)).unwrap_err();
     assert!(matches!(err, PortError::StorageUnavailable(_)), "{err:?}");
 }
 
@@ -484,8 +497,8 @@ fn gaps_transcode_storage_fault_retries() {
     let media = FakeMedia::default();
     let blobs = FakeBlobs::default();
     media.fail_next();
-    let err = run_transcode_job(&media, &blobs, "file01", &test_config("ffmpeg", true))
-        .unwrap_err();
+    let err =
+        run_transcode_job(&media, &blobs, "file01", &test_config("ffmpeg", true)).unwrap_err();
     assert!(matches!(err, PortError::StorageUnavailable(_)), "{err:?}");
 }
 
@@ -498,7 +511,10 @@ fn gaps_transcode_missing_bytes_is_deterministic() {
     meta.blob_key = "00".repeat(32);
     insert(&media, &meta);
     let out = run_transcode_job(&media, &blobs, "file01", &test_config("ffmpeg", true)).unwrap();
-    assert!(matches!(out, TranscodeOutcome::FailedDeterministic(_)), "{out:?}");
+    assert!(
+        matches!(out, TranscodeOutcome::FailedDeterministic(_)),
+        "{out:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -546,9 +562,14 @@ fn gaps_transcode_png_to_webp_with_real_ffmpeg() {
         return;
     };
     let config = test_config(&bin, true);
-    let (derived, stats) =
-        transcode_bytes(&input_bytes, "png", TranscodePlan::ImageToWebp, false, &config)
-            .expect("png->webp");
+    let (derived, stats) = transcode_bytes(
+        &input_bytes,
+        "png",
+        TranscodePlan::ImageToWebp,
+        false,
+        &config,
+    )
+    .expect("png->webp");
     assert!(derived.starts_with(b"RIFF"), "must be WebP");
     assert_eq!(&derived[8..12], b"WEBP");
     assert_eq!(stats.output_bytes, derived.len() as u64);
@@ -585,7 +606,10 @@ fn gaps_transcode_full_job_with_real_toolchain() {
             let row = media.get("file01").unwrap().unwrap();
             assert_eq!(row.mime, "image/webp");
             assert_eq!(row.size_bytes, commit.size_bytes);
-            assert_eq!(blobs.get(&row.blob_key).unwrap().unwrap().len() as u64, row.size_bytes);
+            assert_eq!(
+                blobs.get(&row.blob_key).unwrap().unwrap().len() as u64,
+                row.size_bytes
+            );
             // Re-run converges: target shape + dims → Noop.
             let again = run_transcode_job(&media, &blobs, "file01", &config).unwrap();
             assert!(matches!(again, TranscodeOutcome::Noop), "{again:?}");

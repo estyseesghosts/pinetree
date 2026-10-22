@@ -2,8 +2,8 @@
 //! exceeded — `reserve_cache_bytes` admits or refuses atomically — and
 //! aggressive cache eviction never touches durable bytes.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use pinetree::application::commands::AppServices;
 use pinetree::application::ports::{

@@ -86,9 +86,7 @@ impl SmtpConfig {
             {
                 return Ok(());
             }
-            return Err(
-                "smtp_host and smtp_from are both required to enable email".to_string(),
-            );
+            return Err("smtp_host and smtp_from are both required to enable email".to_string());
         }
         if self.smtp_port == 0 {
             return Err("smtp_port must be non-zero".to_string());
@@ -96,9 +94,7 @@ impl SmtpConfig {
         crate::domain::webhook::validate_email_shape(&self.smtp_from)
             .map_err(|e| format!("smtp_from: {e}"))?;
         if self.smtp_username.is_empty() != self.smtp_password.is_empty() {
-            return Err(
-                "smtp_username and smtp_password must be set together".to_string(),
-            );
+            return Err("smtp_username and smtp_password must be set together".to_string());
         }
         Ok(())
     }
@@ -120,9 +116,8 @@ impl EmailMessage {
             ));
         }
         for addr in &self.to {
-            crate::domain::webhook::validate_email_shape(addr).map_err(|e| {
-                EmailError::InvalidMessage(format!("bad recipient {addr:?}: {e}"))
-            })?;
+            crate::domain::webhook::validate_email_shape(addr)
+                .map_err(|e| EmailError::InvalidMessage(format!("bad recipient {addr:?}: {e}")))?;
         }
         if self.subject.trim().is_empty() || self.subject.chars().count() > 200 {
             return Err(EmailError::InvalidMessage(
@@ -222,26 +217,32 @@ impl EmailSender for SmtpEmailSender {
         }
         msg.validate()?;
         let stream = self.connect()?;
-        let mut reader = BufReader::new(stream.try_clone().map_err(|e| {
-            EmailError::Connection(format!("clone stream: {e}"))
-        })?);
+        let mut reader = BufReader::new(
+            stream
+                .try_clone()
+                .map_err(|e| EmailError::Connection(format!("clone stream: {e}")))?,
+        );
         let mut writer = stream;
-        let mut session = SmtpSession { reader: &mut reader, writer: &mut writer };
+        let mut session = SmtpSession {
+            reader: &mut reader,
+            writer: &mut writer,
+        };
 
         session.expect_code(220, "greeting")?;
         session.command("EHLO pinetree", 250, "EHLO")?;
         if !self.config.smtp_username.is_empty() {
             session.command("AUTH LOGIN", 334, "AUTH LOGIN")?;
-            session.command(
-                &base64::engine::general_purpose::STANDARD
-                    .encode(self.config.smtp_username.as_bytes()),
-                334,
-                "AUTH username",
-            )
-            .map_err(|e| match e {
-                EmailError::Rejected(m) => EmailError::Auth(m),
-                other => other,
-            })?;
+            session
+                .command(
+                    &base64::engine::general_purpose::STANDARD
+                        .encode(self.config.smtp_username.as_bytes()),
+                    334,
+                    "AUTH username",
+                )
+                .map_err(|e| match e {
+                    EmailError::Rejected(m) => EmailError::Auth(m),
+                    other => other,
+                })?;
             session
                 .command(
                     &base64::engine::general_purpose::STANDARD
@@ -309,7 +310,9 @@ impl SmtpSession<'_> {
         if code == want {
             Ok(())
         } else {
-            Err(EmailError::Rejected(format!("{ctx}: got {code} ({line:?})")))
+            Err(EmailError::Rejected(format!(
+                "{ctx}: got {code} ({line:?})"
+            )))
         }
     }
 
@@ -326,7 +329,9 @@ impl SmtpSession<'_> {
             if code == 250 || code == 251 {
                 return Ok(());
             }
-            return Err(EmailError::Rejected(format!("{ctx}: got {code} ({line:?})")));
+            return Err(EmailError::Rejected(format!(
+                "{ctx}: got {code} ({line:?})"
+            )));
         }
         self.expect_code(want, ctx)
     }
@@ -382,7 +387,10 @@ pub fn encode_subject(subject: &str) -> String {
     if subject.is_ascii() {
         return subject.trim().replace(['\r', '\n'], " ");
     }
-    let clean: String = subject.chars().filter(|c| *c != '\r' && *c != '\n').collect();
+    let clean: String = subject
+        .chars()
+        .filter(|c| *c != '\r' && *c != '\n')
+        .collect();
     format!(
         "=?UTF-8?B?{}?=",
         base64::engine::general_purpose::STANDARD.encode(clean)
@@ -467,7 +475,10 @@ mod tests {
     #[test]
     fn smtp_config_validation() {
         assert!(SmtpConfig::default().validate().is_ok());
-        let half = SmtpConfig { smtp_host: "relay.local".into(), ..Default::default() };
+        let half = SmtpConfig {
+            smtp_host: "relay.local".into(),
+            ..Default::default()
+        };
         assert!(half.validate().is_err());
         let bad_from = SmtpConfig {
             smtp_host: "relay.local".into(),

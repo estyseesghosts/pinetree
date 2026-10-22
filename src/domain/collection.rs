@@ -128,7 +128,10 @@ mod tests {
         assert!(!CollectionTier::Private.remotely_servable());
         assert!(!CollectionTier::LocalApproved.remotely_servable());
         assert!(CollectionTier::Unlisted.remotely_servable());
-        assert_eq!(CollectionTier::parse("self-only"), Some(CollectionTier::Private));
+        assert_eq!(
+            CollectionTier::parse("self-only"),
+            Some(CollectionTier::Private)
+        );
         assert!(CollectionTier::parse("bogus").is_none());
     }
 }

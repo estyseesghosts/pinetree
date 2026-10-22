@@ -45,7 +45,9 @@ const TARGET_MASTODON: &str =
 /// Misskey renderer shape: `_misskey_quote` + `quoteUrl` + `RE:` fallback.
 fn misskey_shape() -> serde_json::Value {
     let mut n = base_note();
-    n["content"] = json!("<p><span>commentary<br><br>RE: </span><a href=\"https://misskey.io/notes/8vs6wxufd0\">https://misskey.io/notes/8vs6wxufd0</a></p>");
+    n["content"] = json!(
+        "<p><span>commentary<br><br>RE: </span><a href=\"https://misskey.io/notes/8vs6wxufd0\">https://misskey.io/notes/8vs6wxufd0</a></p>"
+    );
     n["_misskey_quote"] = json!(TARGET_MISSKEY);
     n["quoteUrl"] = json!(TARGET_MISSKEY);
     n["source"] = json!({"content": "commentary", "mediaType": "text/x.misskeymarkdown"});
@@ -108,8 +110,7 @@ fn mastodon_shape() -> serde_json::Value {
     n["quoteUri"] = json!(TARGET_MASTODON);
     n["quoteAuthorization"] =
         json!("https://mastodon.social/users/404mediaco/quote_authorizations/115345489087269783");
-    n["interactionPolicy"] =
-        json!({"canQuote": {"automaticApproval": ["https://www.w3.org/ns/activitystreams#Public"]}});
+    n["interactionPolicy"] = json!({"canQuote": {"automaticApproval": ["https://www.w3.org/ns/activitystreams#Public"]}});
     n
 }
 
@@ -122,15 +123,18 @@ fn all_legacy_shapes_normalize_to_the_same_quote() {
         ("akkoma", akkoma_shape()),
         ("fedibird", fedibird_shape()),
     ] {
-        let parsed = parse_remote_note(&note)
-            .unwrap_or_else(|e| panic!("{name} shape must parse: {e}"));
+        let parsed =
+            parse_remote_note(&note).unwrap_or_else(|e| panic!("{name} shape must parse: {e}"));
         assert_eq!(
             parsed.quote_target_uri.as_deref(),
             Some(TARGET_MISSKEY),
             "{name} quote target"
         );
         // No auth metadata on legacy shapes.
-        assert!(parsed.quote_authorization_uri.is_none(), "{name} has no stamp");
+        assert!(
+            parsed.quote_authorization_uri.is_none(),
+            "{name} has no stamp"
+        );
         // Same domain record for the same target, regardless of carrier.
         let domain = QuoteReference {
             target_uri: parsed.quote_target_uri.clone().unwrap(),
@@ -141,7 +145,11 @@ fn all_legacy_shapes_normalize_to_the_same_quote() {
             last_verified_at: None,
         };
         assert_eq!(domain.authorization, QuoteAuthorizationState::Unapproved);
-        assert_ne!(domain.authorization.api_status(), "rejected", "{name} never rejected");
+        assert_ne!(
+            domain.authorization.api_status(),
+            "rejected",
+            "{name} never rejected"
+        );
         // Content preserved (RE:/QT: fallback text is not protocol metadata
         // and must not be upgraded or stripped).
         let text = parsed.text.clone().unwrap_or_default();
@@ -179,7 +187,10 @@ fn bare_link_tag_without_rel_is_not_a_quote() {
     // FEP-e232 minimal example carries no `rel`: per docs/quote-posts.md
     // only a Link whose `rel` names the Misskey quote relation counts.
     // Promoting every Link tag would fabricate quotes from ordinary links.
-    let mut n = with_content(base_note(), "This is a quote:<br>RE: https://server.example/objects/123");
+    let mut n = with_content(
+        base_note(),
+        "This is a quote:<br>RE: https://server.example/objects/123",
+    );
     n["tag"] = json!([{
         "type": "Link",
         "mediaType": "application/ld+json; profile=\"https://www.w3.org/ns/activitystreams\"",
@@ -193,7 +204,12 @@ fn bare_link_tag_without_rel_is_not_a_quote() {
     // The textual RE: suffix is preserved as content, not metadata.
     let parsed = parse_remote_note(&n).expect("parses as an ordinary note");
     assert!(parsed.quote_target_uri.is_none());
-    assert!(parsed.text.unwrap_or_default().contains("RE: https://server.example/objects/123"));
+    assert!(
+        parsed
+            .text
+            .unwrap_or_default()
+            .contains("RE: https://server.example/objects/123")
+    );
 }
 
 #[test]
@@ -202,7 +218,10 @@ fn conflicting_aliases_prefer_canonical_quote() {
     n["quote"] = json!("https://canonical.example/notes/1");
     let normalized = normalize_inbound_quote(&n).expect("canonical wins");
     assert_eq!(normalized.target_uri, "https://canonical.example/notes/1");
-    assert_eq!(normalized.conflicting_aliases, vec![TARGET_MISSKEY.to_string()]);
+    assert_eq!(
+        normalized.conflicting_aliases,
+        vec![TARGET_MISSKEY.to_string()]
+    );
     assert!(parse_remote_note(&n).expect("parses").quote_has_conflict);
 }
 
@@ -233,8 +252,8 @@ fn real_fixture_files_normalize() {
         };
         let doc: serde_json::Value =
             serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{path} parses: {e}"));
-        let q = normalize_inbound_quote(&doc)
-            .unwrap_or_else(|| panic!("{path} normalizes to a quote"));
+        let q =
+            normalize_inbound_quote(&doc).unwrap_or_else(|| panic!("{path} normalizes to a quote"));
         assert_eq!(q.target_uri, target, "{path} target");
         assert_eq!(
             QuoteReference::from(&q).authorization,

@@ -155,8 +155,13 @@ fn misskey_family_and_unknown_keep_misskey_like() {
 fn emoji_react_render_content_vs_tag() {
     let base = "https://pinetree.local";
     // Unicode reaction: content set, no tag.
-    let unicode =
-        render_emoji_react_activity(base, "r1", "https://pinetree.local/users/a", "https://r.example/n/1", "❤");
+    let unicode = render_emoji_react_activity(
+        base,
+        "r1",
+        "https://pinetree.local/users/a",
+        "https://r.example/n/1",
+        "❤",
+    );
     assert_eq!(unicode["type"], "EmojiReact");
     assert_eq!(unicode["content"], "❤");
     assert!(
@@ -165,8 +170,13 @@ fn emoji_react_render_content_vs_tag() {
     );
     assert!(unicode.get("_misskey_reaction").is_none());
     // Custom reaction: content AND an Emoji tag naming the shortcode.
-    let custom =
-        render_emoji_react_activity(base, "r2", "https://pinetree.local/users/a", "https://r.example/n/1", ":blobcat:");
+    let custom = render_emoji_react_activity(
+        base,
+        "r2",
+        "https://pinetree.local/users/a",
+        "https://r.example/n/1",
+        ":blobcat:",
+    );
     assert_eq!(custom["type"], "EmojiReact");
     assert_eq!(custom["content"], ":blobcat:");
     let tag = custom["tag"].as_array().expect("custom reaction has a tag");
@@ -271,8 +281,7 @@ fn mastodon_glitch_poll_options_with_note_type_parse() {
             { "type": "Note", "name": "b", "_misskey_votes": 2 },
         ],
     });
-    let poll =
-        parse_question_poll(glitch.as_object().unwrap()).expect("glitch options must parse");
+    let poll = parse_question_poll(glitch.as_object().unwrap()).expect("glitch options must parse");
     assert!(poll.multiple);
     assert_eq!(poll.votes, vec![1, 2]);
     // Misskey (no option type) still parses.

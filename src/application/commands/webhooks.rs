@@ -16,21 +16,19 @@
 use serde::{Deserialize, Serialize};
 
 use crate::application::ports::{
-    AbuseReportRecipientStore, Clock, IdGenerator, JobQueue, NewJob, PortError,
-    SystemWebhookStore, UserWebhookStore, MAX_JOBS_PER_TXN,
+    AbuseReportRecipientStore, Clock, IdGenerator, JobQueue, MAX_JOBS_PER_TXN, NewJob, PortError,
+    SystemWebhookStore, UserWebhookStore,
 };
 use crate::domain::id::DomainError;
 use crate::domain::webhook::{
-    AbuseReportRecipient, SystemWebhook, UserWebhook, check_webhook_limit,
-    validate_email_shape, validate_hook_name, validate_hook_secret, validate_hook_url,
-    validate_trigger, webhook_idempotency_key, webhook_signature_hex,
-    MAX_ABUSE_REPORT_EMAILS_PER_EVENT, SYSTEM_WEBHOOK_TRIGGERS, USER_WEBHOOK_TRIGGERS,
+    AbuseReportRecipient, MAX_ABUSE_REPORT_EMAILS_PER_EVENT, SYSTEM_WEBHOOK_TRIGGERS,
+    SystemWebhook, USER_WEBHOOK_TRIGGERS, UserWebhook, check_webhook_limit, validate_email_shape,
+    validate_hook_name, validate_hook_secret, validate_hook_url, validate_trigger,
+    webhook_idempotency_key, webhook_signature_hex,
 };
-use crate::federation::delivery::SafeHttpClient;
 use crate::federation::delivery::MAX_AP_JSON_BYTES;
-use crate::federation::retry::{
-    DeliveryOutcome, DestinationTracker, classify_inbox_status,
-};
+use crate::federation::delivery::SafeHttpClient;
+use crate::federation::retry::{DeliveryOutcome, DestinationTracker, classify_inbox_status};
 use crate::services::email::EmailSendPayload;
 
 /// Low-alphanumeric secret alphabet (matches the endpoint `random_code`
@@ -453,7 +451,12 @@ pub fn new_webhook_job(
     kind: crate::application::ports::JobKind,
     job: &QueuedWebhookJob,
 ) -> Result<NewJob, PortError> {
-    NewJob::new_json(kind, &job.payload, job.idempotency_key.clone(), job.not_before)
+    NewJob::new_json(
+        kind,
+        &job.payload,
+        job.idempotency_key.clone(),
+        job.not_before,
+    )
 }
 
 /// Enqueue planned jobs in ONE `enqueue_jobs` call (one txn on durable
@@ -499,7 +502,13 @@ pub fn execute_webhook_deliver(
         ("X-Pinetree-Hook-Id", payload.webhook_id.as_str()),
         ("X-Pinetree-Hook-Signature", signature.as_str()),
     ];
-    match client.send("POST", &payload.url, &headers, Some(&body), MAX_AP_JSON_BYTES) {
+    match client.send(
+        "POST",
+        &payload.url,
+        &headers,
+        Some(&body),
+        MAX_AP_JSON_BYTES,
+    ) {
         Ok(resp) => {
             let outcome = classify_inbox_status(resp.status, "webhook", None, now_ms);
             match &outcome {
@@ -569,7 +578,12 @@ pub fn new_email_job(
     kind: crate::application::ports::JobKind,
     job: &QueuedEmailJob,
 ) -> Result<NewJob, PortError> {
-    NewJob::new_json(kind, &job.payload, job.idempotency_key.clone(), job.not_before)
+    NewJob::new_json(
+        kind,
+        &job.payload,
+        job.idempotency_key.clone(),
+        job.not_before,
+    )
 }
 
 /// Enqueue planned email jobs in ONE `enqueue_jobs` call.

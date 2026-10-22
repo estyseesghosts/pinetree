@@ -178,7 +178,8 @@ impl AppServices {
                 )?);
             }
         }
-        self.moderation.set_suspended(account_id, suspended, log, jobs)
+        self.moderation
+            .set_suspended(account_id, suspended, log, jobs)
     }
 
     /// `JobKind::UnfollowAll` handler (Batch M WP3): silently remove one
@@ -195,10 +196,7 @@ impl AppServices {
     /// followee account is gone is skipped and never loops the walk).
     /// Deterministic activity ids: a retry mints no second `Undo(Follow)`
     /// for the same edge.
-    pub fn handle_unfollow_all(
-        &self,
-        payload_bytes: &[u8],
-    ) -> Result<Option<NewJob>, PortError> {
+    pub fn handle_unfollow_all(&self, payload_bytes: &[u8]) -> Result<Option<NewJob>, PortError> {
         let payload: UnfollowAllPayload = serde_json::from_slice(payload_bytes)
             .map_err(|e| PortError::Validation(format!("unfollow-all payload invalid: {e}")))?;
         let UnfollowAllPayload { account_id, after } = payload;
@@ -233,7 +231,10 @@ impl AppServices {
                     }
                 }
             }
-            match self.follows.unfollow(&account_id, &follow.followee_id, jobs) {
+            match self
+                .follows
+                .unfollow(&account_id, &follow.followee_id, jobs)
+            {
                 Ok(()) => {}
                 // A concurrently removed edge converges quietly; a gone
                 // followee leaves the dangling row to the cursor (skipped,

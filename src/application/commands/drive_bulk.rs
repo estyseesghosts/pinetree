@@ -96,10 +96,12 @@ impl AppServices {
         };
         let new_list = self.create_user_list(owner_id, name)?;
         for membership in self.lists.members_of_list(&source.id)? {
-            let member = self.users_show_by_id(&membership.member_id).map_err(|e| match e {
-                PortError::NotFound(_) => PortError::NotFound("NO_SUCH_USER".to_string()),
-                other => other,
-            })?;
+            let member = self
+                .users_show_by_id(&membership.member_id)
+                .map_err(|e| match e {
+                    PortError::NotFound(_) => PortError::NotFound("NO_SUCH_USER".to_string()),
+                    other => other,
+                })?;
             // Reuse the exact push path (block refusal, proxy follow for
             // remotes, cap errors) so semantics match `users/lists/push`.
             self.push_list_member(owner_id, &new_list.id, &member.id)?;

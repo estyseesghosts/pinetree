@@ -11,7 +11,7 @@ use super::AppServices;
 
 use crate::application::ports::{PortError, RegistryItem, TimelineCursor};
 use crate::domain::admin::{
-    PushSubscription, GLOBAL_SETTINGS_NAMESPACE, KEY_RETENTION, RESET_DB_REFUSED_REASON,
+    GLOBAL_SETTINGS_NAMESPACE, KEY_RETENTION, PushSubscription, RESET_DB_REFUSED_REASON,
     SCOPE_ADMIN_META, SCOPE_SW, validate_push_subscription,
 };
 
@@ -110,11 +110,7 @@ impl AppServices {
 
     /// `sw/show-registration` (upstream `sw/show-registration.ts`): fetch
     /// one subscription by endpoint. Missing → `NO_SUCH_SUBSCRIPTION`.
-    pub fn sw_show(
-        &self,
-        account_id: &str,
-        endpoint: &str,
-    ) -> Result<PushSubscription, PortError> {
+    pub fn sw_show(&self, account_id: &str, endpoint: &str) -> Result<PushSubscription, PortError> {
         self.registry
             .registry_get(
                 account_id,
@@ -202,7 +198,13 @@ impl AppServices {
 
     fn public_url_host(&self) -> Option<String> {
         let after_scheme = self.public_url.split_once("://").map(|(_, rest)| rest)?;
-        let host = after_scheme.split('/').next().unwrap_or("").split(':').next().unwrap_or("");
+        let host = after_scheme
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .split(':')
+            .next()
+            .unwrap_or("");
         if host.is_empty() {
             None
         } else {

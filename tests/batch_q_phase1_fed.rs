@@ -25,8 +25,8 @@ use pinetree::activitypub::signatures::{
 };
 use pinetree::application::commands::AppServices;
 use pinetree::application::ports::{
-    AccountStore, ActivityDedup, BlobStore, Clock, CreateNoteInput, FollowStore,
-    NoopStreamingSink, NoteStore,
+    AccountStore, ActivityDedup, BlobStore, Clock, CreateNoteInput, FollowStore, NoopStreamingSink,
+    NoteStore,
 };
 use pinetree::domain::id::SystemClock;
 use pinetree::federation::delivery::{
@@ -51,8 +51,7 @@ fn test_services() -> Arc<AppServices> {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let store =
-        RedbStore::open_with_default_ids(dir.join("test.redb"), clock.clone()).unwrap();
+    let store = RedbStore::open_with_default_ids(dir.join("test.redb"), clock.clone()).unwrap();
     let blobs: Arc<dyn BlobStore> = Arc::new(FsBlobStore::new(dir.join("blobs")).unwrap());
     Arc::new(AppServices {
         clock: clock.clone(),
@@ -145,9 +144,16 @@ fn signed_inbox_headers(
 ) -> HeaderMap {
     let date = format_http_date(services.clock.now_ms());
     let host = "pinetree.local";
-    let signed =
-        sign_request_headers("POST", "/inbox", host, &date, Some(body), key_id, private_pem)
-            .unwrap();
+    let signed = sign_request_headers(
+        "POST",
+        "/inbox",
+        host,
+        &date,
+        Some(body),
+        key_id,
+        private_pem,
+    )
+    .unwrap();
     let mut headers = HeaderMap::new();
     headers.insert(
         HeaderName::from_str("date").unwrap(),
@@ -182,11 +188,7 @@ async fn post_inbox(
 
 /// Pre-cache remote actor `uri` with a fresh keypair; returns
 /// `(key_id, private_pem)`.
-fn cache_remote(
-    services: &Arc<AppServices>,
-    uri: &str,
-    username: &str,
-) -> (String, String) {
+fn cache_remote(services: &Arc<AppServices>, uri: &str, username: &str) -> (String, String) {
     let (private_pem, public_pem) = keypair();
     let key_id = format!("{uri}#main-key");
     let doc = actor_doc(uri, username, &key_id, &public_pem);
@@ -209,13 +211,7 @@ fn cache_note(services: &Arc<AppServices>, setup_id: &str, author_id: &str, uri:
 // 8a: featured Add/Remove ingest
 // ---------------------------------------------------------------------------
 
-fn featured_activity(
-    id: &str,
-    added: bool,
-    actor: &str,
-    target: &str,
-    object: &str,
-) -> Value {
+fn featured_activity(id: &str, added: bool, actor: &str, target: &str, object: &str) -> Value {
     json!({
         "id": id,
         "type": if added { "Add" } else { "Remove" },
@@ -269,14 +265,26 @@ async fn inbound_featured_add_remove_pin_sync() {
         post_inbox(&services, &remove, &bob_key, &bob_priv).await,
         StatusCode::ACCEPTED
     );
-    assert!(services.notes.pinnings_for_user(&bob.id).unwrap().is_empty());
+    assert!(
+        services
+            .notes
+            .pinnings_for_user(&bob.id)
+            .unwrap()
+            .is_empty()
+    );
 
     // Duplicate Remove: safe no-op.
     assert_eq!(
         post_inbox(&services, &remove, &bob_key, &bob_priv).await,
         StatusCode::ACCEPTED
     );
-    assert!(services.notes.pinnings_for_user(&bob.id).unwrap().is_empty());
+    assert!(
+        services
+            .notes
+            .pinnings_for_user(&bob.id)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -304,7 +312,13 @@ async fn inbound_featured_forged_and_clips_add_untouched() {
         post_inbox(&services, &forged_target, &bob_key, &bob_priv).await,
         StatusCode::ACCEPTED
     );
-    assert!(services.notes.pinnings_for_user(&bob.id).unwrap().is_empty());
+    assert!(
+        services
+            .notes
+            .pinnings_for_user(&bob.id)
+            .unwrap()
+            .is_empty()
+    );
 
     // Foreign note: bob cannot pin alice's note.
     let foreign_note = featured_activity(
@@ -318,7 +332,13 @@ async fn inbound_featured_forged_and_clips_add_untouched() {
         post_inbox(&services, &foreign_note, &bob_key, &bob_priv).await,
         StatusCode::ACCEPTED
     );
-    assert!(services.notes.pinnings_for_user(&bob.id).unwrap().is_empty());
+    assert!(
+        services
+            .notes
+            .pinnings_for_user(&bob.id)
+            .unwrap()
+            .is_empty()
+    );
 
     // Clips-targeted Add still takes the clip path: accepted, no pin rows.
     let clips_add = featured_activity(
@@ -333,7 +353,11 @@ async fn inbound_featured_forged_and_clips_add_untouched() {
         StatusCode::ACCEPTED
     );
     assert!(
-        services.notes.pinnings_for_user(&bob.id).unwrap().is_empty(),
+        services
+            .notes
+            .pinnings_for_user(&bob.id)
+            .unwrap()
+            .is_empty(),
         "clips Add must not touch pin rows"
     );
 }
@@ -342,7 +366,13 @@ async fn inbound_featured_forged_and_clips_add_untouched() {
 // 8b: Undo(Accept) unfollow
 // ---------------------------------------------------------------------------
 
-fn undo_accept_activity(id: &str, undo_actor: &str, accept_actor: &str, follower: &str, followee: &str) -> Value {
+fn undo_accept_activity(
+    id: &str,
+    undo_actor: &str,
+    accept_actor: &str,
+    follower: &str,
+    followee: &str,
+) -> Value {
     json!({
         "id": id,
         "type": "Undo",
@@ -485,7 +515,10 @@ async fn inbound_delete_person_marks_remote_deleted() {
         StatusCode::ACCEPTED
     );
     let bob_after = services.accounts.find_by_uri(BOB_URI).unwrap().unwrap();
-    assert!(bob_after.is_deleted, "remote account must be marked deleted");
+    assert!(
+        bob_after.is_deleted,
+        "remote account must be marked deleted"
+    );
     assert!(bob_after.is_suspended);
     assert!(
         !services.follows.is_following(&alice.id, &bob.id).unwrap(),

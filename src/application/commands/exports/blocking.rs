@@ -1,0 +1,40 @@
+use crate::application::commands::AppServices;
+
+use super::common::PAGE_SIZE;
+use crate::application::ports::{PortError, TimelineCursor};
+
+impl AppServices {
+    /// Every blocking row by `user_id`, block-row-id order (upstream
+    /// `order: { id: 1 }` parity; the store pages newest-first, so page
+    /// fully and re-sort).
+    pub(crate) fn all_blockings(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<crate::domain::blocking::Blocking>, PortError> {
+        let mut rows = Vec::new();
+        let mut until_id: Option<String> = None;
+        loop {
+            let page = self.blocks.list_blockings(
+                user_id,
+                &TimelineCursor {
+                    since_id: None,
+                    until_id: until_id.clone(),
+                    since_date: None,
+                    until_date: None,
+                    limit: PAGE_SIZE,
+                },
+            )?;
+            if page.is_empty() {
+                break;
+            }
+            until_id = page.last().map(|r| r.id.clone());
+            let len = page.len();
+            rows.extend(page);
+            if len < PAGE_SIZE {
+                break;
+            }
+        }
+        rows.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(rows)
+    }
+}

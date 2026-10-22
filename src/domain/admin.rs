@@ -30,16 +30,12 @@ pub const GLOBAL_SETTINGS_NAMESPACE: &str = "~instance";
 
 /// Loud refusal reasons (400 `INVALID_PARAM` via the dispatcher) for ops
 /// that need missing subsystems. Never silent no-ops.
-pub const PASSKEY_UNSUPPORTED_REASON: &str =
-    "passkey sign-in is not supported by this server: no WebAuthn RP/challenge store or attestation verification (see signin-with-passkey stub)";
-pub const SECURITY_KEY_UNSUPPORTED_REASON: &str =
-    "security keys are not supported by this server: no WebAuthn credential store (TOTP via i/2fa/* is the supported second factor)";
+pub const PASSKEY_UNSUPPORTED_REASON: &str = "passkey sign-in is not supported by this server: no WebAuthn RP/challenge store or attestation verification (see signin-with-passkey stub)";
+pub const SECURITY_KEY_UNSUPPORTED_REASON: &str = "security keys are not supported by this server: no WebAuthn credential store (TOTP via i/2fa/* is the supported second factor)";
 pub const RESET_DB_REFUSED_REASON: &str =
     "reset-db is refused: development-only destructive reset with no single-node equivalent";
-pub const QUEUE_CONTROL_UNSUPPORTED_REASON: &str =
-    "queue delayed/clear controls need job enumeration ports (single unified queue exposes stats only)";
-pub const ROLE_POLICY_UNENFORCED_NOTE: &str =
-    "role policies are stored but not enforced: no role-policy engine (role_ids stored never enforced, TODOS P2)";
+pub const QUEUE_CONTROL_UNSUPPORTED_REASON: &str = "queue delayed/clear controls need job enumeration ports (single unified queue exposes stats only)";
+pub const ROLE_POLICY_UNENFORCED_NOTE: &str = "role policies are stored but not enforced: no role-policy engine (role_ids stored never enforced, TODOS P2)";
 
 // Registry scopes (all match `^[a-zA-Z0-9_]+$`).
 pub const SCOPE_2FA: &str = "2fa";
@@ -174,7 +170,9 @@ pub struct FederationInstanceOverride {
 pub fn validate_app_name(name: &str) -> Result<(), DomainError> {
     let len = name.chars().count();
     if !(1..=64).contains(&len) {
-        return Err(invalid("INVALID_PARAM app name must be 1..=64 chars".to_string()));
+        return Err(invalid(
+            "INVALID_PARAM app name must be 1..=64 chars".to_string(),
+        ));
     }
     Ok(())
 }
@@ -196,10 +194,14 @@ pub fn validate_relay_inbox(inbox: &str) -> Result<(), DomainError> {
 
 pub fn validate_announcement(title: &str, text: &str) -> Result<(), DomainError> {
     if title.trim().is_empty() || title.chars().count() > 128 {
-        return Err(invalid("INVALID_PARAM title must be 1..=128 chars".to_string()));
+        return Err(invalid(
+            "INVALID_PARAM title must be 1..=128 chars".to_string(),
+        ));
     }
     if text.trim().is_empty() || text.chars().count() > 8192 {
-        return Err(invalid("INVALID_PARAM text must be 1..=8192 chars".to_string()));
+        return Err(invalid(
+            "INVALID_PARAM text must be 1..=8192 chars".to_string(),
+        ));
     }
     Ok(())
 }
@@ -212,10 +214,14 @@ pub fn validate_ad(url: &str, memo: &str, place: &str, image_url: &str) -> Resul
         return Err(invalid("INVALID_PARAM invalid ad imageUrl".to_string()));
     }
     if memo.chars().count() > 512 {
-        return Err(invalid("INVALID_PARAM memo must be <=512 chars".to_string()));
+        return Err(invalid(
+            "INVALID_PARAM memo must be <=512 chars".to_string(),
+        ));
     }
     if place.trim().is_empty() || place.chars().count() > 64 {
-        return Err(invalid("INVALID_PARAM place must be 1..=64 chars".to_string()));
+        return Err(invalid(
+            "INVALID_PARAM place must be 1..=64 chars".to_string(),
+        ));
     }
     Ok(())
 }
@@ -227,12 +233,16 @@ pub fn validate_recipient(
     webhook_url: Option<&str>,
 ) -> Result<(), DomainError> {
     if name.trim().is_empty() || name.chars().count() > 128 {
-        return Err(invalid("INVALID_PARAM name must be 1..=128 chars".to_string()));
+        return Err(invalid(
+            "INVALID_PARAM name must be 1..=128 chars".to_string(),
+        ));
     }
     match method {
         "email" => {
             let Some(email) = email else {
-                return Err(invalid("INVALID_PARAM email recipient needs an email".to_string()));
+                return Err(invalid(
+                    "INVALID_PARAM email recipient needs an email".to_string(),
+                ));
             };
             if !email.contains('@') || email.chars().count() > 256 {
                 return Err(invalid("INVALID_PARAM invalid recipient email".to_string()));
@@ -245,7 +255,9 @@ pub fn validate_recipient(
                 ));
             };
             if !is_http_url(url) {
-                return Err(invalid("INVALID_PARAM invalid recipient webhookUrl".to_string()));
+                return Err(invalid(
+                    "INVALID_PARAM invalid recipient webhookUrl".to_string(),
+                ));
             }
         }
         _ => {
@@ -259,7 +271,9 @@ pub fn validate_recipient(
 
 pub fn validate_role(name: &str, target: &str) -> Result<(), DomainError> {
     if name.trim().is_empty() || name.chars().count() > 256 {
-        return Err(invalid("INVALID_PARAM name must be 1..=256 chars".to_string()));
+        return Err(invalid(
+            "INVALID_PARAM name must be 1..=256 chars".to_string(),
+        ));
     }
     match target {
         "manual" | "conditional" => {}

@@ -19,25 +19,25 @@
 use std::collections::BTreeMap;
 
 use pinetree::domain::account::{
-    needs_link_reverify, password_meets_policy, reset_verified_links_for_reverify,
-    validate_move, validate_pinned_page_update, validate_rename, validate_signin_input, Account,
+    Account, needs_link_reverify, password_meets_policy, reset_verified_links_for_reverify,
+    validate_move, validate_pinned_page_update, validate_rename, validate_signin_input,
 };
 use pinetree::domain::antenna::{
+    ANTENNA_AUTO_DEACTIVATE_AFTER_MS, Antenna, AntennaNoteView, AntennaSrc,
     antenna_matches_with_sensitivity, deactivate_stale_antenna, should_auto_deactivate,
-    Antenna, AntennaNoteView, AntennaSrc, ANTENNA_AUTO_DEACTIVATE_AFTER_MS,
 };
-use pinetree::domain::clip::{count_clip_notes, Clip};
-use pinetree::domain::emoji::{emoji_usable_by, CustomEmoji};
+use pinetree::domain::clip::{Clip, count_clip_notes};
+use pinetree::domain::emoji::{CustomEmoji, emoji_usable_by};
 use pinetree::domain::follow::{
-    build_follow_from_request, decide_follow_path, require_follow_request, FollowPath,
-    FollowRequest,
+    FollowPath, FollowRequest, build_follow_from_request, decide_follow_path,
+    require_follow_request,
 };
 use pinetree::domain::id::DomainError;
 use pinetree::domain::note::{
-    aggregate_hashtag_counts, can_delete_note, can_edit_note, rank_hashtag_trends, sanitize_mfm,
-    tombstone_transition, Note, Visibility,
+    Note, Visibility, aggregate_hashtag_counts, can_delete_note, can_edit_note,
+    rank_hashtag_trends, sanitize_mfm, tombstone_transition,
 };
-use pinetree::domain::reaction::{can_unreact, decide_react, Reaction, ReactOutcome};
+use pinetree::domain::reaction::{ReactOutcome, Reaction, can_unreact, decide_react};
 
 fn note_by(author: &str) -> Note {
     Note {
@@ -182,7 +182,8 @@ fn d4_rename_and_move_rules() {
     assert!(validate_rename(&local, "bob", false).is_ok());
     assert!(validate_rename(&local, "bob", true).is_err());
     assert!(validate_move(&local, "https://new.example/users/alice", 7).is_ok());
-    let mut moved = Account::new_local("aid00000000000002".to_string(), "carol".to_string()).unwrap();
+    let mut moved =
+        Account::new_local("aid00000000000002".to_string(), "carol".to_string()).unwrap();
     moved.moved_to_uri = Some("https://new.example/users/carol".to_string());
     assert!(validate_move(&moved, "https://other.example/u", 8).is_err());
 }
@@ -194,7 +195,10 @@ fn d5_sanitize_keeps_mfm_drops_dangerous_html() {
     let plain = "**bold** @alice #tag :emoji:";
     assert_eq!(sanitize_mfm(plain), plain);
     assert_eq!(sanitize_mfm("a<script>alert(1)</script>b"), "ab");
-    assert_eq!(sanitize_mfm("[x](javascript:alert(1))"), "[x](blocked:alert(1))");
+    assert_eq!(
+        sanitize_mfm("[x](javascript:alert(1))"),
+        "[x](blocked:alert(1))"
+    );
 }
 
 // --- D6: role_ids enforcement --------------------------------------------------
@@ -260,15 +264,15 @@ fn d9_antenna_sensitivity_gate_and_stale_deactivation() {
     let (a, v) = antenna(&n);
     assert!(antenna_matches_with_sensitivity(&a, &v, true, false));
     assert!(!antenna_matches_with_sensitivity(&a, &v, true, true));
-    assert_eq!(
-        ANTENNA_AUTO_DEACTIVATE_AFTER_MS,
-        7 * 24 * 60 * 60 * 1000
-    );
+    assert_eq!(ANTENNA_AUTO_DEACTIVATE_AFTER_MS, 7 * 24 * 60 * 60 * 1000);
     assert!(should_auto_deactivate(0, 7 * 24 * 60 * 60 * 1000));
     assert!(!should_auto_deactivate(0, 7 * 24 * 60 * 60 * 1000 - 1));
     let (mut stale, _) = antenna(&n);
     stale.last_used_at_ms = 0;
-    assert!(deactivate_stale_antenna(&mut stale, 8 * 24 * 60 * 60 * 1000));
+    assert!(deactivate_stale_antenna(
+        &mut stale,
+        8 * 24 * 60 * 60 * 1000
+    ));
     assert!(!stale.is_active);
 }
 

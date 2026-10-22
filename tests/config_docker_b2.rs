@@ -18,14 +18,19 @@ fn manifest_dir() -> PathBuf {
 }
 
 fn disabled_transcode() -> TranscodeSection {
-    TranscodeSection { enabled: false, ..TranscodeSection::default() }
+    TranscodeSection {
+        enabled: false,
+        ..TranscodeSection::default()
+    }
 }
 
 fn config_with_url(url: &str, allow_local_http: bool) -> Config {
     Config {
         public_url: url.to_string(),
         transcode: disabled_transcode(),
-        r#unsafe: UnsafeSection { allow_local_http_for_testing: allow_local_http },
+        r#unsafe: UnsafeSection {
+            allow_local_http_for_testing: allow_local_http,
+        },
         ..Config::default()
     }
 }
@@ -37,7 +42,10 @@ fn config_with_url(url: &str, allow_local_http: bool) -> Config {
 #[test]
 fn default_rust_config_disables_transcoding() {
     let cfg = Config::default();
-    assert!(!cfg.transcode.enabled, "new installs must start without FFmpeg");
+    assert!(
+        !cfg.transcode.enabled,
+        "new installs must start without FFmpeg"
+    );
     assert!(cfg.validate().is_ok());
 }
 
@@ -75,7 +83,10 @@ fn enabled_transcode_with_broken_toolchain_fails_the_probe() {
     assert!(err.contains("could not be executed"), "{err}");
     // Static `Config::validate()` stays hermetic (ranges only); the
     // environment probe belongs to startup, never to config parsing.
-    let cfg = Config { transcode: section, ..Config::default() };
+    let cfg = Config {
+        transcode: section,
+        ..Config::default()
+    };
     assert!(cfg.validate().is_ok());
 }
 
@@ -98,11 +109,16 @@ fn docker_default_config_disables_transcode_and_unsafe_http() {
     let path = manifest_dir().join("docker/pinetree.container.json");
     let bytes = std::fs::read(&path).expect("read docker default config");
     let cfg: Config = serde_json::from_slice(&bytes).expect("parse docker default config");
-    assert!(!cfg.transcode.enabled, "default image must not require FFmpeg");
+    assert!(
+        !cfg.transcode.enabled,
+        "default image must not require FFmpeg"
+    );
     assert!(!cfg.r#unsafe.allow_local_http_for_testing);
     // The placeholder canonical URL refuses to start until the operator sets
     // a real one (fail closed, with an actionable message).
-    let err = cfg.validate().expect_err("placeholder public_url must fail closed");
+    let err = cfg
+        .validate()
+        .expect_err("placeholder public_url must fail closed");
     assert!(err.contains("placeholder"), "{err}");
     // With a canonical https URL the same file validates.
     let mut canonical = cfg.clone();
@@ -133,9 +149,19 @@ fn transcode_enabled_example_enables_explicitly() {
 
 #[test]
 fn https_accepted_and_http_rejected_by_default() {
-    assert!(config_with_url("https://social.example.com/", false).validate().is_ok());
-    for url in ["http://localhost:3000/", "http://127.0.0.1:3000/", "http://example.com/"] {
-        let err = config_with_url(url, false).validate().expect_err("http off by default");
+    assert!(
+        config_with_url("https://social.example.com/", false)
+            .validate()
+            .is_ok()
+    );
+    for url in [
+        "http://localhost:3000/",
+        "http://127.0.0.1:3000/",
+        "http://example.com/",
+    ] {
+        let err = config_with_url(url, false)
+            .validate()
+            .expect_err("http off by default");
         assert!(err.contains("unsafe.allow_local_http_for_testing"), "{err}");
     }
 }
@@ -165,7 +191,9 @@ fn enabled_flag_accepts_only_local_test_hosts() {
         "http://169.254.169.254/",
         "http://[fd00::1]/",
     ] {
-        let err = config_with_url(url, true).validate().expect_err("public http rejected");
+        let err = config_with_url(url, true)
+            .validate()
+            .expect_err("public http rejected");
         assert!(err.contains("non-local host"), "{err}");
     }
 }
@@ -178,9 +206,8 @@ fn unsafe_json_key_round_trips_and_rejects_typos() {
     let json = serde_json::to_value(Config::default()).expect("serialize");
     assert!(json.get("unsafe").is_some(), "{json}");
     assert_eq!(json["unsafe"]["allow_local_http_for_testing"], false);
-    let on: Config =
-        serde_json::from_str(r#"{"unsafe": {"allow_local_http_for_testing": true}}"#)
-            .expect("parse");
+    let on: Config = serde_json::from_str(r#"{"unsafe": {"allow_local_http_for_testing": true}}"#)
+        .expect("parse");
     assert!(on.r#unsafe.allow_local_http_for_testing);
     assert!(serde_json::from_str::<Config>(r#"{"unsafe": {"allow_local_http": true}}"#).is_err());
     assert!(serde_json::from_str::<Config>(r#"{"unsaf": {}}"#).is_err());
@@ -216,11 +243,19 @@ fn dockerfile_has_shared_base_and_two_final_targets() {
         assert_ne!(item, "ffmpeg", "minimal stages must not install FFmpeg");
     }
     assert!(
-        after.lines().any(|line| line.trim().trim_end_matches('\\').trim() == "ffmpeg"),
+        after
+            .lines()
+            .any(|line| line.trim().trim_end_matches('\\').trim() == "ffmpeg"),
         "ffmpeg target must install the FFmpeg package"
     );
     // Both final targets drop privileges, keep tini, and probe liveness.
-    assert!(body.matches("USER pinetree").count() >= 2, "non-root in both targets");
+    assert!(
+        body.matches("USER pinetree").count() >= 2,
+        "non-root in both targets"
+    );
     assert!(body.matches("tini").count() >= 2, "tini in both targets");
-    assert!(body.contains("/healthz"), "liveness probe kept (readiness upgrade is Batch G/H)");
+    assert!(
+        body.contains("/healthz"),
+        "liveness probe kept (readiness upgrade is Batch G/H)"
+    );
 }

@@ -75,9 +75,8 @@ impl TranscodeJobPayload {
     /// Extract the file id from a job payload (`Err` when absent: a
     /// programmer error, surfaced loudly rather than silently skipped).
     pub fn file_id_from_bytes(payload: &[u8]) -> Result<String, PortError> {
-        let parsed: TranscodeJobPayload = serde_json::from_slice(payload).map_err(|e| {
-            PortError::Validation(format!("transcode-media payload invalid: {e}"))
-        })?;
+        let parsed: TranscodeJobPayload = serde_json::from_slice(payload)
+            .map_err(|e| PortError::Validation(format!("transcode-media payload invalid: {e}")))?;
         if parsed.file_id.trim().is_empty() {
             return Err(PortError::Validation(
                 "transcode job: missing file_id".to_string(),
@@ -337,12 +336,12 @@ fn map_transcode_error(
     err: TranscodeError,
 ) -> Result<TranscodeOutcome, PortError> {
     match err {
-        TranscodeError::Spawn(detail) | TranscodeError::Io(detail) => Err(
-            PortError::StorageUnavailable(format!(
+        TranscodeError::Spawn(detail) | TranscodeError::Io(detail) => {
+            Err(PortError::StorageUnavailable(format!(
                 "transcode of file {} failed transiently: {detail}",
                 meta.id
-            )),
-        ),
+            )))
+        }
         other => Ok(TranscodeOutcome::FailedDeterministic(format!(
             "transcode failed: {other}"
         ))),
@@ -419,10 +418,7 @@ fn commit_derived(
     let blob_key = sha256_hex(derived);
     blobs.put(&blob_key, derived)?;
     let staged = blobs.get(&blob_key)?.ok_or_else(|| {
-        PortError::StorageUnavailable(format!(
-            "stored derived bytes missing for file {}",
-            meta.id
-        ))
+        PortError::StorageUnavailable(format!("stored derived bytes missing for file {}", meta.id))
     })?;
     if staged.len() != derived.len() {
         return Err(PortError::StorageUnavailable(format!(

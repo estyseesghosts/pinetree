@@ -54,19 +54,19 @@ pub(crate) fn test_services(prefix: &str) -> AppServices {
         moderation: store.clone(),
         instance_settings: store.clone(),
         invites: store.clone(),
-            abuse_reports: store.clone(),
-            lists: store.clone(),
-            signin: store.clone(),
-            password_resets: store.clone(),
-            registry: store.clone(),
-            clips: store.clone(),
-            pages: store.clone(),
-            folders: store.clone(),
-            system_webhooks: store.clone(),
-            user_webhooks: store.clone(),
-            abuse_recipients: store.clone(),
-            memos: store.clone(),
-            thread_mutes: store.clone(),
+        abuse_reports: store.clone(),
+        lists: store.clone(),
+        signin: store.clone(),
+        password_resets: store.clone(),
+        registry: store.clone(),
+        clips: store.clone(),
+        pages: store.clone(),
+        folders: store.clone(),
+        system_webhooks: store.clone(),
+        user_webhooks: store.clone(),
+        abuse_recipients: store.clone(),
+        memos: store.clone(),
+        thread_mutes: store.clone(),
         federation_http: SafeHttpClient::new(SafeHttpConfig {
             allow_private_ips: true,
             ..Default::default()
@@ -106,9 +106,15 @@ fn concurrent_ensure_actor_keypair_yields_one_key() {
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    assert!(keys.windows(2).all(|w| w[0] == w[1]), "callers saw different keys");
+    assert!(
+        keys.windows(2).all(|w| w[0] == w[1]),
+        "callers saw different keys"
+    );
     let stored = services.auth.get_actor_keypair(&alice.id).unwrap().unwrap();
-    assert_eq!(stored, keys[0], "the stored key is the one every caller got");
+    assert_eq!(
+        stored, keys[0],
+        "the stored key is the one every caller got"
+    );
 }
 
 /// Concurrent first fetches of any actor each provision the instance `system_actor`; none may fail.
@@ -116,14 +122,20 @@ fn concurrent_ensure_actor_keypair_yields_one_key() {
 fn concurrent_ensure_system_actor_all_succeed() {
     let services = test_services("system-actor-concurrent");
     let results: Vec<_> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..8).map(|_| scope.spawn(|| services.ensure_system_actor())).collect();
+        let handles: Vec<_> = (0..8)
+            .map(|_| scope.spawn(|| services.ensure_system_actor()))
+            .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
     for r in &results {
         assert!(r.is_ok(), "{r:?}");
     }
     let first = results[0].as_ref().unwrap();
-    assert!(results.iter().all(|r| r.as_ref().unwrap().0.id == first.0.id && r.as_ref().unwrap().1 == first.1));
+    assert!(
+        results
+            .iter()
+            .all(|r| r.as_ref().unwrap().0.id == first.0.id && r.as_ref().unwrap().1 == first.1)
+    );
 }
 
 #[test]
@@ -139,9 +151,7 @@ fn actor_keypair_generation_rotation_and_remote_key_cache() {
     assert!(kp1.private_key_pem.contains("BEGIN PRIVATE KEY"));
 
     let sig = rsa_sha256_sign(&kp1.private_key_pem, b"federation payload").unwrap();
-    assert!(
-        rsa_sha256_verify(&kp1.public_key_pem, b"federation payload", &sig).unwrap()
-    );
+    assert!(rsa_sha256_verify(&kp1.public_key_pem, b"federation payload", &sig).unwrap());
 
     // Key rotation replaces the persisted keypair.
     let kp2 = services.rotate_actor_keypair(&alice.id).unwrap();
@@ -184,12 +194,29 @@ fn slice8_distinct_uploads_never_share_blob_storage() {
     let services = test_services("slice8-distinct");
     let alice = services.create_account("alice", None).unwrap();
     let a = services
-        .upload_media(&alice.id, "a.txt".to_string(), b"payload A", None, false, true)
+        .upload_media(
+            &alice.id,
+            "a.txt".to_string(),
+            b"payload A",
+            None,
+            false,
+            true,
+        )
         .unwrap();
     let b = services
-        .upload_media(&alice.id, "b.txt".to_string(), b"payload B", None, false, true)
+        .upload_media(
+            &alice.id,
+            "b.txt".to_string(),
+            b"payload B",
+            None,
+            false,
+            true,
+        )
         .unwrap();
-    assert_ne!(a.blob_key, b.blob_key, "distinct bytes → distinct blob keys");
+    assert_ne!(
+        a.blob_key, b.blob_key,
+        "distinct bytes → distinct blob keys"
+    );
     assert_ne!(a.hash, b.hash);
     assert_eq!(
         services.blobs.get(&a.blob_key).unwrap().as_deref(),
@@ -231,7 +258,10 @@ fn slice8_owner_dedup_still_works_and_force_bypasses() {
         .upload_media(&alice.id, "a.bin".to_string(), bytes, None, false, true)
         .unwrap();
     assert_ne!(forced.id, first.id, "force bypasses the dedup");
-    assert_eq!(forced.blob_key, first.blob_key, "same bytes → same blob key");
+    assert_eq!(
+        forced.blob_key, first.blob_key,
+        "same bytes → same blob key"
+    );
     assert_eq!(forced.hash, first.hash, "md5 unchanged for the same bytes");
 }
 
@@ -266,7 +296,14 @@ fn local_non_utf8_upload_claiming_html_is_not_html() {
     let alice = services.create_account("alice", None).unwrap();
     let bytes = vec![0xFF, 0xFE, 0x00, 0x01, 0x02, 0x03];
     let meta = services
-        .upload_media(&alice.id, "evil.html".to_string(), &bytes, None, false, true)
+        .upload_media(
+            &alice.id,
+            "evil.html".to_string(),
+            &bytes,
+            None,
+            false,
+            true,
+        )
         .unwrap();
     assert_eq!(meta.mime, "application/octet-stream");
     assert_ne!(meta.mime, "text/html");
@@ -291,15 +328,28 @@ fn local_upload_sniff_beats_declared_type() {
     assert_eq!(meta.mime, "application/octet-stream");
     // Plain UTF-8 still stores as text.
     let meta = services
-        .upload_media(&alice.id, "hi.txt".to_string(), b"hello world", None, false, true)
+        .upload_media(
+            &alice.id,
+            "hi.txt".to_string(),
+            b"hello world",
+            None,
+            false,
+            true,
+        )
         .unwrap();
     assert_eq!(meta.mime, "text/plain");
 }
 
 // --- §0B full profile store -------------------------------------------------
 
-use crate::application::ports::{PortError as ProfilePortError, UpdateAccountPatch as ProfilePatch};
-use crate::domain::account::{AvatarDecoration as ProfileDeco, ChatScope as ProfileChatScope, FollowVisibility as ProfileVisibility, MutedWord as ProfileMuteWord, NotificationRecieveConfig as ProfileNotifConfig};
+use crate::application::ports::{
+    PortError as ProfilePortError, UpdateAccountPatch as ProfilePatch,
+};
+use crate::domain::account::{
+    AvatarDecoration as ProfileDeco, ChatScope as ProfileChatScope,
+    FollowVisibility as ProfileVisibility, MutedWord as ProfileMuteWord,
+    NotificationRecieveConfig as ProfileNotifConfig,
+};
 
 #[test]
 fn profile_store_round_trip_and_defaults() {
@@ -321,7 +371,10 @@ fn profile_store_round_trip_and_defaults() {
     let mut notif = std::collections::BTreeMap::new();
     notif.insert(
         "mention".to_string(),
-        ProfileNotifConfig { kind: "following".to_string(), user_list_id: None },
+        ProfileNotifConfig {
+            kind: "following".to_string(),
+            user_list_id: None,
+        },
     );
     let updated = services
         .update_profile(
@@ -457,7 +510,11 @@ fn profile_word_mute_validation() {
                 },
             )
             .unwrap_err();
-        assert_eq!(err, ProfilePortError::Validation("INVALID_REGEXP".to_string()), "{bad}");
+        assert_eq!(
+            err,
+            ProfilePortError::Validation("INVALID_REGEXP".to_string()),
+            "{bad}"
+        );
     }
     let huge = format!("/{}/", "a".repeat(199));
     let err = services
@@ -479,8 +536,20 @@ fn profile_word_mute_validation() {
             &alice.id,
             ProfilePatch {
                 avatar_decorations: Some(vec![
-                    ProfileDeco { id: "a".to_string(), angle: None, flip_h: None, offset_x: None, offset_y: None },
-                    ProfileDeco { id: "b".to_string(), angle: None, flip_h: None, offset_x: None, offset_y: None },
+                    ProfileDeco {
+                        id: "a".to_string(),
+                        angle: None,
+                        flip_h: None,
+                        offset_x: None,
+                        offset_y: None,
+                    },
+                    ProfileDeco {
+                        id: "b".to_string(),
+                        angle: None,
+                        flip_h: None,
+                        offset_x: None,
+                        offset_y: None,
+                    },
                 ]),
                 ..Default::default()
             },
@@ -550,19 +619,37 @@ fn profile_unlock_accepts_pending_requests() {
     services
         .update_profile(
             &bob.id,
-            ProfilePatch { is_locked: Some(true), ..Default::default() },
+            ProfilePatch {
+                is_locked: Some(true),
+                ..Default::default()
+            },
         )
         .unwrap();
     services.follow(&alice.id, &bob.id, false).unwrap();
-    assert!(services.follows.get_follow_request(&alice.id, &bob.id).unwrap().is_some());
+    assert!(
+        services
+            .follows
+            .get_follow_request(&alice.id, &bob.id)
+            .unwrap()
+            .is_some()
+    );
 
     services
         .update_profile(
             &bob.id,
-            ProfilePatch { is_locked: Some(false), ..Default::default() },
+            ProfilePatch {
+                is_locked: Some(false),
+                ..Default::default()
+            },
         )
         .unwrap();
-    assert!(services.follows.get_follow_request(&alice.id, &bob.id).unwrap().is_none());
+    assert!(
+        services
+            .follows
+            .get_follow_request(&alice.id, &bob.id)
+            .unwrap()
+            .is_none()
+    );
     assert!(services.follows.is_following(&alice.id, &bob.id).unwrap());
 }
 

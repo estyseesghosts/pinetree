@@ -77,11 +77,7 @@ impl CustomEmoji {
 /// Moderators bypass the gate (they can always inspect/apply any emoji for
 /// moderation display). Both the reaction resolver and the MFM renderer
 /// call this, so neither adapter invents its own gate.
-pub fn emoji_usable_by(
-    emoji: &CustomEmoji,
-    user_role_ids: &[String],
-    is_moderator: bool,
-) -> bool {
+pub fn emoji_usable_by(emoji: &CustomEmoji, user_role_ids: &[String], is_moderator: bool) -> bool {
     if is_moderator {
         return true;
     }
@@ -134,7 +130,9 @@ impl RemoteEmoji {
         let host = host.trim().to_ascii_lowercase();
         let shortcode = shortcode.trim().to_ascii_lowercase();
         if host.is_empty() || host.chars().count() > 256 {
-            return Err(invalid("remote emoji host must be 1..=256 chars".to_string()));
+            return Err(invalid(
+                "remote emoji host must be 1..=256 chars".to_string(),
+            ));
         }
         validate_shortcode(&shortcode)?;
         let remote_url = remote_url.trim().to_string();
@@ -204,10 +202,14 @@ mod tests {
         });
         assert_eq!(
             parse_emoji_tag(&tag),
-            Some(("blobcat".to_string(), "https://r.example/e/blobcat.png".to_string()))
+            Some((
+                "blobcat".to_string(),
+                "https://r.example/e/blobcat.png".to_string()
+            ))
         );
         // Bare-string icon and array-icon shapes.
-        let bare = serde_json::json!({"type": "Emoji", "name": ":x:", "icon": "https://r.example/x.png"});
+        let bare =
+            serde_json::json!({"type": "Emoji", "name": ":x:", "icon": "https://r.example/x.png"});
         assert_eq!(
             parse_emoji_tag(&bare),
             Some(("x".to_string(), "https://r.example/x.png".to_string()))

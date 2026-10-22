@@ -119,7 +119,12 @@ impl AppServices {
                 list_id: list.id.clone(),
                 member_id: member.id.clone(),
             },
-            format!("list-push:{}:{}:{}", list.id, member.id, self.ids.generate()),
+            format!(
+                "list-push:{}:{}:{}",
+                list.id,
+                member.id,
+                self.ids.generate()
+            ),
         )?];
         if !member.is_local() {
             // Upstream `addMember`: a proxy follow so remote members' notes
@@ -165,7 +170,8 @@ impl AppServices {
             },
             format!("list-pull:{}:{user_id}:{}", list.id, self.ids.generate()),
         )?;
-        self.lists.remove_list_member(&list.id, user_id, vec![job])?;
+        self.lists
+            .remove_list_member(&list.id, user_id, vec![job])?;
         Ok(())
     }
 

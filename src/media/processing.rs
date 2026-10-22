@@ -119,13 +119,15 @@ fn process_image(mime_type: &str, bytes: &[u8]) -> Result<Processed, ProcessErro
             height: Some(height),
             ..Processed::default()
         }),
-        None
-            if matches!(
-                mime_type,
-                "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/bmp"
-            ) => Err(ProcessError::Unidentifiable(format!(
+        None if matches!(
+            mime_type,
+            "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/bmp"
+        ) =>
+        {
+            Err(ProcessError::Unidentifiable(format!(
                 "could not decode {mime_type}"
-            ))),
+            )))
+        }
         None => Err(ProcessError::Unidentifiable(format!(
             "unsupported media type {mime_type}"
         ))),
@@ -277,8 +279,9 @@ pub fn mp4_dimensions(bytes: &[u8]) -> (Option<u32>, Option<u32>) {
 /// Walk the ISO-BMFF box tree for a `tkhd` box with a positive size.
 fn find_tkhd_size(bytes: &[u8]) -> Option<(Option<u32>, Option<u32>)> {
     // Container boxes a `tkhd` can live in (`moov/trak/...`).
-    const CONTAINERS: [&[u8; 4]; 7] =
-        [b"moov", b"trak", b"mdia", b"minf", b"stbl", b"edts", b"udta"];
+    const CONTAINERS: [&[u8; 4]; 7] = [
+        b"moov", b"trak", b"mdia", b"minf", b"stbl", b"edts", b"udta",
+    ];
     let mut offset = 0usize;
     while offset + 8 <= bytes.len() {
         let size = u32::from_be_bytes(bytes[offset..offset + 4].try_into().ok()?) as u64;
@@ -342,10 +345,7 @@ fn tkhd_size(content: &[u8]) -> (Option<u32>, Option<u32>) {
         .expect("tkhd tail slice is 8 bytes, so [4..8] converts to [u8; 4]");
     let width = u32::from_be_bytes(width_bytes) >> 16;
     let height = u32::from_be_bytes(height_bytes) >> 16;
-    (
-        (width > 0).then_some(width),
-        (height > 0).then_some(height),
-    )
+    ((width > 0).then_some(width), (height > 0).then_some(height))
 }
 
 #[cfg(test)]
@@ -437,11 +437,7 @@ mod tests {
     fn mp4_dimensions_from_tkhd_box() {
         // moov > trak > tkhd; payload ends with 16.16 width/height.
         let mut tkhd = vec![0u8; 84];
-        let tail = [
-            (640u32 << 16).to_be_bytes(),
-            (480u32 << 16).to_be_bytes(),
-        ]
-        .concat();
+        let tail = [(640u32 << 16).to_be_bytes(), (480u32 << 16).to_be_bytes()].concat();
         tkhd[76..84].copy_from_slice(&tail);
         let mut trak = Vec::new();
         trak.extend_from_slice(&((tkhd.len() + 8) as u32).to_be_bytes());
@@ -470,8 +466,11 @@ mod tests {
     fn audio_and_webm_are_accepted_without_dimensions() {
         let ogg = process("audio/ogg", b"OggS some audio bytes here").expect("ogg");
         assert_eq!((ogg.width, ogg.height), (None, None));
-        let webm = process("video/webm", &[0x1A, 0x45, 0xDF, 0xA3, 0, 0, 0, 0, 0, 0, 0, 0])
-            .expect("webm");
+        let webm = process(
+            "video/webm",
+            &[0x1A, 0x45, 0xDF, 0xA3, 0, 0, 0, 0, 0, 0, 0, 0],
+        )
+        .expect("webm");
         assert_eq!((webm.width, webm.height), (None, None));
     }
 

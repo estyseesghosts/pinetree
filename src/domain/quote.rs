@@ -80,15 +80,13 @@ impl QuoteAuthorizationState {
             | (Self::Unknown, Self::ApprovedByException)
             | (Self::Unknown, Self::Unapproved)
             | (Self::Unknown, Self::Pending) => true,
-            (Self::Approved, Self::Revoked)
-            | (Self::ApprovedByException, Self::Revoked) => true,
+            (Self::Approved, Self::Revoked) | (Self::ApprovedByException, Self::Revoked) => true,
             // A fresh stamp after revocation can re-approve (new verification).
             (Self::Revoked, Self::Approved)
             | (Self::Revoked, Self::ApprovedByException)
             | (Self::Revoked, Self::Pending) => true,
             // A fresh decision supersedes a rejection.
-            (Self::Rejected, Self::Approved)
-            | (Self::Rejected, Self::ApprovedByException) => true,
+            (Self::Rejected, Self::Approved) | (Self::Rejected, Self::ApprovedByException) => true,
             _ => false,
         }
     }
@@ -161,9 +159,7 @@ impl QuoteReference {
         }
         if let Some(auth) = self.authorization_uri.as_deref() {
             let auth = auth.trim();
-            if auth.is_empty()
-                || !(auth.starts_with("http://") || auth.starts_with("https://"))
-            {
+            if auth.is_empty() || !(auth.starts_with("http://") || auth.starts_with("https://")) {
                 return Err(invalid(
                     "quote authorization_uri must be an http(s) URI".to_string(),
                 ));
@@ -171,23 +167,17 @@ impl QuoteReference {
         }
         if let Some(req) = self.request_activity_uri.as_deref() {
             let req = req.trim();
-            if req.is_empty()
-                || !(req.starts_with("http://") || req.starts_with("https://"))
-            {
+            if req.is_empty() || !(req.starts_with("http://") || req.starts_with("https://")) {
                 return Err(invalid(
                     "quote request_activity_uri must be an http(s) URI".to_string(),
                 ));
             }
         }
         // Approval must carry evidence: a stamp or an exception.
-        if matches!(
-            self.authorization,
-            QuoteAuthorizationState::Approved
-        ) && self.authorization_uri.as_deref().map(str::trim) == Some("")
-            || matches!(
-                self.authorization,
-                QuoteAuthorizationState::Approved
-            ) && self.authorization_uri.is_none()
+        if matches!(self.authorization, QuoteAuthorizationState::Approved)
+            && self.authorization_uri.as_deref().map(str::trim) == Some("")
+            || matches!(self.authorization, QuoteAuthorizationState::Approved)
+                && self.authorization_uri.is_none()
         {
             return Err(invalid(
                 "approved quotes require an authorization stamp URI".to_string(),
@@ -271,8 +261,7 @@ mod tests {
 
     #[test]
     fn quote_reference_validation() {
-        let mut q =
-            QuoteReference::unapproved("https://remote.example/notes/1".to_string());
+        let mut q = QuoteReference::unapproved("https://remote.example/notes/1".to_string());
         assert!(q.validate().is_ok());
         // request_activity_uri, when present, must be an http(s) URI.
         q.request_activity_uri = Some("not-a-uri".to_string());

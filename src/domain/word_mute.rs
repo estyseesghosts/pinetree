@@ -44,11 +44,8 @@ impl CompiledWordMute {
         for filter in filters {
             match filter {
                 MutedWord::And(words) => {
-                    let terms: Vec<String> = words
-                        .iter()
-                        .filter(|w| !w.is_empty())
-                        .cloned()
-                        .collect();
+                    let terms: Vec<String> =
+                        words.iter().filter(|w| !w.is_empty()).cloned().collect();
                     if !terms.is_empty() {
                         out.and_groups.push(terms);
                     }

@@ -1,12 +1,8 @@
 use super::AppServices;
 
-use crate::application::ports::{
-    ApiTokenRecord, PortError, UpdateAccountPatch,
-};
-use crate::domain::account::{
-    AVATAR_DECORATION_LIMIT_DEFAULT, MutedWord, WORD_MUTE_LIMIT_DEFAULT,
-};
+use crate::application::ports::{ApiTokenRecord, PortError, UpdateAccountPatch};
 use crate::domain::account::Account;
+use crate::domain::account::{AVATAR_DECORATION_LIMIT_DEFAULT, MutedWord, WORD_MUTE_LIMIT_DEFAULT};
 use crate::domain::moderation::{ModerationAction, ModerationLogEntry};
 
 impl AppServices {
@@ -234,9 +230,7 @@ impl AppServices {
         {
             let total: usize = words.iter().map(MutedWord::char_len).sum();
             if total > WORD_MUTE_LIMIT_DEFAULT {
-                return Err(PortError::Validation(
-                    "TOO_MANY_MUTED_WORDS".to_string(),
-                ));
+                return Err(PortError::Validation("TOO_MANY_MUTED_WORDS".to_string()));
             }
             for word in words {
                 if let MutedWord::Single(single) = word {
@@ -322,10 +316,7 @@ impl AppServices {
                             inbox_override: None,
                         }
                         .into_job(
-                            format!(
-                                "federate:actor:{account_id}:{}",
-                                self.ids.generate()
-                            ),
+                            format!("federate:actor:{account_id}:{}", self.ids.generate()),
                             self.now_ms(),
                         )?,
                     );
@@ -336,16 +327,19 @@ impl AppServices {
         let updated = if let Some(job) = federate_job {
             jobs.push(job);
             let activity_id = format!("local-update-{account_id}-{}", self.ids.generate());
-            match self
-                .dedup
-                .record_update_account_activity(&activity_id, account_id, patch, jobs)?
-            {
+            match self.dedup.record_update_account_activity(
+                &activity_id,
+                account_id,
+                patch,
+                jobs,
+            )? {
                 Some(account) => account,
                 // Dedup replay is impossible with a fresh activity id; refetch
                 // defensively instead of failing the update.
-                None => self.accounts.find_by_id(account_id)?.ok_or_else(|| {
-                    PortError::NotFound("NO_SUCH_USER".to_string())
-                })?,
+                None => self
+                    .accounts
+                    .find_by_id(account_id)?
+                    .ok_or_else(|| PortError::NotFound("NO_SUCH_USER".to_string()))?,
             }
         } else {
             self.accounts.update_account(account_id, patch, jobs)?
@@ -355,9 +349,7 @@ impl AppServices {
         // each accept is itself atomic state+jobs).
         if unlocking {
             loop {
-                let pending = self
-                    .follows
-                    .follow_requests_to(account_id, None, 100)?;
+                let pending = self.follows.follow_requests_to(account_id, None, 100)?;
                 if pending.is_empty() {
                     break;
                 }
@@ -400,20 +392,15 @@ impl AppServices {
             Some((user, host)) if !user.is_empty() && !host.is_empty() => {
                 (user, Some(host.to_ascii_lowercase()))
             }
-            _ if !line.is_empty() && !line.contains('@') && !line.contains('/') => {
-                (line, None)
-            }
+            _ if !line.is_empty() && !line.contains('@') && !line.contains('/') => (line, None),
             _ => return Ok(None),
         };
         // A `user@host` line pointing at this instance resolves locally.
         let local_host = host_of_url(&self.public_url);
         let account = match host {
-            None => self
-                .accounts
-                .find_by_username_and_host(username, None)?,
+            None => self.accounts.find_by_username_and_host(username, None)?,
             Some(h) if Some(h.as_str()) == local_host.as_deref() => {
-                self.accounts
-                    .find_by_username_and_host(username, None)?
+                self.accounts.find_by_username_and_host(username, None)?
             }
             Some(h) => self
                 .accounts

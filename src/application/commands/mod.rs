@@ -2,18 +2,16 @@ use std::sync::Arc;
 
 use crate::application::ports::{
     AbuseReportRecipientStore, AbuseReportStore, AccountStore, ActivityDedup, AntennaNoteStore,
-    AntennaStore, AuthStore, BlobStore, BlockStore, ClipStore, Clock,
-    DriveFolderStore, EmojiStore, FavoriteStore, FollowStore, HostCapsStore,
-    IdGenerator, InstanceSettingsStore, InviteStore, JobQueue, MediaStore, ModerationLogStore,
-    MuteStore, NoteStore, NoteThreadMuteStore, NotificationStore, PageStore, PasswordResetStore,
-    PollStore, ReactionStore, RegistryStore, SigninStore, StreamingSink, SystemWebhookStore,
-    UserListStore,
-    UserMemoStore, UserWebhookStore,
+    AntennaStore, AuthStore, BlobStore, BlockStore, ClipStore, Clock, DriveFolderStore, EmojiStore,
+    FavoriteStore, FollowStore, HostCapsStore, IdGenerator, InstanceSettingsStore, InviteStore,
+    JobQueue, MediaStore, ModerationLogStore, MuteStore, NoteStore, NoteThreadMuteStore,
+    NotificationStore, PageStore, PasswordResetStore, PollStore, ReactionStore, RegistryStore,
+    SigninStore, StreamingSink, SystemWebhookStore, UserListStore, UserMemoStore, UserWebhookStore,
 };
 use crate::federation::delivery::SafeHttpClient;
 
-pub mod accounts;
 pub mod abuse_reports;
+pub mod accounts;
 pub mod admin_ext;
 pub mod announcements;
 pub mod antennas;
@@ -22,6 +20,9 @@ pub mod blocks;
 pub mod drafts;
 pub mod emoji;
 
+pub mod clips;
+pub mod drive_bulk;
+pub mod drive_folders;
 pub mod emoji_transfer;
 pub mod exports;
 pub mod favorites;
@@ -35,18 +36,15 @@ pub mod keys;
 pub mod media;
 pub mod misc_endpoints;
 pub mod moderation;
-pub mod notifications;
 pub mod notes;
+pub mod notifications;
+pub mod pages;
 pub mod pins;
 pub mod polls;
-pub mod clips;
-pub mod drive_bulk;
-pub mod drive_folders;
-pub mod pages;
-pub mod user_lists;
-pub mod webhooks;
 #[cfg(test)]
 pub(crate) mod tests;
+pub mod user_lists;
+pub mod webhooks;
 
 /// Application services: the use-case layer over the storage ports.
 ///

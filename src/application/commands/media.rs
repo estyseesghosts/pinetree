@@ -1,7 +1,7 @@
 use super::AppServices;
 
 use crate::application::ports::{CacheStats, InsertMediaInput, PortError, TimelineCursor};
-use crate::domain::media::{sniff_mime, MediaMeta, MediaProperties};
+use crate::domain::media::{MediaMeta, MediaProperties, sniff_mime};
 use crate::media::ingest::{md5_hex, sanitize_filename, sha256_hex};
 use crate::media::remote_cache::validate_remote_media_url;
 
@@ -32,9 +32,7 @@ impl AppServices {
     ) -> Result<MediaMeta, PortError> {
         self.accounts.get_owner(owner_id)?;
         if bytes.len() as u64 > self.max_file_size {
-            return Err(PortError::Validation(
-                "MAX_FILE_SIZE_EXCEEDED".to_string(),
-            ));
+            return Err(PortError::Validation("MAX_FILE_SIZE_EXCEEDED".to_string()));
         }
         // Slice 8 (D6): both hashes are computed on upload. The MD5 stays
         // the per-owner dedup key (same bytes → same md5 → existing row)
@@ -57,9 +55,7 @@ impl AppServices {
         let size_bytes = bytes.len() as u64;
         let used = self.media.durable_bytes(owner_id)?;
         if used.saturating_add(size_bytes) > self.drive_capacity_per_user_bytes {
-            return Err(PortError::Validation(
-                "DRIVE_CAPACITY_EXCEEDED".to_string(),
-            ));
+            return Err(PortError::Validation("DRIVE_CAPACITY_EXCEEDED".to_string()));
         }
         // Slice 7 (H2): the stored MIME comes from the shared sniffer only.
         // The caller-supplied content type is deliberately ignored so a
@@ -177,11 +173,7 @@ impl AppServices {
     /// not the caller's own row — missing, unowned, or a remote-cache row —
     /// is `NO_SUCH_FILE` (profile §3). Grandfathered over-quota reads are
     /// unaffected: no quota check applies on reads.
-    pub fn get_media_for(
-        &self,
-        caller_id: &str,
-        file_id: &str,
-    ) -> Result<MediaMeta, PortError> {
+    pub fn get_media_for(&self, caller_id: &str, file_id: &str) -> Result<MediaMeta, PortError> {
         self.accounts.get_owner(caller_id)?;
         match self.media.get(file_id)? {
             Some(meta) if meta.owner_id.as_deref() == Some(caller_id) => Ok(meta),

@@ -363,8 +363,8 @@ impl<'w> TableSink<'w> {
             if self.seen.contains(name) {
                 continue;
             }
-            let (key_sig, value_sig) =
-                crate::persistence::redb::backup_table_signature(name).ok_or_else(|| {
+            let (key_sig, value_sig) = crate::persistence::redb::backup_table_signature(name)
+                .ok_or_else(|| {
                     BackupError::Storage(format!("backup registry table without signature {name}"))
                 })?;
             self.writer
@@ -715,7 +715,9 @@ pub fn decode_table_file(
         ));
         pos += klen + vlen;
         if rows.len() as u64 > expected_rows {
-            return Err(BackupError::Corrupt("table holds more rows than the manifest declares".to_string()));
+            return Err(BackupError::Corrupt(
+                "table holds more rows than the manifest declares".to_string(),
+            ));
         }
     }
     if rows.len() as u64 != expected_rows {

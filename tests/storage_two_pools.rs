@@ -3,8 +3,8 @@
 //! `blobs_cache/` (capped, LRU+TTL). A pre-overhaul `blobs/` root migrates
 //! by rename and stays readable under the durable pool.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use pinetree::application::commands::AppServices;
 use pinetree::application::ports::{
@@ -32,10 +32,7 @@ struct PoolHarness {
 
 fn pool_harness() -> (PoolHarness, String) {
     let n = POOL_SEQ.fetch_add(1, Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!(
-        "pinetree-twopools-{}-{n}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("pinetree-twopools-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let clock: Arc<ManualClock> = Arc::new(ManualClock::new(BASE_MS));
     let clock_port: Arc<dyn Clock> = clock.clone();
@@ -167,14 +164,7 @@ fn identical_bytes_cache_evict_spares_durable() {
     let bytes = b"shared-payload";
     let meta = h
         .services
-        .upload_media(
-            &owner,
-            "shared.bin".to_string(),
-            bytes,
-            None,
-            false,
-            false,
-        )
+        .upload_media(&owner, "shared.bin".to_string(), bytes, None, false, false)
         .unwrap();
     h.cache.put(&meta.blob_key, bytes).unwrap();
     assert_eq!(h.durable.get(&meta.blob_key).unwrap().unwrap(), bytes);

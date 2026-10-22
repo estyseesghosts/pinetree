@@ -58,8 +58,7 @@ pub fn narrow_on_create(input: NarrowingInput<'_>) -> Result<NarrowedOutput, Dom
     } = input;
 
     // Blocking: pure renote (non-quote) of a user who blocks the author.
-    if renote_target.is_some() && text.is_none() && cw.is_none() && renote_target_blocks_author
-    {
+    if renote_target.is_some() && text.is_none() && cw.is_none() && renote_target_blocks_author {
         return Err(DomainError::Validation("YOU_HAVE_BEEN_BLOCKED".into()));
     }
 
@@ -203,7 +202,10 @@ mod tests {
             text: Some("hello".to_string()),
             cw: None,
             visibility,
-            visible_user_ids: visible_user_ids.into_iter().map(|s: &str| s.to_owned()).collect(),
+            visible_user_ids: visible_user_ids
+                .into_iter()
+                .map(|s: &str| s.to_owned())
+                .collect(),
             local_only,
             reply_id: None,
             renote_id: None,
@@ -295,7 +297,10 @@ mod tests {
         ));
         // Control: the same note without a pending parent is visible.
         note.reply_parent_uri = None;
-        assert!(is_visible(&note, &ViewerContext::local_user("stranger", false)));
+        assert!(is_visible(
+            &note,
+            &ViewerContext::local_user("stranger", false)
+        ));
     }
 
     /// E1 (timelines): only local public notes are local-timeline eligible;
@@ -429,7 +434,16 @@ mod tests {
     /// ineligible for every timeline/delivery surface.
     #[test]
     fn deleted_notes_invisible_and_ineligible() {
-        let note = make_note("author", Visibility::Public, false, vec![], vec![], None, None, true);
+        let note = make_note(
+            "author",
+            Visibility::Public,
+            false,
+            vec![],
+            vec![],
+            None,
+            None,
+            true,
+        );
         for viewer in local_viewers() {
             assert!(!is_visible(&note, &viewer));
         }

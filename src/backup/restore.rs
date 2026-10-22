@@ -198,18 +198,26 @@ fn pass0_enumerate_and_validate(
     let mut manifest_tables: BTreeSet<&str> = BTreeSet::new();
     for table in &manifest.tables {
         if !manifest_tables.insert(table.name.as_str()) {
-            return Err(BackupError::Corrupt("duplicate table in manifest".to_string()));
+            return Err(BackupError::Corrupt(
+                "duplicate table in manifest".to_string(),
+            ));
         }
         if table.rows > MAX_TABLE_ROW_BYTES * 1024 || table.bytes > MAX_BUNDLE_BYTES {
-            return Err(BackupError::Corrupt("table declares excessive size".to_string()));
+            return Err(BackupError::Corrupt(
+                "table declares excessive size".to_string(),
+            ));
         }
         let Some((key_sig, value_sig)) =
             crate::persistence::redb::backup_table_signature(&table.name)
         else {
-            return Err(BackupError::Corrupt("bundle table is not in the pinned schema".to_string()));
+            return Err(BackupError::Corrupt(
+                "bundle table is not in the pinned schema".to_string(),
+            ));
         };
         if table.key_sig != key_sig || table.value_sig != value_sig {
-            return Err(BackupError::Corrupt("bundle table has incompatible type metadata".to_string()));
+            return Err(BackupError::Corrupt(
+                "bundle table has incompatible type metadata".to_string(),
+            ));
         }
     }
     let manifest_set: BTreeSet<&str> = manifest_tables.clone();
@@ -234,10 +242,14 @@ fn pass0_enumerate_and_validate(
         if !media.path.starts_with(MEDIA_DURABLE_PREFIX)
             && !media.path.starts_with(MEDIA_CACHE_PREFIX)
         {
-            return Err(BackupError::Corrupt("manifest media path outside pools".to_string()));
+            return Err(BackupError::Corrupt(
+                "manifest media path outside pools".to_string(),
+            ));
         }
         if media.bytes > MAX_BUNDLE_BYTES {
-            return Err(BackupError::Corrupt("media declares excessive size".to_string()));
+            return Err(BackupError::Corrupt(
+                "media declares excessive size".to_string(),
+            ));
         }
         expected.insert(media.path.clone());
     }
@@ -349,7 +361,9 @@ fn pass2_write_and_verify(
             .map_err(|e| BackupError::Corrupt(format!("open table entry: {e}")))?;
         let imported = import_table_stream(&mut entry, table, &store, &mut media_refs)?;
         if imported != table.rows {
-            return Err(BackupError::Corrupt("table import count mismatch".to_string()));
+            return Err(BackupError::Corrupt(
+                "table import count mismatch".to_string(),
+            ));
         }
         rows_total += imported;
     }
@@ -486,7 +500,9 @@ fn pass2_write_and_verify(
             .map(|(_, n)| *n)
             .unwrap_or(0);
         if found != table.rows {
-            return Err(BackupError::Corrupt("restored table count mismatch".to_string()));
+            return Err(BackupError::Corrupt(
+                "restored table count mismatch".to_string(),
+            ));
         }
     }
     let mismatches = reopened

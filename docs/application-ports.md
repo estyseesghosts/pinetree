@@ -300,3 +300,10 @@ Status: ADDENDUM only. Frozen text above is not rewritten. Sources: `state/logs/
 
 - `StorageUnavailable` convention kept and extended: every new trait default returns `Err(PortError::StorageUnavailable(..))`, never `unimplemented!()` (WP6 zero-`unimplemented!` rule; `grep -c` stays `0`). Mem doubles double as test fakes so nothing panics when an adapter omits a method.
 - Deferred (parent final-wiring, not this addendum): the `ports.rs` trait moves, redb tables + backfills, `JobKind::{TranscodeMedia, WebhookDeliver, EmailSend}` + worker arms, `TranscodeConfig`/`MediaState` + `commit_transcoded_media` + `upload_media_with_transcode_job`, durable `ActivityIndex` + `JobQueue::has_pending_with_key`, `NoteStore::notes_with_file` index (replaces the bounded attached-notes scan), stored antenna `exclude_sensitive` column. All are specified in the WP reports cited above.
+
+## Addendum 2026-10-22 (module split; paths only, no contract change)
+
+Status: ADDENDUM only. Frozen text above is not rewritten. All crate::application::ports::* paths still resolve (parent ports/mod.rs re-exports every trait). Only file locations changed:
+- src/application/ports.rs (3,243 non-blank) is now src/application/ports/ (29 files, one per trait; e.g. ReplyParentResolvePayload in job_queue.rs, MAX_JOB_PAYLOAD_BYTES beside it).
+- grep -c 'unimplemented!' src/application/ports/*.rs returns   (WP6 rule holds).
+- Re-verified by cargo test --lib --offline (626 passed) and cargo test --offline --test conformance (119 passed). Recorded in state/logs/2026-10-22-module-split-program.md.

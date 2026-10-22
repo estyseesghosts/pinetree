@@ -7,8 +7,8 @@
 //! parameter, or the `pinetree_session` cookie.
 
 use argon2::{
-    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Algorithm, Argon2, Params, Version,
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng},
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -164,8 +164,7 @@ pub fn token_from_authorization_header(value: &str) -> Option<String> {
 
 /// Extract the raw credential from a JSON body (`"i"` parameter).
 pub fn token_from_body(body: &Value) -> Option<String> {
-    body
-        .get("i")
+    body.get("i")
         .and_then(Value::as_str)
         .filter(|token| !token.is_empty())
         .map(|token| token.to_string())
@@ -259,7 +258,10 @@ pub fn require_admin(caller: &AuthenticatedCaller) -> Result<(), ApiError> {
 
 /// Resolve `raw_token` to its caller: token-hash lookup, account load,
 /// suspended/deleted gating. Storage faults surface as 500 `ApiError`s.
-pub fn authenticate(services: &AppServices, raw_token: &str) -> Result<AuthenticatedCaller, ApiError> {
+pub fn authenticate(
+    services: &AppServices,
+    raw_token: &str,
+) -> Result<AuthenticatedCaller, ApiError> {
     let record = services
         .auth
         .get_token_by_hash(&hash_token(raw_token))
@@ -471,12 +473,16 @@ mod tests {
             .await
             .expect("hash task");
         assert!(stored.starts_with("$argon2id$"));
-        assert!(verify_password_async("async-pw".to_string(), stored.clone())
-            .await
-            .expect("verify task"));
-        assert!(!verify_password_async("nope".to_string(), stored)
-            .await
-            .expect("verify task"));
+        assert!(
+            verify_password_async("async-pw".to_string(), stored.clone())
+                .await
+                .expect("verify task")
+        );
+        assert!(
+            !verify_password_async("nope".to_string(), stored)
+                .await
+                .expect("verify task")
+        );
     }
 
     #[test]
@@ -491,7 +497,11 @@ mod tests {
     fn credential_extraction_order() {
         let body = serde_json::json!({"i": "body-token"});
         assert_eq!(
-            extract_raw_token(Some("Bearer header-token"), Some(&body), Some("pinetree_session=cookie-token")),
+            extract_raw_token(
+                Some("Bearer header-token"),
+                Some(&body),
+                Some("pinetree_session=cookie-token")
+            ),
             Some("header-token".to_string())
         );
         assert_eq!(

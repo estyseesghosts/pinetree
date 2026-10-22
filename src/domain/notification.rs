@@ -116,7 +116,9 @@ mod tests {
 
     #[test]
     fn notification_roundtrips() {
-        let n = Notification { clip_id: None, page_id: None,
+        let n = Notification {
+            clip_id: None,
+            page_id: None,
             id: "nid00000000000001".to_string(),
             notifiee_id: "aid00000000000001".to_string(),
             notifier_id: "aid00000000000002".to_string(),

@@ -61,17 +61,12 @@ pub fn stream_response_to_store<R: Read>(
     max_bytes: u64,
     store_tmp_dir: &Path,
 ) -> Result<(PathBuf, StreamFetchResult), PortError> {
-    fs::create_dir_all(store_tmp_dir).map_err(|e| {
-        PortError::StorageUnavailable(format!("create fetch staging dir: {e}"))
-    })?;
+    fs::create_dir_all(store_tmp_dir)
+        .map_err(|e| PortError::StorageUnavailable(format!("create fetch staging dir: {e}")))?;
     let seq = FETCH_TMP_SEQ.fetch_add(1, Ordering::SeqCst);
-    let tmp_path = store_tmp_dir.join(format!(
-        "fetch.{}.{seq}.tmp",
-        std::process::id()
-    ));
-    let mut file = fs::File::create(&tmp_path).map_err(|e| {
-        PortError::StorageUnavailable(format!("create staged fetch file: {e}"))
-    })?;
+    let tmp_path = store_tmp_dir.join(format!("fetch.{}.{seq}.tmp", std::process::id()));
+    let mut file = fs::File::create(&tmp_path)
+        .map_err(|e| PortError::StorageUnavailable(format!("create staged fetch file: {e}")))?;
     let mut sha = Sha256::new();
     let mut md5 = Md5::new();
     let mut bytes_written: u64 = 0;
@@ -87,9 +82,7 @@ pub fn stream_response_to_store<R: Read>(
         if bytes_written + n as u64 > max_bytes {
             drop(file);
             let _ = fs::remove_file(&tmp_path);
-            return Err(PortError::Validation(
-                "MAX_FILE_SIZE_EXCEEDED".to_string(),
-            ));
+            return Err(PortError::Validation("MAX_FILE_SIZE_EXCEEDED".to_string()));
         }
         file.write_all(&buf[..n]).map_err(|e| {
             let _ = fs::remove_file(&tmp_path);
@@ -127,18 +120,16 @@ pub fn stream_response_to_store<R: Read>(
 /// prefix, or `application/octet-stream` that longer magic could refine).
 /// The full read is bounded: staged files never exceed their fetch cap.
 fn sniff_staged_file(tmp: &Path) -> Result<String, PortError> {
-    let file_len = fs::metadata(tmp).map(|m| m.len()).map_err(|e| {
-        PortError::StorageUnavailable(format!("stat staged fetch file: {e}"))
-    })?;
+    let file_len = fs::metadata(tmp)
+        .map(|m| m.len())
+        .map_err(|e| PortError::StorageUnavailable(format!("stat staged fetch file: {e}")))?;
     let head_len = (file_len.min(SNIFF_PREFIX_LEN as u64)) as usize;
     let mut head = vec![0u8; head_len];
     {
-        let mut f = fs::File::open(tmp).map_err(|e| {
-            PortError::StorageUnavailable(format!("open staged fetch file: {e}"))
-        })?;
-        f.read_exact(&mut head).map_err(|e| {
-            PortError::StorageUnavailable(format!("read staged fetch file: {e}"))
-        })?;
+        let mut f = fs::File::open(tmp)
+            .map_err(|e| PortError::StorageUnavailable(format!("open staged fetch file: {e}")))?;
+        f.read_exact(&mut head)
+            .map_err(|e| PortError::StorageUnavailable(format!("read staged fetch file: {e}")))?;
     }
     let head_mime = sniff_mime(&head);
     if head_len as u64 == file_len
@@ -146,23 +137,18 @@ fn sniff_staged_file(tmp: &Path) -> Result<String, PortError> {
     {
         return Ok(head_mime);
     }
-    let full = fs::read(tmp).map_err(|e| {
-        PortError::StorageUnavailable(format!("read staged fetch file: {e}"))
-    })?;
+    let full = fs::read(tmp)
+        .map_err(|e| PortError::StorageUnavailable(format!("read staged fetch file: {e}")))?;
     Ok(sniff_mime(&full))
 }
 
 /// Move a staged file from [`stream_response_to_store`] into `store` under
 /// `blob_key` without re-reading the content. Returns the stored length.
 /// The staged file is consumed (renamed or removed) on success.
-pub fn finalize_import(
-    store: &FsBlobStore,
-    blob_key: &str,
-    tmp: &Path,
-) -> Result<u64, PortError> {
-    let len = fs::metadata(tmp).map(|m| m.len()).map_err(|e| {
-        PortError::StorageUnavailable(format!("stat staged blob file: {e}"))
-    })?;
+pub fn finalize_import(store: &FsBlobStore, blob_key: &str, tmp: &Path) -> Result<u64, PortError> {
+    let len = fs::metadata(tmp)
+        .map(|m| m.len())
+        .map_err(|e| PortError::StorageUnavailable(format!("stat staged blob file: {e}")))?;
     store.import_file(blob_key, tmp)?;
     Ok(len)
 }
@@ -183,7 +169,11 @@ mod tests {
 
     impl ChunkReader {
         fn new(data: Vec<u8>, chunk: usize) -> Self {
-            Self { data, pos: 0, chunk }
+            Self {
+                data,
+                pos: 0,
+                chunk,
+            }
         }
     }
 
@@ -228,11 +218,17 @@ mod tests {
     fn stream_cap_exceeded_deletes_partial() {
         let dir = staging_dir("cap");
         let payload = vec![0x89u8; 8192];
-        let before: Vec<PathBuf> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
+        let before: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
         let err = stream_response_to_store(ChunkReader::new(payload, 7), 4096, &dir).unwrap_err();
         assert!(matches!(err, PortError::Validation(msg) if msg == "MAX_FILE_SIZE_EXCEEDED"));
         // No partial staged file may linger.
-        let after: Vec<PathBuf> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
+        let after: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
         assert_eq!(before, after);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -247,8 +243,8 @@ mod tests {
         assert_eq!(res.bytes_written, 100);
         assert_eq!(res.mime, "text/plain");
         let _ = std::fs::remove_file(&tmp);
-        let err = stream_response_to_store(ChunkReader::new(vec![b'a'; 101], 30), 100, &dir)
-            .unwrap_err();
+        let err =
+            stream_response_to_store(ChunkReader::new(vec![b'a'; 101], 30), 100, &dir).unwrap_err();
         assert!(matches!(err, PortError::Validation(msg) if msg == "MAX_FILE_SIZE_EXCEEDED"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -289,7 +285,10 @@ mod tests {
         let len = finalize_import(&pool, &res.sha256, &tmp).unwrap();
         assert_eq!(len, payload.len() as u64);
         assert!(!tmp.exists(), "staged file must be consumed");
-        assert_eq!(pool.get(&res.sha256).unwrap().as_deref(), Some(&payload[..]));
+        assert_eq!(
+            pool.get(&res.sha256).unwrap().as_deref(),
+            Some(&payload[..])
+        );
         assert_eq!(pool.byte_len(&res.sha256).unwrap(), Some(len));
         let _ = std::fs::remove_dir_all(&dir);
     }

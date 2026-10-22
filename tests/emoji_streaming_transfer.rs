@@ -27,7 +27,7 @@ use pinetree::api::misskey::response::{RateLimiter, UploadSlots};
 use pinetree::api::misskey::{ApiState, build_router};
 use pinetree::application::commands::AppServices;
 use pinetree::application::commands::emoji_transfer::{
-    handle_custom_emoji_transfer, TRANSFER_MAX_ENTRIES,
+    TRANSFER_MAX_ENTRIES, handle_custom_emoji_transfer,
 };
 use pinetree::application::events::{EmojiBroadcastOp, StreamingEvent};
 use pinetree::application::ports::{
@@ -39,8 +39,8 @@ use pinetree::federation::delivery::{SafeHttpClient, SafeHttpConfig};
 use pinetree::federation::retry::DestinationTracker;
 use pinetree::jobs::worker::JobWorker;
 use pinetree::media::transcode::TranscodeConfig;
-use pinetree::services::email::{SmtpConfig, SmtpEmailSender};
 use pinetree::persistence::redb::RedbStore;
+use pinetree::services::email::{SmtpConfig, SmtpEmailSender};
 use pinetree::streaming::hub::hub_and_sink;
 
 #[derive(Default)]
@@ -50,7 +50,10 @@ struct MemBlobs {
 
 impl BlobStore for MemBlobs {
     fn put(&self, hash: &str, bytes: &[u8]) -> Result<(), PortError> {
-        self.inner.lock().unwrap().insert(hash.to_string(), bytes.to_vec());
+        self.inner
+            .lock()
+            .unwrap()
+            .insert(hash.to_string(), bytes.to_vec());
         Ok(())
     }
     fn get(&self, hash: &str) -> Result<Option<Vec<u8>>, PortError> {
@@ -70,7 +73,8 @@ struct LiveServer {
 
 impl LiveServer {
     async fn start() -> Self {
-        let dir = std::env::temp_dir().join(format!("pinetree-emoji-xfer-test-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("pinetree-emoji-xfer-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let ids: Arc<dyn IdGenerator> = Arc::new(AidxGenerator::new(clock.clone()));
@@ -204,10 +208,13 @@ impl LiveServer {
     }
 }
 
-type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type Ws =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 async fn connect(url: &str) -> Ws {
-    let (ws, _) = tokio_tungstenite::connect_async(url).await.expect("ws connect");
+    let (ws, _) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("ws connect");
     ws
 }
 
@@ -233,7 +240,11 @@ fn png_bytes(tag: &[u8]) -> Vec<u8> {
     out
 }
 
-fn publish_broadcast(services: &Arc<AppServices>, op: EmojiBroadcastOp, emojis: Vec<pinetree::domain::emoji::CustomEmoji>) {
+fn publish_broadcast(
+    services: &Arc<AppServices>,
+    op: EmojiBroadcastOp,
+    emojis: Vec<pinetree::domain::emoji::CustomEmoji>,
+) {
     let event = StreamingEvent::EmojiBroadcast { op, emojis };
     let job = NewJob::new_json(
         JobKind::StreamingPublish,
@@ -263,11 +274,28 @@ async fn emoji_broadcast_reaches_every_connection_without_channels() {
     // `admin/emoji/add` fans out `emojiAdded` with `{emoji}` post-commit.
     let file = srv
         .services
-        .upload_media(&mod_id, "a.png".to_string(), &png_bytes(b"a"), None, false, false)
+        .upload_media(
+            &mod_id,
+            "a.png".to_string(),
+            &png_bytes(b"a"),
+            None,
+            false,
+            false,
+        )
         .unwrap();
     let emoji = srv
         .services
-        .create_emoji(&mod_id, "blobcat", &file.id, None, vec![], None, false, false, vec![])
+        .create_emoji(
+            &mod_id,
+            "blobcat",
+            &file.id,
+            None,
+            vec![],
+            None,
+            false,
+            false,
+            vec![],
+        )
         .unwrap();
     for ws in [&mut ws1, &mut ws2] {
         let frame = recv(ws).await;
@@ -302,9 +330,20 @@ async fn emoji_broadcast_reaches_every_connection_without_channels() {
 
     // `admin/emoji/delete` fans out `emojiDeleted` with the pre-delete
     // snapshot, even though the row is gone when the worker packs it.
-    let snap = srv.services.emojis.get_emoji_by_name("blobcat").unwrap().unwrap();
+    let snap = srv
+        .services
+        .emojis
+        .get_emoji_by_name("blobcat")
+        .unwrap()
+        .unwrap();
     srv.services.delete_emoji(&mod_id, &snap.id).unwrap();
-    assert!(srv.services.emojis.get_emoji_by_name("blobcat").unwrap().is_none());
+    assert!(
+        srv.services
+            .emojis
+            .get_emoji_by_name("blobcat")
+            .unwrap()
+            .is_none()
+    );
     for ws in [&mut ws1, &mut ws2] {
         let frame = recv(ws).await;
         assert_eq!(frame["type"], "emojiDeleted", "{frame}");
@@ -324,10 +363,27 @@ async fn emoji_broadcast_reaches_every_connection_without_channels() {
     }
     let file2 = srv
         .services
-        .upload_media(&mod_id, "b.png".to_string(), &png_bytes(b"b"), None, false, false)
+        .upload_media(
+            &mod_id,
+            "b.png".to_string(),
+            &png_bytes(b"b"),
+            None,
+            false,
+            false,
+        )
         .unwrap();
     srv.services
-        .create_emoji(&mod_id, "tada", &file2.id, None, vec![], None, false, false, vec![])
+        .create_emoji(
+            &mod_id,
+            "tada",
+            &file2.id,
+            None,
+            vec![],
+            None,
+            false,
+            false,
+            vec![],
+        )
         .unwrap();
     for ws in [&mut ws1, &mut ws2] {
         let frame = recv(ws).await;
@@ -336,17 +392,27 @@ async fn emoji_broadcast_reaches_every_connection_without_channels() {
     }
 }
 
-fn drive_zip_bytes(services: &Arc<AppServices>, owner_id: &str, zip_name: &str) -> (Value, Vec<u8>) {
+fn drive_zip_bytes(
+    services: &Arc<AppServices>,
+    owner_id: &str,
+    zip_name: &str,
+) -> (Value, Vec<u8>) {
     let rows = services.media.list_by_owner(owner_id).unwrap();
-    let meta = rows
-        .iter()
-        .find(|m| m.name == zip_name)
-        .unwrap_or_else(|| panic!("no drive file {zip_name} in {:?}", rows.iter().map(|m| &m.name).collect::<Vec<_>>()));
+    let meta = rows.iter().find(|m| m.name == zip_name).unwrap_or_else(|| {
+        panic!(
+            "no drive file {zip_name} in {:?}",
+            rows.iter().map(|m| &m.name).collect::<Vec<_>>()
+        )
+    });
     let bytes = services.blobs.get(&meta.blob_key).unwrap().unwrap();
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&bytes[..])).unwrap();
     let mut buf = String::new();
     use std::io::Read as _;
-    archive.by_name("meta.json").unwrap().read_to_string(&mut buf).unwrap();
+    archive
+        .by_name("meta.json")
+        .unwrap()
+        .read_to_string(&mut buf)
+        .unwrap();
     (serde_json::from_str(&buf).unwrap(), bytes)
 }
 
@@ -358,24 +424,61 @@ async fn export_builds_stored_zip_and_export_completed_notify() {
 
     let file_a = srv
         .services
-        .upload_media(&alice_id, "a.png".to_string(), &png_bytes(b"aaa"), None, false, false)
+        .upload_media(
+            &alice_id,
+            "a.png".to_string(),
+            &png_bytes(b"aaa"),
+            None,
+            false,
+            false,
+        )
         .unwrap();
     srv.services
-        .create_emoji(&mod_id, "alpha", &file_a.id, None, vec![], None, false, false, vec![])
+        .create_emoji(
+            &mod_id,
+            "alpha",
+            &file_a.id,
+            None,
+            vec![],
+            None,
+            false,
+            false,
+            vec![],
+        )
         .unwrap();
     // An emoji whose media row is gone exports as `downloaded: false`.
     let file_b = srv
         .services
-        .upload_media(&alice_id, "b.png".to_string(), &png_bytes(b"bbb"), None, false, false)
+        .upload_media(
+            &alice_id,
+            "b.png".to_string(),
+            &png_bytes(b"bbb"),
+            None,
+            false,
+            false,
+        )
         .unwrap();
     let beta = srv
         .services
-        .create_emoji(&mod_id, "beta", &file_b.id, None, vec![], None, false, false, vec![])
+        .create_emoji(
+            &mod_id,
+            "beta",
+            &file_b.id,
+            None,
+            vec![],
+            None,
+            false,
+            false,
+            vec![],
+        )
         .unwrap();
     srv.services.media.delete_metadata(&file_b.id).unwrap();
     assert_eq!(beta.shortcode, "beta");
 
-    let payload = CustomEmojiTransferPayload { user_id: alice_id.clone(), file_id: None };
+    let payload = CustomEmojiTransferPayload {
+        user_id: alice_id.clone(),
+        file_id: None,
+    };
     let job = NewJob::new_json(
         JobKind::ExportCustomEmojis,
         &payload,
@@ -388,8 +491,15 @@ async fn export_builds_stored_zip_and_export_completed_notify() {
     // The background worker runs export → drive store → exportCompleted.
     let deadline = Instant::now() + Duration::from_secs(10);
     let notify = loop {
-        let notifs = srv.services.notifications.list_notifications(&alice_id, 100).unwrap();
-        if let Some(n) = notifs.iter().find(|n| matches!(n.kind, NotificationKind::ExportCompleted)) {
+        let notifs = srv
+            .services
+            .notifications
+            .list_notifications(&alice_id, 100)
+            .unwrap();
+        if let Some(n) = notifs
+            .iter()
+            .find(|n| matches!(n.kind, NotificationKind::ExportCompleted))
+        {
             break n.clone();
         }
         if Instant::now() > deadline {
@@ -398,9 +508,15 @@ async fn export_builds_stored_zip_and_export_completed_notify() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
     assert_eq!(notify.exported_entity.as_deref(), Some("customEmoji"));
-    let file_id = notify.file_id.clone().expect("exportCompleted carries fileId");
+    let file_id = notify
+        .file_id
+        .clone()
+        .expect("exportCompleted carries fileId");
     let stored = srv.services.media.list_by_owner(&alice_id).unwrap();
-    let stored = stored.iter().find(|m| m.id == file_id).expect("drive file exists");
+    let stored = stored
+        .iter()
+        .find(|m| m.id == file_id)
+        .expect("drive file exists");
     assert!(stored.name.starts_with("custom-emojis-"), "{}", stored.name);
     assert!(stored.name.ends_with(".zip"), "{}", stored.name);
     let zip_name = stored.name.clone();
@@ -423,7 +539,9 @@ async fn export_builds_stored_zip_and_export_completed_notify() {
     let stored = rows2.iter().find(|m| m.name == zip_name).unwrap();
     let raw = srv.services.blobs.get(&stored.blob_key).unwrap().unwrap();
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&raw[..])).unwrap();
-    let names: Vec<String> = (0..archive.len()).map(|i| archive.name_for_index(i).unwrap().to_string()).collect();
+    let names: Vec<String> = (0..archive.len())
+        .map(|i| archive.name_for_index(i).unwrap().to_string())
+        .collect();
     assert!(names.contains(&"meta.json".to_string()), "{names:?}");
     assert!(names.contains(&"alpha.png".to_string()), "{names:?}");
     assert!(!names.iter().any(|n| n.contains("beta")), "{names:?}");
@@ -437,10 +555,15 @@ fn build_zip(meta: &Value, entries: &[(&str, zip::CompressionMethod, Vec<u8>)]) 
     let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let opts = zip::write::SimpleFileOptions::default();
     writer.start_file("meta.json", opts).unwrap();
-    writer.write_all(&serde_json::to_vec(meta).unwrap()).unwrap();
+    writer
+        .write_all(&serde_json::to_vec(meta).unwrap())
+        .unwrap();
     for (name, method, bytes) in entries {
         writer
-            .start_file(*name, zip::write::SimpleFileOptions::default().compression_method(*method))
+            .start_file(
+                *name,
+                zip::write::SimpleFileOptions::default().compression_method(*method),
+            )
             .unwrap();
         writer.write_all(bytes).unwrap();
     }
@@ -478,11 +601,28 @@ async fn import_applies_rows_and_replaces_collisions() {
     // Collision: a live row with the same name but different bytes.
     let old_file = srv
         .services
-        .upload_media(&alice_id, "old.png".to_string(), &png_bytes(b"old"), None, false, false)
+        .upload_media(
+            &alice_id,
+            "old.png".to_string(),
+            &png_bytes(b"old"),
+            None,
+            false,
+            false,
+        )
         .unwrap();
     let before = srv
         .services
-        .create_emoji(&alice_id, "repl", &old_file.id, None, vec![], None, false, false, vec![])
+        .create_emoji(
+            &alice_id,
+            "repl",
+            &old_file.id,
+            None,
+            vec![],
+            None,
+            false,
+            false,
+            vec![],
+        )
         .unwrap();
 
     let new_png = png_bytes(b"new-bytes-here");
@@ -490,7 +630,10 @@ async fn import_applies_rows_and_replaces_collisions() {
         "metaVersion": 2, "host": "remote.test", "exportedAt": "2026-10-20T00:00:00.000Z",
         "emojis": [meta_row("repl.png", true, "repl")],
     });
-    let zip = build_zip(&meta, &[("repl.png", zip::CompressionMethod::Stored, new_png.clone())]);
+    let zip = build_zip(
+        &meta,
+        &[("repl.png", zip::CompressionMethod::Stored, new_png.clone())],
+    );
     let zip_id = upload_zip(&srv.services, &alice_id, "import.zip", &zip);
     let out = handle_custom_emoji_transfer(
         &srv.services,
@@ -500,10 +643,23 @@ async fn import_applies_rows_and_replaces_collisions() {
     .unwrap();
     assert!(out.is_none());
 
-    let after = srv.services.emojis.get_emoji_by_name("repl").unwrap().unwrap();
+    let after = srv
+        .services
+        .emojis
+        .get_emoji_by_name("repl")
+        .unwrap()
+        .unwrap();
     assert_ne!(after.id, before.id, "delete-then-add replaces the row");
-    let media = srv.services.media.get(after.media_id.as_deref().unwrap()).unwrap().unwrap();
-    assert_eq!(srv.services.blobs.get(&media.blob_key).unwrap().unwrap(), new_png);
+    let media = srv
+        .services
+        .media
+        .get(after.media_id.as_deref().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        srv.services.blobs.get(&media.blob_key).unwrap().unwrap(),
+        new_png
+    );
 }
 
 #[tokio::test]
@@ -535,10 +691,26 @@ async fn import_skips_bad_rows_but_applies_good_ones() {
         &meta,
         &[
             ("good.png", zip::CompressionMethod::Stored, good_png.clone()),
-            ("text.png", zip::CompressionMethod::Stored, b"hello world".to_vec()),
-            ("../evil.png", zip::CompressionMethod::Stored, png_bytes(b"evil")),
-            ("bad-name.png", zip::CompressionMethod::Stored, png_bytes(b"bad")),
-            ("skipped.png", zip::CompressionMethod::Stored, png_bytes(b"sk")),
+            (
+                "text.png",
+                zip::CompressionMethod::Stored,
+                b"hello world".to_vec(),
+            ),
+            (
+                "../evil.png",
+                zip::CompressionMethod::Stored,
+                png_bytes(b"evil"),
+            ),
+            (
+                "bad-name.png",
+                zip::CompressionMethod::Stored,
+                png_bytes(b"bad"),
+            ),
+            (
+                "skipped.png",
+                zip::CompressionMethod::Stored,
+                png_bytes(b"sk"),
+            ),
         ],
     );
     let zip_id = upload_zip(&srv.services, &alice_id, "mixed.zip", &zip);
@@ -549,10 +721,20 @@ async fn import_skips_bad_rows_but_applies_good_ones() {
     )
     .unwrap();
 
-    assert!(srv.services.emojis.get_emoji_by_name("good").unwrap().is_some());
+    assert!(
+        srv.services
+            .emojis
+            .get_emoji_by_name("good")
+            .unwrap()
+            .is_some()
+    );
     for missing in ["notimage", "evil", "has-dash", "skippeddl", "ghost"] {
         assert!(
-            srv.services.emojis.get_emoji_by_name(missing).unwrap().is_none(),
+            srv.services
+                .emojis
+                .get_emoji_by_name(missing)
+                .unwrap()
+                .is_none(),
             "{missing} must not be imported"
         );
     }
@@ -565,7 +747,9 @@ async fn import_rejects_archive_level_problems() {
 
     // Missing meta.json fails the job.
     let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    writer.start_file("stray.png", zip::write::SimpleFileOptions::default()).unwrap();
+    writer
+        .start_file("stray.png", zip::write::SimpleFileOptions::default())
+        .unwrap();
     writer.write_all(&png_bytes(b"x")).unwrap();
     let no_meta: Vec<u8> = writer.finish().unwrap().into_inner();
     let no_meta_id = upload_zip(&srv.services, &alice_id, "no-meta.zip", &no_meta);
@@ -591,10 +775,19 @@ async fn import_rejects_archive_level_problems() {
 
     // Entry count over the cap (zip-bomb shape: many tiny entries).
     let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    writer.start_file("meta.json", zip::write::SimpleFileOptions::default()).unwrap();
-    writer.write_all(br#"{"metaVersion":2,"emojis":[]}"#).unwrap();
+    writer
+        .start_file("meta.json", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    writer
+        .write_all(br#"{"metaVersion":2,"emojis":[]}"#)
+        .unwrap();
     for i in 0..=TRANSFER_MAX_ENTRIES {
-        writer.start_file(format!("f{i}.png"), zip::write::SimpleFileOptions::default()).unwrap();
+        writer
+            .start_file(
+                format!("f{i}.png"),
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
         writer.write_all(b"x").unwrap();
     }
     let many: Vec<u8> = writer.finish().unwrap().into_inner();
@@ -609,7 +802,11 @@ async fn import_rejects_archive_level_problems() {
     ));
 
     // Missing fileId in the payload is a bad payload (quarantine).
-    let no_file = serde_json::to_vec(&CustomEmojiTransferPayload { user_id: alice_id.clone(), file_id: None }).unwrap();
+    let no_file = serde_json::to_vec(&CustomEmojiTransferPayload {
+        user_id: alice_id.clone(),
+        file_id: None,
+    })
+    .unwrap();
     assert!(matches!(
         handle_custom_emoji_transfer(&srv.services, &JobKind::ImportCustomEmojis, &no_file),
         Err(PortError::Validation(_))
@@ -629,7 +826,11 @@ async fn import_rejects_archive_level_problems() {
         handle_custom_emoji_transfer(
             &srv.services,
             &JobKind::ExportCustomEmojis,
-            &serde_json::to_vec(&CustomEmojiTransferPayload { user_id: "bbbbbbbbbbbbbbbb".to_string(), file_id: None }).unwrap(),
+            &serde_json::to_vec(&CustomEmojiTransferPayload {
+                user_id: "bbbbbbbbbbbbbbbb".to_string(),
+                file_id: None
+            })
+            .unwrap(),
         )
         .unwrap()
         .is_none()
@@ -668,6 +869,18 @@ async fn import_skips_huge_declared_entry_but_applies_the_rest() {
         &import_payload(&alice_id, &zip_id),
     )
     .unwrap();
-    assert!(srv.services.emojis.get_emoji_by_name("huge").unwrap().is_none());
-    assert!(srv.services.emojis.get_emoji_by_name("survivor").unwrap().is_some());
+    assert!(
+        srv.services
+            .emojis
+            .get_emoji_by_name("huge")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        srv.services
+            .emojis
+            .get_emoji_by_name("survivor")
+            .unwrap()
+            .is_some()
+    );
 }

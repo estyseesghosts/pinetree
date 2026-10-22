@@ -42,11 +42,7 @@ impl RegistrationPolicy {
     }
 
     pub fn from_disable_registration(disabled: bool) -> Self {
-        if disabled {
-            Self::Closed
-        } else {
-            Self::Open
-        }
+        if disabled { Self::Closed } else { Self::Open }
     }
 }
 
@@ -307,7 +303,10 @@ mod tests {
             RegistrationPolicy::from_disable_registration(true),
             RegistrationPolicy::Closed
         );
-        assert_eq!(RegistrationPolicy::parse("open"), Some(RegistrationPolicy::Open));
+        assert_eq!(
+            RegistrationPolicy::parse("open"),
+            Some(RegistrationPolicy::Open)
+        );
         assert_eq!(RegistrationPolicy::parse("nope"), None);
     }
 
@@ -378,12 +377,19 @@ mod tests {
 
         invite.consume("aid00000000000002", 1_500).unwrap();
         assert!(invite.is_used());
-        assert!(invite
-            .consume("aid00000000000003", 1_600)
-            .is_err());
+        assert!(invite.consume("aid00000000000003", 1_600).is_err());
 
         for bad in ["", "has space", &"x".repeat(65), "dash-code"] {
-            assert!(InviteCode::new("aid0000000000000b".to_string(), bad.to_string(), None, 0, None).is_err());
+            assert!(
+                InviteCode::new(
+                    "aid0000000000000b".to_string(),
+                    bad.to_string(),
+                    None,
+                    0,
+                    None
+                )
+                .is_err()
+            );
         }
     }
 }

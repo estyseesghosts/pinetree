@@ -1,6 +1,6 @@
 use std::fmt;
-use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const TIME2000: i64 = 946_684_800_000;
@@ -132,9 +132,11 @@ impl AidxGenerator {
 
     pub fn with_node_id(clock: Arc<dyn Clock>, node_id: &str, initial_counter: u32) -> Self {
         assert_eq!(node_id.len(), 4);
-        assert!(node_id
-            .bytes()
-            .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase()));
+        assert!(
+            node_id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase())
+        );
         Self {
             clock,
             node_id: node_id.to_string(),

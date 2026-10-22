@@ -56,9 +56,7 @@ impl AppServices {
             self.accounts.find_by_id(followee_id)?,
         ) {
             if followee.is_local() && !followee.is_locked && !follower.is_local() {
-                if let Some(inbox_url) =
-                    crate::federation::outbox::preferred_inbox(&follower)
-                {
+                if let Some(inbox_url) = crate::federation::outbox::preferred_inbox(&follower) {
                     let follow_activity = serde_json::json!({
                         "id": activity_id,
                         "type": "Follow",
@@ -137,7 +135,10 @@ impl AppServices {
                 follower_id: follower_id.to_string(),
                 followee_id: followee_id.to_string(),
             },
-            format!("inbound-unfollow:{follower_id}:{followee_id}:{}", self.ids.generate()),
+            format!(
+                "inbound-unfollow:{follower_id}:{followee_id}:{}",
+                self.ids.generate()
+            ),
         )?];
         match self
             .dedup
@@ -163,22 +164,25 @@ impl AppServices {
         if self.inbound_host_blocked(follower_id) {
             return Ok(None);
         }
-        let jobs = vec![self.streaming_job(
-            &StreamingEvent::MeUpdated {
-                account_id: followee_id.to_string(),
-            },
-            format!(
-                "inbound-accept:{follower_id}:{followee_id}:{}",
-                self.ids.generate()
-            ),
-        )?, self.notify_job(
-            follower_id,
-            followee_id,
-            NotificationKind::FollowRequestAccepted,
-            None,
-            None,
-            "inbound-accept",
-        )?];
+        let jobs = vec![
+            self.streaming_job(
+                &StreamingEvent::MeUpdated {
+                    account_id: followee_id.to_string(),
+                },
+                format!(
+                    "inbound-accept:{follower_id}:{followee_id}:{}",
+                    self.ids.generate()
+                ),
+            )?,
+            self.notify_job(
+                follower_id,
+                followee_id,
+                NotificationKind::FollowRequestAccepted,
+                None,
+                None,
+                "inbound-accept",
+            )?,
+        ];
         match self.dedup.record_follow_activity(
             activity_id,
             follower_id,

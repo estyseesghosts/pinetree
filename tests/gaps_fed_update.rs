@@ -24,10 +24,12 @@ use pinetree::activitypub::signatures::{
 };
 use pinetree::application::commands::AppServices;
 use pinetree::application::ports::{BlobStore, Clock, CreateAccountInput, NoopStreamingSink};
-use pinetree::domain::fed_policy::{late_link_notify, relay_decision, reply_resolve_key, RelayDecision};
+use pinetree::domain::fed_policy::{
+    RelayDecision, late_link_notify, relay_decision, reply_resolve_key,
+};
 use pinetree::domain::id::{AidxGenerator, IdGenerator, ManualClock};
 use pinetree::federation::delivery::{
-    format_http_date, upsert_remote_actor_from_doc, SafeHttpClient, SafeHttpConfig,
+    SafeHttpClient, SafeHttpConfig, format_http_date, upsert_remote_actor_from_doc,
 };
 use pinetree::federation::inbox::{has_rfc9421_headers, inbox_handler};
 use pinetree::federation::{ActivityIdIndex, ReplyCoalescer, StampNegativeCache};
@@ -157,9 +159,16 @@ fn signed_headers(
     extra: &[(&str, &str)],
 ) -> HeaderMap {
     let date = format_http_date(services.clock.now_ms());
-    let signed =
-        sign_request_headers("POST", path, "pinetree.local", &date, Some(body), key_id, private_pem)
-            .unwrap();
+    let signed = sign_request_headers(
+        "POST",
+        path,
+        "pinetree.local",
+        &date,
+        Some(body),
+        key_id,
+        private_pem,
+    )
+    .unwrap();
     let mut headers = HeaderMap::new();
     for (k, v) in [
         ("date".to_string(), date),
@@ -185,7 +194,14 @@ async fn post_inbox(
     extra_headers: &[(&str, &str)],
 ) -> StatusCode {
     let body = serde_json::to_vec(activity).unwrap();
-    let headers = signed_headers(services, "/inbox", &body, &remote.key_id, &remote.private_pem, extra_headers);
+    let headers = signed_headers(
+        services,
+        "/inbox",
+        &body,
+        &remote.key_id,
+        &remote.private_pem,
+        extra_headers,
+    );
     inbox_handler(State(services.clone()), headers, Bytes::from(body))
         .await
         .status()
@@ -316,7 +332,11 @@ async fn update_note_forged_signer_ignored() {
         .find_by_uri(&alice.note_uri)
         .unwrap()
         .expect("note still cached");
-    assert_eq!(cached.text.as_deref(), Some("v1"), "forged edit must not apply");
+    assert_eq!(
+        cached.text.as_deref(),
+        Some("v1"),
+        "forged edit must not apply"
+    );
 }
 
 #[tokio::test]
@@ -337,7 +357,13 @@ async fn delete_tombstone_wrapped_deletes_note() {
         post_inbox(&services, &create, &alice, &[]).await,
         StatusCode::ACCEPTED
     );
-    assert!(services.notes.find_by_uri(&alice.note_uri).unwrap().is_some());
+    assert!(
+        services
+            .notes
+            .find_by_uri(&alice.note_uri)
+            .unwrap()
+            .is_some()
+    );
 
     // Misskey dispatch shape: Delete{object: Tombstone{id}}.
     let delete = json!({
@@ -351,7 +377,11 @@ async fn delete_tombstone_wrapped_deletes_note() {
         StatusCode::ACCEPTED
     );
     assert!(
-        services.notes.find_by_uri(&alice.note_uri).unwrap().is_none(),
+        services
+            .notes
+            .find_by_uri(&alice.note_uri)
+            .unwrap()
+            .is_none(),
         "Delete(Tombstone) must delete the remote note"
     );
 }
@@ -370,7 +400,12 @@ async fn undo_accept_by_id_revokes_follow() {
         .unwrap();
     let bob_account = services.accounts.find_by_uri(&bob.uri).unwrap().unwrap();
     services.follow(&alice.id, &bob_account.id, false).unwrap();
-    assert!(services.follows.is_following(&alice.id, &bob_account.id).unwrap());
+    assert!(
+        services
+            .follows
+            .is_following(&alice.id, &bob_account.id)
+            .unwrap()
+    );
 
     let base = "https://pinetree.local";
     let alice_uri = format!("{base}/users/{}", alice.id);
@@ -407,7 +442,10 @@ async fn undo_accept_by_id_revokes_follow() {
         StatusCode::ACCEPTED
     );
     assert!(
-        !services.follows.is_following(&alice.id, &bob_account.id).unwrap(),
+        !services
+            .follows
+            .is_following(&alice.id, &bob_account.id)
+            .unwrap(),
         "Undo(Accept) by-ID must revoke the follow"
     );
     assert_eq!(
@@ -440,7 +478,10 @@ async fn undo_accept_unknown_id_is_noop() {
 async fn rfc9421_fields_are_permissive_first() {
     assert!(has_rfc9421_headers(&{
         let mut h = HeaderMap::new();
-        h.insert("signature-input", HeaderValue::from_static("sig1=(:method)"));
+        h.insert(
+            "signature-input",
+            HeaderValue::from_static("sig1=(:method)"),
+        );
         h
     }));
     assert!(!has_rfc9421_headers(&HeaderMap::new()));
@@ -466,8 +507,18 @@ async fn rfc9421_fields_are_permissive_first() {
         &[("signature-input", "sig1=(:method :path);keyid=\"x\"")],
     )
     .await;
-    assert_eq!(status, StatusCode::ACCEPTED, "RFC 9421 presence must not break legacy auth");
-    assert!(services.notes.find_by_uri(&alice.note_uri).unwrap().is_some());
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "RFC 9421 presence must not break legacy auth"
+    );
+    assert!(
+        services
+            .notes
+            .find_by_uri(&alice.note_uri)
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[tokio::test]
@@ -505,7 +556,16 @@ fn stamp_authority_exact_host_cases() {
         "interactingObject": quote,
         "interactionTarget": target,
     });
-    assert!(verify_stamp_for_quote(&good, "https://target.example/stamps/1", quote, target, author).is_ok());
+    assert!(
+        verify_stamp_for_quote(
+            &good,
+            "https://target.example/stamps/1",
+            quote,
+            target,
+            author
+        )
+        .is_ok()
+    );
     // Port split: different exact authority.
     let stamped_port = "https://target.example:8443/stamps/1";
     let mut bad = good.clone();

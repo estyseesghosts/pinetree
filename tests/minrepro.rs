@@ -34,25 +34,29 @@ fn blocking_get(url: &str) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn minimal_cross_call() {
     // B: trivial responder.
-    let app_b = axum::Router::new().route(
-        "/x",
-        axum::routing::get(|| async { "b-ok" }),
-    );
+    let app_b = axum::Router::new().route("/x", axum::routing::get(|| async { "b-ok" }));
     let lb = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let b_url = format!("http://{}/x", lb.local_addr().unwrap());
-    let _hb = tokio::spawn(async move { let _ = axum::serve(lb, app_b).await; });
+    let _hb = tokio::spawn(async move {
+        let _ = axum::serve(lb, app_b).await;
+    });
 
     // A: handler does a BLOCKING cross-call to B on the handler thread.
     let app_a = axum::Router::new().route(
         "/y",
         axum::routing::get(move || async move {
-            let u = b_url.clone(); let peer = tokio::task::spawn_blocking(move || blocking_get(&u)).await.unwrap();
+            let u = b_url.clone();
+            let peer = tokio::task::spawn_blocking(move || blocking_get(&u))
+                .await
+                .unwrap();
             format!("a-ok peer={peer}")
         }),
     );
     let la = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let a_url = format!("http://{}/y", la.local_addr().unwrap());
-    let _ha = tokio::spawn(async move { let _ = axum::serve(la, app_a).await; });
+    let _ha = tokio::spawn(async move {
+        let _ = axum::serve(la, app_a).await;
+    });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Test thread parks in a blocking GET to A (mirrors api_post/client.send).

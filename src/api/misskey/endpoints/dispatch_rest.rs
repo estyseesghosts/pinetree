@@ -1,0 +1,71 @@
+//! Remaining dispatcher arms (gallery/flash/hashtags/announcements etc.).
+//!
+//! Split from `endpoints/mod.rs` (decomposition). Pure move, no behavior change.
+#![allow(unused_imports)]
+
+mod announcements;
+mod flash;
+mod gallery;
+mod hashtags;
+mod moderation;
+mod queue;
+mod server;
+
+pub(crate) use announcements::announcements;
+pub(crate) use announcements::announcements_show;
+pub(crate) use announcements::ap_get;
+pub(crate) use announcements::ap_show;
+pub(crate) use announcements::i_read_announcement;
+pub(crate) use announcements::pack_announcement_view;
+pub(crate) use announcements::promo_read;
+pub(crate) use flash::flash_create;
+pub(crate) use flash::flash_delete;
+pub(crate) use flash::flash_featured;
+pub(crate) use flash::flash_like;
+pub(crate) use flash::flash_my;
+pub(crate) use flash::flash_my_likes;
+pub(crate) use flash::flash_show;
+pub(crate) use flash::flash_unlike;
+pub(crate) use flash::flash_update;
+pub(crate) use flash::pack_flash;
+pub(crate) use gallery::GALLERY_STORE;
+pub(crate) use gallery::gallery_featured;
+pub(crate) use gallery::gallery_popular;
+pub(crate) use gallery::gallery_posts;
+pub(crate) use gallery::gallery_posts_create;
+pub(crate) use gallery::gallery_posts_delete;
+pub(crate) use gallery::gallery_posts_like;
+pub(crate) use gallery::gallery_posts_show;
+pub(crate) use gallery::gallery_posts_unlike;
+pub(crate) use gallery::gallery_posts_update;
+pub(crate) use gallery::gallery_store;
+pub(crate) use gallery::pack_gallery_post;
+pub(crate) use hashtags::hashtags_list;
+pub(crate) use hashtags::hashtags_search;
+pub(crate) use hashtags::hashtags_show;
+pub(crate) use hashtags::hashtags_trend;
+pub(crate) use hashtags::hashtags_users;
+pub(crate) use moderation::blocking_create;
+pub(crate) use moderation::blocking_delete;
+pub(crate) use moderation::blocking_list;
+pub(crate) use moderation::mute_create;
+pub(crate) use moderation::mute_delete;
+pub(crate) use moderation::mute_list;
+pub(crate) use moderation::renote_mute_create;
+pub(crate) use moderation::renote_mute_delete;
+pub(crate) use moderation::renote_mute_list;
+pub(crate) use queue::endpoint;
+pub(crate) use queue::endpoints;
+pub(crate) use queue::queue_deliver_delayed;
+pub(crate) use queue::queue_stats;
+pub(crate) use queue::reset_db;
+pub(crate) use queue::retention;
+pub(crate) use server::fetch_external_resources;
+pub(crate) use server::fetch_rss;
+pub(crate) use server::get_online_users_count;
+pub(crate) use server::i_delete_account;
+pub(crate) use server::pack_server_info;
+pub(crate) use server::pinned_users;
+pub(crate) use server::server_info;
+pub(crate) use server::stats;
+pub(crate) use server::url_preview;

@@ -16,7 +16,7 @@
 //! is derived at read time; pinetree notes carry no `clippedCount` counter
 //! (DIVERGENCE — counts come from the `clip_notes` index instead).
 
-use crate::domain::collection::{tier_from_is_public, CollectionTier};
+use crate::domain::collection::{CollectionTier, tier_from_is_public};
 use crate::domain::id::DomainError;
 
 /// Max clips per owner (upstream `RoleService.clipLimit` default).
@@ -197,10 +197,7 @@ mod tests {
     #[test]
     fn notes_count_derives_distinct_members() {
         assert_eq!(count_clip_notes(&[]), 0);
-        assert_eq!(
-            count_clip_notes(&["n1".to_string(), "n2".to_string()]),
-            2
-        );
+        assert_eq!(count_clip_notes(&["n1".to_string(), "n2".to_string()]), 2);
         // Duplicate index rows count once (defensive dedup).
         assert_eq!(
             count_clip_notes(&["n1".to_string(), "n1".to_string(), "n2".to_string()]),

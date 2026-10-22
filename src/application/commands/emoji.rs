@@ -15,7 +15,7 @@ use super::AppServices;
 
 use crate::application::events::{EmojiBroadcastOp, StreamingEvent};
 use crate::application::ports::{InsertMediaInput, NewJob, PortError, TimelineCursor};
-use crate::domain::emoji::{validate_shortcode, CustomEmoji, RemoteEmoji};
+use crate::domain::emoji::{CustomEmoji, RemoteEmoji, validate_shortcode};
 use crate::domain::moderation::{ModerationAction, ModerationLogEntry};
 
 /// Cap on AP `Emoji` tags ingested per object (WP8b; stated in the session
@@ -141,7 +141,8 @@ impl AppServices {
         // `SAME_NAME_EMOJI_EXISTS`.
         if let (Some(_), Some(new_name)) = (id, name) {
             if new_name != emoji.shortcode {
-                validate_shortcode(new_name).map_err(|e| PortError::Validation(format!("{e:?}")))?;
+                validate_shortcode(new_name)
+                    .map_err(|e| PortError::Validation(format!("{e:?}")))?;
                 emoji.shortcode = new_name.to_string();
             }
         }
@@ -279,7 +280,10 @@ impl AppServices {
         }
         // Content-type gate (upstream `FILE_TYPE_IMAGE` parity) plus the
         // shared sniffer (same rule as uploads: never store `text/html`).
-        let content_type = resp.header("content-type").unwrap_or("").to_ascii_lowercase();
+        let content_type = resp
+            .header("content-type")
+            .unwrap_or("")
+            .to_ascii_lowercase();
         if !content_type.starts_with("image/") {
             return Ok(());
         }
@@ -291,25 +295,27 @@ impl AppServices {
         let url = format!("{}/files/{media_id}", self.public_url.trim_end_matches('/'));
         self.blobs
             .put(&crate::media::ingest::sha256_hex(&resp.body), &resp.body)?;
-        self.media.insert_metadata(crate::application::ports::InsertMediaInput {
-            id: Some(media_id.clone()),
-            owner_id: None,
-            name: shortcode.to_string(),
-            mime: sniffed,
-            size_bytes: resp.body.len() as u64,
-            hash: crate::media::ingest::md5_hex(&resp.body),
-            blob_key: crate::media::ingest::sha256_hex(&resp.body),
-            blurhash: None,
-            properties: crate::domain::media::MediaProperties::default(),
-            is_sensitive: false,
-            is_link: false,
-            url,
-            thumbnail_url: None,
-            comment: None,
-            source_url: Some(row.remote_url.clone()),
-            max_file_size: self.max_file_size,
-        })?;
-        self.emojis.set_remote_emoji_media(&row.host, &row.shortcode, &media_id)?;
+        self.media
+            .insert_metadata(crate::application::ports::InsertMediaInput {
+                id: Some(media_id.clone()),
+                owner_id: None,
+                name: shortcode.to_string(),
+                mime: sniffed,
+                size_bytes: resp.body.len() as u64,
+                hash: crate::media::ingest::md5_hex(&resp.body),
+                blob_key: crate::media::ingest::sha256_hex(&resp.body),
+                blurhash: None,
+                properties: crate::domain::media::MediaProperties::default(),
+                is_sensitive: false,
+                is_link: false,
+                url,
+                thumbnail_url: None,
+                comment: None,
+                source_url: Some(row.remote_url.clone()),
+                max_file_size: self.max_file_size,
+            })?;
+        self.emojis
+            .set_remote_emoji_media(&row.host, &row.shortcode, &media_id)?;
         Ok(())
     }
 
@@ -331,7 +337,12 @@ impl AppServices {
                     host: row.host.clone(),
                     shortcode: row.shortcode.clone(),
                 },
-                format!("remote-emoji:{}:{}:{}", row.host, row.shortcode, self.ids.generate()),
+                format!(
+                    "remote-emoji:{}:{}:{}",
+                    row.host,
+                    row.shortcode,
+                    self.ids.generate()
+                ),
                 self.now_ms(),
             )?);
             if jobs.len() >= crate::application::ports::MAX_JOBS_PER_TXN {
@@ -579,7 +590,10 @@ impl AppServices {
                 REMOTE_EMOJI_MAX_BYTES
             )));
         }
-        let content_type = resp.header("content-type").unwrap_or("").to_ascii_lowercase();
+        let content_type = resp
+            .header("content-type")
+            .unwrap_or("")
+            .to_ascii_lowercase();
         if !content_type.starts_with("image/") {
             return Err(fail(format!("unsupported content type {content_type:?}")));
         }

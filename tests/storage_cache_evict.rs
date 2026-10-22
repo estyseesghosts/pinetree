@@ -4,14 +4,13 @@
 //! lives. The avatar reserve is preferred over full originals under
 //! pressure, and eviction runs as a `JobKind::CacheEvict` job.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use pinetree::application::commands::AppServices;
 use pinetree::application::ports::{
-    AccountStore, ActivityDedup, BlobStore, CacheEvictPayload, CreateAccountInput,
-    InsertMediaInput, JobKind, JobQueue, MediaClass, MediaStore, NewJob, NoopStreamingSink,
-    RemoteCacheRecord,
+    ActivityDedup, BlobStore, CacheEvictPayload, InsertMediaInput, JobKind, JobQueue, MediaClass,
+    MediaStore, NewJob, NoopStreamingSink, RemoteCacheRecord,
 };
 use pinetree::config::RemoteCacheMode;
 use pinetree::domain::id::{Clock, ManualClock};
@@ -19,11 +18,11 @@ use pinetree::domain::media::MediaProperties;
 use pinetree::federation::delivery::{SafeHttpClient, SafeHttpConfig};
 use pinetree::federation::retry::DestinationTracker;
 use pinetree::jobs::worker::JobWorker;
-use pinetree::media::transcode::TranscodeConfig;
-use pinetree::services::email::{SmtpConfig, SmtpEmailSender};
 use pinetree::media::ingest::{md5_hex, sha256_hex};
 use pinetree::media::storage::FsBlobStore;
+use pinetree::media::transcode::TranscodeConfig;
 use pinetree::persistence::redb::RedbStore;
+use pinetree::services::email::{SmtpConfig, SmtpEmailSender};
 
 const BASE_MS: i64 = 1_760_400_000_000;
 const DAY_MS: i64 = 86_400_000;
@@ -38,10 +37,7 @@ struct EvictHarness {
 
 fn evict_harness() -> EvictHarness {
     let n = EVICT_SEQ.fetch_add(1, Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!(
-        "pinetree-cacheevict-{}-{n}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("pinetree-cacheevict-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let clock: Arc<ManualClock> = Arc::new(ManualClock::new(BASE_MS));
     let clock_port: Arc<dyn Clock> = clock.clone();
@@ -240,11 +236,12 @@ fn stale_full_evicts_first_and_metadata_survives() {
         "https://cdn.example/old.jpg",
         "https://cdn.example/mid.jpg",
     ] {
-        assert!(h
-            .store
-            .remote_cache_lookup(url, "original")
-            .unwrap()
-            .is_some());
+        assert!(
+            h.store
+                .remote_cache_lookup(url, "original")
+                .unwrap()
+                .is_some()
+        );
     }
     assert!(stats.evictions >= 1);
 }

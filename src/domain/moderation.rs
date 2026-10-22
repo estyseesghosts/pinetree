@@ -176,7 +176,9 @@ impl ModerationLogEntry {
 
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.id.is_empty() || self.id.chars().count() > 32 {
-            return Err(invalid("moderation log id must be 1..=32 chars".to_string()));
+            return Err(invalid(
+                "moderation log id must be 1..=32 chars".to_string(),
+            ));
         }
         if let Some(actor) = &self.actor_account {
             if actor.is_empty() || actor.chars().count() > 32 {
@@ -322,7 +324,10 @@ mod tests {
             (ModerationAction::Suspend, "suspend"),
             (ModerationAction::Unsuspend, "unsuspend"),
             (ModerationAction::UpdateUserNote, "updateUserNote"),
-            (ModerationAction::UpdateServerSettings, "updateServerSettings"),
+            (
+                ModerationAction::UpdateServerSettings,
+                "updateServerSettings",
+            ),
             (ModerationAction::CreateInvitation, "createInvitation"),
             (ModerationAction::ResolveAbuseReport, "resolveAbuseReport"),
             (ModerationAction::ForwardAbuseReport, "forwardAbuseReport"),
@@ -378,14 +383,16 @@ mod tests {
         assert!(r.moderation_note.is_empty());
 
         for bad_comment in ["", &"c".repeat(2049)] {
-            assert!(AbuseReport::new(
-                "abr0000000000001".to_string(),
-                "aid00000000000002".to_string(),
-                "aid00000000000001".to_string(),
-                bad_comment.to_string(),
-                1_000,
-            )
-            .is_err());
+            assert!(
+                AbuseReport::new(
+                    "abr0000000000001".to_string(),
+                    "aid00000000000002".to_string(),
+                    "aid00000000000001".to_string(),
+                    bad_comment.to_string(),
+                    1_000,
+                )
+                .is_err()
+            );
         }
         assert!(AbuseReportResolution::parse("accept") == Some(AbuseReportResolution::Accept));
         assert!(AbuseReportResolution::parse("nope").is_none());

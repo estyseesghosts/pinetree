@@ -25,10 +25,7 @@ impl FsBlobStore {
     }
 
     fn validate_hash(hash: &str) -> Result<(), PortError> {
-        if hash.len() < 4
-            || hash.len() > 128
-            || !hash.bytes().all(|b| b.is_ascii_alphanumeric())
-        {
+        if hash.len() < 4 || hash.len() > 128 || !hash.bytes().all(|b| b.is_ascii_alphanumeric()) {
             return Err(PortError::Validation(format!("invalid blob hash: {hash}")));
         }
         Ok(())
@@ -44,7 +41,10 @@ impl FsBlobStore {
         Self::validate_hash(hash)?;
         let seq = self.temp_seq.fetch_add(1, Ordering::SeqCst);
         let pid = std::process::id();
-        Ok(self.root.join("tmp").join(format!("{hash}.{pid}.{seq}.tmp")))
+        Ok(self
+            .root
+            .join("tmp")
+            .join(format!("{hash}.{pid}.{seq}.tmp")))
     }
 
     /// Length sidecar for an object: `{object_path}.len`, holding the
@@ -121,7 +121,7 @@ impl FsBlobStore {
             Err(e) => {
                 return Err(PortError::StorageUnavailable(format!(
                     "read blob sidecar: {e}"
-                )))
+                )));
             }
         };
         match fs::metadata(&final_path) {
@@ -149,9 +149,9 @@ impl FsBlobStore {
         // Batch F backup gate: pool mutations wait behind an active backup
         // (see the gate region at the end of this file).
         let _gate = acquire_media_op("import_file")?;
-        let src_len = fs::metadata(src).map(|m| m.len()).map_err(|e| {
-            PortError::StorageUnavailable(format!("stat staged blob file: {e}"))
-        })?;
+        let src_len = fs::metadata(src)
+            .map(|m| m.len())
+            .map_err(|e| PortError::StorageUnavailable(format!("stat staged blob file: {e}")))?;
         let final_path = self.object_path(hash)?;
         let sidecar = self.sidecar_path(hash)?;
         // SHA-256 keys make the skip safe (same key ⇒ same bytes): skip
@@ -186,9 +186,9 @@ impl FsBlobStore {
                 let _ = fs::remove_file(src);
             }
         }
-        let actual = fs::metadata(&final_path).map(|m| m.len()).map_err(|e| {
-            PortError::StorageUnavailable(format!("stat imported blob file: {e}"))
-        })?;
+        let actual = fs::metadata(&final_path)
+            .map(|m| m.len())
+            .map_err(|e| PortError::StorageUnavailable(format!("stat imported blob file: {e}")))?;
         if actual != src_len {
             return Err(PortError::StorageUnavailable(format!(
                 "blob import length mismatch: staged {src_len}, stored {actual}"
@@ -209,8 +209,8 @@ impl BlobStore for FsBlobStore {
         // when the object length (via stat, no content read) and the sidecar
         // both record exactly this length, otherwise (re)write both files so
         // a torn object or a missing/stale sidecar heals instead of lingering.
-        let object_len_ok = fs::metadata(&final_path).map(|m| m.len()).ok()
-            == Some(bytes.len() as u64);
+        let object_len_ok =
+            fs::metadata(&final_path).map(|m| m.len()).ok() == Some(bytes.len() as u64);
         let sidecar_ok = fs::read_to_string(&sidecar)
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
@@ -238,7 +238,7 @@ impl BlobStore for FsBlobStore {
             Err(e) => {
                 return Err(PortError::StorageUnavailable(format!(
                     "read blob sidecar: {e}"
-                )))
+                )));
             }
         };
         match fs::read(&final_path) {
@@ -266,7 +266,7 @@ impl BlobStore for FsBlobStore {
             Err(e) => {
                 return Err(PortError::StorageUnavailable(format!(
                     "delete blob file: {e}"
-                )))
+                )));
             }
         }?;
         let sidecar = self.sidecar_path(hash)?;
@@ -365,10 +365,8 @@ mod tests {
     }
 
     fn test_store(tag: &str) -> (FsBlobStore, PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "pinetree-blob-test-{tag}-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("pinetree-blob-test-{tag}-{}", uuid::Uuid::new_v4()));
         let store = FsBlobStore::new(&dir).unwrap();
         (store, dir)
     }
@@ -467,8 +465,8 @@ mod tests {
 // the parent snippet covers it. Failing that, never schedule a sweep
 // concurrently with a backup.
 
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 use std::sync::atomic::AtomicUsize;
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 
 fn gate_now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -532,7 +530,9 @@ impl std::fmt::Debug for MediaOpGuard {
 pub fn acquire_media_op(_op: &'static str) -> Result<MediaOpGuard, PortError> {
     MEDIA_GATE_WAITERS.fetch_add(1, Ordering::SeqCst);
     let started = std::time::Instant::now();
-    let guard = media_gate().read().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let guard = media_gate()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let waited_ms = started.elapsed().as_millis() as u64;
     MEDIA_GATE_WAITERS.fetch_sub(1, Ordering::SeqCst);
     MEDIA_GATE_WAITS_TOTAL.fetch_add(1, Ordering::SeqCst);
@@ -597,9 +597,7 @@ pub fn acquire_backup_gate(backup_id: &str) -> Result<BackupGateGuard, BackupBus
                         active_backup_id: read_active_backup_id(),
                     });
                 }
-                std::thread::sleep(std::time::Duration::from_millis(
-                    BACKUP_GATE_DRAIN_POLL_MS,
-                ));
+                std::thread::sleep(std::time::Duration::from_millis(BACKUP_GATE_DRAIN_POLL_MS));
                 continue;
             }
         };

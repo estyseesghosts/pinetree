@@ -73,11 +73,11 @@ pub fn parse_retry_after_ms(value: &str, now_ms: i64) -> Option<i64> {
     }
     let delay_ms = if v.bytes().all(|b| b.is_ascii_digit()) {
         let secs: u64 = v.parse().ok()?;
-        i64::try_from(secs.min(3_600))
-            .ok()?
-            .saturating_mul(1_000)
+        i64::try_from(secs.min(3_600)).ok()?.saturating_mul(1_000)
     } else {
-        let when = chrono::DateTime::parse_from_rfc2822(v).ok()?.timestamp_millis();
+        let when = chrono::DateTime::parse_from_rfc2822(v)
+            .ok()?
+            .timestamp_millis();
         when.saturating_sub(now_ms).max(0)
     };
     Some(now_ms.saturating_add(delay_ms.min(MAX_RETRY_AFTER_MS)))

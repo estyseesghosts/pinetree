@@ -16,8 +16,7 @@ use crate::domain::id::DomainError;
 /// System-webhook trigger names (admin-owned, instance-wide events).
 /// Pinetree-defined set; reconcile with upstream
 /// `SystemWebhookService` trigger types at merge.
-pub const SYSTEM_WEBHOOK_TRIGGERS: &[&str] =
-    &["userCreated", "abuseReport", "abuseReportResolved"];
+pub const SYSTEM_WEBHOOK_TRIGGERS: &[&str] = &["userCreated", "abuseReport", "abuseReportResolved"];
 
 /// User-webhook trigger names (per-user events). Pinetree-defined set;
 /// reconcile with upstream `WebhookService` event types at merge.
@@ -157,9 +156,10 @@ pub fn validate_email_shape(addr: &str) -> Result<(), DomainError> {
     let mut parts = addr.split('@');
     match (parts.next(), parts.next(), parts.next()) {
         (Some(local), Some(domain), None)
-            if !local.is_empty()
-                && !domain.is_empty()
-                && domain.contains('.') => Ok(()),
+            if !local.is_empty() && !domain.is_empty() && domain.contains('.') =>
+        {
+            Ok(())
+        }
         _ => Err(DomainError::Validation(
             "malformed email address".to_string(),
         )),
@@ -260,6 +260,10 @@ mod tests {
         assert!(verify_webhook_signature("s3cret", b"{\"a\":1}", &sig));
         assert!(!verify_webhook_signature("s3cret", b"{\"a\":2}", &sig));
         assert!(!verify_webhook_signature("other", b"{\"a\":1}", &sig));
-        assert!(!verify_webhook_signature("s3cret", b"{\"a\":1}", "deadbeef"));
+        assert!(!verify_webhook_signature(
+            "s3cret",
+            b"{\"a\":1}",
+            "deadbeef"
+        ));
     }
 }

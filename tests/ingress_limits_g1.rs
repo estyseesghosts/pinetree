@@ -206,11 +206,10 @@ impl TestServer {
         tokio::net::tcp::OwnedReadHalf,
         tokio::net::tcp::OwnedWriteHalf,
     ) {
-        let stream =
-            tokio::time::timeout(Duration::from_secs(15), TcpStream::connect(self.addr))
-                .await
-                .expect("connect times out")
-                .expect("connect test server");
+        let stream = tokio::time::timeout(Duration::from_secs(15), TcpStream::connect(self.addr))
+            .await
+            .expect("connect times out")
+            .expect("connect test server");
         // Split first: `TcpStream::shutdown()` closes both halves.
         let (rd, mut wr) = stream.into_split();
         tokio::time::timeout(Duration::from_secs(15), wr.write_all(head.as_bytes()))
@@ -557,11 +556,29 @@ async fn upload_small_multipart_reaches_auth_gate() {
     );
 }
 
-const INBOX_SRC: &str = include_str!("../src/federation/inbox.rs");
+const INBOX_SRC: &str = include_str!("../src/federation/inbox/mod.rs");
+const INBOX_COMMON_SRC: &str = include_str!("../src/federation/inbox/common.rs");
+const INBOX_CREATE_SRC: &str = include_str!("../src/federation/inbox/create.rs");
+const INBOX_UPDATE_SRC: &str = include_str!("../src/federation/inbox/update.rs");
+const INBOX_DELETE_SRC: &str = include_str!("../src/federation/inbox/delete.rs");
+const INBOX_LIKE_SRC: &str = include_str!("../src/federation/inbox/like.rs");
+const INBOX_ANNOUNCE_SRC: &str = include_str!("../src/federation/inbox/announce.rs");
+const INBOX_FOLLOW_SRC: &str = include_str!("../src/federation/inbox/follow.rs");
+const INBOX_FLAG_SRC: &str = include_str!("../src/federation/inbox/flag.rs");
+const INBOX_VOTE_SRC: &str = include_str!("../src/federation/inbox/vote.rs");
 const ROUTER_SRC: &str = include_str!("../src/api/misskey/endpoints/mod.rs");
-const RESPONSE_SRC: &str = include_str!("../src/api/misskey/response.rs");
+const FILES_SRC: &str = include_str!("../src/api/misskey/endpoints/files_http.rs");
+const RESPONSE_SRC: &str = include_str!("../src/api/misskey/response/upload_slots.rs");
 const ACTOR_SRC: &str = include_str!("../src/activitypub/actor.rs");
+const ACTOR_REMOTE_SRC: &str = include_str!("../src/activitypub/actor/remote_actor.rs");
+const ACTOR_DOCUMENT_SRC: &str = include_str!("../src/activitypub/actor/actor_document.rs");
+const ACTOR_COLLECTIONS_SRC: &str = include_str!("../src/activitypub/actor/collections.rs");
+const ACTOR_OUTBOX_SRC: &str = include_str!("../src/activitypub/actor/outbox.rs");
 const WEBFINGER_SRC: &str = include_str!("../src/activitypub/webfinger.rs");
+const WEBFINGER_RESPONSES_SRC: &str = include_str!("../src/activitypub/webfinger/responses.rs");
+const WEBFINGER_HOST_META_SRC: &str = include_str!("../src/activitypub/webfinger/host_meta.rs");
+const WEBFINGER_FINGER_SRC: &str = include_str!("../src/activitypub/webfinger/finger.rs");
+const WEBFINGER_NODEINFO_SRC: &str = include_str!("../src/activitypub/webfinger/nodeinfo.rs");
 
 #[test]
 fn inbox_cap_value_and_router_wiring() {
@@ -608,11 +625,11 @@ fn misskey_json_and_upload_caps_unchanged() {
         "JSON dispatcher keeps its 1 MiB check"
     );
     assert!(
-        ROUTER_SRC.contains("read_capped_body(body, upload_cap_bytes("),
+        FILES_SRC.contains("read_capped_body(body, upload_cap_bytes("),
         "uploads keep the bounded streaming read"
     );
     assert!(
-        ROUTER_SRC.contains(".upload_slots") && ROUTER_SRC.contains(".acquire(&client_ip"),
+        FILES_SRC.contains(".upload_slots") && FILES_SRC.contains(".acquire(&client_ip"),
         "uploads keep the semaphore gate"
     );
     assert!(
@@ -630,10 +647,28 @@ fn no_unbounded_body_collect_on_untrusted_routes() {
     // test module (after the first `#[cfg(test)]`); production code on
     // untrusted routes only collects through capped extractors / `Limited`.
     for (name, src) in [
-        ("inbox.rs", INBOX_SRC),
+        ("inbox/mod.rs", INBOX_SRC),
+        ("inbox/common.rs", INBOX_COMMON_SRC),
+        ("inbox/create.rs", INBOX_CREATE_SRC),
+        ("inbox/update.rs", INBOX_UPDATE_SRC),
+        ("inbox/delete.rs", INBOX_DELETE_SRC),
+        ("inbox/like.rs", INBOX_LIKE_SRC),
+        ("inbox/announce.rs", INBOX_ANNOUNCE_SRC),
+        ("inbox/follow.rs", INBOX_FOLLOW_SRC),
+        ("inbox/flag.rs", INBOX_FLAG_SRC),
+        ("inbox/vote.rs", INBOX_VOTE_SRC),
         ("endpoints/mod.rs", ROUTER_SRC),
-        ("actor.rs", ACTOR_SRC),
-        ("webfinger.rs", WEBFINGER_SRC),
+        ("endpoints/files_http.rs", FILES_SRC),
+        ("actor/mod.rs", ACTOR_SRC),
+        ("actor/remote_actor.rs", ACTOR_REMOTE_SRC),
+        ("actor/actor_document.rs", ACTOR_DOCUMENT_SRC),
+        ("actor/collections.rs", ACTOR_COLLECTIONS_SRC),
+        ("actor/outbox.rs", ACTOR_OUTBOX_SRC),
+        ("webfinger/mod.rs", WEBFINGER_SRC),
+        ("webfinger/responses.rs", WEBFINGER_RESPONSES_SRC),
+        ("webfinger/host_meta.rs", WEBFINGER_HOST_META_SRC),
+        ("webfinger/finger.rs", WEBFINGER_FINGER_SRC),
+        ("webfinger/nodeinfo.rs", WEBFINGER_NODEINFO_SRC),
     ] {
         let test_offset = src.find("#[cfg(test)]").unwrap_or(src.len());
         let (production, _) = src.split_at(test_offset);

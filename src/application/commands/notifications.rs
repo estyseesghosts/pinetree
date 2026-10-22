@@ -18,10 +18,7 @@ impl AppServices {
         let Some(notifiee) = self.accounts.find_by_id(notifiee_id)? else {
             return Ok(true);
         };
-        let Some(config) = notifiee
-            .notification_recieve_config
-            .get(kind.wire_type())
-        else {
+        let Some(config) = notifiee.notification_recieve_config.get(kind.wire_type()) else {
             return Ok(true);
         };
         Ok(config.kind.as_str() != "never")
@@ -102,14 +99,10 @@ impl AppServices {
             "never" => Ok(false),
             "following" => self.follows.is_following(notifiee_id, notifier_id),
             "follower" => self.follows.is_following(notifier_id, notifiee_id),
-            "mutualFollow" => Ok(
-                self.follows.is_following(notifiee_id, notifier_id)?
-                    && self.follows.is_following(notifier_id, notifiee_id)?,
-            ),
-            "followingOrFollower" => Ok(
-                self.follows.is_following(notifiee_id, notifier_id)?
-                    || self.follows.is_following(notifier_id, notifiee_id)?,
-            ),
+            "mutualFollow" => Ok(self.follows.is_following(notifiee_id, notifier_id)?
+                && self.follows.is_following(notifier_id, notifiee_id)?),
+            "followingOrFollower" => Ok(self.follows.is_following(notifiee_id, notifier_id)?
+                || self.follows.is_following(notifier_id, notifiee_id)?),
             // Batch O WP16: list configs deliver when the notifier is a
             // member of the referenced list (dangling/foreign lists deliver
             // nothing, never error — upstream missing-list parity).
@@ -145,10 +138,10 @@ mod tests {
     use crate::domain::note::Visibility;
     use crate::federation::delivery::{SafeHttpClient, SafeHttpConfig};
     use crate::jobs::worker::JobWorker;
-    use crate::media::transcode::TranscodeConfig;
-    use crate::services::email::{SmtpConfig, SmtpEmailSender};
     use crate::media::storage::FsBlobStore;
+    use crate::media::transcode::TranscodeConfig;
     use crate::persistence::redb::RedbStore;
+    use crate::services::email::{SmtpConfig, SmtpEmailSender};
 
     /// Same harness shape as the sibling command modules (redb-backed
     /// services + a real worker), plus the concrete clock so notification
@@ -216,17 +209,17 @@ mod tests {
             scheduled_note_limit: crate::domain::draft::DEFAULT_SCHEDULED_NOTE_LIMIT,
             pin_limit: crate::domain::pinning::DEFAULT_PIN_LIMIT,
             default_like: None,
-        cache_blobs: blobs.clone(),
-        drive_capacity_per_user_bytes: 1 << 30,
-        remote_cache_max_bytes: 512 << 20,
-        remote_cache_avatar_bytes: 128 << 20,
-        remote_cache_preview_bytes: 256 << 20,
-        remote_cache_full_bytes: 128 << 20,
-        remote_cache_mode: crate::config::RemoteCacheMode::OnDemand,
-        remote_cache_avatar_ttl_days: 30,
-        remote_cache_preview_ttl_days: 7,
-        remote_cache_full_ttl_days: 3,
-        remote_cache_warming_enabled: false,
+            cache_blobs: blobs.clone(),
+            drive_capacity_per_user_bytes: 1 << 30,
+            remote_cache_max_bytes: 512 << 20,
+            remote_cache_avatar_bytes: 128 << 20,
+            remote_cache_preview_bytes: 256 << 20,
+            remote_cache_full_bytes: 128 << 20,
+            remote_cache_mode: crate::config::RemoteCacheMode::OnDemand,
+            remote_cache_avatar_ttl_days: 30,
+            remote_cache_preview_ttl_days: 7,
+            remote_cache_full_ttl_days: 3,
+            remote_cache_warming_enabled: false,
         };
         (services, clock)
     }
@@ -247,7 +240,12 @@ mod tests {
         }
     }
 
-    fn set_receive_config(services: &AppServices, user_id: &str, kind: &str, config: ProfileNotifConfig) {
+    fn set_receive_config(
+        services: &AppServices,
+        user_id: &str,
+        kind: &str,
+        config: ProfileNotifConfig,
+    ) {
         let mut map = std::collections::BTreeMap::new();
         map.insert(kind.to_string(), config);
         services
@@ -261,15 +259,13 @@ mod tests {
             .unwrap();
     }
 
-    fn notifs_for(services: &AppServices, user_id: &str) -> Vec<crate::domain::notification::Notification> {
+    fn notifs_for(
+        services: &AppServices,
+        user_id: &str,
+    ) -> Vec<crate::domain::notification::Notification> {
         services
             .notifications
-            .list_notifications_filtered(
-                user_id,
-                &TimelineCursor::with_limit(100),
-                &[],
-                &[],
-            )
+            .list_notifications_filtered(user_id, &TimelineCursor::with_limit(100), &[], &[])
             .unwrap()
     }
 
@@ -291,7 +287,14 @@ mod tests {
         // A `Notify` job addressed to its own author converges quietly: no
         // row, no error, job completes.
         let job = services
-            .notify_job(&alice.id, &alice.id, NotificationKind::Mention, None, None, "self")
+            .notify_job(
+                &alice.id,
+                &alice.id,
+                NotificationKind::Mention,
+                None,
+                None,
+                "self",
+            )
             .unwrap();
         services.jobs.enqueue_jobs(vec![job]).unwrap();
         worker_for(&services).drain(100).unwrap();
@@ -320,7 +323,10 @@ mod tests {
             &services,
             &alice.id,
             "follow",
-            ProfileNotifConfig { kind: "never".to_string(), user_list_id: None },
+            ProfileNotifConfig {
+                kind: "never".to_string(),
+                user_list_id: None,
+            },
         );
         let services = Arc::new(services);
         assert_eq!(follow_notifs(&services, &bob.id, &alice.id), 0);
@@ -343,43 +349,91 @@ mod tests {
             &services,
             &alice.id,
             "mention",
-            ProfileNotifConfig { kind: "following".to_string(), user_list_id: None },
+            ProfileNotifConfig {
+                kind: "following".to_string(),
+                user_list_id: None,
+            },
         );
-        assert!(!services.notification_delivery_allowed(&alice.id, NotificationKind::Mention, &bob.id).unwrap());
-        assert!(!services.notification_delivery_allowed(&alice.id, NotificationKind::Mention, &carol.id).unwrap());
+        assert!(
+            !services
+                .notification_delivery_allowed(&alice.id, NotificationKind::Mention, &bob.id)
+                .unwrap()
+        );
+        assert!(
+            !services
+                .notification_delivery_allowed(&alice.id, NotificationKind::Mention, &carol.id)
+                .unwrap()
+        );
         services.follow(&alice.id, &bob.id, false).unwrap();
         worker_for(&services).drain(100).unwrap();
-        assert!(services.notification_delivery_allowed(&alice.id, NotificationKind::Mention, &bob.id).unwrap());
+        assert!(
+            services
+                .notification_delivery_allowed(&alice.id, NotificationKind::Mention, &bob.id)
+                .unwrap()
+        );
 
         // `follower`: notifier must follow the notifiee.
         set_receive_config(
             &services,
             &alice.id,
             "mention",
-            ProfileNotifConfig { kind: "follower".to_string(), user_list_id: None },
+            ProfileNotifConfig {
+                kind: "follower".to_string(),
+                user_list_id: None,
+            },
         );
-        assert!(services.notification_delivery_allowed(&alice.id, NotificationKind::Mention, &bob.id).unwrap());
-        assert!(!services.notification_delivery_allowed(&alice.id, NotificationKind::Mention, &carol.id).unwrap());
+        assert!(
+            services
+                .notification_delivery_allowed(&alice.id, NotificationKind::Mention, &bob.id)
+                .unwrap()
+        );
+        assert!(
+            !services
+                .notification_delivery_allowed(&alice.id, NotificationKind::Mention, &carol.id)
+                .unwrap()
+        );
 
         // `mutualFollow`: both directions required (alice↔bob now).
         set_receive_config(
             &services,
             &alice.id,
             "mention",
-            ProfileNotifConfig { kind: "mutualFollow".to_string(), user_list_id: None },
+            ProfileNotifConfig {
+                kind: "mutualFollow".to_string(),
+                user_list_id: None,
+            },
         );
-        assert!(services.notification_delivery_allowed(&alice.id, NotificationKind::Mention, &bob.id).unwrap());
-        assert!(!services.notification_delivery_allowed(&alice.id, NotificationKind::Mention, &carol.id).unwrap());
+        assert!(
+            services
+                .notification_delivery_allowed(&alice.id, NotificationKind::Mention, &bob.id)
+                .unwrap()
+        );
+        assert!(
+            !services
+                .notification_delivery_allowed(&alice.id, NotificationKind::Mention, &carol.id)
+                .unwrap()
+        );
 
         // `followingOrFollower`: either direction passes.
         set_receive_config(
             &services,
             &alice.id,
             "mention",
-            ProfileNotifConfig { kind: "followingOrFollower".to_string(), user_list_id: None },
+            ProfileNotifConfig {
+                kind: "followingOrFollower".to_string(),
+                user_list_id: None,
+            },
         );
-        assert!(services.notification_delivery_allowed(&alice.id, NotificationKind::Mention, &bob.id).unwrap());
-        assert!(!services.notification_delivery_allowed(&alice.id, NotificationKind::Mention, &carol.id).unwrap());
+        assert!(
+            services
+                .notification_delivery_allowed(&alice.id, NotificationKind::Mention, &bob.id)
+                .unwrap()
+        );
+        assert!(
+            !services
+                .notification_delivery_allowed(&alice.id, NotificationKind::Mention, &carol.id)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -393,22 +447,48 @@ mod tests {
             &services,
             &alice.id,
             "mention",
-            ProfileNotifConfig { kind: "list".to_string(), user_list_id: Some("lst1".to_string()) },
+            ProfileNotifConfig {
+                kind: "list".to_string(),
+                user_list_id: Some("lst1".to_string()),
+            },
         );
         let services = Arc::new(services);
-        assert!(!services.notification_delivery_allowed(&alice.id, NotificationKind::Mention, &bob.id).unwrap());
+        assert!(
+            !services
+                .notification_delivery_allowed(&alice.id, NotificationKind::Mention, &bob.id)
+                .unwrap()
+        );
         // Member delivers; non-member and foreign lists drop.
-        let list = services.create_user_list(&alice.id, "l".to_string()).unwrap();
-        services.push_list_member(&alice.id, &list.id, &bob.id).unwrap();
+        let list = services
+            .create_user_list(&alice.id, "l".to_string())
+            .unwrap();
+        services
+            .push_list_member(&alice.id, &list.id, &bob.id)
+            .unwrap();
         set_receive_config(
             &services,
             &alice.id,
             "mention",
-            ProfileNotifConfig { kind: "list".to_string(), user_list_id: Some(list.id.clone()) },
+            ProfileNotifConfig {
+                kind: "list".to_string(),
+                user_list_id: Some(list.id.clone()),
+            },
         );
-        assert!(services.notification_delivery_allowed(&alice.id, NotificationKind::Mention, &bob.id).unwrap());
-        assert!(!services.notification_delivery_allowed(&alice.id, NotificationKind::Mention, &carol.id).unwrap());
-        assert!(!services.notification_delivery_allowed(&bob.id, NotificationKind::Mention, &bob.id).unwrap());
+        assert!(
+            services
+                .notification_delivery_allowed(&alice.id, NotificationKind::Mention, &bob.id)
+                .unwrap()
+        );
+        assert!(
+            !services
+                .notification_delivery_allowed(&alice.id, NotificationKind::Mention, &carol.id)
+                .unwrap()
+        );
+        assert!(
+            !services
+                .notification_delivery_allowed(&bob.id, NotificationKind::Mention, &bob.id)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -422,13 +502,19 @@ mod tests {
         for kind in ["mention", "reaction"] {
             map.insert(
                 kind.to_string(),
-                ProfileNotifConfig { kind: "never".to_string(), user_list_id: None },
+                ProfileNotifConfig {
+                    kind: "never".to_string(),
+                    user_list_id: None,
+                },
             );
         }
         services
             .update_profile(
                 &alice.id,
-                UpdateAccountPatch { notification_recieve_config: Some(map), ..Default::default() },
+                UpdateAccountPatch {
+                    notification_recieve_config: Some(map),
+                    ..Default::default()
+                },
             )
             .unwrap();
         // Mention via create_note, reaction via react: both enqueue Notify
@@ -446,7 +532,9 @@ mod tests {
             ))
             .unwrap();
         // A reaction notifies the note's author (alice here).
-        services.react(&bob.id, &alice_note.id, "👍", false).unwrap();
+        services
+            .react(&bob.id, &alice_note.id, "👍", false)
+            .unwrap();
         let services = Arc::new(services);
         worker_for(&services).drain(100).unwrap();
         assert!(notifs_for(&services, &alice.id).is_empty());
@@ -477,12 +565,19 @@ mod tests {
         let alice = services.create_account("alice", None).unwrap();
         let bob = services.create_account("bob", None).unwrap();
         // No config row at all, and an explicit `all`, both deliver.
-        assert!(services.notification_delivery_allowed(&alice.id, NotificationKind::Follow, &bob.id).unwrap());
+        assert!(
+            services
+                .notification_delivery_allowed(&alice.id, NotificationKind::Follow, &bob.id)
+                .unwrap()
+        );
         set_receive_config(
             &services,
             &alice.id,
             "follow",
-            ProfileNotifConfig { kind: "all".to_string(), user_list_id: None },
+            ProfileNotifConfig {
+                kind: "all".to_string(),
+                user_list_id: None,
+            },
         );
         let services = Arc::new(services);
         assert_eq!(follow_notifs(&services, &bob.id, &alice.id), 1);
@@ -495,21 +590,24 @@ mod tests {
         let (services, _) = notify_services("remote-host");
         let remote = services
             .accounts
-            .create_account(CreateAccountInput {
-                handle: "rina".to_string(),
-                host: Some("remote.example".to_string()),
-                display_name: None,
-                description: None,
-                location: None,
-                birthday: None,
-                uri: Some("https://remote.example/users/rina".to_string()),
-                inbox: Some("https://remote.example/inbox".to_string()),
-                shared_inbox: None,
-                is_bot: false,
-                is_cat: false,
-                is_locked: false,
-                preserved_usernames: Vec::new(),
-            }, None)
+            .create_account(
+                CreateAccountInput {
+                    handle: "rina".to_string(),
+                    host: Some("remote.example".to_string()),
+                    display_name: None,
+                    description: None,
+                    location: None,
+                    birthday: None,
+                    uri: Some("https://remote.example/users/rina".to_string()),
+                    inbox: Some("https://remote.example/inbox".to_string()),
+                    shared_inbox: None,
+                    is_bot: false,
+                    is_cat: false,
+                    is_locked: false,
+                    preserved_usernames: Vec::new(),
+                },
+                None,
+            )
             .unwrap();
         let note = services
             .create_note(crate::application::ports::CreateNoteInput {

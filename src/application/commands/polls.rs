@@ -75,7 +75,10 @@ impl AppServices {
                 user_id: voter_id.to_string(),
                 choice,
             },
-            format!("poll-vote:{voter_id}:{note_id}:{choice}:{}", self.ids.generate()),
+            format!(
+                "poll-vote:{voter_id}:{note_id}:{choice}:{}",
+                self.ids.generate()
+            ),
         )?];
         // Federated notes fan fresh tallies out as `Update(Question)`
         // (Misskey `deliverQuestionUpdate`); local-only notes never
@@ -98,9 +101,7 @@ impl AppServices {
         // `Create` vote activity (Misskey `renderVote` parity).
         if let Some(author) = self.accounts.find_by_id(&note.author_id)? {
             if !author.is_local() {
-                if let Some(inbox_url) =
-                    crate::federation::outbox::preferred_inbox(&author)
-                {
+                if let Some(inbox_url) = crate::federation::outbox::preferred_inbox(&author) {
                     let base = self.public_url.trim_end_matches('/');
                     let vote_row_id = self.ids.generate();
                     let target_uri = note
@@ -115,10 +116,7 @@ impl AppServices {
                             choice_name: poll.choices[choice].clone(),
                             inbox_url,
                         }
-                        .into_job(
-                            format!("federate:vote:{voter_id}:{note_id}:{choice}"),
-                            now,
-                        )?,
+                        .into_job(format!("federate:vote:{voter_id}:{note_id}:{choice}"), now)?,
                     );
                 }
             }
@@ -156,9 +154,7 @@ impl AppServices {
             &serde_json::to_vec(&StreamingEvent::PollEnded {
                 note_id: note_id.to_string(),
             })
-            .map_err(|e| {
-                PortError::Validation(format!("poll-ended payload invalid: {e}"))
-            })?,
+            .map_err(|e| PortError::Validation(format!("poll-ended payload invalid: {e}")))?,
         )?;
         Ok(true)
     }
@@ -313,16 +309,14 @@ impl AppServices {
         let Some(expires_at) = poll.expires_at_ms else {
             return Ok(None);
         };
-        Ok(Some(
-            crate::application::ports::NewJob::new_json(
-                crate::application::ports::JobKind::PollExpiry,
-                &PollExpiryPayload {
-                    note_id: note_id.to_string(),
-                },
-                format!("poll-expiry:{note_id}:{}", self.ids.generate()),
-                expires_at,
-            )?,
-        ))
+        Ok(Some(crate::application::ports::NewJob::new_json(
+            crate::application::ports::JobKind::PollExpiry,
+            &PollExpiryPayload {
+                note_id: note_id.to_string(),
+            },
+            format!("poll-expiry:{note_id}:{}", self.ids.generate()),
+            expires_at,
+        )?))
     }
 }
 
@@ -358,8 +352,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let clock: Arc<ManualClock> = Arc::new(ManualClock::new(1_760_400_000_000));
         let ids: Arc<dyn IdGenerator> = Arc::new(AidxGenerator::new(clock.clone()));
-        let store =
-            RedbStore::open(dir.join("test.redb"), clock.clone(), ids.clone()).unwrap();
+        let store = RedbStore::open(dir.join("test.redb"), clock.clone(), ids.clone()).unwrap();
         let blobs: Arc<dyn BlobStore> = Arc::new(FsBlobStore::new(dir.join("blobs")).unwrap());
         let services = AppServices {
             clock: clock.clone() as Arc<dyn Clock>,
@@ -412,17 +405,17 @@ mod tests {
             scheduled_note_limit: crate::domain::draft::DEFAULT_SCHEDULED_NOTE_LIMIT,
             pin_limit: crate::domain::pinning::DEFAULT_PIN_LIMIT,
             default_like: None,
-        cache_blobs: blobs.clone(),
-        drive_capacity_per_user_bytes: 1 << 30,
-        remote_cache_max_bytes: 512 << 20,
-        remote_cache_avatar_bytes: 128 << 20,
-        remote_cache_preview_bytes: 256 << 20,
-        remote_cache_full_bytes: 128 << 20,
-        remote_cache_mode: crate::config::RemoteCacheMode::OnDemand,
-        remote_cache_avatar_ttl_days: 30,
-        remote_cache_preview_ttl_days: 7,
-        remote_cache_full_ttl_days: 3,
-        remote_cache_warming_enabled: false,
+            cache_blobs: blobs.clone(),
+            drive_capacity_per_user_bytes: 1 << 30,
+            remote_cache_max_bytes: 512 << 20,
+            remote_cache_avatar_bytes: 128 << 20,
+            remote_cache_preview_bytes: 256 << 20,
+            remote_cache_full_bytes: 128 << 20,
+            remote_cache_mode: crate::config::RemoteCacheMode::OnDemand,
+            remote_cache_avatar_ttl_days: 30,
+            remote_cache_preview_ttl_days: 7,
+            remote_cache_full_ttl_days: 3,
+            remote_cache_warming_enabled: false,
         };
         (services, clock)
     }
@@ -471,8 +464,7 @@ mod tests {
             assert!(services.create_note(input).is_err());
         }
         // Duplicate choices.
-        let mut input =
-            crate::application::ports::CreateNoteInput::simple_public(&alice.id, "t");
+        let mut input = crate::application::ports::CreateNoteInput::simple_public(&alice.id, "t");
         input.poll = Some(PollInput {
             choices: vec!["a".to_string(), "a".to_string()],
             multiple: false,
@@ -483,8 +475,7 @@ mod tests {
         assert!(port_code(err).contains("unique"));
 
         // Already-expired poll carries the exact Misskey ident.
-        let mut input =
-            crate::application::ports::CreateNoteInput::simple_public(&alice.id, "t");
+        let mut input = crate::application::ports::CreateNoteInput::simple_public(&alice.id, "t");
         input.poll = Some(PollInput {
             choices: vec!["a".to_string(), "b".to_string()],
             multiple: false,
@@ -546,8 +537,7 @@ mod tests {
         let now = clock.now_ms();
 
         // NO_POLL on a plain note.
-        let plain =
-            crate::application::ports::CreateNoteInput::simple_public(&alice.id, "plain");
+        let plain = crate::application::ports::CreateNoteInput::simple_public(&alice.id, "plain");
         let plain = services.create_note(plain).unwrap();
         let err = services.vote_on_poll(&bob.id, &plain.id, 0).unwrap_err();
         assert_eq!(port_code(err), "NO_POLL");
@@ -572,7 +562,12 @@ mod tests {
             .unwrap_err();
         assert_eq!(port_code(err), "ALREADY_EXPIRED");
         assert_eq!(
-            services.polls.get_poll(&expiring.id).unwrap().unwrap().votes,
+            services
+                .polls
+                .get_poll(&expiring.id)
+                .unwrap()
+                .unwrap()
+                .votes,
             vec![1, 0]
         );
 
@@ -621,8 +616,7 @@ mod tests {
         );
 
         // Plain notes pack `hasPoll: false` + `poll: null`.
-        let plain =
-            crate::application::ports::CreateNoteInput::simple_public(&alice.id, "plain");
+        let plain = crate::application::ports::CreateNoteInput::simple_public(&alice.id, "plain");
         let plain = services.create_note(plain).unwrap();
         let packed =
             crate::api::misskey::packers::pack_note(&plain, Some(&bob.id), &services, 0).unwrap();
@@ -695,8 +689,7 @@ mod tests {
 
         // Renote + poll but no text: a quote (Misskey `isQuote` parity),
         // not a pure renote.
-        let mut input =
-            crate::application::ports::CreateNoteInput::simple_public(&bob.id, "");
+        let mut input = crate::application::ports::CreateNoteInput::simple_public(&bob.id, "");
         input.text = None;
         input.renote_of = Some(target.id.clone());
         input.poll = Some(PollInput {
@@ -725,20 +718,42 @@ mod tests {
         let (services, clock) = poll_services("inbound");
         let alice = services.create_account("alice", None).unwrap();
         let now = clock.now_ms();
-        let note = poll_note(&services, &alice.id, &["a", "b"], false, Some(now + 600_000));
+        let note = poll_note(
+            &services,
+            &alice.id,
+            &["a", "b"],
+            false,
+            Some(now + 600_000),
+        );
 
         // A remote voter id (no local account needed for the op itself).
         let voter = "remote-voter-1";
-        assert!(services.handle_inbound_vote("act-1", voter, &note.id, "b").unwrap());
+        assert!(
+            services
+                .handle_inbound_vote("act-1", voter, &note.id, "b")
+                .unwrap()
+        );
         // Replay of the same choice converges without double-counting.
-        assert!(!services.handle_inbound_vote("act-1", voter, &note.id, "b").unwrap());
+        assert!(
+            !services
+                .handle_inbound_vote("act-1", voter, &note.id, "b")
+                .unwrap()
+        );
         assert_eq!(
             services.polls.get_poll(&note.id).unwrap().unwrap().votes,
             vec![0, 1]
         );
         // Unknown choice / expired / missing converge quietly.
-        assert!(!services.handle_inbound_vote("act-2", voter, &note.id, "zzz").unwrap());
-        assert!(!services.handle_inbound_vote("act-3", voter, "nope", "a").unwrap());
+        assert!(
+            !services
+                .handle_inbound_vote("act-2", voter, &note.id, "zzz")
+                .unwrap()
+        );
+        assert!(
+            !services
+                .handle_inbound_vote("act-3", voter, "nope", "a")
+                .unwrap()
+        );
 
         // Question sync by choice name (Misskey `updateQuestion` parity).
         let counts = vec![

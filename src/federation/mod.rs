@@ -1,13 +1,13 @@
-pub mod inbox;
-pub mod outbox;
 pub mod delivery;
-pub mod host_caps;
-pub mod retry;
 /// Generic authenticated-fetch gate: HTTP-signature verification on
 /// inbound GETs plus the serve/403/404 decision interface. Clip/page tier
 /// enforcement and (later) private-community membership checks are
 /// resource callbacks above this gate — never below it.
 pub mod fetch_gate;
+pub mod host_caps;
+pub mod inbox;
+pub mod outbox;
+pub mod retry;
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
@@ -49,7 +49,10 @@ impl ActivityIdIndex {
         if follower.is_empty() || followee.is_empty() || id.is_empty() {
             return;
         }
-        let mut inner = Self::global().inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = Self::global()
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if inner.len() >= ACTIVITY_INDEX_CAP && !inner.contains_key(id) {
             // Arbitrary-single eviction (the map is a convergence aid, not
             // an LRU: any evicted entry degrades to the pre-index
@@ -84,7 +87,11 @@ impl ActivityIdIndex {
 
     #[cfg(test)]
     fn clear_for_tests() {
-        Self::global().inner.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        Self::global()
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 }
 
@@ -115,7 +122,10 @@ impl ReplyCoalescer {
     /// caller's clock; tests pass synthetic times.
     pub fn should_enqueue(parent_uri: &str, now_ms: i64) -> bool {
         let key = reply_resolve_key(parent_uri);
-        let mut inner = Self::global().inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = Self::global()
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Opportunistic prune: keep the map proportional to live parents.
         if inner.len() > ACTIVITY_INDEX_CAP {
             let cutoff = now_ms.saturating_sub(REPLY_COALESCE_TTL_MS);
@@ -132,7 +142,11 @@ impl ReplyCoalescer {
 
     #[cfg(test)]
     fn clear_for_tests() {
-        Self::global().inner.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        Self::global()
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 }
 
@@ -160,7 +174,10 @@ impl StampNegativeCache {
     /// backoff window for the recorded failures has elapsed).
     pub fn should_fetch(stamp_uri: &str, now_ms: i64) -> bool {
         let key = stamp_uri.trim().to_string();
-        let inner = Self::global().inner.lock().unwrap_or_else(|e| e.into_inner());
+        let inner = Self::global()
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         match inner.get(&key).copied() {
             None => true,
             Some((last, failures)) => stamp_retry_due(failures, Some(last), now_ms),
@@ -174,11 +191,17 @@ impl StampNegativeCache {
         if key.is_empty() {
             return;
         }
-        let mut inner = Self::global().inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = Self::global()
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if success {
             inner.remove(&key);
         } else {
-            let failures = inner.get(&key).map(|(_, f)| f.saturating_add(1)).unwrap_or(1);
+            let failures = inner
+                .get(&key)
+                .map(|(_, f)| f.saturating_add(1))
+                .unwrap_or(1);
             if inner.len() >= ACTIVITY_INDEX_CAP && !inner.contains_key(&key) {
                 if let Some(first) = inner.keys().next().cloned() {
                     inner.remove(&first);
@@ -190,7 +213,11 @@ impl StampNegativeCache {
 
     #[cfg(test)]
     fn clear_for_tests() {
-        Self::global().inner.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        Self::global()
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 }
 
@@ -249,7 +276,10 @@ mod tests {
             assert!(!ReplyCoalescer::should_enqueue(uri, now + dt));
         }
         // Past the window a fresh trigger is allowed (job-loss cover).
-        assert!(ReplyCoalescer::should_enqueue(uri, now + REPLY_COALESCE_TTL_MS));
+        assert!(ReplyCoalescer::should_enqueue(
+            uri,
+            now + REPLY_COALESCE_TTL_MS
+        ));
         // A different parent is independent.
         assert!(ReplyCoalescer::should_enqueue(
             "https://remote.example/notes/other",

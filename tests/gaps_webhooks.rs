@@ -17,14 +17,14 @@ use pinetree::application::commands::webhooks::{
     UpdateUserWebhookInput,
 };
 use pinetree::application::ports::{
-    AbuseReportRecipientStore, Job, JobKind, JobQueue, NewJob, PortError,
-    SystemWebhookStore, UserWebhookStore, MAX_JOBS_PER_TXN,
+    AbuseReportRecipientStore, Job, JobKind, JobQueue, MAX_JOBS_PER_TXN, NewJob, PortError,
+    SystemWebhookStore, UserWebhookStore,
 };
 use pinetree::domain::id::{IdGenerator, ManualClock, PortError as DomainPortError};
 use pinetree::domain::webhook::{
-    apply_rate_limit_factor, verify_webhook_signature, webhook_idempotency_key,
-    webhook_signature_hex, AbuseReportRecipient, SystemWebhook, UserWebhook,
-    SYSTEM_WEBHOOK_TRIGGERS, USER_WEBHOOK_TRIGGERS,
+    AbuseReportRecipient, SYSTEM_WEBHOOK_TRIGGERS, SystemWebhook, USER_WEBHOOK_TRIGGERS,
+    UserWebhook, apply_rate_limit_factor, verify_webhook_signature, webhook_idempotency_key,
+    webhook_signature_hex,
 };
 use pinetree::federation::delivery::{SafeHttpClient, SafeHttpConfig};
 use pinetree::federation::retry::{DeliveryOutcome, DestinationTracker};
@@ -178,7 +178,10 @@ struct MemRecipientStore {
 }
 
 impl AbuseReportRecipientStore for MemRecipientStore {
-    fn insert_recipient(&self, row: AbuseReportRecipient) -> Result<AbuseReportRecipient, PortError> {
+    fn insert_recipient(
+        &self,
+        row: AbuseReportRecipient,
+    ) -> Result<AbuseReportRecipient, PortError> {
         let mut rows = self.rows.lock().unwrap();
         if rows.contains_key(&row.id) {
             return Err(PortError::Conflict("duplicate recipient".to_string()));
@@ -194,10 +197,7 @@ impl AbuseReportRecipientStore for MemRecipientStore {
         v.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(v)
     }
-    fn put_recipient(
-        &self,
-        row: AbuseReportRecipient,
-    ) -> Result<AbuseReportRecipient, PortError> {
+    fn put_recipient(&self, row: AbuseReportRecipient) -> Result<AbuseReportRecipient, PortError> {
         let mut rows = self.rows.lock().unwrap();
         if !rows.contains_key(&row.id) {
             return Err(PortError::NotFound("no such recipient".to_string()));
@@ -229,7 +229,13 @@ struct FakeQueue {
 
 impl FakeQueue {
     fn all(&self) -> Vec<NewJob> {
-        self.batches.lock().unwrap().iter().flatten().cloned().collect()
+        self.batches
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .cloned()
+            .collect()
     }
 }
 
@@ -290,9 +296,14 @@ fn system_crud_happy_path() {
     let store = MemSystemStore::default();
     let ids = CounterIds::default();
     let clock = ManualClock::new(1_760_400_000_000);
-    let created = webhooks::create_system_webhook(&store, &ids, &clock, true, sys_input("abuseReport"))
-        .expect("create");
-    assert_eq!(created.secret.chars().count(), 32, "secret minted at 32 chars");
+    let created =
+        webhooks::create_system_webhook(&store, &ids, &clock, true, sys_input("abuseReport"))
+            .expect("create");
+    assert_eq!(
+        created.secret.chars().count(),
+        32,
+        "secret minted at 32 chars"
+    );
     assert!(created.is_active);
 
     let shown = webhooks::show_system_webhook(&store, true, &created.id).expect("show");
@@ -339,7 +350,8 @@ fn system_rejects_bad_shapes_and_non_admin() {
 
     for trigger in ["mention", "", "nope"] {
         assert!(
-            webhooks::create_system_webhook(&store, &ids, &clock, true, sys_input(trigger)).is_err(),
+            webhooks::create_system_webhook(&store, &ids, &clock, true, sys_input(trigger))
+                .is_err(),
             "trigger {trigger:?} must be rejected for system hooks"
         );
     }
@@ -454,7 +466,14 @@ fn recipient_crud_and_active_fanout_list() {
     let ids = CounterIds::default();
     let clock = ManualClock::new(1_760_400_000_000);
     assert!(matches!(
-        webhooks::create_recipient(&store, &ids, &clock, false, "m".to_string(), "m@example.com".to_string()),
+        webhooks::create_recipient(
+            &store,
+            &ids,
+            &clock,
+            false,
+            "m".to_string(),
+            "m@example.com".to_string()
+        ),
         Err(PortError::Validation(_))
     ));
     assert!(
@@ -506,22 +525,35 @@ fn plan_system_event_scopes_and_caps() {
     let store = MemSystemStore::default();
     let ids = CounterIds::default();
     let clock = ManualClock::new(1_760_400_000_000);
-    let h1 = webhooks::create_system_webhook(&store, &ids, &clock, true, sys_input("abuseReport")).unwrap();
-    let h2 = webhooks::create_system_webhook(&store, &ids, &clock, true, sys_input("abuseReport")).unwrap();
+    let h1 = webhooks::create_system_webhook(&store, &ids, &clock, true, sys_input("abuseReport"))
+        .unwrap();
+    let h2 = webhooks::create_system_webhook(&store, &ids, &clock, true, sys_input("abuseReport"))
+        .unwrap();
     webhooks::create_system_webhook(&store, &ids, &clock, true, sys_input("userCreated")).unwrap();
     webhooks::update_system_webhook(
         &store,
         &clock,
         true,
         &h2.id,
-        UpdateSystemWebhookInput { is_active: Some(false), ..Default::default() },
+        UpdateSystemWebhookInput {
+            is_active: Some(false),
+            ..Default::default()
+        },
     )
     .unwrap();
 
     let payload = serde_json::json!({"reportId": "r1"});
     // Inactive h2 and wrong-trigger h3 are excluded: only h1 fires.
-    let jobs = webhooks::plan_system_event(&store, "abuseReport", "abuseReport", &payload, "r1", 100, 500)
-        .unwrap();
+    let jobs = webhooks::plan_system_event(
+        &store,
+        "abuseReport",
+        "abuseReport",
+        &payload,
+        "r1",
+        100,
+        500,
+    )
+    .unwrap();
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].payload.webhook_id, h1.id);
     assert!(jobs[0].payload.is_system);
@@ -530,16 +562,28 @@ fn plan_system_event_scopes_and_caps() {
         webhook_idempotency_key(&h1.id, "abuseReport", "r1")
     );
     // Deterministic keys: same inputs plan the same key.
-    let again = webhooks::plan_system_event(&store, "abuseReport", "abuseReport", &payload, "r1", 999, 500)
-        .unwrap();
+    let again = webhooks::plan_system_event(
+        &store,
+        "abuseReport",
+        "abuseReport",
+        &payload,
+        "r1",
+        999,
+        500,
+    )
+    .unwrap();
     assert_eq!(again[0].idempotency_key, jobs[0].idempotency_key);
 
     // Cap honored.
-    let capped = webhooks::plan_system_event(&store, "abuseReport", "abuseReport", &payload, "r1", 100, 1)
-        .unwrap();
+    let capped =
+        webhooks::plan_system_event(&store, "abuseReport", "abuseReport", &payload, "r1", 100, 1)
+            .unwrap();
     assert_eq!(capped.len(), 1);
     // Unknown trigger never plans.
-    assert!(webhooks::plan_system_event(&store, "mention", "mention", &payload, "r1", 100, 500).is_err());
+    assert!(
+        webhooks::plan_system_event(&store, "mention", "mention", &payload, "r1", 100, 500)
+            .is_err()
+    );
 }
 
 #[test]
@@ -566,8 +610,10 @@ fn plan_user_event_is_owner_scoped() {
     let a = mk("alice");
     mk("bob");
     let payload = serde_json::json!({"noteId": "n1"});
-    let jobs = webhooks::plan_user_event(&store, "alice", "mention", "mention", &payload, "n1", 100, 500)
-        .unwrap();
+    let jobs = webhooks::plan_user_event(
+        &store, "alice", "mention", "mention", &payload, "n1", 100, 500,
+    )
+    .unwrap();
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].payload.webhook_id, a.id);
     assert_eq!(jobs[0].payload.owner_id.as_deref(), Some("alice"));
@@ -581,11 +627,24 @@ fn enqueue_planned_is_one_call_and_bounded() {
     let clock = ManualClock::new(1_760_400_000_000);
     webhooks::create_system_webhook(&store, &ids, &clock, true, sys_input("abuseReport")).unwrap();
     let payload = serde_json::json!({});
-    let jobs = webhooks::plan_system_event(&store, "abuseReport", "abuseReport", &payload, "d", 100, 500).unwrap();
+    let jobs = webhooks::plan_system_event(
+        &store,
+        "abuseReport",
+        "abuseReport",
+        &payload,
+        "d",
+        100,
+        500,
+    )
+    .unwrap();
     let queue = FakeQueue::default();
     webhooks::enqueue_planned(&queue, TEST_KIND, &jobs).unwrap();
     assert_eq!(queue.all().len(), 1);
-    assert_eq!(queue.batches.lock().unwrap().len(), 1, "single enqueue_jobs call");
+    assert_eq!(
+        queue.batches.lock().unwrap().len(),
+        1,
+        "single enqueue_jobs call"
+    );
     assert_eq!(queue.pending_count().unwrap(), 1);
 
     // Over-cap plans are rejected, never partially enqueued.
@@ -601,8 +660,24 @@ fn enqueue_planned_is_one_call_and_bounded() {
 
     // Abuse-report email fan-out: one job per active recipient, bounded.
     let rstore = MemRecipientStore::default();
-    webhooks::create_recipient(&rstore, &ids, &clock, true, "a".into(), "a@example.com".into()).unwrap();
-    webhooks::create_recipient(&rstore, &ids, &clock, true, "b".into(), "b@example.com".into()).unwrap();
+    webhooks::create_recipient(
+        &rstore,
+        &ids,
+        &clock,
+        true,
+        "a".into(),
+        "a@example.com".into(),
+    )
+    .unwrap();
+    webhooks::create_recipient(
+        &rstore,
+        &ids,
+        &clock,
+        true,
+        "b".into(),
+        "b@example.com".into(),
+    )
+    .unwrap();
     let email_jobs = webhooks::plan_abuse_report_emails(&rstore, "rep1", "comment", 100).unwrap();
     assert_eq!(email_jobs.len(), 2);
     assert_eq!(email_jobs[0].payload.to, vec!["a@example.com".to_string()]);
@@ -629,15 +704,27 @@ struct CapturedRequest {
 
 /// Minimal HTTP stub: `n` connections, canned status, captures requests.
 /// Loopback only — hermetic by construction.
-fn stub_server(status: u16, n: usize) -> (String, Arc<Mutex<Vec<CapturedRequest>>>, std::thread::JoinHandle<()>) {
+fn stub_server(
+    status: u16,
+    n: usize,
+) -> (
+    String,
+    Arc<Mutex<Vec<CapturedRequest>>>,
+    std::thread::JoinHandle<()>,
+) {
     let captured: Arc<Mutex<Vec<CapturedRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
-    let url = format!("http://127.0.0.1:{}/hook", listener.local_addr().unwrap().port());
+    let url = format!(
+        "http://127.0.0.1:{}/hook",
+        listener.local_addr().unwrap().port()
+    );
     let out = Arc::clone(&captured);
     let handle = std::thread::spawn(move || {
         for _ in 0..n {
             let (stream, _) = listener.accept().expect("accept");
-            stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut request_line = String::new();
             reader.read_line(&mut request_line).unwrap();
@@ -664,7 +751,12 @@ fn stub_server(status: u16, n: usize) -> (String, Arc<Mutex<Vec<CapturedRequest>
             if content_length > 0 {
                 reader.read_exact(&mut body).unwrap();
             }
-            out.lock().unwrap().push(CapturedRequest { method, path, headers, body });
+            out.lock().unwrap().push(CapturedRequest {
+                method,
+                path,
+                headers,
+                body,
+            });
             let response = format!(
                 "HTTP/1.1 {status} X\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
             );
@@ -700,7 +792,8 @@ fn deliver_success_posts_signed_body() {
     let (url, captured, handle) = stub_server(200, 1);
     let tracker = DestinationTracker::new();
     let payload = deliver_payload(&url);
-    let outcome = webhooks::execute_webhook_deliver(&loopback_client(), &tracker, 1000, 5000, &payload);
+    let outcome =
+        webhooks::execute_webhook_deliver(&loopback_client(), &tracker, 1000, 5000, &payload);
     assert_eq!(outcome, DeliveryOutcome::Delivered);
     handle.join().unwrap();
     let reqs = captured.lock().unwrap();
@@ -718,7 +811,10 @@ fn deliver_success_posts_signed_body() {
     assert_eq!(reqs[0].body, expected_body);
     assert_eq!(sig, webhook_signature_hex("s3cret", &expected_body));
     assert!(verify_webhook_signature("s3cret", &expected_body, &sig));
-    assert!(tracker.cooldown_until(&url, 5000).is_none(), "success clears cooldown");
+    assert!(
+        tracker.cooldown_until(&url, 5000).is_none(),
+        "success clears cooldown"
+    );
 }
 
 #[test]
@@ -726,14 +822,23 @@ fn deliver_transient_then_cooldown_defers() {
     let (url, _captured, handle) = stub_server(500, 1);
     let tracker = DestinationTracker::new();
     let payload = deliver_payload(&url);
-    let outcome = webhooks::execute_webhook_deliver(&loopback_client(), &tracker, 1000, 5000, &payload);
-    assert!(matches!(outcome, DeliveryOutcome::TransientFailure { .. }), "{outcome:?}");
+    let outcome =
+        webhooks::execute_webhook_deliver(&loopback_client(), &tracker, 1000, 5000, &payload);
+    assert!(
+        matches!(outcome, DeliveryOutcome::TransientFailure { .. }),
+        "{outcome:?}"
+    );
     handle.join().unwrap();
     // Same instant: destination in cooldown — no second send, no attempt burned.
-    let deferred = webhooks::execute_webhook_deliver(&loopback_client(), &tracker, 1000, 5000, &payload);
+    let deferred =
+        webhooks::execute_webhook_deliver(&loopback_client(), &tracker, 1000, 5000, &payload);
     match deferred {
         DeliveryOutcome::Deferred { until_ms } => {
-            assert_eq!(until_ms, 5000 + 1000, "first-failure backoff is one base unit");
+            assert_eq!(
+                until_ms,
+                5000 + 1000,
+                "first-failure backoff is one base unit"
+            );
         }
         other => panic!("expected Deferred, got {other:?}"),
     }
@@ -760,5 +865,9 @@ fn hmac_vectors_are_stable() {
     let sig = webhook_signature_hex("key", b"data");
     assert_eq!(sig.len(), 64);
     assert!(verify_webhook_signature("key", b"data", &sig));
-    assert!(!verify_webhook_signature("key", b"data", &sig.to_uppercase()));
+    assert!(!verify_webhook_signature(
+        "key",
+        b"data",
+        &sig.to_uppercase()
+    ));
 }

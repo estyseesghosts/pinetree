@@ -124,10 +124,14 @@ fn relays_crud() {
         code_of(services.relay_add("not-a-url").unwrap_err()),
         "INVALID_PARAM"
     );
-    services.relay_remove("https://relay.example/inbox").unwrap();
+    services
+        .relay_remove("https://relay.example/inbox")
+        .unwrap();
     assert!(services.relay_list().unwrap().is_empty());
     // Missing remove is a no-op.
-    services.relay_remove("https://relay.example/inbox").unwrap();
+    services
+        .relay_remove("https://relay.example/inbox")
+        .unwrap();
 }
 
 #[test]
@@ -153,7 +157,11 @@ fn admin_announcements_crud() {
         "NO_SUCH_ANNOUNCEMENT"
     );
     assert_eq!(
-        code_of(services.admin_announcement_create("", "x", None).unwrap_err()),
+        code_of(
+            services
+                .admin_announcement_create("", "x", None)
+                .unwrap_err()
+        ),
         "INVALID_PARAM"
     );
 }
@@ -212,7 +220,18 @@ fn ads_crud_and_refresh() {
     assert_eq!(
         code_of(
             services
-                .ad_update("missing", "https://x.example", "m", "square", 1.0, "low", 2, 1, "https://x.example/i.png", 6)
+                .ad_update(
+                    "missing",
+                    "https://x.example",
+                    "m",
+                    "square",
+                    1.0,
+                    "low",
+                    2,
+                    1,
+                    "https://x.example/i.png",
+                    6
+                )
                 .unwrap_err()
         ),
         "NO_SUCH_AD"
@@ -284,7 +303,26 @@ fn roles_crud_and_membership() {
     assert!(services.role_list().unwrap().is_empty());
     // delete is a no-op for missing ids.
     services.role_delete(&role.id).unwrap();
-    assert_eq!(code_of(services.role_create("", "d", None, None, "manual", serde_json::json!({}), false, false, false, 0, serde_json::json!({})).unwrap_err()), "INVALID_PARAM");
+    assert_eq!(
+        code_of(
+            services
+                .role_create(
+                    "",
+                    "d",
+                    None,
+                    None,
+                    "manual",
+                    serde_json::json!({}),
+                    false,
+                    false,
+                    false,
+                    0,
+                    serde_json::json!({})
+                )
+                .unwrap_err()
+        ),
+        "INVALID_PARAM"
+    );
 }
 
 #[test]
@@ -292,7 +330,14 @@ fn abuse_recipients_crud() {
     let (services, _) = test_services();
     let alice = make_user(&services, "alice");
     let email_recipient = services
-        .abuse_recipient_create(true, "mailbox", "email", Some(alice.clone()), Some("abuse@example.local".to_string()), None)
+        .abuse_recipient_create(
+            true,
+            "mailbox",
+            "email",
+            Some(alice.clone()),
+            Some("abuse@example.local".to_string()),
+            None,
+        )
         .unwrap();
     assert_eq!(services.abuse_recipient_list().unwrap().len(), 1);
     let shown = services.abuse_recipient_show(&email_recipient.id).unwrap();
@@ -309,10 +354,16 @@ fn abuse_recipients_crud() {
         )
         .unwrap();
     assert!(!updated.is_active);
-    services.abuse_recipient_delete(&email_recipient.id).unwrap();
+    services
+        .abuse_recipient_delete(&email_recipient.id)
+        .unwrap();
     assert!(services.abuse_recipient_list().unwrap().is_empty());
     assert_eq!(
-        code_of(services.abuse_recipient_show(&email_recipient.id).unwrap_err()),
+        code_of(
+            services
+                .abuse_recipient_show(&email_recipient.id)
+                .unwrap_err()
+        ),
         "NO_SUCH_ABUSE_REPORT_NOTIFICATION_RECIPIENT"
     );
     // method validation.
@@ -409,9 +460,16 @@ fn reset_password_and_user_ips_and_find_by_email() {
     let new_hash = pinetree::api::misskey::auth::hash_password("brand-new-password");
     services.admin_reset_password(&alice, &new_hash).unwrap();
     let stored = services.auth.get_password_hash(&alice).unwrap().unwrap();
-    assert!(pinetree::api::misskey::auth::verify_password("brand-new-password", &stored));
+    assert!(pinetree::api::misskey::auth::verify_password(
+        "brand-new-password",
+        &stored
+    ));
     assert_eq!(
-        code_of(services.admin_reset_password("ghost", &new_hash).unwrap_err()),
+        code_of(
+            services
+                .admin_reset_password("ghost", &new_hash)
+                .unwrap_err()
+        ),
         "NO_SUCH_USER"
     );
 
@@ -436,7 +494,10 @@ fn reset_password_and_user_ips_and_find_by_email() {
     );
 
     // find_account_by_email: exact case-insensitive match.
-    assert_eq!(services.find_account_by_email("a@example.local").unwrap(), None);
+    assert_eq!(
+        services.find_account_by_email("a@example.local").unwrap(),
+        None
+    );
     services
         .accounts
         .update_account(
@@ -448,7 +509,10 @@ fn reset_password_and_user_ips_and_find_by_email() {
             Vec::new(),
         )
         .unwrap();
-    let found = services.find_account_by_email("alice@example.local").unwrap().unwrap();
+    let found = services
+        .find_account_by_email("alice@example.local")
+        .unwrap()
+        .unwrap();
     assert_eq!(found.id, alice);
 }
 
@@ -480,20 +544,47 @@ fn federation_instances_update_refresh() {
         .unwrap();
     let instances = services.federation_instances().unwrap();
     assert_eq!(instances.len(), 1);
-    assert_eq!(instances[0].get("host").and_then(|v| v.as_str()), Some("remote.example"));
-    assert_eq!(instances[0].get("usersCount").and_then(|v| v.as_u64()), Some(1));
+    assert_eq!(
+        instances[0].get("host").and_then(|v| v.as_str()),
+        Some("remote.example")
+    );
+    assert_eq!(
+        instances[0].get("usersCount").and_then(|v| v.as_u64()),
+        Some(1)
+    );
 
     let updated = services
-        .federation_update_instance("remote.example", Some(true), None, None, Some("spam".to_string()))
+        .federation_update_instance(
+            "remote.example",
+            Some(true),
+            None,
+            None,
+            Some("spam".to_string()),
+        )
         .unwrap();
     assert!(updated.is_suspended);
-    let shown = services.federation_show_instance("REMOTE.EXAMPLE").unwrap().unwrap();
-    assert_eq!(shown.get("isSuspended").and_then(|v| v.as_bool()), Some(true));
-    assert!(services.federation_show_instance("unknown.example").unwrap().is_none());
+    let shown = services
+        .federation_show_instance("REMOTE.EXAMPLE")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        shown.get("isSuspended").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert!(
+        services
+            .federation_show_instance("unknown.example")
+            .unwrap()
+            .is_none()
+    );
 
     // refresh touches the override (204 semantics); unknown hosts are no-ops.
-    services.federation_refresh_metadata("remote.example").unwrap();
-    services.federation_refresh_metadata("unknown.example").unwrap();
+    services
+        .federation_refresh_metadata("remote.example")
+        .unwrap();
+    services
+        .federation_refresh_metadata("unknown.example")
+        .unwrap();
 }
 
 #[test]
@@ -501,10 +592,14 @@ fn push_subscriptions_crud() {
     let (services, _) = test_services();
     let alice = make_user(&services, "alice");
     let endpoint = "https://push.example/sub/1";
-    let sub = services.sw_register(&alice, endpoint, "auth-key", "pub-key").unwrap();
+    let sub = services
+        .sw_register(&alice, endpoint, "auth-key", "pub-key")
+        .unwrap();
     assert_eq!(sub.endpoint, endpoint);
     assert_eq!(services.sw_show(&alice, endpoint).unwrap().auth, "auth-key");
-    let updated = services.sw_update(&alice, endpoint, "auth2", "pub2").unwrap();
+    let updated = services
+        .sw_update(&alice, endpoint, "auth2", "pub2")
+        .unwrap();
     assert_eq!(updated.auth, "auth2");
     services.sw_unregister(&alice, endpoint).unwrap();
     assert_eq!(
@@ -514,7 +609,11 @@ fn push_subscriptions_crud() {
     // missing unregister is a no-op.
     services.sw_unregister(&alice, endpoint).unwrap();
     assert_eq!(
-        code_of(services.sw_register(&alice, "http://insecure.example/x", "a", "p").unwrap_err()),
+        code_of(
+            services
+                .sw_register(&alice, "http://insecure.example/x", "a", "p")
+                .unwrap_err()
+        ),
         "INVALID_PARAM"
     );
 }
@@ -567,12 +666,20 @@ fn retention_roundtrip_and_endpoints_inventory() {
     ] {
         assert!(ENDPOINT_NAMES.contains(&name), "{name}");
         assert_eq!(
-            services.endpoint_describe(name).unwrap().get("name").and_then(|v| v.as_str()),
+            services
+                .endpoint_describe(name)
+                .unwrap()
+                .get("name")
+                .and_then(|v| v.as_str()),
             Some(name)
         );
     }
     assert_eq!(
-        code_of(services.endpoint_describe("drive/folders/create").unwrap_err()),
+        code_of(
+            services
+                .endpoint_describe("drive/folders/create")
+                .unwrap_err()
+        ),
         "NO_SUCH_ENDPOINT"
     );
 
@@ -585,7 +692,13 @@ fn retention_roundtrip_and_endpoints_inventory() {
         limit: 10,
     };
     let page = services.list_emojis_v2(None, None, &cursor).unwrap();
-    assert!(matches!(page, pinetree::application::commands::misc_endpoints::EmojisV2Page::Local(ref rows) if rows.is_empty()));
-    let page = services.list_emojis_v2(None, Some("remote.example"), &cursor).unwrap();
-    assert!(matches!(page, pinetree::application::commands::misc_endpoints::EmojisV2Page::Remote(ref rows) if rows.is_empty()));
+    assert!(
+        matches!(page, pinetree::application::commands::misc_endpoints::EmojisV2Page::Local(ref rows) if rows.is_empty())
+    );
+    let page = services
+        .list_emojis_v2(None, Some("remote.example"), &cursor)
+        .unwrap();
+    assert!(
+        matches!(page, pinetree::application::commands::misc_endpoints::EmojisV2Page::Remote(ref rows) if rows.is_empty())
+    );
 }

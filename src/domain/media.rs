@@ -484,7 +484,10 @@ mod tests {
         ftyp[8..12].copy_from_slice(b"isom");
         assert_eq!(sniff_mime(&ftyp), "video/mp4");
         // EBML → WebM; OggS → audio/ogg.
-        assert_eq!(sniff_mime(&[0x1A, 0x45, 0xDF, 0xA3, 0x93, 0x42]), "video/webm");
+        assert_eq!(
+            sniff_mime(&[0x1A, 0x45, 0xDF, 0xA3, 0x93, 0x42]),
+            "video/webm"
+        );
         assert_eq!(sniff_mime(b"OggS\x00\x02"), "audio/ogg");
         // MPEG audio: ID3 tag or frame sync.
         assert_eq!(sniff_mime(b"ID3\x04\x00\x00\x00"), "audio/mpeg");
@@ -580,8 +583,7 @@ mod tests {
         assert!(!m.evicted);
         assert!(m.validate(MAX_FILE_SIZE).is_ok());
         // Round-trip keeps the new fields.
-        let rt: MediaMeta =
-            serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        let rt: MediaMeta = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
         assert_eq!(rt, m);
     }
 
@@ -645,8 +647,14 @@ mod tests {
         // Avatar is caller-context, never inferred from MIME.
         assert_eq!(MediaClass::classify_mime("image/png"), MediaClass::Preview);
         assert_eq!(MediaClass::classify_mime("image/avif"), MediaClass::Preview);
-        assert_eq!(MediaClass::classify_mime("audio/mpeg"), MediaClass::AudioVideo);
-        assert_eq!(MediaClass::classify_mime("video/mp4"), MediaClass::AudioVideo);
+        assert_eq!(
+            MediaClass::classify_mime("audio/mpeg"),
+            MediaClass::AudioVideo
+        );
+        assert_eq!(
+            MediaClass::classify_mime("video/mp4"),
+            MediaClass::AudioVideo
+        );
         assert_eq!(MediaClass::classify_mime("text/plain"), MediaClass::Full);
         assert_eq!(
             MediaClass::classify_mime("application/octet-stream"),

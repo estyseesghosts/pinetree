@@ -31,9 +31,7 @@ pub fn validate_block_params(blocker_id: &str, blockee_id: &str) -> Result<(), D
         ));
     }
     if blocker_id == blockee_id {
-        return Err(DomainError::Validation(
-            "BLOCKEE_IS_YOURSELF".to_string(),
-        ));
+        return Err(DomainError::Validation("BLOCKEE_IS_YOURSELF".to_string()));
     }
     Ok(())
 }

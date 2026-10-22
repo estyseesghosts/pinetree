@@ -8,10 +8,9 @@ use pinetree::api::misskey::response::{RateLimiter, UploadSlots};
 use pinetree::api::misskey::{ApiState, build_router};
 use pinetree::application::commands::AppServices;
 use pinetree::application::ports::{
-    AccountStore, ActivityDedup, AuthStore, BlobStore, BlockStore, FollowStore, JobQueue, MediaStore,
-    MuteStore, NoteStore, NotificationStore, PollStore, ReactionStore, StreamingSink,
+    AccountStore, ActivityDedup, AuthStore, BlobStore, BlockStore, FollowStore, JobQueue,
+    MediaStore, MuteStore, NoteStore, NotificationStore, PollStore, ReactionStore, StreamingSink,
 };
-use pinetree::streaming::hub::hub_and_sink;
 use pinetree::application::ports::{Clock, IdGenerator};
 use pinetree::config::{Config, DeploymentMode, RemoteCacheMode};
 use pinetree::domain::id::{AidxGenerator, SystemClock};
@@ -21,226 +20,11 @@ use pinetree::jobs::worker::JobWorker;
 use pinetree::media::storage::FsBlobStore;
 use pinetree::persistence::redb::RedbStore;
 use pinetree::services::email::{EmailSender, SmtpEmailSender};
+use pinetree::streaming::hub::hub_and_sink;
 
-fn build_services(
-    cfg: &Config,
-) -> Result<
-    (
-        Arc<AppServices>,
-        pinetree::streaming::hub::Hub,
-        Arc<RedbStore>,
-    ),
-    String,
-> {
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let ids: Arc<dyn IdGenerator> = Arc::new(AidxGenerator::new(clock.clone()));
-    let store = RedbStore::open(cfg.data_dir.join("pinetree.redb"), clock.clone(), ids.clone())
-        .map_err(|err| format!("open redb store: {err}"))?;
-    store
-        .set_cache_cap(cfg.remote_cache_max_bytes)
-        .map_err(|err| format!("init cache cap: {err}"))?;
-    // Storage overhaul: durable local uploads live in `blobs_durable/`
-    // (never evicted), remote fetches in `blobs_cache/` (LRU+TTL, capped).
-    // Both roots are config-overridable (`durable_dir` / `cache_dir`) and
-    // must be distinct (enforced by `Config::validate`).
-    // A pre-overhaul `blobs/` directory is migrated once via rename.
-    let legacy_blobs = cfg.data_dir.join("blobs");
-    let durable_dir = cfg.durable_pool_dir();
-    if !durable_dir.exists() && legacy_blobs.exists() {
-        std::fs::rename(&legacy_blobs, &durable_dir)
-            .map_err(|err| format!("migrate blobs/ to {}: {err}", durable_dir.display()))?;
-    }
-    let cache_dir = cfg.cache_pool_dir();
-    let blobs: Arc<dyn BlobStore> = Arc::new(
-        FsBlobStore::new(&durable_dir).map_err(|err| format!("init blob store: {err}"))?,
-    );
-    let cache_blobs: Arc<dyn BlobStore> = Arc::new(
-        FsBlobStore::new(&cache_dir)
-            .map_err(|err| format!("init cache blob store: {err}"))?,
-    );
-    let streaming: Arc<dyn StreamingSink>;
-    let hub: pinetree::streaming::hub::Hub;
-    (hub, streaming) = hub_and_sink(1024);
-    let services = Arc::new(AppServices {
-        clock: clock.clone(),
-        ids: ids.clone(),
-        accounts: store.clone() as Arc<dyn AccountStore>,
-        notes: store.clone() as Arc<dyn NoteStore>,
-        follows: store.clone() as Arc<dyn FollowStore>,
-        blocks: store.clone() as Arc<dyn BlockStore>,
-        mutes: store.clone() as Arc<dyn MuteStore>,
-        reactions: store.clone() as Arc<dyn ReactionStore>,
-        favorites: store.clone(),
-        emojis: store.clone(),
-        antennas: store.clone(),
-        antenna_notes: store.clone(),
-        polls: store.clone() as Arc<dyn PollStore>,
-        jobs: store.clone() as Arc<dyn JobQueue>,
-        media: store.clone() as Arc<dyn MediaStore>,
-        blobs,
-        cache_blobs,
-        notifications: store.clone() as Arc<dyn NotificationStore>,
-        auth: store.clone() as Arc<dyn AuthStore>,
-        streaming,
-        dedup: store.clone() as Arc<dyn ActivityDedup>,
-        host_caps: store.clone(),
-        moderation: store.clone(),
-        instance_settings: store.clone(),
-        invites: store.clone(),
-            abuse_reports: store.clone(),
-            lists: store.clone(),
-            signin: store.clone(),
-            password_resets: store.clone(),
-            registry: store.clone(),
-            clips: store.clone(),
-            pages: store.clone(),
-            folders: store.clone(),
-            system_webhooks: store.clone(),
-            user_webhooks: store.clone(),
-            abuse_recipients: store.clone(),
-            memos: store.clone(),
-            thread_mutes: store.clone(),
-        federation_http: SafeHttpClient::new(SafeHttpConfig::default()),
-        public_url: cfg.normalized_public_url(),
-        max_file_size: cfg.max_file_size,
-        preserved_usernames: cfg.preserved_usernames.clone(),
-        prohibited_words: cfg.prohibited_words.clone(),
-        sensitive_words: cfg.sensitive_words.clone(),
-        note_draft_limit: cfg.note_draft_limit,
-        scheduled_note_limit: cfg.scheduled_note_limit,
-        pin_limit: cfg.pin_limit,
-        default_like: cfg.default_like.clone(),
-        drive_capacity_per_user_bytes: cfg.drive_capacity_per_user_bytes,
-        remote_cache_max_bytes: cfg.remote_cache_max_bytes,
-        remote_cache_avatar_bytes: cfg.remote_cache_avatar_bytes,
-        remote_cache_preview_bytes: cfg.remote_cache_preview_bytes,
-        remote_cache_full_bytes: cfg.remote_cache_full_bytes,
-        remote_cache_mode: cfg.remote_cache_mode,
-        remote_cache_avatar_ttl_days: cfg.remote_cache_avatar_ttl_days,
-        remote_cache_preview_ttl_days: cfg.remote_cache_preview_ttl_days,
-        remote_cache_full_ttl_days: cfg.remote_cache_full_ttl_days,
-        remote_cache_warming_enabled: cfg.remote_cache_warming_enabled,
-    });
-    // Crash-heal: a previous process may have died mid-fetch holding an
-    // in-flight reservation. Clear it before serving (idempotent).
-    pinetree::media::reconciler::reset_in_flight(&services)
-        .map_err(|err| format!("reset cache in-flight: {err}"))?;
-    Ok((services, hub, store))
-}
+mod cli;
+mod runtime;
 
-/// `create-account --username=<name> --password=<pw>`: create a local
-/// account (with password) from the CLI for operators and scripts
-/// (`docs/phase-1-plan.md` gap #2).
-fn run_create_account(args: &[String], cfg: &Config) -> ! {
-    let mut username: Option<String> = None;
-    let mut password: Option<String> = None;
-    for arg in args {
-        if let Some(value) = arg.strip_prefix("--username=") {
-            username = Some(value.to_string());
-        } else if let Some(value) = arg.strip_prefix("--password=") {
-            password = Some(value.to_string());
-        } else {
-            eprintln!("unknown create-account argument: {arg}");
-            std::process::exit(2);
-        }
-    }
-    let (username, password) = match (username, password) {
-        (Some(username), Some(password)) if !username.is_empty() && !password.is_empty() => {
-            (username, password)
-        }
-        _ => {
-            eprintln!("usage: create-account --username=<name> --password=<pw>");
-            std::process::exit(2);
-        }
-    };
-    let services = build_services(cfg).unwrap_or_else(|err| {
-        eprintln!("{err}");
-        std::process::exit(1);
-    }).0;
-    match services.create_account(&username, Some(&hash_password(&password))) {
-        Ok(account) => {
-            println!("created account {} id={}", account.username, account.id);
-            std::process::exit(0);
-        }
-        Err(err) => {
-            eprintln!("create account {username}: {err}");
-            std::process::exit(1);
-        }
-    }
-}
-
-/// `set-role --username=<name> (--admin|--moderator)[=false]`: set the
-/// fixed built-in role flags on a local account from the CLI (Batch M
-/// §3.1). This is how the first admin is created (§9.9). Flags not named
-/// keep their current values. Writes a `setRole` moderation-log row with
-/// no actor account (operator action).
-fn run_set_role(args: &[String], cfg: &Config) -> ! {
-    fn parse_flag(name: &str, rest: &str) -> bool {
-        match rest {
-            "" | "=true" => true,
-            "=false" => false,
-            _ => {
-                eprintln!("usage: set-role --username=<name> (--admin|--moderator)[=false]");
-                eprintln!("bad flag value: {name}{rest}");
-                std::process::exit(2);
-            }
-        }
-    }
-    let mut username: Option<String> = None;
-    let mut is_admin: Option<bool> = None;
-    let mut is_moderator: Option<bool> = None;
-    for arg in args {
-        if let Some(value) = arg.strip_prefix("--username=") {
-            username = Some(value.to_string());
-        } else if let Some(rest) = arg.strip_prefix("--admin") {
-            is_admin = Some(parse_flag("--admin", rest));
-        } else if let Some(rest) = arg.strip_prefix("--moderator") {
-            is_moderator = Some(parse_flag("--moderator", rest));
-        } else {
-            eprintln!("unknown set-role argument: {arg}");
-            std::process::exit(2);
-        }
-    }
-    let (Some(username), true) = (username, is_admin.is_some() || is_moderator.is_some()) else {
-        eprintln!("usage: set-role --username=<name> (--admin|--moderator)[=false]");
-        std::process::exit(2);
-    };
-    let services = build_services(cfg).unwrap_or_else(|err| {
-        eprintln!("{err}");
-        std::process::exit(1);
-    }).0;
-    let account = match services
-        .accounts
-        .find_by_username_and_host(&username, None)
-    {
-        Ok(Some(account)) => account,
-        Ok(None) => {
-            eprintln!("no local account {username}");
-            std::process::exit(1);
-        }
-        Err(err) => {
-            eprintln!("lookup {username}: {err}");
-            std::process::exit(1);
-        }
-    };
-    let new_is_admin = is_admin.unwrap_or(account.is_admin);
-    let new_is_moderator = is_moderator.unwrap_or(account.is_moderator);
-    match services.set_role(None, &account.id, new_is_admin, new_is_moderator) {
-        Ok(account) => {
-            println!(
-                "account {} id={} isAdmin={} isModerator={}",
-                account.username, account.id, account.is_admin, account.is_moderator
-            );
-            std::process::exit(0);
-        }
-        Err(err) => {
-            eprintln!("set role {username}: {err}");
-            std::process::exit(1);
-        }
-    }
-}
-
-#[allow(clippy::too_many_lines)]
 fn main() {
     // Storage-overhaul fallout (2026-10-21): the sync `/api` dispatch
     // match needs just over 2 MiB of stack in dev builds, overflowing
@@ -267,7 +51,7 @@ async fn async_main() {
     // defaults (unknown keys, unreadable files and malformed JSON are hard
     // errors naming the path). Every key below is optional in the file;
     // absent keys take the defaults. This loop's flags override the file.
-    let mut cfg = config_base();
+    let mut cfg = cli::config_base();
     let mut positional: Vec<String> = Vec::new();
     let mut debug_federation_flag = false;
     let mut debug_weak_rate_limits_flag = false;
@@ -278,7 +62,9 @@ async fn async_main() {
             debug_weak_rate_limits_flag = true;
         } else if let Some(path) = arg.strip_prefix("--federation-extra-ca=") {
             pinetree::federation::delivery::set_extra_ca(path.into());
-            eprintln!("federation extra CA in force (--federation-extra-ca={path}): not for production");
+            eprintln!(
+                "federation extra CA in force (--federation-extra-ca={path}): not for production"
+            );
         } else if arg.starts_with("--config=") {
             // Consumed by `config_base()` (sets the base this loop
             // overrides); ignored here so it never falls through to
@@ -302,7 +88,7 @@ async fn async_main() {
                 std::process::exit(1);
             });
         } else if let Some(list) = arg.strip_prefix("--trusted-proxies=") {
-            cfg.trusted_proxies = match parse_trusted_proxies(list) {
+            cfg.trusted_proxies = match cli::parse_trusted_proxies(list) {
                 Ok(proxies) => proxies,
                 Err(err) => {
                     eprintln!("{err}");
@@ -315,11 +101,11 @@ async fn async_main() {
                 std::process::exit(2);
             });
         } else if let Some(list) = arg.strip_prefix("--preserved-usernames=") {
-            cfg.preserved_usernames = parse_csv_list(list);
+            cfg.preserved_usernames = cli::parse_csv_list(list);
         } else if let Some(list) = arg.strip_prefix("--prohibited-words=") {
-            cfg.prohibited_words = parse_csv_list(list);
+            cfg.prohibited_words = cli::parse_csv_list(list);
         } else if let Some(list) = arg.strip_prefix("--sensitive-words=") {
-            cfg.sensitive_words = parse_csv_list(list);
+            cfg.sensitive_words = cli::parse_csv_list(list);
         } else if let Some(limit) = arg.strip_prefix("--note-draft-limit=") {
             cfg.note_draft_limit = limit.parse().ok().filter(|n| *n > 0).unwrap_or_else(|| {
                 eprintln!("invalid --note-draft-limit (want an integer > 0): {limit}");
@@ -342,30 +128,39 @@ async fn async_main() {
             }
             cfg.default_like = Some(like.to_string());
         } else if let Some(bytes) = arg.strip_prefix("--drive-capacity-per-user-bytes=") {
-            cfg.drive_capacity_per_user_bytes = bytes.parse().ok().filter(|n| *n > 0).unwrap_or_else(|| {
-                eprintln!("invalid --drive-capacity-per-user-bytes (want an integer > 0): {bytes}");
-                std::process::exit(2);
-            });
+            cfg.drive_capacity_per_user_bytes =
+                bytes.parse().ok().filter(|n| *n > 0).unwrap_or_else(|| {
+                    eprintln!(
+                        "invalid --drive-capacity-per-user-bytes (want an integer > 0): {bytes}"
+                    );
+                    std::process::exit(2);
+                });
         } else if let Some(bytes) = arg.strip_prefix("--remote-cache-max-bytes=") {
-            cfg.remote_cache_max_bytes = bytes.parse().ok().filter(|n| *n > 0).unwrap_or_else(|| {
-                eprintln!("invalid --remote-cache-max-bytes (want an integer > 0): {bytes}");
-                std::process::exit(2);
-            });
+            cfg.remote_cache_max_bytes =
+                bytes.parse().ok().filter(|n| *n > 0).unwrap_or_else(|| {
+                    eprintln!("invalid --remote-cache-max-bytes (want an integer > 0): {bytes}");
+                    std::process::exit(2);
+                });
         } else if let Some(bytes) = arg.strip_prefix("--remote-cache-avatar-bytes=") {
-            cfg.remote_cache_avatar_bytes = bytes.parse().ok().filter(|n| *n > 0).unwrap_or_else(|| {
-                eprintln!("invalid --remote-cache-avatar-bytes (want an integer > 0): {bytes}");
-                std::process::exit(2);
-            });
+            cfg.remote_cache_avatar_bytes =
+                bytes.parse().ok().filter(|n| *n > 0).unwrap_or_else(|| {
+                    eprintln!("invalid --remote-cache-avatar-bytes (want an integer > 0): {bytes}");
+                    std::process::exit(2);
+                });
         } else if let Some(bytes) = arg.strip_prefix("--remote-cache-preview-bytes=") {
-            cfg.remote_cache_preview_bytes = bytes.parse().ok().filter(|n| *n > 0).unwrap_or_else(|| {
-                eprintln!("invalid --remote-cache-preview-bytes (want an integer > 0): {bytes}");
-                std::process::exit(2);
-            });
+            cfg.remote_cache_preview_bytes =
+                bytes.parse().ok().filter(|n| *n > 0).unwrap_or_else(|| {
+                    eprintln!(
+                        "invalid --remote-cache-preview-bytes (want an integer > 0): {bytes}"
+                    );
+                    std::process::exit(2);
+                });
         } else if let Some(bytes) = arg.strip_prefix("--remote-cache-full-bytes=") {
-            cfg.remote_cache_full_bytes = bytes.parse().ok().filter(|n| *n > 0).unwrap_or_else(|| {
-                eprintln!("invalid --remote-cache-full-bytes (want an integer > 0): {bytes}");
-                std::process::exit(2);
-            });
+            cfg.remote_cache_full_bytes =
+                bytes.parse().ok().filter(|n| *n > 0).unwrap_or_else(|| {
+                    eprintln!("invalid --remote-cache-full-bytes (want an integer > 0): {bytes}");
+                    std::process::exit(2);
+                });
         } else if let Some(mode) = arg.strip_prefix("--remote-cache-mode=") {
             cfg.remote_cache_mode = match mode {
                 "disabled" => RemoteCacheMode::Disabled,
@@ -377,20 +172,27 @@ async fn async_main() {
                 }
             };
         } else if let Some(days) = arg.strip_prefix("--remote-cache-avatar-ttl-days=") {
-            cfg.remote_cache_avatar_ttl_days = days.parse().ok().filter(|n| *n > 0).unwrap_or_else(|| {
-                eprintln!("invalid --remote-cache-avatar-ttl-days (want an integer > 0): {days}");
-                std::process::exit(2);
-            });
+            cfg.remote_cache_avatar_ttl_days =
+                days.parse().ok().filter(|n| *n > 0).unwrap_or_else(|| {
+                    eprintln!(
+                        "invalid --remote-cache-avatar-ttl-days (want an integer > 0): {days}"
+                    );
+                    std::process::exit(2);
+                });
         } else if let Some(days) = arg.strip_prefix("--remote-cache-preview-ttl-days=") {
-            cfg.remote_cache_preview_ttl_days = days.parse().ok().filter(|n| *n > 0).unwrap_or_else(|| {
-                eprintln!("invalid --remote-cache-preview-ttl-days (want an integer > 0): {days}");
-                std::process::exit(2);
-            });
+            cfg.remote_cache_preview_ttl_days =
+                days.parse().ok().filter(|n| *n > 0).unwrap_or_else(|| {
+                    eprintln!(
+                        "invalid --remote-cache-preview-ttl-days (want an integer > 0): {days}"
+                    );
+                    std::process::exit(2);
+                });
         } else if let Some(days) = arg.strip_prefix("--remote-cache-full-ttl-days=") {
-            cfg.remote_cache_full_ttl_days = days.parse().ok().filter(|n| *n > 0).unwrap_or_else(|| {
-                eprintln!("invalid --remote-cache-full-ttl-days (want an integer > 0): {days}");
-                std::process::exit(2);
-            });
+            cfg.remote_cache_full_ttl_days =
+                days.parse().ok().filter(|n| *n > 0).unwrap_or_else(|| {
+                    eprintln!("invalid --remote-cache-full-ttl-days (want an integer > 0): {days}");
+                    std::process::exit(2);
+                });
         } else if let Some(flag) = arg.strip_prefix("--remote-cache-warming-enabled=") {
             cfg.remote_cache_warming_enabled = match flag {
                 "true" | "1" => true,
@@ -468,18 +270,27 @@ async fn async_main() {
     // Federation debug lines (accept/reject, delivery). Off unless the flag or
     // PINETREE_DEBUG_FEDERATION is set. See `pinetree::observability`.
     let env_debug = pinetree::observability::env_enables_federation_debug(
-        std::env::var(pinetree::observability::DEBUG_FEDERATION_ENV).ok().as_deref(),
+        std::env::var(pinetree::observability::DEBUG_FEDERATION_ENV)
+            .ok()
+            .as_deref(),
     );
     if debug_federation_flag || env_debug {
         pinetree::observability::set_federation_debug(true);
-        let source = if debug_federation_flag { "--debug-federation" } else { "PINETREE_DEBUG_FEDERATION" };
+        let source = if debug_federation_flag {
+            "--debug-federation"
+        } else {
+            "PINETREE_DEBUG_FEDERATION"
+        };
         eprintln!("federation debug logging on (source: {source})");
     }
 
-    if positional.first().is_some_and(|cmd| cmd == "create-account") {
-        run_create_account(&positional[1..], &cfg);
+    if positional
+        .first()
+        .is_some_and(|cmd| cmd == "create-account")
+    {
+        cli::run_create_account(&positional[1..], &cfg);
     } else if positional.first().is_some_and(|cmd| cmd == "set-role") {
-        run_set_role(&positional[1..], &cfg);
+        cli::run_set_role(&positional[1..], &cfg);
     } else if let Some(cmd) = positional.first() {
         if maintenance_op.is_none() {
             eprintln!("unknown subcommand: {cmd}");
@@ -536,7 +347,7 @@ async fn async_main() {
         eprintln!("transcode temp sweep: removed {swept} stale files");
     }
 
-    let (services, hub, store) = build_services(&cfg).unwrap_or_else(|err| {
+    let (services, hub, store) = runtime::build_services(&cfg).unwrap_or_else(|err| {
         eprintln!("{err}");
         std::process::exit(1);
     });
@@ -566,7 +377,7 @@ async fn async_main() {
     // already open — if the server holds it, the open above fails with the
     // lock error, which is the actionable message).
     if let Some(op) = maintenance_op.as_deref() {
-        run_maintenance_op(op, &positional[1..], &services, &backup_ctx);
+        runtime::run_maintenance_op(op, &positional[1..], &services, &backup_ctx);
     }
     // Batch H ops surface: probes + admin status read this (never raw
     // paths, secrets, or key material — see `OpsConfig`).
@@ -601,7 +412,10 @@ async fn async_main() {
     // `PINETREE_REPLY_REPAIR_LIMIT=<1..=5000>` to re-fetch at most that many
     // of the newest stored notes' origin documents and mark the ones that
     // still declare a parent. Sequential, restartable, and safe to re-run.
-    if let Some(limit_raw) = std::env::var("PINETREE_REPLY_REPAIR_LIMIT").ok().filter(|v| !v.trim().is_empty()) {
+    if let Some(limit_raw) = std::env::var("PINETREE_REPLY_REPAIR_LIMIT")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    {
         match limit_raw.trim().parse::<usize>() {
             Ok(limit) if limit > 0 => {
                 eprintln!("reply repair: scanning up to {limit} stored notes");
@@ -625,8 +439,7 @@ async fn async_main() {
     // unconfigured transport stays dormant here — sends fail loudly and
     // the job quarantines (endpoints map the same state to
     // `EMAIL_NOT_CONFIGURED`).
-    let email_sender: Arc<dyn EmailSender> =
-        Arc::new(SmtpEmailSender::new(cfg.smtp_config()));
+    let email_sender: Arc<dyn EmailSender> = Arc::new(SmtpEmailSender::new(cfg.smtp_config()));
     // Publish the sender to the dispatcher slot so the email-identity arms
     // (`i/update-email`, `request-reset-password`) send live when SMTP is
     // configured; unconfigured stays dormant (`EMAIL_NOT_CONFIGURED`).
@@ -651,7 +464,9 @@ async fn async_main() {
     // the lease expires and the next process to start reclaims it, so no
     // work is lost across a restart.
     let stop = Arc::new(AtomicBool::new(false));
-    let _worker_handle = worker.clone().spawn_until(Duration::from_millis(50), stop.clone());
+    let _worker_handle = worker
+        .clone()
+        .spawn_until(Duration::from_millis(50), stop.clone());
     // Batch F backup drain: the worker tick owns durable jobs; backup
     // requests are durable status files, so a slow-interval task claims the
     // oldest queued request and builds its bundle (exclusive gate, bounded
@@ -690,7 +505,9 @@ async fn async_main() {
     if debug_weak_rate_limits_flag {
         // Load tests only: 10x the endpoint bucket counts (same factor as birchtree).
         rate_limiter = rate_limiter.with_weakened_limits(10);
-        eprintln!("debug rate-limit weakening is in force (x10, --debug-weak-rate-limits): not for production");
+        eprintln!(
+            "debug rate-limit weakening is in force (x10, --debug-weak-rate-limits): not for production"
+        );
     }
     let rate_limiter = Arc::new(rate_limiter);
     let api_state = ApiState {
@@ -725,181 +542,4 @@ async fn async_main() {
     .with_graceful_shutdown(shutdown)
     .await
     .expect("serve axum");
-}
-
-/// `--trusted-proxies=ip[,ip...]`: reverse proxies whose `X-Forwarded-For`
-/// is honored for client IPs (slice 9, H4).
-fn parse_trusted_proxies(list: &str) -> Result<Vec<IpAddr>, String> {
-    list.split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            part.parse::<IpAddr>()
-                .map_err(|err| format!("invalid --trusted-proxies address {part}: {err}"))
-        })
-        .collect()
-}
-
-/// Comma-separated string lists (`--preserved-usernames`,
-/// `--prohibited-words`, `--sensitive-words`). Empty items are dropped;
-/// pass an empty value to clear the file/default list.
-fn parse_csv_list(list: &str) -> Vec<String> {
-    list.split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-/// Batch H/F/C maintenance CLI ops. These diverge (never return): they run
-/// one store-backed one-shot instead of serving. The store is already open
-/// (a running server holds the redb lock, so the open above fails first
-/// with the actionable error); the worker and listener never start here.
-fn run_maintenance_op(
-    op: &str,
-    args: &[String],
-    services: &Arc<AppServices>,
-    backup_ctx: &pinetree::backup::BackupContext,
-) -> ! {
-    match op {
-        // Batch F: queue one backup and build it synchronously, then print
-        // the final bundle path. Same engine as the admin route + drain.
-        "backup" => {
-            if !args.is_empty() {
-                eprintln!("usage: backup (no arguments)");
-                std::process::exit(2);
-            }
-            let job_id = pinetree::backup::request_backup(backup_ctx).unwrap_or_else(|err| {
-                eprintln!("backup request failed: {err}");
-                std::process::exit(1);
-            });
-            match pinetree::backup::run_backup_blocking(backup_ctx, &job_id) {
-                Ok(path) => {
-                    println!("backup {} complete: {}", job_id, path.display());
-                    std::process::exit(0);
-                }
-                Err(err) => {
-                    eprintln!("backup {job_id} failed: {err}");
-                    std::process::exit(1);
-                }
-            }
-        }
-        // Batch F: read durable backup statuses (`--id=<job>` for one).
-        // Offline-safe: status files only, no store access.
-        "backup-status" => {
-            let mut id: Option<String> = None;
-            for arg in args {
-                if let Some(value) = arg.strip_prefix("--id=") {
-                    id = Some(value.to_string());
-                } else {
-                    eprintln!("usage: backup-status [--id=<backup-job-id>]");
-                    std::process::exit(2);
-                }
-            }
-            match id {
-                Some(job_id) => match pinetree::backup::backup_status(backup_ctx, &job_id) {
-                    Some(status) => {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&status)
-                                .unwrap_or_else(|_| format!("{status:?}"))
-                        );
-                        std::process::exit(0);
-                    }
-                    None => {
-                        eprintln!("unknown backup job: {job_id}");
-                        std::process::exit(1);
-                    }
-                },
-                None => {
-                    let statuses = pinetree::backup::list_backup_statuses(&backup_ctx.backup_dir);
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&statuses)
-                            .unwrap_or_else(|_| "[]".to_string())
-                    );
-                    std::process::exit(0);
-                }
-            }
-        }
-        // Batch F: validate a bundle and restore it into a FRESH directory
-        // (never the live data dir). Operator cutover stays manual; see
-        // `docs/prod-ready.md` §7 F5.
-        "restore" => {
-            let mut bundle: Option<String> = None;
-            let mut target_dir: Option<String> = None;
-            for arg in args {
-                if let Some(value) = arg.strip_prefix("--bundle=") {
-                    bundle = Some(value.to_string());
-                } else if let Some(value) = arg.strip_prefix("--target-dir=") {
-                    target_dir = Some(value.to_string());
-                } else {
-                    eprintln!("usage: restore --bundle=<file.zip> --target-dir=<fresh-dir>");
-                    std::process::exit(2);
-                }
-            }
-            let (Some(bundle), Some(target_dir)) = (bundle, target_dir) else {
-                eprintln!("usage: restore --bundle=<file.zip> --target-dir=<fresh-dir>");
-                std::process::exit(2);
-            };
-            match pinetree::backup::restore_bundle(
-                std::path::Path::new(&bundle),
-                std::path::Path::new(&target_dir),
-            ) {
-                Ok(report) => {
-                    println!(
-                        "restore complete: dir={} tables={} rows={} media_files={} media_bytes={}",
-                        report.restored_dir.display(),
-                        report.tables_restored,
-                        report.rows_total,
-                        report.media_files,
-                        report.media_bytes,
-                    );
-                    std::process::exit(0);
-                }
-                Err(err) => {
-                    eprintln!("restore failed: {err}");
-                    std::process::exit(1);
-                }
-            }
-        }
-        // Batch C: enqueue one backfill repair job (the worker drains it at
-        // next boot/serve). Explicit operator trigger, never automatic.
-        "storage-backfill" => {
-            if !args.is_empty() {
-                eprintln!("usage: storage-backfill (no arguments)");
-                std::process::exit(2);
-            }
-            if let Err(err) = pinetree::media::reconciler::enqueue_storage_backfill(
-                services.jobs.as_ref(),
-                services.clock.now_ms(),
-            ) {
-                eprintln!("storage-backfill enqueue failed: {err}");
-                std::process::exit(1);
-            }
-            println!("storage backfill enqueued (drains on next serve)");
-            std::process::exit(0);
-        }
-        _ => {
-            eprintln!("unknown subcommand: {op}");
-            std::process::exit(2);
-        }
-    }
-}
-
-/// Base configuration: the `--config=PATH` JSON file over the compiled
-/// defaults (unknown keys, unreadable files and malformed JSON are hard
-/// errors naming the path). Every other CLI flag overrides the file.
-fn config_base() -> Config {
-    let path = std::env::args()
-        .skip(1)
-        .filter_map(|arg| arg.strip_prefix("--config=").map(str::to_string))
-        .next();
-    match path {
-        None => Config::default(),
-        Some(path) => Config::load_from_file(std::path::Path::new(&path)).unwrap_or_else(|err| {
-            eprintln!("configuration error: {err}");
-            std::process::exit(1);
-        }),
-    }
 }

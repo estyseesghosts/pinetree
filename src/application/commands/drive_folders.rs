@@ -31,10 +31,10 @@
 
 use super::AppServices;
 
-use crate::application::ports::{DriveFolderStore, NewJob, PortError, TimelineCursor};
+use crate::application::ports::{DriveFolderStore, PortError, TimelineCursor};
 use crate::domain::drive_folder::{
-    require_folder_empty, validate_folder_name, validate_folder_parent_change,
-    validate_new_folder, DriveFolder,
+    DriveFolder, require_folder_empty, validate_folder_name, validate_folder_parent_change,
+    validate_new_folder,
 };
 use crate::domain::id::DomainError;
 use crate::domain::media::MediaMeta;
@@ -152,11 +152,7 @@ impl AppServices {
                 None => None,
                 Some(pid) => match folders.get_folder(&pid)? {
                     Some(p) if p.owner_id == owner_id => Some(p),
-                    _ => {
-                        return Err(PortError::NotFound(
-                            "NO_SUCH_PARENT_FOLDER".to_string(),
-                        ))
-                    }
+                    _ => return Err(PortError::NotFound("NO_SUCH_PARENT_FOLDER".to_string())),
                 },
             };
             // Walk the proposed parent's ancestor chain for cycle detection.
@@ -255,16 +251,9 @@ impl AppServices {
     }
 
     /// `drive/files/check-existence {md5}`: owner-scoped md5 hit test.
-    pub fn drive_file_exists(
-        &self,
-        owner_id: &str,
-        md5: &str,
-    ) -> Result<bool, PortError> {
+    pub fn drive_file_exists(&self, owner_id: &str, md5: &str) -> Result<bool, PortError> {
         self.accounts.get_owner(owner_id)?;
-        Ok(self
-            .media
-            .find_by_owner_and_hash(owner_id, md5)?
-            .is_some())
+        Ok(self.media.find_by_owner_and_hash(owner_id, md5)?.is_some())
     }
 
     /// `drive/files/attached-notes {fileId, ...cursor}`: notes referencing
@@ -311,12 +300,18 @@ impl AppServices {
                         }
                     }
                     if cursor.since_date.is_some_and(|s| {
-                        self.ids.parse_time(&note.id).map(|t| t <= s).unwrap_or(true)
+                        self.ids
+                            .parse_time(&note.id)
+                            .map(|t| t <= s)
+                            .unwrap_or(true)
                     }) {
                         continue;
                     }
                     if cursor.until_date.is_some_and(|u| {
-                        self.ids.parse_time(&note.id).map(|t| t >= u).unwrap_or(true)
+                        self.ids
+                            .parse_time(&note.id)
+                            .map(|t| t >= u)
+                            .unwrap_or(true)
                     }) {
                         continue;
                     }

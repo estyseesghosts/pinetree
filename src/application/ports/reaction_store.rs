@@ -1,0 +1,39 @@
+use super::job_queue::NewJob;
+use crate::domain::id::PortError;
+use crate::domain::reaction::Reaction;
+
+pub trait ReactionStore: Send + Sync {
+    /// `reaction_id` becomes the stored row id. The application also federates
+    /// the Like under this id, so a later `Undo(Like)` (built from the row id)
+    /// names the activity the remote server actually received.
+    fn react(
+        &self,
+        user_id: &str,
+        note_id: &str,
+        reaction: &str,
+        reaction_id: &str,
+        upsert: bool,
+        jobs: Vec<NewJob>,
+    ) -> Result<Reaction, PortError>;
+    fn unreact(&self, user_id: &str, note_id: &str, jobs: Vec<NewJob>) -> Result<(), PortError>;
+    fn get_reaction(&self, user_id: &str, note_id: &str) -> Result<Option<Reaction>, PortError>;
+    /// Every reaction row by `user_id` (`users/reactions` read path;
+    /// Misskey `NoteReactionsRepository` query parity). Backends return
+    /// rows in any order; the application op sorts newest-first and pages.
+    fn reactions_by_user(&self, user_id: &str) -> Result<Vec<Reaction>, PortError>;
+    /// Every reaction row on `note_id` (§8 edit fan-out: remote reactors
+    /// join the `Update(Note)` audience). Backends may scan; rows in any
+    /// order.
+    fn reactions_for_note(&self, note_id: &str) -> Result<Vec<Reaction>, PortError> {
+        let _ = note_id;
+        Err(PortError::StorageUnavailable(
+            "ReactionStore::reactions_for_note not implemented".to_string(),
+        ))
+    }
+    /// Total stored reaction rows (Batch P `stats`).
+    fn count_reactions(&self) -> Result<u64, PortError> {
+        Err(PortError::StorageUnavailable(
+            "ReactionStore::count_reactions not implemented".to_string(),
+        ))
+    }
+}

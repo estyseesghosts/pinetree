@@ -62,12 +62,10 @@ pub fn handle_reply_parent_resolve(
         .map_err(|e| PortError::Validation(format!("reply-resolve payload invalid: {e}")))?;
     match resolve_reply_parent(services, &parsed.parent_uri, REPLY_RESOLVE_BATCH)? {
         ReplyResolveOutcome::Done => Ok(None),
-        ReplyResolveOutcome::Continue => {
-            Ok(Some(build_reply_parent_resolve_job(
-                services,
-                parsed.parent_uri.trim(),
-            )?))
-        }
+        ReplyResolveOutcome::Continue => Ok(Some(build_reply_parent_resolve_job(
+            services,
+            parsed.parent_uri.trim(),
+        )?)),
     }
 }
 
@@ -103,11 +101,7 @@ pub fn resolve_reply_parent(
             "reply resolve requires a parent URI".to_string(),
         ));
     }
-    if services
-        .notes
-        .pending_reply_children(uri, 1)?
-        .is_empty()
-    {
+    if services.notes.pending_reply_children(uri, 1)?.is_empty() {
         return Ok(ReplyResolveOutcome::Done);
     }
     let parent_id = match crate::federation::inbox::resolve_note_target_id(services, uri)? {
@@ -146,7 +140,8 @@ pub fn resolve_reply_parent(
             }
         }
     }
-    for child in children.iter().take(batch) {        // Alias normalization: the child's `inReplyTo` named the requested
+    for child in children.iter().take(batch) {
+        // Alias normalization: the child's `inReplyTo` named the requested
         // URI while the fetched document canonicalizes to another URI for
         // the same object (HTTP redirect). Re-key the pending URI to the
         // canonical form first — `set_pending_reply_parent` only replaces
@@ -234,14 +229,16 @@ pub fn repair_unresolved_reply_parents(
         if note.reply_id.is_some() || note.reply_parent_uri.is_some() {
             continue;
         }
-        let parsed =
-            match fetch_remote_note(services, &services.federation_http, own_uri.trim()) {
-                Ok(parsed) => parsed,
-                Err(_) => continue,
-            };
-        let Some(target) = parsed.in_reply_to.as_deref().map(str::trim).filter(|s| {
-            !s.is_empty() && *s != own_uri.as_str()
-        }) else {
+        let parsed = match fetch_remote_note(services, &services.federation_http, own_uri.trim()) {
+            Ok(parsed) => parsed,
+            Err(_) => continue,
+        };
+        let Some(target) = parsed
+            .in_reply_to
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != own_uri.as_str())
+        else {
             continue;
         };
         let job = build_reply_parent_resolve_job(services, target)?;

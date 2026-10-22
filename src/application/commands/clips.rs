@@ -17,9 +17,9 @@ use super::AppServices;
 
 use crate::application::ports::PortError;
 use crate::domain::clip::{Clip, ClipFavorite, ClipFollow, ClipNote};
-use crate::domain::notification::NotificationKind;
 use crate::domain::collection::CollectionTier;
 use crate::domain::id::DomainError;
+use crate::domain::notification::NotificationKind;
 
 fn domain_err(e: DomainError) -> PortError {
     match e {
@@ -235,8 +235,7 @@ impl AppServices {
         if !self.clips.delete_clip(owner_id, clip_id, jobs)? {
             return Err(PortError::NotFound("NO_SUCH_CLIP".to_string()));
         }
-        self.clips
-            .record_clip_tombstone(&clip_uri, self.now_ms())?;
+        self.clips.record_clip_tombstone(&clip_uri, self.now_ms())?;
         Ok(())
     }
 
@@ -380,11 +379,7 @@ impl AppServices {
     /// Shared private-clip gate for `show`/`notes`/`favorite`: a private
     /// clip is `NO_SUCH_CLIP` to anonymous and non-owner readers (upstream
     /// parity; `unfavorite` deliberately skips this check).
-    pub fn visible_clip(
-        &self,
-        clip_id: &str,
-        viewer_id: Option<&str>,
-    ) -> Result<Clip, PortError> {
+    pub fn visible_clip(&self, clip_id: &str, viewer_id: Option<&str>) -> Result<Clip, PortError> {
         match self.clips.get_clip(clip_id)? {
             Some(clip) if clip.is_public => Ok(clip),
             Some(clip) if viewer_id == Some(clip.owner_id.as_str()) => Ok(clip),
@@ -468,7 +463,12 @@ impl AppServices {
                 NotificationKind::ClipUpdated,
                 Some(note.id.clone()),
                 None,
-                &format!("clip-member:{}:{}:{}", clip.id, note.id, self.ids.generate()),
+                &format!(
+                    "clip-member:{}:{}:{}",
+                    clip.id,
+                    note.id,
+                    self.ids.generate()
+                ),
             )?);
         }
         let row = ClipNote {
@@ -518,12 +518,20 @@ impl AppServices {
                         NotificationKind::ClipUpdated,
                         Some(note.id.clone()),
                         None,
-                        &format!("clip-member:{}:{}:{}", clip.id, note.id, self.ids.generate()),
+                        &format!(
+                            "clip-member:{}:{}:{}",
+                            clip.id,
+                            note.id,
+                            self.ids.generate()
+                        ),
                     )?);
                 }
             }
         }
-        if !self.clips.remove_clip_note(&clip.id, note_id, self.now_ms(), jobs)? {
+        if !self
+            .clips
+            .remove_clip_note(&clip.id, note_id, self.now_ms(), jobs)?
+        {
             return Err(PortError::NotFound("NO_SUCH_NOTE".to_string()));
         }
         Ok(())
@@ -702,9 +710,7 @@ impl AppServices {
             CollectionTier::LocalApproved => FetchDecision::Forbidden,
             CollectionTier::Unlisted | CollectionTier::Listed => FetchDecision::Serve,
             CollectionTier::RemoteApproved => match fetcher_actor_uri {
-                Some(uri)
-                    if clip.approved_actor_uris.iter().any(|a| a == uri) =>
-                {
+                Some(uri) if clip.approved_actor_uris.iter().any(|a| a == uri) => {
                     FetchDecision::Serve
                 }
                 _ => FetchDecision::Forbidden,

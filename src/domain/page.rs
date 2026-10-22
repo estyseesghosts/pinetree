@@ -39,8 +39,25 @@ fn slug_char_allowed(c: char) -> bool {
     }
     !matches!(
         c,
-        ':' | '/' | '?' | '#' | '[' | ']' | '@' | '!' | '$' | '&' | '\'' | '(' | ')' | '*'
-            | '+' | ',' | ';' | '=' | '\\' | '%'
+        ':' | '/'
+            | '?'
+            | '#'
+            | '['
+            | ']'
+            | '@'
+            | '!'
+            | '$'
+            | '&'
+            | '\''
+            | '('
+            | ')'
+            | '*'
+            | '+'
+            | ','
+            | ';'
+            | '='
+            | '\\'
+            | '%'
     )
 }
 
@@ -182,9 +199,9 @@ impl Page {
     /// string `type` (block shapes are validated leniently — unknown block
     /// types are stored and skipped at render, never executed).
     pub fn validate_content(content: &serde_json::Value) -> Result<(), DomainError> {
-        let arr = content.as_array().ok_or_else(|| {
-            DomainError::Validation("page content must be an array".to_string())
-        })?;
+        let arr = content
+            .as_array()
+            .ok_or_else(|| DomainError::Validation("page content must be an array".to_string()))?;
         for block in arr {
             let obj = block.as_object().ok_or_else(|| {
                 DomainError::Validation("page content blocks must be objects".to_string())
@@ -229,9 +246,9 @@ pub fn page_visible_to(
     match page.visibility {
         Visibility::Public | Visibility::Home => true,
         Visibility::Followers => viewer_id.is_some_and(|_| follows_owner),
-        Visibility::Specified => viewer_id.is_some_and(|v| {
-            page.visible_user_ids.iter().any(|id| id == v)
-        }),
+        Visibility::Specified => {
+            viewer_id.is_some_and(|v| page.visible_user_ids.iter().any(|id| id == v))
+        }
     }
 }
 
@@ -245,7 +262,9 @@ mod tests {
         assert!(validate_page_name("").is_err());
         assert!(validate_page_name(&"n".repeat(256)).is_ok());
         assert!(validate_page_name(&"n".repeat(257)).is_err());
-        for bad in ["a b", "a/b", "a?b", "a#b", "a@b", "a:b", "a%b", "a\\b", "a,b", "a;b"] {
+        for bad in [
+            "a b", "a/b", "a?b", "a#b", "a@b", "a:b", "a%b", "a\\b", "a,b", "a;b",
+        ] {
             assert!(validate_page_name(bad).is_err(), "{bad}");
         }
     }

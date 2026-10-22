@@ -4,8 +4,12 @@ use crate::domain::notification::NotificationKind;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StreamingEvent {
-    NoteCreated { note_id: String },
-    NoteDeleted { note_id: String },
+    NoteCreated {
+        note_id: String,
+    },
+    NoteDeleted {
+        note_id: String,
+    },
     NoteReacted {
         note_id: String,
         user_id: String,
@@ -24,38 +28,69 @@ pub enum StreamingEvent {
         choice: usize,
     },
     /// A poll reached its expiry (Misskey note-stream `pollEnded` parity).
-    PollEnded { note_id: String },
+    PollEnded {
+        note_id: String,
+    },
     /// A public note entered a role timeline (Misskey
     /// `publishRoleTimelineStream(roleId, 'note', ...)` parity). The
     /// streaming server fans it to `roleTimeline` channels subscribed to
     /// that role. Pinetree has no role model yet, so no command publishes
     /// this today (DIVERGENCE, recorded in `server.rs`); the variant exists
     /// so the channel wiring is complete and testable.
-    RoleTimelineNote { role_id: String, note_id: String },
+    RoleTimelineNote {
+        role_id: String,
+        note_id: String,
+    },
     /// A drive file changed (Misskey `publishDriveStream(userId, ...)`
     /// parity: `fileCreated`/`fileUpdated`/`fileDeleted`). The `user_id` is
     /// filled at enqueue time (the sink resolves nothing); files are packed
     /// at socket time from the file row (deletes carry only the id).
-    DriveFileCreated { user_id: String, file_id: String },
-    DriveFileUpdated { user_id: String, file_id: String },
-    DriveFileDeleted { user_id: String, file_id: String },
+    DriveFileCreated {
+        user_id: String,
+        file_id: String,
+    },
+    DriveFileUpdated {
+        user_id: String,
+        file_id: String,
+    },
+    DriveFileDeleted {
+        user_id: String,
+        file_id: String,
+    },
     /// A drive folder changed (same parity; bodies are `{id}` until the
     /// WP2 folder packer lands — recorded in `server.rs`).
-    DriveFolderCreated { user_id: String, folder_id: String },
-    DriveFolderUpdated { user_id: String, folder_id: String },
-    DriveFolderDeleted { user_id: String, folder_id: String },
+    DriveFolderCreated {
+        user_id: String,
+        folder_id: String,
+    },
+    DriveFolderUpdated {
+        user_id: String,
+        folder_id: String,
+    },
+    DriveFolderDeleted {
+        user_id: String,
+        folder_id: String,
+    },
     /// A clip changed (Misskey `publishClipStream(clipId, ...)` parity:
     /// `updated`/`deleted`, both with a null body).
-    ClipUpdated { clip_id: String },
-    ClipDeleted { clip_id: String },
+    ClipUpdated {
+        clip_id: String,
+    },
+    ClipDeleted {
+        clip_id: String,
+    },
     /// An abuse report was filed (Misskey `publishAdminStream(userId,
     /// 'newAbuseUserReport', ...)` parity). Packed at socket time from the
     /// report row (moderator sockets only).
-    AdminReport { report_id: String },
+    AdminReport {
+        report_id: String,
+    },
     /// A note was edited (§8; Sharkey `publishNoteStream(note.id,
     /// 'updated', ...)` parity). The server arm packs the current note and
     /// emits the `updated` frame with its `{ cw, text }`.
-    NoteUpdated { note_id: String },
+    NoteUpdated {
+        note_id: String,
+    },
     /// Local `follower_id` unfollowed `followee_id`: the follower's `main`
     /// channel gets `unfollow` with the packed followee (Misskey
     /// `UserFollowingService` parity).
@@ -63,20 +98,33 @@ pub enum StreamingEvent {
         follower_id: String,
         followee_id: String,
     },
-    MeUpdated { account_id: String },
+    MeUpdated {
+        account_id: String,
+    },
     /// One antenna feed gained a note (Batch N WS4): the worker publishes
     /// this post-commit per match; the `antenna` stream channel packs it.
-    AntennaNote { antenna_id: String, note_id: String },
+    AntennaNote {
+        antenna_id: String,
+        note_id: String,
+    },
     /// A user-list member was added/removed (Batch O WP16): post-commit
     /// fan-out to the `userList` stream channel (`userAdded`/`userRemoved`
     /// with the packed member).
-    UserListMemberAdded { list_id: String, member_id: String },
-    UserListMemberRemoved { list_id: String, member_id: String },
+    UserListMemberAdded {
+        list_id: String,
+        member_id: String,
+    },
+    UserListMemberRemoved {
+        list_id: String,
+        member_id: String,
+    },
     /// The account was suspended (Batch M WP3): drop its open `/streaming`
     /// connections (upstream publishes `userChangeSuspendedState`; the
     /// pinned upstream only invalidates caches with it, so the socket drop
     /// is a pinetree hardening — see `docs/endpoint-manifest.md` §23).
-    UserSuspended { account_id: String },
+    UserSuspended {
+        account_id: String,
+    },
     /// Custom-emoji broadcast (Misskey `emojiAdded`/`emojiUpdated`/
     /// `emojiDeleted` parity): emitted by the admin emoji ops. Carries
     /// domain snapshots (deletes snapshot before the row is gone); the
@@ -259,9 +307,15 @@ mod tests {
                 user_id: "u".to_string(),
                 folder_id: "d".to_string(),
             },
-            StreamingEvent::ClipUpdated { clip_id: "c".to_string() },
-            StreamingEvent::ClipDeleted { clip_id: "c".to_string() },
-            StreamingEvent::AdminReport { report_id: "a".to_string() },
+            StreamingEvent::ClipUpdated {
+                clip_id: "c".to_string(),
+            },
+            StreamingEvent::ClipDeleted {
+                clip_id: "c".to_string(),
+            },
+            StreamingEvent::AdminReport {
+                report_id: "a".to_string(),
+            },
         ];
         for event in events {
             let bytes = serde_json::to_vec(&event).unwrap();

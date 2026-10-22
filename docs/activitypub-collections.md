@@ -133,3 +133,7 @@ The contract text above is unchanged. The Status line above stays `Frozen (Phase
 **OPEN: §9 outbox `totalItems`.** Still omitted by design (`src/activitypub/actor.rs:823`; the test asserts absence at `actor.rs:1728,1733`). There is no store-side count index, so a visible count would still need a scan. Keep the omission unless a count is required.
 
 **LANDED: §2–§7 and the §10 tests.** The `slice11_` tests are in `src/activitypub/actor.rs` (for example `:1533-1575` for paging and counter parity, `:1800` for the index `totalItems`).
+
+## Addendum 2026-10-22 (module split; paths only, no contract change)
+
+Status: ADDENDUM only. Frozen text above is not rewritten. Public module paths are unchanged (parents re-export). Only file locations changed: src/activitypub/actor.rs is now a slim parent with src/activitypub/actor/ children � the slice11_ tests live in ctor/collections.rs (paging, counter parity, index 	otalItems). Verified by cargo test --lib --offline (626 passed, incl. all slice11_ tests). Recorded in state/logs/2026-10-22-module-split-program.md.

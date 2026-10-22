@@ -137,9 +137,7 @@ fn moderator_can_delete_anothers_note() {
     let services = test_services("mod-delete");
     let alice = services.create_account("alice", None).unwrap();
     let moderator = services.create_account("mod", None).unwrap();
-    services
-        .set_role(None, &moderator.id, false, true)
-        .unwrap();
+    services.set_role(None, &moderator.id, false, true).unwrap();
     let note = services
         .create_note(CreateNoteInput::simple_public(&alice.id, "hello"))
         .unwrap();
@@ -188,12 +186,8 @@ fn users_show_suspended_hidden_from_non_moderator_visible_to_moderator() {
     let bob = services.create_account("bob", None).unwrap();
     let carol = services.create_account("carol", None).unwrap();
     let moderator = services.create_account("mod", None).unwrap();
-    services
-        .set_role(None, &moderator.id, false, true)
-        .unwrap();
-    services
-        .suspend_user(&moderator.id, &carol.id)
-        .unwrap();
+    services.set_role(None, &moderator.id, false, true).unwrap();
+    services.suspend_user(&moderator.id, &carol.id).unwrap();
 
     // Anonymous and ordinary viewers read the suspended account as missing.
     for viewer in [None, Some(bob.id.as_str())] {
@@ -223,10 +217,7 @@ fn users_show_suspended_hidden_from_non_moderator_visible_to_moderator() {
 
     // Non-suspended accounts are unaffected on every path.
     assert_eq!(
-        services
-            .users_show_by_id_as(&bob.id, None)
-            .unwrap()
-            .id,
+        services.users_show_by_id_as(&bob.id, None).unwrap().id,
         bob.id
     );
     assert_eq!(
@@ -385,8 +376,14 @@ fn home_timeline_include_local_renotes_false_keeps_only_remote_target_renotes() 
         .into_iter()
         .map(|n| n.id)
         .collect();
-    assert!(default.contains(&local_renote), "default keeps local-target renote");
-    assert!(default.contains(&remote_renote), "default keeps remote-target renote");
+    assert!(
+        default.contains(&local_renote),
+        "default keeps local-target renote"
+    );
+    assert!(
+        default.contains(&remote_renote),
+        "default keeps remote-target renote"
+    );
 
     let filtered: Vec<String> = services
         .home_timeline_with_includes(&bob.id, &cursor, false, true, true, true, false)

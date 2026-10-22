@@ -13,13 +13,17 @@ use crate::domain::favorite::NoteFavorite;
 use crate::domain::policy::{ViewerContext, is_visible};
 
 impl AppServices {
-    fn visible_note_or_no_such(&self, viewer_id: &str, note_id: &str) -> Result<crate::domain::note::Note, PortError> {
+    fn visible_note_or_no_such(
+        &self,
+        viewer_id: &str,
+        note_id: &str,
+    ) -> Result<crate::domain::note::Note, PortError> {
         let note = match self.notes.get_note(note_id)? {
             Some(n) if !n.is_deleted => n,
             _ => return Err(PortError::NotFound("NO_SUCH_NOTE".to_string())),
         };
-        let follows_author = viewer_id == note.author_id
-            || self.follows.is_following(viewer_id, &note.author_id)?;
+        let follows_author =
+            viewer_id == note.author_id || self.follows.is_following(viewer_id, &note.author_id)?;
         let viewer = ViewerContext::local_user(viewer_id, follows_author);
         if !is_visible(&note, &viewer) {
             return Err(PortError::NotFound("NO_SUCH_NOTE".to_string()));
@@ -47,7 +51,7 @@ impl AppServices {
     pub fn unfavorite_note(&self, user_id: &str, note_id: &str) -> Result<(), PortError> {
         self.accounts.get_owner(user_id)?;
         match self.notes.get_note(note_id)? {
-            Some(n) if !n.is_deleted => {},
+            Some(n) if !n.is_deleted => {}
             _ => return Err(PortError::NotFound("NO_SUCH_NOTE".to_string())),
         }
         if !self.favorites.unfavorite_note(user_id, note_id)? {
