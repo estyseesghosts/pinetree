@@ -197,10 +197,14 @@ else
 fi
 
 # --- (4) ffmpeg target + enabled: real worker-path transcode smoke ------------
-# TODO(integration-owner): confirm the /api/signin response token field and the
-# /api/drive/files/create + /api/drive/files/show field names against the live
-# build before stamping this scenario green; the container mechanics below are
-# exact, the three JSON field assumptions are marked ASSUMPTION.
+# Verified field contract (see src/api/misskey/endpoints/dispatch_auth/password.rs
+# `signin`: `POST /api/signin` returns {"id","token","i","user"} with
+# `token == i`; `tests_auth.rs::signup_signin_and_i_roundtrip` asserts
+# `value["i"] == value["token"]`. `drive/files/create` multipart fields are
+# `i` + `file` (files_http.rs `drive_files_create`); `drive/files/show`
+# takes {"fileId"} and packs DriveFile with `id`/`type` (= MIME)/
+# `thumbnailUrl` (packers/drive_file.rs `pack_drive_file`). The python below
+# reads `i` first, `token` as alias; no `access_token` field exists.
 P4=$((PORT_BASE + 4)); V4="b2v4"; VOLS="$VOLS $V4"
 docker volume create "$V4" >/dev/null
 mkconfig "$T/c4.json" "https://smoke-b2.test" true false
@@ -230,14 +234,15 @@ pass "(4) tiny deterministic fixture generated in-image ($SZ bytes)"
 TOKEN=$(curl -fsS --max-time 10 -X POST "http://127.0.0.1:$P4/api/signin" \
   -H 'Content-Type: application/json' \
   -d '{"username":"smoke","password":"s3cret-pw-b2"}' \
-  | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("token") or d.get("access_token") or d.get("i") or "")') \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("i") or d.get("token") or "")') \
   || TOKEN=""
-  # ASSUMPTION: /api/signin returns the token under one of these keys.
-[[ -n "$TOKEN" ]] || { fail "(4) signin returned no token (see ASSUMPTION)"; exit 1; }
+  # VERIFIED (dispatch_auth/password.rs `signin`): response carries both `i`
+  # and `token` with identical values; no `access_token` key exists.
+[[ -n "$TOKEN" ]] || { fail "(4) signin returned no token"; exit 1; }
 UP=$(curl -fsS --max-time 60 -X POST "http://127.0.0.1:$P4/api/drive/files/create" \
   -F "i=$TOKEN" -F "file=@$T/tiny-b2.png;type=image/png") \
   || { fail "(4) upload request failed"; exit 1; }
-  # ASSUMPTION: multipart fields `i` + `file` per Misskey convention.
+  # VERIFIED (files_http.rs `drive_files_create`): multipart fields `i` + `file`.
 echo "$UP" >"$T/up.json"
 FID=$(python3 -c 'import json; print(json.load(open("'"$T/up.json"'")).get("id") or "")')
 [[ -n "$FID" ]] || { fail "(4) upload returned no file id"; cat "$T/up.json"; exit 1; }
@@ -247,7 +252,8 @@ OK4=""
 for _ in $(seq 1 60); do
   SHOW=$(curl -fsS --max-time 10 -X POST "http://127.0.0.1:$P4/api/drive/files/show" \
     -H 'Content-Type: application/json' -d "{\"i\":\"$TOKEN\",\"fileId\":\"$FID\"}" 2>/dev/null || true)
-  # ASSUMPTION: /api/drive/files/show takes {i,fileId}; derived file reports type/thumbnailUrl.
+  # VERIFIED (dispatch_drive/files.rs `drive_files_show` + pack_drive_file):
+  # show takes {fileId}; derived file reports `type` (= MIME) + `thumbnailUrl`.
   TYP=$(echo "$SHOW" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("type") or "")' 2>/dev/null || true)
   THUMB=$(echo "$SHOW" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("thumbnailUrl") or "")' 2>/dev/null || true)
   if [[ "$TYP" == "image/webp" && -n "$THUMB" ]]; then OK4="yes"; break; fi
@@ -256,7 +262,7 @@ done
 if [[ "$OK4" == "yes" ]]; then
   pass "(4) worker-path transcode converged to derived image/webp with thumbnail"
 else
-  fail "(4) derived WebP never converged (see ASSUMPTIONs)"; tail -c 2000 "$T/up.json"
+  fail "(4) derived WebP never converged"; tail -c 2000 "$T/up.json"
 fi
 # Corrupt upload must never report completed success: garbage bytes advertised
 # as PNG must fail loudly (non-2xx, error envelope, or a failed file state —
@@ -311,7 +317,7 @@ docker exec b2c5 ffmpeg -hide_banner -loglevel error -y -f lavfi \
 docker cp b2c5:/tmp/mid-b2.mp4 "$T/mid-b2.mp4"
 T5=$(curl -fsS --max-time 10 -X POST "http://127.0.0.1:$P5/api/signin" \
   -H 'Content-Type: application/json' -d '{"username":"smoke","password":"s3cret-pw-b2"}' \
-  | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("token") or d.get("access_token") or d.get("i") or "")') \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("i") or d.get("token") or "")') \
   || T5=""
 [[ -n "$T5" ]] || { fail "(5) signin returned no token"; exit 1; }
 curl -fsS --max-time 120 -X POST "http://127.0.0.1:$P5/api/drive/files/create" \

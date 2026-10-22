@@ -114,11 +114,13 @@ USER pinetree
 # compose file cannot drift apart. Publish it as you like: `-p 8080:3000`.
 EXPOSE 3000
 
-# Liveness. `curl` is already in the image, so no extra package is needed.
-# Readiness is available at /ready for orchestrators that need it; the
-# healthcheck moves to readiness once the Batch G/H contract lands.
+# Readiness. `curl` is already in the image, so no extra package is needed.
+# Probes /ready (bounded redb read + storage-root checks; 503 while the
+# store is unavailable) so unhealthy nodes leave rotation instead of
+# serving 500s. Liveness remains available at /healthz for bare
+# process checks.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:3000/healthz || exit 1
+    CMD curl -fsS http://127.0.0.1:3000/ready || exit 1
 
 # tini is PID 1: it forwards SIGTERM to the server (which now drains) and
 # reaps any child the server leaves behind.
@@ -157,11 +159,13 @@ USER pinetree
 # compose file cannot drift apart. Publish it as you like: `-p 8080:3000`.
 EXPOSE 3000
 
-# Liveness. `curl` is already in the image, so no extra package is needed.
-# Readiness is available at /ready for orchestrators that need it; the
-# healthcheck moves to readiness once the Batch G/H contract lands.
+# Readiness. `curl` is already in the image, so no extra package is needed.
+# Probes /ready (bounded redb read + storage-root checks; 503 while the
+# store is unavailable) so unhealthy nodes leave rotation instead of
+# serving 500s. Liveness remains available at /healthz for bare
+# process checks.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:3000/healthz || exit 1
+    CMD curl -fsS http://127.0.0.1:3000/ready || exit 1
 
 # tini is PID 1: it forwards SIGTERM to the server (which now drains) and
 # reaps any child the server leaves behind.
