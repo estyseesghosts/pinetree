@@ -44,6 +44,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 declare -a RESULTS=()
 START_ALL=$SECONDS
+# Per-step logs: each step() tees live output to $LOGDIR/<slug>.log while
+# streaming to the console. SMOKE_ALL_LOGDIR overrides the directory (CI
+# sets it to a collected artifact dir); default is /tmp/smoke-all-logs.
+LOGDIR="${SMOKE_ALL_LOGDIR:-/tmp/smoke-all-logs}"
+mkdir -p "$LOGDIR" 2>/dev/null || true
 
 print_metadata() {
   local sha tools
@@ -51,6 +56,7 @@ print_metadata() {
   echo "[smoke-all] source SHA: $sha"
   echo "[smoke-all] worktree: $(cd "$ROOT" && git status --short 2>/dev/null | head -5 | tr '\n' ';' || echo unknown)"
   echo "[smoke-all] started (UTC): $(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo unknown)"
+  echo "[smoke-all] logdir: $LOGDIR"
   tools="$(cargo --version 2>/dev/null || echo 'cargo unknown')"
   tools="$tools | $(rustc --version 2>/dev/null || echo 'rustc unknown')"
   tools="$tools | node $(node --version 2>/dev/null || echo absent)"
@@ -58,6 +64,23 @@ print_metadata() {
   tools="$tools | $(docker --version 2>/dev/null || echo 'docker absent')"
   tools="$tools | bun $(bun --version 2>/dev/null || echo absent)"
   echo "[smoke-all] tools: $tools"
+  if command -v docker >/dev/null 2>&1; then
+    echo "[smoke-all] docker images:"
+    docker images --format '{{.Repository}}:{{.Tag}} ({{.Size}})' 2>/dev/null | head -20 | sed 's/^/[smoke-all]   /' || echo "[smoke-all]   (docker images unavailable)"
+  else
+    echo "[smoke-all] docker images: docker absent"
+  fi
+  if [[ -d "$ROOT/misskey/.git" || -f "$ROOT/misskey/package.json" ]]; then
+    echo "[smoke-all] misskey rev: $(cd "$ROOT/misskey" 2>/dev/null && git rev-parse HEAD 2>/dev/null || echo unknown)"
+  else
+    echo "[smoke-all] misskey rev: absent (no ./misskey checkout)"
+  fi
+  if [[ -d "$ROOT/sharkey/.git" || -f "$ROOT/sharkey/package.json" ]]; then
+    echo "[smoke-all] sharkey rev: $(cd "$ROOT/sharkey" 2>/dev/null && git rev-parse HEAD 2>/dev/null || echo unknown)"
+  else
+    echo "[smoke-all] sharkey rev: absent (no ./sharkey checkout)"
+  fi
+  echo "[smoke-all] interop work log: ${INTEROP_WORK:-/tmp/pinetree-interop}/test.log"
   if [[ -n "${SMOKE_ALL_REQUIRED:-}" ]]; then
     echo "[smoke-all] mode: STRICT (SMOKE_ALL_REQUIRED=1; skips fail)"
   else
@@ -69,13 +92,17 @@ print_metadata() {
 step() { # name, then command...
   local name="$1"; shift
   local start=$SECONDS
+  local slug
+  slug="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')"
+  [[ -n "$slug" ]] || slug="step"
+  local log="$LOGDIR/$slug.log"
   echo "======================================================================"
-  echo "[smoke-all] STEP: $name (live output follows)"
+  echo "[smoke-all] STEP: $name (live output follows; full log: $log)"
   echo "======================================================================"
-  # Stream live AND keep the full log: teed output shows each suite's own
-  # progress lines as they happen.
+  # Stream live AND keep the per-step full log: teed output shows each
+  # suite's own progress lines as they happen.
   set +e
-  "$@" 2>&1 | tee /tmp/smoke-all-step.log
+  "$@" 2>&1 | tee "$log"
   local step_status=${PIPESTATUS[0]}
   set -e
   local took=$((SECONDS - start))
@@ -83,7 +110,7 @@ step() { # name, then command...
     echo "[smoke-all] DONE: $name (${took}s)"
     RESULTS+=("PASS  $name (${took}s)")
   else
-    echo "[smoke-all] FAIL: $name (${took}s, exit $step_status) — full log at /tmp/smoke-all-step.log"
+    echo "[smoke-all] FAIL: $name (${took}s, exit $step_status) — full log at $log"
     RESULTS+=("FAIL  $name (${took}s)")
     return 1
   fi
@@ -110,8 +137,8 @@ print_metadata
 # Inner `bash -o pipefail -c` (not bare `bash -c`): the outer `set -o pipefail`
 # cannot see inside the inner shell, so without it a succeeding `tail` would
 # mask a failing cargo. The inner `tee` keeps the FULL cargo log at
-# /tmp/smoke-cargo-full.log while `tail -30` keeps the console summary short.
-step "cargo test (unit + contract + integration)" bash -o pipefail -c "cd \"$ROOT\" && cargo test --offline 2>&1 | tee /tmp/smoke-cargo-full.log | tail -30" || true
+# $LOGDIR/cargo-full.log while `tail -30` keeps the console summary short.
+step "cargo test (unit + contract + integration)" bash -o pipefail -c "cd \"$ROOT\" && cargo test --offline 2>&1 | tee \"$LOGDIR/cargo-full.log\" | tail -30" || true
 
 # --- steps 2-4: live throwaway single-node suites -----------------------------
 # Each guarded with `|| true` so a failing step records FAIL and the run still

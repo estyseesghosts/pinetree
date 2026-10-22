@@ -119,10 +119,16 @@ if [[ ! -x "$BIN" ]]; then
   (cd "$ROOT" && cargo build --offline) || { echo "SMOKE_FAIL: cargo build failed" >&2; exit 1; }
 fi
 [[ -x "$BIN" ]] || { echo "SMOKE_FAIL: pinetree binary missing at $BIN" >&2; exit 1; }
-# Warn (never fail) when a source file is newer than the binary: a stale
-# binary can pass while the current tree is broken.
+# Freshness gate: a stale binary can pass while the current tree is broken.
+# PINETREE_BIN bypass is explicit opt-in — when set, freshness is the
+# caller's responsibility and this check is skipped.
 if [[ -z "${PINETREE_BIN:-}" ]] && newer="$(find "$ROOT/src" -name '*.rs' -newer "$BIN" -print 2>/dev/null | head -1)" && [[ -n "$newer" ]]; then
-  echo "[interop] WARNING: binary $BIN predates $newer; rebuild to test the current tree" >&2
+  if [[ -n "${SMOKE_ALL_REQUIRED:-}" ]]; then
+    echo "SMOKE_FAIL: stale binary $BIN predates $newer (strict mode; rebuild to test the current tree)" >&2
+    exit 1
+  fi
+  echo "[interop] rebuilding stale binary ($newer newer than $BIN)..." >&2
+  (cd "$ROOT" && cargo build --offline) || { echo "SMOKE_FAIL: cargo build failed" >&2; exit 1; }
 fi
 
 # --- backing services ------------------------------------------------------

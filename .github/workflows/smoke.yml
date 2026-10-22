@@ -1,0 +1,73 @@
+name: smoke
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  MISSKEY_REF: "2026.10.1-alpha.0"
+  SHARKEY_REF: "2025.4.7"
+
+jobs:
+  fast:
+    name: cargo test (offline)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo test --offline
+        run: cargo test --offline
+
+  strict-gate:
+    name: smoke-all (strict)
+    runs-on: ubuntu-latest
+    env:
+      SMOKE_ALL_REQUIRED: "1"
+      SMOKE_ALL_LOGDIR: ${{ github.workspace }}/smoke-logs
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: oven-sh/setup-bun@v2
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node 24 (Misskey) + Node 22 (Sharkey)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install Node 22 for Sharkey
+        run: |
+          set -euo pipefail
+          curl -fsSL https://nodejs.org/dist/v22.14.0/node-v22.14.0-linux-x64.tar.xz -o /tmp/node22.tar.xz
+          mkdir -p "$RUNNER_TEMP/node22"
+          tar -xJf /tmp/node22.tar.xz -C "$RUNNER_TEMP/node22" --strip-components=1
+          echo "SHARKEY_NODE_BIN=$RUNNER_TEMP/node22/bin" >> "$GITHUB_ENV"
+
+      - name: Provision Misskey + Sharkey checkouts (pinned, built from source)
+        run: |
+          set -euo pipefail
+          # Do NOT depend on prebuilt git-ignored ./misskey ./sharkey checkouts:
+          # clone + build the pinned refs fresh on every CI run.
+          if [ ! -d misskey ]; then
+            git clone --depth 1 --branch "${MISSKEY_REF}" https://github.com/misskey-dev/misskey.git misskey
+          fi
+          if [ ! -d sharkey ]; then
+            git clone --depth 1 --branch "${SHARKEY_REF}" https://git.joinsharkey.org/Sharkey/Sharkey.git sharkey
+          fi
+          (cd misskey && pnpm install --frozen-lockfile && pnpm build-pre && pnpm --filter "backend..." build)
+          (cd sharkey && PATH="$SHARKEY_NODE_BIN:$PATH" pnpm install --frozen-lockfile && PATH="$SHARKEY_NODE_BIN:$PATH" pnpm build-pre && PATH="$SHARKEY_NODE_BIN:$PATH" pnpm --filter "backend..." build)
+
+      - name: Run full smoke gate (strict)
+        run: bash scripts/smoke-all.sh
+
+      - name: Upload smoke logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-logs
+          path: ${{ github.workspace }}/smoke-logs
