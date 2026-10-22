@@ -78,7 +78,7 @@ Key:
 | Blocks, reports, account moves | WORKS | | [endpoint manifest](../endpoint-manifest.md) |
 | Open internet with strangers' servers | PARTLY | Only tested on a local lab | [testing guide](../testing.md) |
 | Mastodon, Pleroma, Akkoma | PARTLY | Exchanges seen in test runs; full tests are Misskey and Sharkey | [testing guide](../testing.md) |
-| RFC 9421 message signatures | NOT YET | | [TODOS](../TODOS.md) |
+| RFC 9421 message signatures | WORKS (single-node) | rsa-v1_5-sha256 profile: permissive default, enforce opt-in; live interop pending | [TODOS](../TODOS.md) |
 | OAuth sign-in | NOT YET | Only if an app needs it | [Roadmap](Roadmap.md) |
 | Mastodon's own app interface | WON'T DO (intentional) | | [Intentional differences](Intentional-Differences.md) |
 | Relays | WON'T DO (intentional, for now) | | [Roadmap](Roadmap.md) |
@@ -87,9 +87,9 @@ Key:
 | Settings file | WORKS | A few settings still only by environment variable or flag | [TODOS](../TODOS.md) |
 | Rate limits | WORKS | Same "try again later" answer as Misskey | [endpoint manifest](../endpoint-manifest.md) |
 | Error answers | WORKS | Unknown address: not found; unknown field: clear error | [endpoint manifest](../endpoint-manifest.md) |
-| Health check | PARTLY | Always answers "ok"; does not check the database | [TODOS](../TODOS.md) |
-| Logs and metrics | PARTLY | Basic logs; no metrics | [TODOS](../TODOS.md) |
-| Backups | NOT YET | | [TODOS](../TODOS.md) |
+| Health check | WORKS | `/healthz` liveness + `/ready` bounded readiness; Docker probes `/ready` | [Operations](Operations.md) |
+| Logs and metrics | WORKS (single-node) | Structured logs + redaction; admin status with honest nulls | [Operations](Operations.md) |
+| Backups | WORKS (single-node) | Versioned ZIP snapshot + offline restore | [Operations](Operations.md) |
 | Many machines as one server (FoundationDB) | NOT YET | Phase 4; placeholders only | [Roadmap](Roadmap.md) |
 
 ## Read more

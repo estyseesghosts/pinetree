@@ -27,19 +27,25 @@ means a dev-mode run skipped a prerequisite-gated phase and is **not** a
 release pass; `SMOKE_ALL_FAIL` (exit 1) means a phase ran and failed, or a
 strict-mode run skipped a required phase. `SMOKE_ALL_REQUIRED=1` selects
 strict mode for CI/release (missing Docker, Node versions, or
-Misskey/Sharkey reference checkouts fail the gate). Step 1 pipes cargo
-output through `tail` with `bash -o pipefail` plus a full log at
-`/tmp/smoke-cargo-full.log`, so a failing `cargo test` cannot be masked.
+Misskey/Sharkey reference checkouts fail the gate). Each step streams live
+and writes its full log to `${SMOKE_ALL_LOGDIR:-/tmp/smoke-all-logs}/<slug>.log`
+(cargo also keeps `cargo-full.log`; console shows `tail -30` under
+`bash -o pipefail`), so a failing `cargo test` cannot be masked.
 The runner's own failure paths are pinned by
-`scripts/tests/test-smoke-runner.sh` (11 checks, run under Git Bash).
+`scripts/tests/test-smoke-runner.sh` (11 checks) plus
+`scripts/tests/test-smoke-gate-a-fix.sh` (22 checks, per-step logs and
+stale-binary gate), run under native Git Bash.
 
 Each step streams its own progress live (`[smoke1]` / `[smoke3]` / `[PASS]`
 / `[interop]` lines); the wrapper adds per-step timing and always ends with
 a results table plus exactly one of `SMOKE_ALL_OK` / `SMOKE_ALL_PARTIAL` /
-`SMOKE_ALL_FAIL` (full log of the last step at `/tmp/smoke-all-step.log`).
-Every serve step builds the binary from the current checkout (or honors
-`PINETREE_BIN`) and fails on build error, and the run header logs the source
-SHA, tool versions, and phases run — a stale binary cannot claim a pass.
+`SMOKE_ALL_FAIL` (per-step full logs under `${SMOKE_ALL_LOGDIR}`).
+Stale binary gate: with no `PINETREE_BIN`, a source file newer than the
+binary fails strict runs (`SMOKE_FAIL` stale) and rebuilds in dev.
+`PINETREE_BIN=...` is explicit opt-in (freshness is yours).
+CI (`.github/workflows/smoke.yml`): fast `cargo test --offline` plus strict
+`bash scripts/smoke-all.sh` with pinned Misskey/Sharkey checkouts built from
+source; logs uploaded as `smoke-logs` always.
 Do not treat `SMOKE_ALL_PARTIAL` as a release pass.
 
 Environment:

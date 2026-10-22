@@ -55,7 +55,7 @@ Rules enforced: `durable_dir != cache_dir`, class budgets ≤ global and sum ≤
 
 Exceptions (env-only, tracked TODOS P3, no exception granted): `PINETREE_ALLOW_PRIVATE_IPS`, `PINETREE_DEBUG_FEDERATION`, `PINETREE_REPLY_REPAIR_LIMIT`; lease/retry numbers hardcoded; timeouts/SSRF/redirects/proxy-8MiB/log/metrics knobs hardcoded. Timeouts: 10 s op / 20 s total / 5 s DNS, ≤3 redirects, 64 KiB AP/WebFinger, 32 KiB headers.
 
-Docker: `runtime` (no FFmpeg) and `runtime-ffmpeg` (Debian `ffmpeg` + build-time probe) targets from a shared base; bare `docker build` yields the minimal image. Both use an opt-in transcode config (`docker/pinetree.container.json` disabled default; `docker/pinetree.transcode-enabled.example.json` for the FFmpeg image). Debian (curl+OpenSSL3, `tini`, unprivileged `pinetree`, `700 /data`, `EXPOSE 3000`, `CMD --config --data-dir --listen`). `HEALTHCHECK` probes `/healthz` (liveness); `/ready` does bounded readiness (redb read + storage roots) — switch the probe to `/ready` once accepted for traffic.
+Docker: `runtime` (no FFmpeg) and `runtime-ffmpeg` (Debian `ffmpeg` + build-time probe) targets from a shared base; bare `docker build` yields the minimal image. Both use an opt-in transcode config (`docker/pinetree.container.json` disabled default; `docker/pinetree.transcode-enabled.example.json` for the FFmpeg image). Debian (curl+OpenSSL3, `tini`, unprivileged `pinetree`, `700 /data`, `EXPOSE 3000`, `CMD --config --data-dir --listen`). `HEALTHCHECK` probes `/ready` (bounded readiness; `/healthz` is liveness-only).
 
 ## 3. Moderation tools (how to use them)
 

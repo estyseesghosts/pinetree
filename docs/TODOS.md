@@ -35,7 +35,7 @@ Conventions: `- [ ]` = open, `- [x]` = done (move to log, don't delete the line)
 - [x] Remote-media GC/quotas/eviction/reconciler — LANDED 2026-10-21 (S1+S2+S3): per-user durable quota (`DRIVE_CAPACITY_EXCEEDED`), refcounted shared blobs, global+class caps, LRU+TTL eviction (bytes-only), on-demand fetch with in-flight reservation, idempotent reconciler, 3 storage job kinds + worker arms, 22 storage tests green, gate `SMOKE_ALL_OK` (phase2 SKIP).
 - [x] Shared-blob refcount: `delete_media` drops row+bytes non-atomically (`application/commands/media.rs:211-216`) — fix before eviction. — LANDED 2026-10-21: `delete_media_record` decrements in-txn, bytes deleted only at refcount 0 outside txn, reconciler sweeps the rest.
 - [x] Stream-to-disk under byte cap (local upload + remote fetch hold full bodies in RAM: `media/remote_cache.rs:174,232-254`). — LANDED 2026-10-21: `fetch_stream.rs` stages to disk under cap with mid-stream abort + `import_file`; transport (`SafeHttpClient`) buffering is a documented follow-up, not a cap hole.
-- [ ] Backup/snapshot/restore for `pinetree.redb` + `blobs/` (crash-between-row-and-blob orphans; plan `:44-46`).
+- [x] Backup/snapshot/restore for `pinetree.redb` + `blobs/` — LANDED single-node (Batch F): versioned ZIP online snapshot (single read txn + 103-table registry + both pools + sidecars, `.partial` staging + verify + atomic publish, shared media gate) + offline restore into fresh dir (validate → checksums → schema → counts → integrity → accounting → sidecars → RESTORE_READY.json); `tests/backup_snapshot_f1.rs` + `tests/backup_snapshot_f-fix.rs` green. Live Docker drill stays unqualified until provisioned host run.
 - [x] `drive/files/find|move-bulk|check-existence|attached-notes` — LANDED 2026-10-21 (gaps WP2a final; manifest §43.1). Still OPEN: `attached-chat-messages` (no chat model, SKIP stays).
 - [ ] Thumbnails/`Range`/avatar-emoji static variants (declared-out; `thumbnail_url` = own url until the thumbnail route exists). Transcode itself LANDED 2026-10-21 (WP1; WebM/VP9+WebP, toolchain gate; manifest §43.9).
 
@@ -83,11 +83,11 @@ Conventions: `- [ ]` = open, `- [x]` = done (move to log, don't delete the line)
 
 ## P3 — ops/observability/config
 
-- [ ] `/healthz` static `"ok"` (`mod.rs:192-194`) — add DB check; add `readyz`; split liveness/readiness.
+- [x] `/healthz` static `"ok"` — LANDED: `/healthz` liveness + `/ready` bounded readiness (redb read + storage roots, 503 on fail); Docker probes `/ready`; `tests/admin_diagnostics_h-fix.rs` proves readiness-fails-while-liveness-up.
 - [ ] Metrics/prometheus/tracing counters (bytes used, hits/misses, evictions — plan `:141-143` requires "without shell access").
-- [ ] Structured logging levels (current: `observability.rs:21` no-op + ad-hoc `eprintln!`); keep `fed_debug!` gate.
-- [ ] Config surface: timeouts/SSRF/redirects, proxy 8 MiB cap, cache budgets, log/metrics knobs not in JSON (env/CLI-only or hardcoded); `PINETREE_ALLOW_PRIVATE_IPS`, `PINETREE_DEBUG_FEDERATION`, `PINETREE_REPLY_REPAIR_LIMIT` violate no-env-only-settings rule — address each into `--config` or document exception.
-- [ ] Rate limits in-memory per-process (`UploadSlots`, `RateLimiter`) — shared limiter needed for multi-node.
+- [x] Structured logging levels — LANDED: structured levels + stable events + correlation IDs + redaction (`observability.rs`); `fed_debug!` gate retained.
+- [x] Config surface — LANDED single-node: `rate_limit.*` + `uploads.*` JSON-configurable (validate >0, round-trip + typo tests); `transcode.enabled=false` default, `unsafe.allow_local_http_for_testing` JSON opt-in, `diagnostics.*`, `rfc9421_mode`; remaining env-only `PINETREE_ALLOW_PRIVATE_IPS`, `PINETREE_DEBUG_FEDERATION`, `PINETREE_REPLY_REPAIR_LIMIT` documented as throwaway-rig/test exceptions.
+- [x] Rate limits bounded in-memory per-process (`UploadSlots`, `RateLimiter`) — LANDED Batch D (bounded + expiry + race-safe, `tests/rate_limit_bounded_d4.rs` + `tests/rate_limit_config_d-fix.rs`); shared limiter still needs multi-node (out of scope).
 
 ## Verify-then-close — RESOLVED 2026-10-20 (freshness pass; section intentionally empty)
 
@@ -136,7 +136,7 @@ Items already covered above are NOT repeated. `[landed?]` = doc said TODO but in
 - [x] Like-vs-favorite split — LANDED 2026-10-20: `notes/like` (`override ?? defaultReaction ?? default_like ?? ❤`, Sharkey toggle, 2/sec bucket; manifest §41; `tests/notes_like_contract.rs` 6 + endpoint tests 2 green). Both references verified to implement like as react-with-default (no separate table/activity); Misskey favorites stay local-only bookmarks, untouched.
 - [ ] Specified-visibility hiding: non-event specified notes stay out of home/local/global/custom feeds, profile notes, live streams (owner sees own via exempt); invite-only event posts are NOT messages and still list (decisions `:22`, extension-plan C2).
 - [ ] Cat mode split: `isCat` (cosmetic) independent from `speakAsCat` (speech transform) (decisions `:25`, extension-plan C3).
-- [ ] RFC 9421: implement verify-if-present permissive-first with logging, then tighten; `Signature-Input` + `Content-Digest` alongside legacy (decisions `:26`, extension-plan C4). Deferred per wiki roadmap.
+- [x] RFC 9421: verify-if-present permissive-first LANDED single-node (rsa-v1_5-sha256; `tests/federation_sig_mode_e5.rs` + overflow hardening `tests/federation_sig_mode_e-fix.rs`); enforce opt-in; live-interop pending. Was deferred per wiki roadmap.
 - [ ] Events: steal Catodon FEP-8a8e outright — NoteEvent sidecar, EventRsvp unique-pair, EventInvitation PK-pair, dual-dialect RSVP, inviteTo DM fallback, visitor-gated `.ics`, `events/{upcoming,rsvp,unrsvp,attendees,invitees,invite}` shape, ≤20/call public-invite local-only never federates (decisions `:18-20`, extension-plan D1-D3).
 - [ ] Imports: per-source parsers for Misskey, Pixelfed, Mastodon, Sharkey, Catodon now; Lemmy later; Akkoma/Firefish explicitly out unless demanded (decisions `:27`, extension-plan E1).
 - [ ] Open: translate pipeline composition (provider picker + LLM quality gate composed, single langdetect lingua; heuristic works with zero deps, LLM gate flagged only) (decisions `:35`, extension-plan E2).
@@ -184,7 +184,7 @@ Items already covered above are NOT repeated. `[landed?]` = doc said TODO but in
 ### Wiki roadmap (planned / non-goals)
 
 - [ ] Phase 4 FDB multi-node + Phase 5 scale/hardening — planned, see P0 (wiki Roadmap).
-- [ ] Deferred: RFC 9421, OAuth (only if target client needs), public-internet federation soak (wiki Roadmap).
+- [x] Deferred: RFC 9421 LANDED single-node (permissive + enforce, overflow-hardened); OAuth still deferred (only if target client needs), public-internet federation soak still open (wiki Roadmap).
 - [ ] Non-goals (keep marked, promote by decision only): Mastodon client API, Reversi/chat + legacy features unless target client requires, `assetlinks`/`oauth-authorization-server` 404-fine, Sharkey `service-server` ML/queues, C2S outbox, relays + LD-sign relays (wiki + catodon `:68`).
 
 ### Manifest/profile stale lines — verify-then-close (supplemental to list above)

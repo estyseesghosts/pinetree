@@ -11,11 +11,11 @@ Status: living page, as of 2026-10-20. These are choices, not accidents. Each on
 ## Left out for now
 
 - **Chat, channels, games, galleries, flash posts.** These are separate features with their own large surfaces.
-- **Drive folders.** Files are kept in one flat list.
-- **Hashtag trends and hashtag pages.** Looking up an exact hashtag works.
-- **Announcements.** Left out for now. This causes a visible gap in some apps.
-- **Roles and most admin screens.** Only admin account creation and basic moderation are there.
-- **Two-factor sign-in, webhooks, OAuth.** Not built. OAuth only if an app needs it.
+- **Drive folders: works (single-node).** Real folder model with `folderId`, `drive/stream`.
+- **Hashtag trends and hashtag pages: works.** List/search/show/trend/users landed.
+- **Announcements: works.** Full CRUD + `announcements/show` + read badges.
+- **Roles and most admin screens: partly.** `admin/roles/*` stores policies verbatim, NOT enforced; `is_admin/is_moderator` gate everything. Moderation, emoji bulk, invites, send-email, queue stats landed.
+- **Two-factor sign-in, webhooks: works (single-node).** OAuth only if an app needs it.
 - **Mastodon's own app interface.** pinetree speaks the Mastodon-family federation rules, not Mastodon's app interface.
 - **Relays.** Not built.
 

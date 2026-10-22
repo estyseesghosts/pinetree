@@ -101,7 +101,7 @@ Streaming means the server pushes new posts and events to an app as they happen,
 - **Blocks, reports and account moves: works.**
 - **Real strangers' servers on the open internet: partly.** Tests ran on a local lab only.
 - **Mastodon and Pleroma/Akkoma: partly.** Exchanges have been seen in test runs. The full test set runs against Misskey and Sharkey.
-- **Newer message signature standard (RFC 9421): not yet.**
+- **Newer message signature standard (RFC 9421): works (single-node).** rsa-v1_5-sha256 profile, permissive default + enforce opt-in; `tests/federation_sig_mode_e5.rs` green; live interop pending.
 - **Built-in sign-in through other apps (OAuth): not yet,** only if an app needs it.
 - **Mastodon's own app interface: won't do.** See [Intentional differences](Intentional-Differences.md).
 - **Relays (shared forwarding servers): won't do (for now).**
@@ -114,9 +114,9 @@ Safety for incoming messages from other servers: they are size-limited, time-lim
 - **Settings file: works** for most settings. A few settings are still only set by environment variables or command-line flags.
 - **Limits on how often each app can call (rate limits): works,** answering "slow down, try again later" in the same way Misskey does.
 - **Error answers: works.** Unknown addresses get "not found"; unknown fields get a clear error.
-- **Health check: partly.** It answers "ok" without checking the database.
-- **Logs and metrics: partly.** Basic logs only; no metrics.
-- **Backups: not yet.**
+- **Health check: works.** `/healthz` liveness + `/ready` bounded readiness (redb read + storage roots); Docker probes `/ready`.
+- **Logs and metrics: works (single-node).** Structured levels + correlation IDs + redaction; admin status/diagnostics with honest nulls until ports expose aggregates.
+- **Backups: works (single-node).** Versioned ZIP online snapshot + offline restore drill.
 - **Many machines as one server, on FoundationDB: not yet.** See [Roadmap](Roadmap.md).
 
 ## What is missing, in one list
