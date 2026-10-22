@@ -237,6 +237,7 @@ fn insert_cached(h: &Harness, seq: usize, size: u64, with_bytes: bool) -> MediaM
             fetched_at_ms: BASE_MS,
             last_access_ms: BASE_MS,
             access_count: 1,
+            bytes_absent: false,
         })
         .unwrap();
     h.store

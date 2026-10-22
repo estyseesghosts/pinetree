@@ -127,6 +127,96 @@ impl RegistryStore for RedbStore {
         }
         Ok(pairs)
     }
+
+    fn consume_totp_login(
+        &self,
+        account_id: &str,
+        challenge: &str,
+        matched_step: u64,
+        now_ms: i64,
+    ) -> Result<(), PortError> {
+        use serde::Deserialize;
+        #[derive(Deserialize)]
+        struct StoredChallenge {
+            challenge: String,
+            account_id: String,
+            expires_at_ms: i64,
+        }
+        let scope = vec!["2fa".to_string()];
+        let challenge_key = registry_key(account_id, None, &scope, "totp_challenge");
+        let last_step_key = registry_key(account_id, None, &scope, "totp_last_step");
+        let write_txn = self.begin_write()?;
+        let outcome: Result<(), PortError> = {
+            let mut table = write_txn.open_table(REGISTRY).map_err(map_redb_err)?;
+            let item: Option<RegistryItem> =
+                match table.get(challenge_key.as_str()).map_err(map_redb_err)? {
+                    Some(g) => Some(decode_json(g.value())?),
+                    None => None,
+                };
+            let Some(item) = item else {
+                return Err(PortError::Validation(
+                    "INVALID_TOKEN no second-factor challenge is active".to_string(),
+                ));
+            };
+            let stored: StoredChallenge = serde_json::from_value(item.value).map_err(|e| {
+                PortError::Validation(format!("INVALID_PARAM corrupt 2fa challenge: {e}"))
+            })?;
+            if stored.account_id != account_id || stored.challenge != challenge {
+                return Err(PortError::Validation(
+                    "INVALID_TOKEN invalid challenge".to_string(),
+                ));
+            }
+            if now_ms > stored.expires_at_ms {
+                table.remove(challenge_key.as_str()).map_err(map_redb_err)?;
+                drop(table);
+                self.commit_write(write_txn)?;
+                return Err(PortError::Validation(
+                    "INVALID_TOKEN challenge expired".to_string(),
+                ));
+            }
+            let last_step: Option<u64> =
+                match table.get(last_step_key.as_str()).map_err(map_redb_err)? {
+                    Some(g) => {
+                        let last_item: RegistryItem = decode_json(g.value())?;
+                        let step = last_item
+                            .value
+                            .get("step")
+                            .and_then(serde_json::Value::as_u64)
+                            .ok_or_else(|| {
+                                PortError::Validation(
+                                    "INVALID_PARAM corrupt 2fa replay guard".to_string(),
+                                )
+                            })?;
+                        Some(step)
+                    }
+                    None => None,
+                };
+            if let Some(last) = last_step
+                && matched_step <= last
+            {
+                return Err(PortError::Validation(
+                    "INVALID_TOKEN token already used".to_string(),
+                ));
+            }
+            let last_item = RegistryItem {
+                id: self.ids.generate(),
+                user_id: account_id.to_string(),
+                domain: None,
+                scope: scope.clone(),
+                key: "totp_last_step".to_string(),
+                value: serde_json::json!({ "step": matched_step }),
+                updated_at_ms: now_ms,
+            };
+            let encoded = encode_json(&last_item)?;
+            table
+                .insert(last_step_key.as_str(), encoded.as_slice())
+                .map_err(map_redb_err)?;
+            table.remove(challenge_key.as_str()).map_err(map_redb_err)?;
+            Ok(())
+        };
+        outcome?;
+        self.commit_write(write_txn)
+    }
 }
 
 // --- Drive folders (WP2 part A) --------------------------------------------

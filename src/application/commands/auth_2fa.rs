@@ -34,12 +34,12 @@ const B32_ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 /// enough for a user to read a code off their authenticator app.
 pub(crate) const TOTP_CHALLENGE_TTL_MS: i64 = 5 * 60 * 1000;
 
-/// Registry keys under scope [`SCOPE_2FA`]: the verified secret
-/// ([`KEY_TOTP`], pre-existing), the outstanding login challenge, and the
-/// TOTP step counter the last successful second-factor login consumed
-/// (cross-challenge code-replay guard).
+/// Registry key under scope [`SCOPE_2FA`] for the outstanding login
+/// challenge. The verified secret lives under [`KEY_TOTP`]
+/// (pre-existing); the replay-guard step row (`totp_last_step`) is read
+/// and written only inside `RegistryStore::consume_totp_login`, never
+/// here, so the check-and-write stays one durable transaction.
 const KEY_TOTP_CHALLENGE: &str = "totp_challenge";
-const KEY_TOTP_LAST_STEP: &str = "totp_last_step";
 
 /// Outstanding second-factor challenge: issued only after a password
 /// success, bound to one account, single-use, expiring. Stored as a
@@ -227,9 +227,12 @@ impl AppServices {
     /// Account gates mirror `authenticate()`: suspended refuses loudly
     /// (403); deleted/missing accounts answer like a TOTP-less account
     /// (400 `NO_SUCH_2FA`), so the endpoint is not a username oracle.
-    /// The challenge is consumed on success only, so a mistyped code can
-    /// be retried within the TTL; the consumed TOTP step counter stops a
-    /// code from minting a second session under a fresh challenge.
+    /// Challenge validation, the cross-challenge replay guard, the
+    /// last-step record, and challenge removal commit in one
+    /// `RegistryStore::consume_totp_login` transaction, so two
+    /// concurrent logins with the same code mint at most one session.
+    /// A mistyped code leaves the challenge in place (retry within the
+    /// TTL); only an expired challenge itself is pruned.
     pub fn authenticate_2fa(
         &self,
         account_id: &str,
@@ -257,18 +260,20 @@ impl AppServices {
             Some(_) => {}
         }
         let state = self.verified_totp(account_id)?;
-        self.check_totp_challenge(account_id, challenge)?;
-        let matched = verify_totp_step(&state.secret_b32, self.now_ms(), token)
-            .ok_or_else(|| PortError::Validation("INVALID_TOKEN invalid token".to_string()))?;
-        if let Some(last) = self.last_used_totp_step(account_id)?
-            && matched <= last
-        {
+        let now = self.now_ms();
+        let Some(matched) = verify_totp_step(&state.secret_b32, now, token) else {
+            // Failure precedence (pre-race parity): a missing/mismatched
+            // or expired challenge still reads as a challenge error —
+            // expired rows are pruned on this read — and only a live
+            // challenge yields the token error. A mistyped code never
+            // consumes the challenge.
+            self.check_totp_challenge(account_id, challenge)?;
             return Err(PortError::Validation(
-                "INVALID_TOKEN token already used".to_string(),
+                "INVALID_TOKEN invalid token".to_string(),
             ));
-        }
-        self.store_last_used_totp_step(account_id, matched)?;
-        self.consume_totp_challenge(account_id)
+        };
+        self.registry
+            .consume_totp_login(account_id, challenge, matched, now)
     }
 
     /// Packed `MeDetailed` security flags: `(twoFactorEnabled,
@@ -309,7 +314,10 @@ impl AppServices {
 
     /// Validate a presented challenge without consuming it. Missing,
     /// mismatched, account-unbound, or expired challenges all read as
-    /// `INVALID_TOKEN`; expired rows are pruned on read.
+    /// `INVALID_TOKEN`; expired rows are pruned on read. Used on the
+    /// failure path only (a mistyped code still reports challenge
+    /// problems first); the success path consumes atomically via
+    /// `RegistryStore::consume_totp_login` instead.
     fn check_totp_challenge(&self, account_id: &str, challenge: &str) -> Result<(), PortError> {
         let scope = vec![SCOPE_2FA.to_string()];
         let item = self
@@ -337,52 +345,6 @@ impl AppServices {
             ));
         }
         Ok(())
-    }
-
-    /// Atomically retire a challenge after a successful second factor.
-    /// `registry_remove` is idempotent, so a vanished row (concurrent
-    /// consumer) is not an error here: the consumed-step guard above
-    /// already stops the second mint.
-    fn consume_totp_challenge(&self, account_id: &str) -> Result<(), PortError> {
-        let scope = vec![SCOPE_2FA.to_string()];
-        self.registry
-            .registry_remove(account_id, None, &scope, KEY_TOTP_CHALLENGE)
-    }
-
-    /// TOTP step counter consumed by the last successful second-factor
-    /// login, if any. Kept in its own row so the [`TotpState`] shape
-    /// (parent-owned domain type) stays untouched.
-    fn last_used_totp_step(&self, account_id: &str) -> Result<Option<u64>, PortError> {
-        let scope = vec![SCOPE_2FA.to_string()];
-        let item = self
-            .registry
-            .registry_get(account_id, None, &scope, KEY_TOTP_LAST_STEP)?;
-        match item {
-            None => Ok(None),
-            Some(item) => {
-                let step = item
-                    .value
-                    .get("step")
-                    .and_then(serde_json::Value::as_u64)
-                    .ok_or_else(|| {
-                        PortError::Validation("INVALID_PARAM corrupt 2fa replay guard".to_string())
-                    })?;
-                Ok(Some(step))
-            }
-        }
-    }
-
-    fn store_last_used_totp_step(&self, account_id: &str, step: u64) -> Result<(), PortError> {
-        let scope = vec![SCOPE_2FA.to_string()];
-        self.registry.registry_set(RegistryItem {
-            id: self.ids.generate(),
-            user_id: account_id.to_string(),
-            domain: None,
-            scope,
-            key: KEY_TOTP_LAST_STEP.to_string(),
-            value: serde_json::json!({ "step": step }),
-            updated_at_ms: self.now_ms(),
-        })
     }
 
     /// `i/2fa/remove-key` (security-key removal): loud 400 — pinetree stores

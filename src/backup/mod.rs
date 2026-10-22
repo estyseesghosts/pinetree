@@ -371,6 +371,23 @@ pub fn list_backup_statuses(backup_dir: &Path) -> Vec<BackupStatus> {
     out
 }
 
+/// Newest `cap` statuses in `backup_dir` (newest-first) for diagnostics.
+/// Unlike [`list_backup_statuses`] (oldest-first for the worker drain),
+/// this selects the newest tail: sorts descending by `requested_ms` and
+/// truncates to `cap` before callers compute last success, last failure,
+/// last duration, last bytes, or the recent list. Ties on `requested_ms`
+/// order by descending `job_id` (monotonic suffix), so the newest job wins.
+pub fn newest_backup_statuses(backup_dir: &Path, cap: usize) -> Vec<BackupStatus> {
+    let mut all = list_backup_statuses(backup_dir);
+    all.sort_by(|a, b| {
+        b.requested_ms
+            .cmp(&a.requested_ms)
+            .then_with(|| b.job_id.cmp(&a.job_id))
+    });
+    all.truncate(cap);
+    all
+}
+
 /// Retention pruning outcome (best-effort counts for logs/diagnostics).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RetentionReport {
@@ -440,14 +457,26 @@ pub fn prune_retained_backups(ctx: &BackupContext) -> RetentionReport {
         };
         let zip = ctx.backup_dir.join(&name);
         let bytes = std::fs::metadata(&zip).map(|m| m.len()).unwrap_or(size);
-        if std::fs::remove_file(&zip).is_ok() {
-            report.bundles_removed += 1;
-            report.bytes_reclaimed = report.bytes_reclaimed.saturating_add(bytes);
+        // Only drop the status after the ZIP is gone: success or already
+        // absent. Permission/sharing errors leave both files for a later
+        // run to retry; they never count and never abort the prune.
+        let zip_gone = match std::fs::remove_file(&zip) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => false,
+        };
+        if !zip_gone {
+            continue;
         }
         let status_file = status_path(&ctx.backup_dir, &status.job_id);
-        if std::fs::remove_file(&status_file).is_ok() {
-            lock_registry().remove(&status.job_id);
+        match std::fs::remove_file(&status_file) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => continue,
         }
+        lock_registry().remove(&status.job_id);
+        report.bundles_removed += 1;
+        report.bytes_reclaimed = report.bytes_reclaimed.saturating_add(bytes);
     }
     report
 }

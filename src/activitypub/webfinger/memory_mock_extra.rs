@@ -145,6 +145,21 @@ impl MediaStore for Mem {
     ) -> Result<Vec<crate::domain::media::MediaMeta>, PortError> {
         Ok(Vec::new())
     }
+    fn commit_cache_eviction(
+        &self,
+        _blob_key: &str,
+        _size_bytes: u64,
+        _class: crate::application::ports::MediaClass,
+        _index_keys: &[(String, String)],
+    ) -> Result<crate::application::ports::CacheEvictionOutcome, PortError> {
+        Ok(crate::application::ports::CacheEvictionOutcome::AlreadyAbsent)
+    }
+    fn cache_entries_for_blob_key(
+        &self,
+        _blob_key: &str,
+    ) -> Result<Vec<crate::application::ports::RemoteCacheRecord>, PortError> {
+        Ok(Vec::new())
+    }
 }
 
 impl BlobStore for Mem {
@@ -396,6 +411,17 @@ impl crate::application::ports::RegistryStore for Mem {
         _user_id: &str,
     ) -> Result<Vec<(Option<String>, Vec<String>)>, PortError> {
         Ok(Vec::new())
+    }
+    fn consume_totp_login(
+        &self,
+        _account_id: &str,
+        _challenge: &str,
+        _matched_step: u64,
+        _now_ms: i64,
+    ) -> Result<(), PortError> {
+        Err(PortError::Validation(
+            "INVALID_TOKEN no second-factor challenge is active".to_string(),
+        ))
     }
 }
 

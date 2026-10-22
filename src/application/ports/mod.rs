@@ -59,7 +59,8 @@ pub use job_queue::{
     RemoteMediaFetchPayload, ReplyParentResolvePayload, ScheduledDraftPayload, UnfollowAllPayload,
 };
 pub use media_store::{
-    CacheStats, InsertMediaInput, MediaStore, RemoteCacheRecord, RemoteMediaAttachment,
+    CacheEvictionOutcome, CacheStats, InsertMediaInput, MediaStore, RemoteCacheRecord,
+    RemoteMediaAttachment,
 };
 pub use moderation_store::{
     AbuseReportFilter, AbuseReportRecipientStore, AbuseReportStore, ModerationLogFilter,

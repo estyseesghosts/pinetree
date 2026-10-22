@@ -1,6 +1,8 @@
 use crate::application::commands::AppServices;
-use crate::application::ports::{BlobStore, MediaClass, PortError, TimelineCursor};
-use crate::media::storage::{acquire_blob_key, acquire_media_op};
+use crate::application::ports::{
+    BlobStore, CacheEvictionOutcome, MediaClass, PortError, TimelineCursor,
+};
+use crate::media::storage;
 use crate::persistence::redb::MAX_MEDIA_PAGE_ROWS;
 use std::collections::{HashMap, HashSet};
 
@@ -170,8 +172,8 @@ pub fn reconcile_media_paged(
                         Some(bytes) => {
                             // Whole-transition hold: the re-put races with
                             // concurrent deletes/evictions of this key.
-                            let _lifecycle = acquire_media_op("reconcile_sidecar")?;
-                            let _key_lock = acquire_blob_key(&meta.blob_key)?;
+                            let _lifecycle = storage::acquire_media_op("reconcile_sidecar")?;
+                            let _key_lock = storage::acquire_blob_key(&meta.blob_key)?;
                             pool.put(&meta.blob_key, &bytes)?;
                             report.sidecars_healed += 1;
                         }
@@ -188,22 +190,15 @@ pub fn reconcile_media_paged(
                             }
                         }
                         None => {
-                            // Cache bytes missing: adjust accounting down
-                            // exactly once per blob per run (several rows
-                            // can share one blob key), anchored on the
-                            // `(source_url, variant)` index row so re-runs
-                            // stay idempotent. The trait has no persisted
-                            // evicted flag (`InsertMediaInput` carries none
-                            // and the backend derives the field), so the
-                            // index record doubles as the adjustment
-                            // record: its `size_bytes` is zeroed when the
-                            // missing bytes are charged off (a zero size
-                            // adjusts nothing on re-runs), while the index
-                            // row itself is KEPT for re-fetch bookkeeping.
-                            // A later re-fetch overwrites the record with
-                            // fresh bytes + size, self-healing the anchor.
-                            // The metadata row always survives: dropping it
-                            // would destroy the re-fetch path.
+                            // Cache bytes missing: charge off exactly once per
+                            // physical key through the shared eviction
+                            // transition (index-anchored, idempotent). Bytes
+                            // already restored by a concurrent refetch skip
+                            // below; a durable row sharing the key reports
+                            // `SkippedDurableRef` (its own row counts
+                            // `durable_missing`). `commit` owns the only
+                            // accounting move on this path — never subtract
+                            // `meta.size_bytes` here.
                             //
                             // Whole-transition hold: the accounting write +
                             // index zeroing commit under the same key
@@ -215,40 +210,44 @@ pub fn reconcile_media_paged(
                             if !adjusted_blobs.insert(meta.blob_key.clone()) {
                                 continue;
                             }
-                            let _lifecycle = acquire_media_op("reconcile_missing")?;
-                            let _key_lock = acquire_blob_key(&meta.blob_key)?;
-                            let Some(url) = meta.source_url.as_deref() else {
-                                // No index anchor exists to record the
-                                // adjustment: leave the charge in place
-                                // (bounded, non-ratcheting) rather than
-                                // double-subtracting on every run.
-                                continue;
-                            };
-                            let Some(mut rec) =
-                                services.media.remote_cache_lookup(url, &meta.variant)?
-                            else {
-                                // Already adjusted on an earlier run (anchor
-                                // zeroed) — skip so re-runs never
-                                // double-subtract.
-                                continue;
-                            };
-                            if rec.size_bytes == 0 {
+                            let _lifecycle = storage::acquire_media_op("reconcile_missing")?;
+                            let _key_lock = storage::acquire_blob_key(&meta.blob_key)?;
+                            // Bytes refetched after the page read: nothing
+                            // is missing.
+                            if services.cache_blobs.byte_len(&meta.blob_key)?.is_some() {
                                 continue;
                             }
-                            let class = MediaClass::classify_mime(&meta.mime);
-                            services.media.cache_accounting_apply(
-                                -(meta.size_bytes as i64),
-                                class,
-                                -(meta.size_bytes as i64),
-                                0,
-                                0,
-                                0,
-                                0,
-                                0,
-                            )?;
-                            rec.size_bytes = 0;
-                            services.media.remote_cache_insert(&rec)?;
-                            report.missing_marked_evicted += 1;
+                            let entries =
+                                services.media.cache_entries_for_blob_key(&meta.blob_key)?;
+                            // Debit the size still charged on the index (max
+                            // when rows disagree, never the sum); zero (or no
+                            // rows at all) means nothing is still charged, so
+                            // re-runs stay idempotent.
+                            let mut charge_bytes = 0u64;
+                            let mut charge_class = MediaClass::classify_mime(&meta.mime);
+                            let mut index_keys: Vec<(String, String)> = Vec::new();
+                            for entry in &entries {
+                                index_keys.push((entry.source_url.clone(), entry.variant.clone()));
+                                if entry.size_bytes > charge_bytes {
+                                    charge_bytes = entry.size_bytes;
+                                    charge_class = entry.class;
+                                }
+                            }
+                            if charge_bytes == 0 {
+                                continue;
+                            }
+                            match services.media.commit_cache_eviction(
+                                &meta.blob_key,
+                                charge_bytes,
+                                charge_class,
+                                &index_keys,
+                            )? {
+                                CacheEvictionOutcome::Evicted { .. } => {
+                                    report.missing_marked_evicted += 1;
+                                }
+                                CacheEvictionOutcome::AlreadyAbsent
+                                | CacheEvictionOutcome::SkippedDurableRef => {}
+                            }
                         }
                     }
                 }
@@ -272,8 +271,8 @@ pub fn reconcile_media_paged(
     let mut accounted_blobs: HashSet<String> = HashSet::new();
     let candidates = services.media.remote_cache_evict_candidates(cap)?;
     for rec in &candidates {
-        let _lifecycle = acquire_media_op("reconcile_dangling")?;
-        let _key_lock = acquire_blob_key(&rec.blob_key)?;
+        let _lifecycle = storage::acquire_media_op("reconcile_dangling")?;
+        let _key_lock = storage::acquire_blob_key(&rec.blob_key)?;
         if services.media.get(&rec.media_id)?.is_some() {
             continue;
         }
@@ -364,7 +363,10 @@ pub fn collect_live_blob_keys(
         for meta in &rows {
             if meta.owner_id.is_some() {
                 durable.insert(meta.blob_key.clone());
-            } else {
+            } else if !meta.evicted && !meta.blob_key.is_empty() {
+                // Evicted (or key-less) owner-less rows protect nothing:
+                // their bytes are gone by definition, so the orphan sweep
+                // must not treat the key as live.
                 cache.insert(meta.blob_key.clone());
             }
         }
@@ -448,6 +450,7 @@ mod tests {
                 fetched_at_ms: 1,
                 last_access_ms: 1,
                 access_count: 1,
+                bytes_absent: false,
             })
             .unwrap();
         // Legacy MD5-keyed row: flagged, never deleted.
@@ -494,6 +497,7 @@ mod tests {
                 fetched_at_ms: 1,
                 last_access_ms: 1,
                 access_count: 1,
+                bytes_absent: false,
             })
             .unwrap();
         let report = reconcile_media(&services).unwrap();

@@ -1,13 +1,13 @@
-use super::evict::ensure_cache_budget;
+use super::evict;
 use crate::activitypub::objects::ParsedAttachment;
 use crate::application::commands::AppServices;
 use crate::application::ports::{InsertMediaInput, MediaClass, PortError, RemoteCacheRecord};
 use crate::config::RemoteCacheMode;
-use crate::domain::media::{MediaMeta, MediaProperties, sniff_mime};
-use crate::federation::delivery::{SafeHttpClient, parse_http_url, resolve_and_validate_url};
-use crate::media::fetch_stream::stream_response_to_store;
-use crate::media::ingest::{md5_hex, sanitize_filename, sha256_hex};
-use crate::media::storage::{acquire_blob_key, acquire_media_op};
+use crate::domain::media::{MediaMeta, MediaProperties};
+use crate::federation::delivery::{SafeHttpClient, SafeHttpConfig};
+use crate::media::fetch_stream;
+use crate::media::ingest;
+use crate::media::storage;
 
 /// Variant key for the original bytes (what the `GET /files/:id` handler
 /// asks for and what the fetch job caches).
@@ -19,7 +19,7 @@ pub const AVATAR_VARIANT: &str = "avatar";
 
 /// Validate a remote media URL before any network fetch occurs.
 pub fn validate_remote_media_url(url: &str, client: &SafeHttpClient) -> Result<(), PortError> {
-    let parsed = parse_http_url(url).map_err(PortError::Validation)?;
+    let parsed = crate::federation::delivery::parse_http_url(url).map_err(PortError::Validation)?;
     if parsed.scheme != "http" && parsed.scheme != "https" {
         return Err(PortError::Validation(format!(
             "unsupported remote media scheme: {}",
@@ -31,7 +31,7 @@ pub fn validate_remote_media_url(url: &str, client: &SafeHttpClient) -> Result<(
             "remote media URL exceeds 1024 chars".to_string(),
         ));
     }
-    resolve_and_validate_url(url, &client.config)
+    crate::federation::delivery::resolve_and_validate_url(url, &client.config)
         .map_err(|e| PortError::Validation(e.to_string()))?;
     Ok(())
 }
@@ -110,11 +110,16 @@ pub(crate) fn fetch_and_index_remote_media(
     if services.remote_cache_mode == RemoteCacheMode::Disabled {
         return Err(PortError::Validation("REMOTE_CACHE_DISABLED".to_string()));
     }
-    // Freshness lookup: hit + bytes present → touch + hit++ + serve.
-    // Hit with evicted (or otherwise missing) bytes, or metadata lost
+    // Freshness lookup: index hit with present, still-charged bytes →
+    // touch + hit++ + serve, no network. A row flagged absent (evicted or
+    // reconciled) re-fetches even when bytes are readable, so flag tears
+    // self-heal through the commit below; bytes missing, or metadata lost
     // meanwhile → fall through and re-fetch (miss path).
     if let Some(rec) = services.media.remote_cache_lookup(source_url, variant)? {
-        if services.cache_blobs.byte_len(&rec.blob_key)?.is_some() {
+        if !rec.bytes_absent
+            && rec.size_bytes > 0
+            && services.cache_blobs.byte_len(&rec.blob_key)?.is_some()
+        {
             services
                 .media
                 .remote_cache_touch(source_url, variant, services.clock.now_ms())?;
@@ -136,7 +141,7 @@ pub(crate) fn fetch_and_index_remote_media(
     // `ensure_cache_budget` evicted everything it could.
     let max_bytes = services.max_file_size;
     let provisional = force_class.unwrap_or(MediaClass::Preview);
-    ensure_cache_budget(services, max_bytes, provisional)?;
+    evict::ensure_cache_budget(services, max_bytes, provisional)?;
     if !services.media.reserve_cache_bytes(max_bytes)? {
         services
             .media
@@ -184,7 +189,7 @@ pub(crate) fn fetch_and_index_remote_media(
     > {
         let tmp_dir = std::env::temp_dir().join("pinetree-remote-cache");
         let (tmp_path, staged) =
-            stream_response_to_store(&prepared.bytes[..], max_bytes, &tmp_dir)?;
+            fetch_stream::stream_response_to_store(&prepared.bytes[..], max_bytes, &tmp_dir)?;
         if staged.sha256 != prepared.blob_key || staged.bytes_written != actual {
             let _ = std::fs::remove_file(&tmp_path);
             return Err(PortError::StorageUnavailable(
@@ -207,21 +212,24 @@ pub(crate) fn fetch_and_index_remote_media(
     // winner instead of double-installing and double-accounting. The inner
     // `import_file` re-acquire nests safely (counted no-op). Bytes always
     // land in the cache pool (`cache_blobs`), never the durable pool.
-    let _lifecycle = acquire_media_op("fetch_commit")?;
-    let _key_lock = acquire_blob_key(&prepared.blob_key)?;
-    if let Some(rec) = services.media.remote_cache_lookup(source_url, variant)?
-        && services.cache_blobs.byte_len(&rec.blob_key)?.is_some()
-    {
-        let _ = std::fs::remove_file(&tmp_path);
-        services
-            .media
-            .remote_cache_touch(source_url, variant, services.clock.now_ms())?;
-        services
-            .media
-            .cache_accounting_apply(0, rec.class, 0, 1, 0, 0, 0, 0)?;
-        if let Some(meta) = services.media.get(&rec.media_id)? {
-            let _ = services.media.release_cache_reservation(max_bytes);
-            return Ok(meta);
+    let _lifecycle = storage::acquire_media_op("fetch_commit")?;
+    let _key_lock = storage::acquire_blob_key(&prepared.blob_key)?;
+    if let Some(rec) = services.media.remote_cache_lookup(source_url, variant)? {
+        if !rec.bytes_absent
+            && rec.size_bytes > 0
+            && services.cache_blobs.byte_len(&rec.blob_key)?.is_some()
+        {
+            let _ = std::fs::remove_file(&tmp_path);
+            services
+                .media
+                .remote_cache_touch(source_url, variant, services.clock.now_ms())?;
+            services
+                .media
+                .cache_accounting_apply(0, rec.class, 0, 1, 0, 0, 0, 0)?;
+            if let Some(meta) = services.media.get(&rec.media_id)? {
+                let _ = services.media.release_cache_reservation(max_bytes);
+                return Ok(meta);
+            }
         }
     }
 
@@ -229,16 +237,46 @@ pub(crate) fn fetch_and_index_remote_media(
     // cross-table transaction on the trait): a crash between them heals
     // via the reconciler (dangling meta without index re-fetches on next
     // lookup miss; production backends should co-locate them).
+    //
+    // Exactly-once charge per physical key: bytes already in the pool
+    // (another URL/variant fetched them) are not charged again; a restore
+    // of a previously debited key (every index row zeroed and flagged)
+    // re-charges once; a still-charged key adds nothing (crash window).
+    // Our index row is updated in place (same media id, flags cleared);
+    // every other row sharing the key is restored the same way.
     let stored = (|| -> Result<MediaMeta, PortError> {
+        // Presence BEFORE the import decides the charge.
+        let was_absent = services.cache_blobs.byte_len(&prepared.blob_key)?.is_none();
         // `BlobStore::import_file` dispatches to the filesystem rename
         // path on `FsBlobStore`; the staged file is removed either way
-        // (post-rename the remove is a harmless miss).
+        // (post-rename the remove is a harmless miss). Identical bytes are
+        // a no-op; torn bytes heal instead of lingering.
         let out = services
             .cache_blobs
             .import_file(&prepared.blob_key, &tmp_path);
         let _ = std::fs::remove_file(&tmp_path);
         out?;
-        let media_id = services.ids.generate();
+        // Fresh index view for the key: sharers from other URLs/variants
+        // plus our own row when it already pointed here.
+        let entries = services
+            .media
+            .cache_entries_for_blob_key(&prepared.blob_key)?;
+        let previously_debited = !entries.is_empty()
+            && entries
+                .iter()
+                .all(|entry| entry.bytes_absent || entry.size_bytes == 0);
+        let charge = was_absent || previously_debited;
+        let now_ms = services.clock.now_ms();
+        let existing = services.media.remote_cache_lookup(source_url, variant)?;
+        let live_row = match &existing {
+            Some(rec) => services.media.get(&rec.media_id)?,
+            None => None,
+        };
+        // Same id when the indexed row still has its media row; fresh id
+        // only for a true first insert. The upsert clears `evicted`.
+        let media_id = live_row
+            .map(|meta| meta.id)
+            .unwrap_or_else(|| services.ids.generate());
         let local_url = format!(
             "{}/files/{media_id}",
             services.public_url.trim_end_matches('/')
@@ -261,7 +299,10 @@ pub(crate) fn fetch_and_index_remote_media(
             source_url: Some(source_url.to_string()),
             max_file_size: services.max_file_size,
         })?;
-        let now_ms = services.clock.now_ms();
+        let access_count = existing
+            .as_ref()
+            .map(|rec| rec.access_count.saturating_add(1))
+            .unwrap_or(1);
         services.media.remote_cache_insert(&RemoteCacheRecord {
             source_url: source_url.to_string(),
             variant: variant.to_string(),
@@ -271,18 +312,93 @@ pub(crate) fn fetch_and_index_remote_media(
             class,
             fetched_at_ms: now_ms,
             last_access_ms: now_ms,
-            access_count: 1,
+            access_count,
+            bytes_absent: false,
         })?;
-        services.media.cache_accounting_apply(
-            actual as i64,
-            class,
-            actual as i64,
-            0,
-            1,
-            actual,
-            0,
-            0,
-        )?;
+        // Every other row sharing this key was restored by this fetch:
+        // clear its absence flags (and normalize its size) so eviction,
+        // reconcile, and backup all see present bytes. Its media row is
+        // upserted in place (same id) so its evicted flag clears too.
+        for entry in &entries {
+            if entry.source_url == source_url && entry.variant == variant {
+                continue;
+            }
+            services.media.remote_cache_insert(&RemoteCacheRecord {
+                source_url: entry.source_url.clone(),
+                variant: entry.variant.clone(),
+                media_id: entry.media_id.clone(),
+                blob_key: prepared.blob_key.clone(),
+                size_bytes: actual,
+                class: entry.class,
+                fetched_at_ms: entry.fetched_at_ms,
+                last_access_ms: entry.last_access_ms,
+                access_count: entry.access_count,
+                bytes_absent: false,
+            })?;
+            if let Some(other) = services.media.get(&entry.media_id)? {
+                if other.owner_id.is_none() && other.id != media_id {
+                    services.media.insert_metadata(InsertMediaInput {
+                        id: Some(other.id.clone()),
+                        owner_id: None,
+                        name: other.name.clone(),
+                        mime: other.mime.clone(),
+                        size_bytes: actual,
+                        hash: other.hash.clone(),
+                        blob_key: prepared.blob_key.clone(),
+                        blurhash: other.blurhash.clone(),
+                        properties: other.properties.clone(),
+                        is_sensitive: other.is_sensitive,
+                        is_link: true,
+                        url: other.url.clone(),
+                        thumbnail_url: other.thumbnail_url.clone(),
+                        comment: other.comment.clone(),
+                        source_url: other.source_url.clone(),
+                        max_file_size: services.max_file_size,
+                    })?;
+                }
+            }
+        }
+        // The row may have abandoned a previous key (content changed at
+        // this URL): when nothing references the old key anymore, drop its
+        // bytes and its still-charged bytes exactly once.
+        if let Some(rec) = existing.as_ref() {
+            if rec.blob_key != prepared.blob_key && !rec.blob_key.is_empty() {
+                let old_refs = services.media.blob_refcount(&rec.blob_key)?;
+                let old_entries = services.media.cache_entries_for_blob_key(&rec.blob_key)?;
+                if old_refs == 0 && old_entries.is_empty() {
+                    services.cache_blobs.delete(&rec.blob_key)?;
+                    if !rec.bytes_absent && rec.size_bytes > 0 {
+                        services.media.cache_accounting_apply(
+                            -(rec.size_bytes as i64),
+                            rec.class,
+                            -(rec.size_bytes as i64),
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                        )?;
+                    }
+                }
+            }
+        }
+        if charge {
+            services.media.cache_accounting_apply(
+                actual as i64,
+                class,
+                actual as i64,
+                0,
+                1,
+                actual,
+                0,
+                0,
+            )?;
+        } else {
+            // Bytes already charged: count the miss without moving totals.
+            services
+                .media
+                .cache_accounting_apply(0, class, 0, 0, 1, actual, 0, 0)?;
+        }
         Ok(meta)
     })();
     // True-up the reservation on success; release it whole on failure
@@ -346,7 +462,7 @@ fn download_and_sniff(
         return Err(PortError::Validation("MAX_FILE_SIZE_EXCEEDED".to_string()));
     }
 
-    let mime = sniff_mime(&resp.body);
+    let mime = crate::domain::media::sniff_mime(&resp.body);
     let ext = match mime.as_str() {
         "image/png" => "png",
         "image/jpeg" => "jpg",
@@ -363,22 +479,24 @@ fn download_and_sniff(
         _ => "bin",
     };
 
-    let url_leaf = parse_http_url(&attachment.url).ok().and_then(|u| {
-        u.path_and_query
-            .split('?')
-            .next()
-            .and_then(|p| p.rsplit('/').next())
-            .filter(|s| !s.is_empty())
-            .map(ToOwned::to_owned)
-    });
-    let name = sanitize_filename(attachment.name.as_deref().or(url_leaf.as_deref()), ext);
+    let url_leaf = crate::federation::delivery::parse_http_url(&attachment.url)
+        .ok()
+        .and_then(|u| {
+            u.path_and_query
+                .split('?')
+                .next()
+                .and_then(|p| p.rsplit('/').next())
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+        });
+    let name = ingest::sanitize_filename(attachment.name.as_deref().or(url_leaf.as_deref()), ext);
     let comment = attachment
         .name
         .as_deref()
         .map(|c| c.chars().take(512).collect());
 
-    let hash = md5_hex(&resp.body);
-    let blob_key = sha256_hex(&resp.body);
+    let hash = ingest::md5_hex(&resp.body);
+    let blob_key = ingest::sha256_hex(&resp.body);
     Ok(PreparedRemoteMedia {
         bytes: resp.body,
         mime,
@@ -430,13 +548,12 @@ pub fn fetch_and_cache_remote_media(
 
 #[cfg(test)]
 mod tests {
-    use super::super::support::{attachment_for, serve_bodies, test_services};
+    use super::super::support;
     use super::*;
     use crate::activitypub::objects::ParsedAttachment;
     use crate::application::ports::PortError;
     use crate::config::RemoteCacheMode;
     use crate::federation::delivery::{SafeHttpClient, SafeHttpConfig};
-    use crate::media::ingest::{md5_hex, sha256_hex};
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
@@ -444,7 +561,7 @@ mod tests {
     fn fetch_on_first_request_disabled_fails_closed() {
         // Mode gate fires before any store or network I/O, so this holds
         // regardless of backend quota/index implementations.
-        let mut services = test_services("disabled-mode", 4096);
+        let mut services = support::test_services("disabled-mode", 4096);
         services.remote_cache_mode = RemoteCacheMode::Disabled;
         let err = fetch_on_first_request(&services, "http://remote.invalid/a.png", "original")
             .expect_err("disabled cache must fail closed");
@@ -456,7 +573,7 @@ mod tests {
 
     #[test]
     fn remote_media_ssrf_and_fetch_cache_roundtrip() {
-        let services = test_services("cache", 4096);
+        let services = support::test_services("cache", 4096);
         let strict_client = SafeHttpClient::new(SafeHttpConfig {
             allow_private_ips: false,
             ..Default::default()
@@ -530,8 +647,8 @@ mod tests {
         // SHA-256 key while the meta keeps the md5; both are the real
         // digests of the fetched bytes. Remote bytes live in the cache
         // pool, never the durable pool.
-        assert_eq!(meta.hash, md5_hex(&png_bytes));
-        assert_eq!(meta.blob_key, sha256_hex(&png_bytes));
+        assert_eq!(meta.hash, ingest::md5_hex(&png_bytes));
+        assert_eq!(meta.blob_key, ingest::sha256_hex(&png_bytes));
         assert_ne!(meta.blob_key, meta.hash);
         assert_eq!(
             services.cache_blobs.get(&meta.blob_key).unwrap().unwrap(),
@@ -565,11 +682,11 @@ mod tests {
         // Declared `mediaType` (and the response header) must never win:
         // HTML served as `text/html` and declared `image/png` still stores
         // as octet-stream; an SVG served/declared as svg still does.
-        let services = test_services("slice7-html-svg", 4096);
+        let services = support::test_services("slice7-html-svg", 4096);
         let html = b"<!DOCTYPE html><html><body><script>alert(1)</script></body></html>".to_vec();
         let svg =
             b"<svg xmlns=\"http://www.w3.org/2000/svg\"><script>alert(1)</script></svg>".to_vec();
-        let addr = serve_bodies(vec![
+        let addr = support::serve_bodies(vec![
             ("/evil.html".to_string(), "text/html".to_string(), html),
             ("/pic.svg".to_string(), "image/svg+xml".to_string(), svg),
         ]);
@@ -578,12 +695,14 @@ mod tests {
             ..Default::default()
         });
 
-        let html_att = attachment_for(&format!("http://{addr}/evil.html"), Some("image/png"));
+        let html_att =
+            support::attachment_for(&format!("http://{addr}/evil.html"), Some("image/png"));
         let meta = fetch_and_cache_remote_media(&services, &local_client, &html_att).unwrap();
         assert_eq!(meta.mime, "application/octet-stream");
         assert_ne!(meta.mime, "text/html");
 
-        let svg_att = attachment_for(&format!("http://{addr}/pic.svg"), Some("image/svg+xml"));
+        let svg_att =
+            support::attachment_for(&format!("http://{addr}/pic.svg"), Some("image/svg+xml"));
         let meta = fetch_and_cache_remote_media(&services, &local_client, &svg_att).unwrap();
         assert_eq!(meta.mime, "application/octet-stream");
         assert_ne!(meta.mime, "image/svg+xml");

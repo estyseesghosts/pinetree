@@ -396,11 +396,10 @@ pub(crate) fn admin_backups(
     caller.require_permission("read:admin:meta")?;
     require_admin(&caller)?;
     let context = read_backup_context().ok_or_else(ApiError::internal)?;
-    let mut statuses = crate::backup::list_backup_statuses(&context.backup_dir);
-    statuses.truncate(STATUS_BACKUP_LIST_CAP * 4);
+    let statuses =
+        crate::backup::newest_backup_statuses(&context.backup_dir, STATUS_BACKUP_LIST_CAP * 4);
     let recent: Vec<Value> = statuses
         .iter()
-        .rev()
         .take(STATUS_BACKUP_LIST_CAP)
         .map(pack_backup_status)
         .collect();

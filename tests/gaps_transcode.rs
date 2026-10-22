@@ -103,6 +103,21 @@ impl MediaStore for FakeMedia {
     fn list_all_media(&self, _cursor: &TimelineCursor) -> Result<Vec<MediaMeta>, PortError> {
         Ok(Vec::new())
     }
+    fn commit_cache_eviction(
+        &self,
+        _blob_key: &str,
+        _size_bytes: u64,
+        _class: pinetree::application::ports::MediaClass,
+        _index_keys: &[(String, String)],
+    ) -> Result<pinetree::application::ports::CacheEvictionOutcome, PortError> {
+        Ok(pinetree::application::ports::CacheEvictionOutcome::AlreadyAbsent)
+    }
+    fn cache_entries_for_blob_key(
+        &self,
+        _blob_key: &str,
+    ) -> Result<Vec<pinetree::application::ports::RemoteCacheRecord>, PortError> {
+        Ok(Vec::new())
+    }
 }
 
 #[derive(Default)]

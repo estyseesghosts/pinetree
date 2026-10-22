@@ -258,6 +258,7 @@ fn eviction_bytes_only_metadata_and_source_url_survive_refetch_heals() {
         fetched_at_ms: BASE_MS,
         last_access_ms: BASE_MS,
         access_count: 0,
+        bytes_absent: false,
     };
     h.store.remote_cache_insert(&rec).expect("index insert");
     let found = h

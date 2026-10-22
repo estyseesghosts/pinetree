@@ -186,6 +186,7 @@ fn insert_remote_row(
             fetched_at_ms: BASE_MS,
             last_access_ms: BASE_MS,
             access_count: 1,
+            bytes_absent: false,
         })
         .unwrap();
     h.store

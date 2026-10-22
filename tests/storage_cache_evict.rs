@@ -178,6 +178,7 @@ fn insert_cache_row(
             fetched_at_ms,
             last_access_ms,
             access_count: 1,
+            bytes_absent: false,
         })
         .unwrap();
     h.store

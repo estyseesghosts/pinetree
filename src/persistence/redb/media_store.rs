@@ -2,8 +2,8 @@ use super::codec::{decode_json, encode_json, map_redb_err};
 use super::note_store::matches_cursor;
 use super::store::{BLOB_REFCOUNT, DURABLE_BYTES_BY_OWNER, MEDIA_META, RedbStore};
 use crate::application::ports::{
-    CacheStats, InsertMediaInput, MediaClass, MediaStore, PortError, RemoteCacheRecord,
-    TimelineCursor,
+    CacheEvictionOutcome, CacheStats, InsertMediaInput, MediaClass, MediaStore, PortError,
+    RemoteCacheRecord, TimelineCursor,
 };
 use crate::domain::media::MediaMeta;
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
@@ -295,15 +295,40 @@ impl MediaStore for RedbStore {
         &self,
         limit: usize,
     ) -> Result<Vec<RemoteCacheRecord>, PortError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let read_txn = self.db.begin_read().map_err(map_redb_err)?;
         let table = read_txn.open_table(REMOTE_CACHE).map_err(map_redb_err)?;
-        let mut out: Vec<RemoteCacheRecord> = Vec::new();
+        let mut best: Vec<(i64, String, String, RemoteCacheRecord)> = Vec::new();
         for entry in table.iter().map_err(map_redb_err)? {
             let (_, v) = entry.map_err(map_redb_err)?;
-            out.push(decode_json(v.value())?);
+            let rec: RemoteCacheRecord = decode_json(v.value())?;
+            best.push((
+                rec.last_access_ms,
+                rec.source_url.clone(),
+                rec.variant.clone(),
+                rec,
+            ));
+            if best.len() > limit {
+                if let Some(pos) = best
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| (a.0, &a.1, &a.2).cmp(&(b.0, &b.1, &b.2)))
+                    .map(|(i, _)| i)
+                {
+                    best.swap_remove(pos);
+                }
+            }
         }
-        out.sort_by_key(|r| (r.last_access_ms, r.source_url.clone(), r.variant.clone()));
-        out.truncate(limit);
+        let mut out: Vec<RemoteCacheRecord> = best.into_iter().map(|(_, _, _, r)| r).collect();
+        out.sort_by(|a, b| {
+            (a.last_access_ms, &a.source_url, &a.variant).cmp(&(
+                b.last_access_ms,
+                &b.source_url,
+                &b.variant,
+            ))
+        });
         Ok(out)
     }
 
@@ -314,6 +339,148 @@ impl MediaStore for RedbStore {
             table.remove((source_url, variant)).map_err(map_redb_err)?;
         }
         self.commit_write(write_txn)
+    }
+
+    fn cache_entries_for_blob_key(
+        &self,
+        blob_key: &str,
+    ) -> Result<Vec<RemoteCacheRecord>, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(REMOTE_CACHE).map_err(map_redb_err)?;
+        let mut out = Vec::new();
+        for entry in table.iter().map_err(map_redb_err)? {
+            let (_, v) = entry.map_err(map_redb_err)?;
+            let rec: RemoteCacheRecord = decode_json(v.value())?;
+            if rec.blob_key == blob_key {
+                out.push(rec);
+            }
+        }
+        Ok(out)
+    }
+
+    fn commit_cache_eviction(
+        &self,
+        blob_key: &str,
+        size_bytes: u64,
+        class: MediaClass,
+        index_keys: &[(String, String)],
+    ) -> Result<CacheEvictionOutcome, PortError> {
+        fn apply_signed(base: u64, delta: i64) -> u64 {
+            if delta >= 0 {
+                base.saturating_add(delta as u64)
+            } else {
+                base.saturating_sub(delta.unsigned_abs())
+            }
+        }
+        let write_txn = self.begin_write()?;
+        let outcome = {
+            let mut media = write_txn.open_table(MEDIA_META).map_err(map_redb_err)?;
+            let mut remote = write_txn.open_table(REMOTE_CACHE).map_err(map_redb_err)?;
+            let mut accounting = write_txn
+                .open_table(CACHE_ACCOUNTING)
+                .map_err(map_redb_err)?;
+            let mut has_durable = false;
+            for entry in media.iter().map_err(map_redb_err)? {
+                let (_, v) = entry.map_err(map_redb_err)?;
+                let meta: MediaMeta = decode_json(v.value())?;
+                if meta.blob_key == blob_key && meta.owner_id.is_some() {
+                    has_durable = true;
+                    break;
+                }
+            }
+            if has_durable {
+                return Ok(CacheEvictionOutcome::SkippedDurableRef);
+            }
+            let mut targets: Vec<RemoteCacheRecord> = Vec::new();
+            if index_keys.is_empty() {
+                for entry in remote.iter().map_err(map_redb_err)? {
+                    let (_, v) = entry.map_err(map_redb_err)?;
+                    let rec: RemoteCacheRecord = decode_json(v.value())?;
+                    if rec.blob_key == blob_key {
+                        targets.push(rec);
+                    }
+                }
+            } else {
+                for (url, variant) in index_keys {
+                    match remote
+                        .get((url.as_str(), variant.as_str()))
+                        .map_err(map_redb_err)?
+                    {
+                        Some(g) => {
+                            let rec: RemoteCacheRecord = decode_json(g.value())?;
+                            if rec.blob_key == blob_key {
+                                targets.push(rec);
+                            }
+                        }
+                        None => {}
+                    }
+                }
+            }
+            if size_bytes == 0 {
+                return Ok(CacheEvictionOutcome::AlreadyAbsent);
+            }
+            if !targets.is_empty() && targets.iter().all(|r| r.bytes_absent || r.size_bytes == 0) {
+                return Ok(CacheEvictionOutcome::AlreadyAbsent);
+            }
+            for rec in &targets {
+                let mut updated = rec.clone();
+                updated.size_bytes = 0;
+                updated.bytes_absent = true;
+                let encoded = encode_json(&updated)?;
+                remote
+                    .insert(
+                        (updated.source_url.as_str(), updated.variant.as_str()),
+                        encoded.as_slice(),
+                    )
+                    .map_err(map_redb_err)?;
+            }
+            let mut evict_ids: Vec<String> = Vec::new();
+            for entry in media.iter().map_err(map_redb_err)? {
+                let (k, v) = entry.map_err(map_redb_err)?;
+                let meta: MediaMeta = decode_json(v.value())?;
+                if meta.blob_key == blob_key && meta.owner_id.is_none() && !meta.evicted {
+                    evict_ids.push(k.value().to_string());
+                }
+            }
+            for id in &evict_ids {
+                let meta_opt: Option<MediaMeta> =
+                    match media.get(id.as_str()).map_err(map_redb_err)? {
+                        Some(g) => Some(decode_json(g.value())?),
+                        None => None,
+                    };
+                let Some(mut meta) = meta_opt else {
+                    continue;
+                };
+                meta.evicted = true;
+                let encoded = encode_json(&meta)?;
+                media
+                    .insert(id.as_str(), encoded.as_slice())
+                    .map_err(map_redb_err)?;
+            }
+            let mut stats: CacheStats = match accounting.get("stats").map_err(map_redb_err)? {
+                Some(g) => decode_json(g.value())?,
+                None => CacheStats::default(),
+            };
+            let debit = size_bytes as i64;
+            stats.total_bytes = apply_signed(stats.total_bytes, -debit);
+            let class_total = match class {
+                MediaClass::Avatar => &mut stats.avatar_bytes,
+                MediaClass::Preview => &mut stats.preview_bytes,
+                MediaClass::Full => &mut stats.full_bytes,
+                MediaClass::AudioVideo => &mut stats.full_bytes,
+            };
+            *class_total = apply_signed(*class_total, -debit);
+            stats.evictions = stats.evictions.saturating_add(1);
+            let encoded = encode_json(&stats)?;
+            accounting
+                .insert("stats", encoded.as_slice())
+                .map_err(map_redb_err)?;
+            CacheEvictionOutcome::Evicted {
+                debited_bytes: size_bytes,
+            }
+        };
+        self.commit_write(write_txn)?;
+        Ok(outcome)
     }
 
     fn cache_stats(&self) -> Result<CacheStats, PortError> {

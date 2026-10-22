@@ -563,12 +563,10 @@ pub fn pack_me_detailed(
     // Phase 2 (P0): security flags reflect persisted TOTP state instead
     // of hardcoded `false`. `securityKeys` stays `false`: pinetree stores
     // no WebAuthn credentials, so there is nothing to reflect (TOTP via
-    // `i/2fa/*` is the supported second factor). A store fault degrades
-    // the hint to `false` (this file's `unwrap_or` view convention);
-    // enforcement stays fail-closed because the signin paths propagate
-    // the same read as an error and mint nothing.
-    let (two_factor_enabled, use_password_less_login) =
-        services.totp_flags(&account.id).unwrap_or((false, false));
+    // `i/2fa/*` is the supported second factor). A store fault propagates
+    // as an error so `i` never reports `twoFactorEnabled: false` on a
+    // failed read; enforcement stays fail-closed on the signin paths too.
+    let (two_factor_enabled, use_password_less_login) = services.totp_flags(&account.id)?;
     obj.insert(
         "twoFactorEnabled".to_string(),
         Value::Bool(two_factor_enabled),

@@ -56,6 +56,24 @@ pub struct RemoteCacheRecord {
     pub fetched_at_ms: i64,
     pub last_access_ms: i64,
     pub access_count: u64,
+    /// True once the bytes for this key have been charged off. Old rows
+    /// decode as `false` (present). Set by `commit_cache_eviction`; a
+    /// refetch clears it when bytes are restored.
+    #[serde(default)]
+    pub bytes_absent: bool,
+}
+
+/// Outcome of `commit_cache_eviction`: one physical key transitions once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheEvictionOutcome {
+    /// Bytes were charged off in this call.
+    Evicted { debited_bytes: u64 },
+    /// Key was already debited (`size_bytes == 0` or every index row
+    /// already `bytes_absent`); no accounting moved.
+    AlreadyAbsent,
+    /// A durable row still references the key; the caller must leave the
+    /// blob alone and charge nothing.
+    SkippedDurableRef,
 }
 
 /// Shell-free observability snapshot (`docs/remote-media-cache-plan.md`
@@ -184,6 +202,22 @@ pub trait MediaStore: Send + Sync {
     fn cache_stats(&self) -> Result<CacheStats, PortError> {
         Ok(CacheStats::default())
     }
+    /// One physical-key eviction transition in a single write transaction.
+    /// The caller holds `acquire_media_op` + `acquire_blob_key` and has
+    /// already deleted the cache-pool bytes (or verified absence).
+    fn commit_cache_eviction(
+        &self,
+        blob_key: &str,
+        size_bytes: u64,
+        class: MediaClass,
+        index_keys: &[(String, String)],
+    ) -> Result<CacheEvictionOutcome, PortError>;
+    /// Every index row still pointing at `blob_key` (bounded to matching
+    /// rows only, never a full-table clone).
+    fn cache_entries_for_blob_key(
+        &self,
+        blob_key: &str,
+    ) -> Result<Vec<RemoteCacheRecord>, PortError>;
     /// Apply accounting deltas (all saturating). `total_delta`/`class_delta`
     /// are signed (eviction/release negative, insert positive).
     fn cache_accounting_apply(

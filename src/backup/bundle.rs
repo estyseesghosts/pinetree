@@ -554,20 +554,31 @@ fn build_and_publish(
         let mut sink = TableSink::new(&mut writer, cap);
         ctx.store
             .export_backup_snapshot(&mut |table, key, value| {
-                if table == "media_meta"
-                    && let Ok(meta) =
-                        serde_json::from_slice::<crate::domain::media::MediaMeta>(&value)
-                    && !meta.evicted
-                    && !meta.blob_key.is_empty()
-                {
-                    referenced.insert(meta.blob_key.clone());
-                    if meta.owner_id.is_some() {
-                        durable_keys.insert(meta.blob_key.clone());
+                if table == "media_meta" {
+                    // A row that does not decode as `MediaMeta` is a corrupt
+                    // snapshot: fail closed before anything is published
+                    // (restore refuses unparseable media rows the same way).
+                    let meta: crate::domain::media::MediaMeta = serde_json::from_slice(&value)
+                        .map_err(|e| {
+                            crate::application::ports::PortError::Validation(format!(
+                                "unparseable media row: {e}"
+                            ))
+                        })?;
+                    if !meta.evicted && !meta.blob_key.is_empty() {
+                        referenced.insert(meta.blob_key.clone());
+                        if meta.owner_id.is_some() {
+                            durable_keys.insert(meta.blob_key.clone());
+                        }
                     }
                 }
                 sink.emit(table, key, value)
             })
-            .map_err(|e| BackupError::Storage(format!("export snapshot: {e}")))?;
+            .map_err(|e| match e {
+                crate::application::ports::PortError::Validation(message) => {
+                    BackupError::Corrupt(message)
+                }
+                other => BackupError::Storage(format!("export snapshot: {other}")),
+            })?;
         sink.finish()?
     };
 
@@ -609,12 +620,14 @@ fn build_and_publish(
     }
     // Keep table lines in registry order (deterministic manifest).
     table_manifests.sort_by(|a, b| a.name.cmp(&b.name));
-    // Every non-evicted reference must resolve to an archived object plus
-    // its `.len` sidecar in the appropriate pool (owner rows need the
-    // durable pool; owner-less cache rows need the cache pool). A placement
-    // in the other pool still restores (restore tolerates it with a pool
-    // warning), so it is accepted here; anything missing from both pools
-    // fails creation and prevents publication.
+    // Every non-evicted reference must resolve to an archived object in
+    // some pool (owner rows prefer the durable pool, owner-less the cache
+    // pool, but restore tolerates the other pool with a warning, so either
+    // is accepted). Sidecars mirror `restore.rs` pass 2: a present `.len`
+    // must parse and agree with its object bytes, while a missing sidecar
+    // heals on restore and is allowed here. Anything missing from both
+    // pools, or with a disagreeing sidecar, fails creation and prevents
+    // publication.
     for key in &referenced {
         let Some(shard) = key.get(..2) else {
             return Err(BackupError::Corrupt(
@@ -622,24 +635,63 @@ fn build_and_publish(
             ));
         };
         let needs_durable = durable_keys.contains(key);
+        let (primary_pool, fallback_pool) = if needs_durable {
+            (&ctx.durable_pool, &ctx.cache_pool)
+        } else {
+            (&ctx.cache_pool, &ctx.durable_pool)
+        };
         let (primary_prefix, fallback_prefix) = if needs_durable {
             (MEDIA_DURABLE_PREFIX, MEDIA_CACHE_PREFIX)
         } else {
             (MEDIA_CACHE_PREFIX, MEDIA_DURABLE_PREFIX)
         };
-        let primary_obj = format!("{primary_prefix}objects/{shard}/{key}");
-        let primary_sidecar = format!("{primary_obj}.len");
-        if archived.contains(&primary_obj) && archived.contains(&primary_sidecar) {
-            continue;
+        let mut found = false;
+        for (pool, prefix) in [
+            (primary_pool, primary_prefix),
+            (fallback_pool, fallback_prefix),
+        ] {
+            let obj_path = pool.join("objects").join(shard).join(key);
+            let obj_len = match std::fs::metadata(&obj_path) {
+                Ok(meta) => meta.len(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(BackupError::Storage(format!("stat pool file: {e}")));
+                }
+            };
+            let archive_obj = format!("{prefix}objects/{shard}/{key}");
+            if !archived.contains(&archive_obj) {
+                continue;
+            }
+            let mut sidecar_path = obj_path.clone();
+            let sidecar_name = obj_path
+                .file_name()
+                .map(|s| format!("{}.len", s.to_string_lossy()))
+                .unwrap_or_default();
+            sidecar_path.set_file_name(sidecar_name);
+            match std::fs::read_to_string(&sidecar_path) {
+                Ok(content) => {
+                    let declared: u64 = content.trim().parse().map_err(|_| {
+                        BackupError::Corrupt("sidecar is not a byte count".to_string())
+                    })?;
+                    if declared != obj_len {
+                        return Err(BackupError::Corrupt(
+                            "sidecar disagrees with object bytes".to_string(),
+                        ));
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(BackupError::Storage(format!("read pool sidecar: {e}")));
+                }
+            }
+            found = true;
+            break;
         }
-        let fallback_obj = format!("{fallback_prefix}objects/{shard}/{key}");
-        let fallback_sidecar = format!("{fallback_obj}.len");
-        if archived.contains(&fallback_obj) && archived.contains(&fallback_sidecar) {
-            continue;
+        if !found {
+            return Err(BackupError::Corrupt(
+                "backup snapshot references a blob missing from its pools".to_string(),
+            ));
         }
-        return Err(BackupError::Corrupt(
-            "backup snapshot references a blob missing from its pools".to_string(),
-        ));
     }
 
     // --- Manifest (written last; counts + checksums only). ---

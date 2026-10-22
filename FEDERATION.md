@@ -1,6 +1,6 @@
 # FEDERATION.md — pinetree
 
-**Status:** accurate against `master` at `ad4f7b8daaf89ca78783bc0dbdb04b3e2abb034e`
+**Status:** accurate against working tree after the 2026-10-22 audit follow-up
 (`2026-10-22`, `docs: align single-node ops and release gates`).
 Upstream `origin/master` verified equal to `HEAD` at audit time
 (`git fetch` + `rev-parse`; 0 ahead / 0 behind). The working tree contained
@@ -221,7 +221,10 @@ re-resolved/re-validated. DNS is performed per send with SSRF validation
 multicast/IPv6 ULA/doc/mapped-v4 rejected) unless `allow_private_ips` /
 `allowed_hosts`; TLS always verified (never `-k`); timeouts 10 s op /
 20 s total, 5 s DNS, 64 KiB response cap. Blocked-host inboxes are skipped
-quietly (`Delivered`) at dispatch.
+quietly (`Delivered`) at dispatch. DNS resolution uses a bounded in-flight
+pool (`DnsResolverPolicy::max_in_flight`, from `federation.dns_max_in_flight`);
+a timed-out caller does not free its slot until the lookup returns (the late
+answer is discarded).
 
 Delivery converges quietly (`Delivered`) when the author/target is gone,
 remote, mismatched, deleted, `localOnly`, or blocked — delivery workers do

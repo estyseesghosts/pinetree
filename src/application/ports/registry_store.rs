@@ -55,4 +55,14 @@ pub trait RegistryStore: Send + Sync {
         &self,
         user_id: &str,
     ) -> Result<Vec<(Option<String>, Vec<String>)>, PortError>;
+    /// Atomic second-factor consume: validate the challenge, enforce the
+    /// cross-challenge replay guard, then consume the challenge and record
+    /// the step in one write transaction.
+    fn consume_totp_login(
+        &self,
+        account_id: &str,
+        challenge: &str,
+        matched_step: u64,
+        now_ms: i64,
+    ) -> Result<(), PortError>;
 }

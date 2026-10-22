@@ -199,8 +199,10 @@ pub(crate) fn build_admin_status(state: &ApiState, detailed: bool) -> Value {
         last_backup_bytes_written,
     ) = match read_backup_context() {
         Some(context) => {
-            let mut statuses = crate::backup::list_backup_statuses(&context.backup_dir);
-            statuses.truncate(STATUS_BACKUP_LIST_CAP * 4);
+            let statuses = crate::backup::newest_backup_statuses(
+                &context.backup_dir,
+                STATUS_BACKUP_LIST_CAP * 4,
+            );
             let last_success = statuses
                 .iter()
                 .filter(|s| s.state == crate::backup::BackupState::Completed)
@@ -213,7 +215,6 @@ pub(crate) fn build_admin_status(state: &ApiState, detailed: bool) -> Value {
                 .max();
             let recent: Vec<Value> = statuses
                 .iter()
-                .rev()
                 .take(STATUS_BACKUP_LIST_CAP)
                 .map(pack_backup_status)
                 .collect();

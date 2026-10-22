@@ -418,6 +418,7 @@ impl RedbStore {
                                 fetched_at_ms: 0,
                                 last_access_ms: 0,
                                 access_count: 0,
+                                bytes_absent: false,
                             };
                             let encoded = encode_json(&rec)?;
                             remote_cache

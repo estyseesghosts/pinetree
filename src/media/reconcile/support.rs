@@ -1,7 +1,7 @@
 use crate::application::commands::AppServices;
 use crate::application::ports::{
-    ActivityDedup, BlobStore, CacheStats, InsertMediaInput, MediaClass, MediaStore,
-    NoopStreamingSink, PortError, RemoteCacheRecord, TimelineCursor,
+    ActivityDedup, BlobStore, CacheEvictionOutcome, CacheStats, InsertMediaInput, MediaClass,
+    MediaStore, NoopStreamingSink, PortError, RemoteCacheRecord, TimelineCursor,
 };
 use crate::domain::id::{AidxGenerator, Clock, IdGenerator, ManualClock};
 use crate::domain::media::{MediaMeta, MediaProperties};
@@ -184,6 +184,102 @@ impl MediaStore for FakeMedia {
             .unwrap()
             .remove(&(source_url.to_string(), variant.to_string()));
         Ok(())
+    }
+    fn cache_entries_for_blob_key(
+        &self,
+        blob_key: &str,
+    ) -> Result<Vec<RemoteCacheRecord>, PortError> {
+        Ok(self
+            .index
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|r| r.blob_key == blob_key)
+            .cloned()
+            .collect())
+    }
+    fn commit_cache_eviction(
+        &self,
+        blob_key: &str,
+        size_bytes: u64,
+        class: MediaClass,
+        index_keys: &[(String, String)],
+    ) -> Result<CacheEvictionOutcome, PortError> {
+        if self
+            .rows
+            .lock()
+            .unwrap()
+            .values()
+            .any(|m| m.blob_key == blob_key && m.owner_id.is_some())
+        {
+            return Ok(CacheEvictionOutcome::SkippedDurableRef);
+        }
+        if size_bytes == 0 {
+            return Ok(CacheEvictionOutcome::AlreadyAbsent);
+        }
+        let mut index = self.index.lock().unwrap();
+        let keys: Vec<(String, String)> = if index_keys.is_empty() {
+            index
+                .iter()
+                .filter(|(_, r)| r.blob_key == blob_key)
+                .map(|(k, _)| k.clone())
+                .collect()
+        } else {
+            index_keys.to_vec()
+        };
+        let mut targets: Vec<(String, String)> = Vec::new();
+        for key in &keys {
+            if let Some(rec) = index.get(key)
+                && rec.blob_key == blob_key
+            {
+                targets.push(key.clone());
+            }
+        }
+        if !targets.is_empty()
+            && targets.iter().all(|k| {
+                index
+                    .get(k)
+                    .is_none_or(|r| r.bytes_absent || r.size_bytes == 0)
+            })
+        {
+            return Ok(CacheEvictionOutcome::AlreadyAbsent);
+        }
+        for key in &targets {
+            if let Some(rec) = index.get_mut(key) {
+                rec.size_bytes = 0;
+                rec.bytes_absent = true;
+            }
+        }
+        drop(index);
+        let mut rows = self.rows.lock().unwrap();
+        for meta in rows.values_mut() {
+            if meta.blob_key == blob_key && meta.owner_id.is_none() {
+                meta.evicted = true;
+            }
+        }
+        drop(rows);
+        let mut stats = self.stats.lock().unwrap();
+        let debit = size_bytes as i64;
+        let apply = |v: u64, d: i64| -> u64 {
+            if d >= 0 {
+                v.saturating_add(d as u64)
+            } else {
+                v.saturating_sub((-d) as u64)
+            }
+        };
+        stats.total_bytes = apply(stats.total_bytes, -debit);
+        match class {
+            MediaClass::Avatar => stats.avatar_bytes = apply(stats.avatar_bytes, -debit),
+            MediaClass::Preview => stats.preview_bytes = apply(stats.preview_bytes, -debit),
+            MediaClass::Full => stats.full_bytes = apply(stats.full_bytes, -debit),
+            MediaClass::AudioVideo => {
+                stats.total_bytes = apply(stats.total_bytes, (-debit).saturating_sub(-debit));
+            }
+        }
+        stats.evictions = stats.evictions.saturating_add(1);
+        Ok(CacheEvictionOutcome::Evicted {
+            debited_bytes: size_bytes,
+        })
     }
     fn cache_stats(&self) -> Result<CacheStats, PortError> {
         Ok(self.stats.lock().unwrap().clone())
