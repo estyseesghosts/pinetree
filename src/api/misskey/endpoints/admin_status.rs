@@ -115,6 +115,12 @@ use super::middleware::{last_readiness, ops_now_ms, read_backup_context, read_op
 
 /// Newest backup statuses exposed on one status response (size limit).
 pub const STATUS_BACKUP_LIST_CAP: usize = 20;
+/// Cap on detailed-arm variable lists (`recentErrors`). The recent-error
+/// ring already bounds to [`crate::observability::MAX_RECENT_ERRORS`]; this
+/// tighter cap keeps one status body under ~8 KiB (each sample is two small
+/// fields) with zero I/O: only a mutex snapshot plus clone, no table walk,
+/// `check_integrity`, network fetch, or recursive hash per request.
+pub const STATUS_DETAIL_CAP: usize = 32;
 /// Page budget for the `admin/drive/show-file` url fallback walk: 20
 /// pages × 500 rows bounds one lookup (same order as the old 10k clamp,
 /// with correct empty-page termination).
@@ -238,9 +244,16 @@ pub(crate) fn build_admin_status(state: &ApiState, detailed: bool) -> Value {
             }),
             None => Value::Null,
         },
-        // No total-durable-bytes or free-disk API on the current ports, and
-        // no maintained backfill/reconcile timestamp yet: explicit nulls
-        // (stale/unknown is data) until the parent-owned traits expose them.
+        // Honest nulls (unknown is data, never a guess): no
+        // total-durable-bytes or free-disk API exists on the current ports
+        // (no new dependency or pool walk per request), no maintained
+        // backfill/reconcile timestamp is kept yet, and per-kind job
+        // breakdowns, oldest-pending age, quarantine counts, delivery
+        // aggregates, and redb file bytes all need parent-owned port
+        // getters (see the Batch H report snippets). `DestinationTracker`
+        // exposes per-host health only (no aggregate export on the
+        // parent-owned type): destination detail stays per-host and out of
+        // this surface.
         "durableUsedBytes": Value::Null,
         "freeDiskBytes": Value::Null,
         "accountingDrift": Value::Null,
@@ -253,22 +266,34 @@ pub(crate) fn build_admin_status(state: &ApiState, detailed: bool) -> Value {
         "jobBreakdown": Value::Null,
         "oldestPendingMs": Value::Null,
         "quarantine": Value::Null,
-        // `DestinationTracker` exposes per-host health only (no aggregate
-        // export on the parent-owned type): destination detail stays
-        // per-host and out of this surface.
         "federationDelivery": Value::Null,
         "http": {
             "rateLimitBuckets": state.rate_limiter.bucket_count(),
             "authFailureKeys": state.rate_limiter.failure_count(),
             "uploadSlotIps": state.upload_slots.slot_ip_count(),
         },
-        "webSocket": Value::Null,
+        // Bounded presence snapshot (no secrets, no I/O): live broadcast
+        // receivers plus distinct streaming accounts seen within
+        // `ONLINE_THRESHOLD_MS` (prunes stale entries on read).
+        "webSocket": serde_json::json!({
+            "connections": state.hub.receiver_count(),
+            "onlineAccounts": state.hub.online_count(
+                ops_now_ms() as i64,
+                ONLINE_THRESHOLD_MS,
+            ),
+        }),
         "backups": backups,
         "lastBackupSuccessMs": last_backup_success_ms,
         "transcode": { "enabled": ops.transcode_enabled, "status": ops.ffmpeg_status },
     });
     if detailed {
-        let recent: Vec<Value> = crate::observability::recent_errors()
+        // Bounded detail arm (see `STATUS_DETAIL_CAP`): newest samples only,
+        // categories only (never messages, bodies, or key material). No
+        // `check_integrity`, table walk, or network fetch runs per request;
+        // every source here is a mutex snapshot or a cloned snapshot value.
+        let all_recent = crate::observability::recent_errors();
+        let start = all_recent.len().saturating_sub(STATUS_DETAIL_CAP);
+        let recent: Vec<Value> = all_recent[start..]
             .iter()
             .map(|sample| {
                 serde_json::json!({
