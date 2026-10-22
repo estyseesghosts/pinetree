@@ -91,8 +91,10 @@ pub trait MediaStore: Send + Sync {
     /// `drive/files`). Ordering is by row id (aidx ids are time-ordered).
     fn list_by_owner(&self, owner_id: &str) -> Result<Vec<MediaMeta>, PortError>;
     /// Newest-first metadata rows across all owners (Batch N WS6
-    /// `admin/drive/files`). Backends return rows in any order; the
-    /// application op sorts newest-first and pages.
+    /// `admin/drive/files`). Paging contract: newest-first, exclusive
+    /// `until_id`, `limit` counts matching rows bounded by
+    /// `MAX_MEDIA_PAGE_ROWS`. Only an empty page terminates a scan; a short
+    /// page is never end-of-scan (concurrent deletes / exact multiples).
     fn list_all_media(&self, cursor: &TimelineCursor) -> Result<Vec<MediaMeta>, PortError>;
     /// Durable bytes currently charged to `owner_id` (sum over owned rows).
     /// Test-double default: no rows.

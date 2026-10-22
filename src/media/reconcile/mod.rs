@@ -46,10 +46,11 @@
 //! * Filesystem-level orphans (bytes no metadata references — e.g. a crash
 //!   between `blobs.put` and the metadata commit) cannot be enumerated
 //!   through the `BlobStore` trait, which has no list operation. They are
-//!   swept by [`sweep_orphan_blobs`], which walks an `objects/` pool
+//!   swept by [`sweep_orphan_blobs_checked`], which walks an `objects/` pool
 //!   directory; the server startup wiring (which owns the `FsBlobStore`
 //!   roots, `blobs_durable/` + `blobs_cache/` under the data dir) calls it
-//!   with the live key sets from [`collect_live_blob_keys`].
+//!   with the live key sets from [`collect_live_blob_keys`] plus the
+//!   completion signal from that full walk.
 //!
 //! No-snapshot disclosure: separate pages are separate reads. Rows inserted
 //! after a walk starts (larger ids, already passed) are not revisited, and

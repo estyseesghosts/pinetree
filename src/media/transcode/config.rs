@@ -64,7 +64,10 @@ pub struct TranscodeConfig {
 impl Default for TranscodeConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            // Batch B policy (matches `TranscodeSection::default`): a new
+            // install must start without FFmpeg, so the runtime default is
+            // also disabled. `{}`-JSON must not opt into transcoding.
+            enabled: false,
             ffmpeg_path: "ffmpeg".to_string(),
             webp_quality: 80,
             vp9_crf: 30,

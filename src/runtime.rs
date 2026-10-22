@@ -244,6 +244,9 @@ pub(crate) fn run_maintenance_op(
         }
         // Batch C: enqueue one backfill repair job (the worker drains it at
         // next boot/serve). Explicit operator trigger, never automatic.
+        // Operator must run this in a QUIET maintenance window (no
+        // uploads/deletes/evictions): the at-open migration is the source
+        // of truth; this job path is best-effort convergent repair.
         "storage-backfill" => {
             if !args.is_empty() {
                 eprintln!("usage: storage-backfill (no arguments)");
@@ -256,7 +259,9 @@ pub(crate) fn run_maintenance_op(
                 eprintln!("storage-backfill enqueue failed: {err}");
                 std::process::exit(1);
             }
-            println!("storage backfill enqueued (drains on next serve)");
+            println!(
+                "storage backfill enqueued (drains on next serve; run only in a quiet maintenance window)"
+            );
             std::process::exit(0);
         }
         _ => {

@@ -140,6 +140,35 @@ impl FsBlobStore {
         }
     }
 
+    /// Direct stat + write-sidecar heal for sidecar-only tears. `get` and
+    /// `byte_len` both require the sidecar, so a present-but-unsidecarred
+    /// object reads as `None` through the trait and the generic reconciler
+    /// cannot regenerate the sidecar from `get` bytes. This path stats the
+    /// object file and rewrites the `.len` sidecar without reading content.
+    /// Returns `true` when a sidecar was (re)written, `false` when the row
+    /// was already healthy or the object is absent. Best-effort: callers
+    /// that only have `&dyn BlobStore` (ports frozen) cannot reach this and
+    /// keep the documented limitation (see the reconciler scan heal).
+    pub fn heal_sidecar(&self, hash: &str) -> Result<bool, PortError> {
+        let _gate = acquire_media_op("heal_sidecar")?;
+        if self.byte_len(hash)?.is_some() {
+            return Ok(false);
+        }
+        let final_path = self.object_path(hash)?;
+        let len = match fs::metadata(&final_path) {
+            Ok(m) => m.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => {
+                return Err(PortError::StorageUnavailable(format!(
+                    "stat blob file: {e}"
+                )));
+            }
+        };
+        let sidecar = self.sidecar_path(hash)?;
+        self.write_atomic(hash, &sidecar, len.to_string().as_bytes())?;
+        Ok(true)
+    }
+
     /// Efficient server-side import of a staged temp file (stream-to-disk
     /// target): rename-or-copy into the content-addressed path, verify the
     /// length, then write the `.len` sidecar. Mirrors the `put` skip: when
@@ -458,12 +487,18 @@ mod tests {
 // inside `RedbStore::open` with write txns only — no gate, no pool
 // mutation — so it composes trivially (no backup exists before `open`).
 //
-// Known gap (for the parent merge): `reconciler::sweep_orphan_blobs` deletes
-// orphan bytes with direct `std::fs::remove_file` calls, bypassing
-// `FsBlobStore::delete` and therefore this gate. Either route the sweep
-// through `BlobStore::delete` or wrap it in `acquire_media_op("sweep")`;
-// the parent snippet covers it. Failing that, never schedule a sweep
-// concurrently with a backup.
+// Orphan sweep (`reconciler::sweep_orphan_blobs_checked`) holds
+// `acquire_media_op("sweep")` for the whole walk, so filesystem deletes
+// wait behind an active backup like every other pool mutation (the sweep
+// uses direct `remove_file` on orphan keys + sidecars — key-shape-gated —
+// rather than `FsBlobStore::delete`, but under the same shared hold).
+
+// Batch F single-backup invariant: the exclusive gate below enforces
+// `MAX_CONCURRENT_BACKUPS == 1` (a second backup fails fast with
+// `BackupBusy` via `WouldBlock`, it never queues behind the lock).
+// Compile-time pin so a future const bump fails the build until the gate
+// is reworked.
+const _: () = assert!(crate::backup::MAX_CONCURRENT_BACKUPS == 1);
 
 use std::sync::atomic::AtomicUsize;
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
@@ -576,6 +611,11 @@ pub fn acquire_backup_gate(backup_id: &str) -> Result<BackupGateGuard, BackupBus
     const BACKUP_GATE_DRAIN_TIMEOUT_MS: u64 = 30_000;
     /// Poll interval while draining readers.
     const BACKUP_GATE_DRAIN_POLL_MS: u64 = 5;
+    debug_assert_eq!(
+        crate::backup::MAX_CONCURRENT_BACKUPS,
+        1,
+        "exclusive media gate enforces a single concurrent backup"
+    );
     let deadline = gate_now_ms().saturating_add(BACKUP_GATE_DRAIN_TIMEOUT_MS);
     loop {
         let mut guard = match media_gate().try_write() {

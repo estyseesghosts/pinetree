@@ -28,11 +28,11 @@ pub fn reset_in_flight(services: &AppServices) -> Result<(), PortError> {
 /// are skipped, a missing pool directory sweeps nothing, and `NotFound`
 /// races on delete are ignored. Metadata is never touched here.
 ///
-/// The caller vouches that `live_keys` is COMPLETE (a fully walked set
-/// from [`collect_live_blob_keys`): this function cannot tell a partial
-/// set from a full one. Callers that cannot vouch completeness must use
-/// [`sweep_orphan_blobs_checked`] and pass their completion signal.
-/// Prefer leaking an orphan over deleting live media.
+/// Test-only convenience wrapper: assumes a COMPLETE live-key set (as if
+/// `complete == true`). Production wiring must call
+/// [`sweep_orphan_blobs_checked`] with the completion signal from a full
+/// [`crate::media::reconcile::collect_live_blob_keys`] walk; a partial set
+/// must refuse, never sweep.
 pub fn sweep_orphan_blobs(
     objects_dir: &Path,
     live_keys: &HashSet<String>,

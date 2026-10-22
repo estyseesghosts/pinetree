@@ -278,9 +278,14 @@ pub fn enqueue_storage_reconcile(jobs: &dyn JobQueue, now_ms: i64) -> Result<(),
 }
 
 /// Production trigger, explicit side: enqueue one backfill repair job.
-/// Intended call site: an explicit operator maintenance operation (CLI;
-/// patch proposed in the Batch C report) — never automatic, per the module
-/// safety model.
+///
+/// Safety: the at-open `run_storage_accounting_backfill` migration is the
+/// source of truth (runs before serve/worker, so nothing races it). This
+/// job path is best-effort convergent repair for QUIET periods only: run
+/// the `storage-backfill` CLI op during a maintenance window with no
+/// upload/delete/evict traffic. A run that observes a concurrent mutation
+/// may persist slightly stale sums; re-running (or the next detection
+/// pass) converges. Never automatic, never during peak traffic.
 pub fn enqueue_storage_backfill(jobs: &dyn JobQueue, now_ms: i64) -> Result<(), PortError> {
     jobs.enqueue_jobs(vec![new_backfill_job(now_ms)?])
 }

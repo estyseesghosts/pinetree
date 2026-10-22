@@ -74,7 +74,10 @@ impl JobWorker {
     // persists exact sums (walk ended — the only path that writes
     // counters) or enqueues a durable continuation carrying the
     // staged prefix sums plus the resume cursor. Counters are never
-    // overwritten from a partial scan. Bad payloads quarantine;
+    // overwritten from a partial scan. Best-effort convergent repair
+    // for quiet windows (the at-open migration is the source of
+    // truth; concurrent mutations may leave residual drift for the
+    // next detection pass). Bad payloads quarantine;
     // storage faults retry.
     pub(crate) fn handle_backfill_durable_accounting(&self, payload: &[u8]) -> Disposition {
         match serde_json::from_slice::<crate::media::reconciler::BackfillDurableJobPayload>(payload)
