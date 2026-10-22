@@ -68,7 +68,7 @@ pub fn ensure_cache_budget(
             if !evicted_keys.insert(snapshot.blob_key.clone()) {
                 continue;
             }
-            if try_evict_snapshot(services, snapshot)? {
+            if try_evict_snapshot(services, &ordered, snapshot)? {
                 progressed = true;
                 break; // re-read accounting before the next eviction.
             }
@@ -99,6 +99,7 @@ pub fn ensure_cache_budget(
 /// never runs without the byte delete.
 fn try_evict_snapshot(
     services: &AppServices,
+    listed: &[RemoteCacheRecord],
     snapshot: &RemoteCacheRecord,
 ) -> Result<bool, PortError> {
     // Bytes ONLY + accounting, under the whole-transition hold:
@@ -122,10 +123,19 @@ fn try_evict_snapshot(
         return Ok(false);
     }
     // Touched or refetched after the candidate was listed: a concurrent
-    // fetch won the key — leave the fresh bytes alone.
+    // fetch won the key — leave the fresh bytes alone. Each index row is
+    // compared against ITS OWN listed version (shared keys have several
+    // rows with different clocks; comparing a sharer against a sibling's
+    // snapshot would misfire on every shared key).
     for entry in &entries {
-        if entry.last_access_ms > snapshot.last_access_ms
-            || entry.fetched_at_ms > snapshot.fetched_at_ms
+        let listed_entry = listed
+            .iter()
+            .find(|rec| rec.source_url == entry.source_url && rec.variant == entry.variant);
+        let Some(listed_entry) = listed_entry else {
+            return Ok(false);
+        };
+        if entry.last_access_ms > listed_entry.last_access_ms
+            || entry.fetched_at_ms > listed_entry.fetched_at_ms
         {
             return Ok(false);
         }
@@ -375,7 +385,8 @@ mod tests {
             .media
             .remote_cache_touch("https://r.example/pic.png", "original", 200)
             .unwrap();
-        assert!(!try_evict_snapshot(&services, &snapshot).unwrap());
+        let listed = vec![snapshot.clone()];
+        assert!(!try_evict_snapshot(&services, &listed, &snapshot).unwrap());
         assert_eq!(services.cache_blobs.get(key).unwrap().unwrap(), bytes);
         assert_eq!(services.media.cache_stats().unwrap().total_bytes, 24);
         // Fresh snapshot evicts.
@@ -384,11 +395,12 @@ mod tests {
             .remote_cache_lookup("https://r.example/pic.png", "original")
             .unwrap()
             .unwrap();
-        assert!(try_evict_snapshot(&services, &fresh).unwrap());
+        let fresh_listed = vec![fresh.clone()];
+        assert!(try_evict_snapshot(&services, &fresh_listed, &fresh).unwrap());
         assert!(services.cache_blobs.byte_len(key).unwrap().is_none());
         // Idempotent: a second call moves nothing.
         let stats = services.media.cache_stats().unwrap();
-        assert!(!try_evict_snapshot(&services, &fresh).unwrap());
+        assert!(!try_evict_snapshot(&services, &fresh_listed, &fresh).unwrap());
         assert_eq!(services.media.cache_stats().unwrap(), stats);
     }
 }
