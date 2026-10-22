@@ -552,8 +552,11 @@ pub fn create_bundle(ctx: &BackupContext, job_id: &str) -> Result<BundleOutcome,
 }
 
 /// Snapshot-referenced blob keys: every non-evicted `blob_key` in the media
-/// table, walked newest-first with exclusive `until_id` cursors (empty page
-/// terminates — never a short page, per the Batch C paging contract).
+/// table, walked newest-first with exclusive `until_id` cursors. Only an
+/// empty page terminates — never a short page (see
+/// `crate::media::reconcile::scan::collect_live_blob_keys`, lines 320-335):
+/// a short page can be concurrent deletes, and an exact multiple needs the
+/// trailing empty read.
 fn collect_referenced_blobs(ctx: &BackupContext) -> Result<BTreeSet<String>, BackupError> {
     use crate::application::ports::{MediaStore, TimelineCursor};
     use crate::persistence::redb::MAX_MEDIA_PAGE_ROWS;
@@ -571,9 +574,6 @@ fn collect_referenced_blobs(ctx: &BackupContext) -> Result<BTreeSet<String>, Bac
             if !meta.evicted && !meta.blob_key.is_empty() {
                 out.insert(meta.blob_key.clone());
             }
-        }
-        if page.len() < cursor.limit {
-            break;
         }
         let last = page.last().map(|m| m.id.clone()).unwrap_or_default();
         cursor = TimelineCursor::with_limit(MAX_MEDIA_PAGE_ROWS);
