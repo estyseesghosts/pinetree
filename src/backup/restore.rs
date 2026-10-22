@@ -31,14 +31,12 @@ use sha2::{Digest, Sha256};
 
 use super::BackupError;
 use super::bundle::{
+    BACKUP_FORMAT_VERSION, BACKUP_REDB_VERSION, BACKUP_SCHEMA_VERSION, BackupPolicy, MANIFEST_NAME,
     MAX_BUNDLE_BYTES, MAX_MANIFEST_BYTES, MAX_TABLE_ROW_BYTES, Manifest, TABLE_MAGIC,
     compute_overall, table_entry_name,
 };
 use crate::backup::RESTORE_COMMIT_CHUNK_ROWS;
-use crate::backup::bundle::{
-    BACKUP_FORMAT_VERSION, BACKUP_REDB_VERSION, BACKUP_SCHEMA_VERSION, MANIFEST_NAME,
-    MEDIA_CACHE_PREFIX, MEDIA_DURABLE_PREFIX,
-};
+use crate::backup::bundle::{MEDIA_CACHE_PREFIX, MEDIA_DURABLE_PREFIX};
 
 const FRESH_DB_FILE: &str = "pinetree.redb";
 const FRESH_DURABLE_DIR: &str = "blobs_durable";
@@ -59,13 +57,32 @@ pub struct RestoreReport {
 }
 
 /// Validate `src` and restore it into `fresh_dir` (which must not exist).
+/// Enforces the hard bundle ceiling; see [`restore_bundle_with_policy`] for
+/// a configured tighter cap.
 pub fn restore_bundle(src: &Path, fresh_dir: &Path) -> Result<RestoreReport, BackupError> {
+    restore_bundle_with_policy(src, fresh_dir, BackupPolicy::default())
+}
+
+/// [`restore_bundle`] with an explicit [`BackupPolicy`] (tests and the
+/// future CLI wiring; [`restore_bundle`] defaults to the hard ceiling until
+/// the CLI threads the configured cap through).
+pub fn restore_bundle_with_policy(
+    src: &Path,
+    fresh_dir: &Path,
+    policy: BackupPolicy,
+) -> Result<RestoreReport, BackupError> {
+    let cap = policy.cap();
+    if cap == 0 || cap > MAX_BUNDLE_BYTES {
+        return Err(BackupError::Invalid(
+            "backup policy exceeds the hard bundle ceiling".to_string(),
+        ));
+    }
     let meta = std::fs::metadata(src)
         .map_err(|e| BackupError::Invalid(format!("bundle not readable: {e}")))?;
     if !meta.is_file() {
         return Err(BackupError::Invalid("bundle is not a file".to_string()));
     }
-    if meta.len() > MAX_BUNDLE_BYTES {
+    if meta.len() > cap {
         return Err(BackupError::Corrupt("bundle exceeds size cap".to_string()));
     }
     if src.extension().and_then(|s| s.to_str()) != Some("zip") {
@@ -85,9 +102,9 @@ pub fn restore_bundle(src: &Path, fresh_dir: &Path) -> Result<RestoreReport, Bac
             .map_err(|e| BackupError::Storage(format!("open bundle: {e}")))?;
         let mut archive = zip::ZipArchive::new(file)
             .map_err(|e| BackupError::Corrupt(format!("open bundle zip: {e}")))?;
-        let manifest = pass0_enumerate_and_validate(&mut archive)?;
+        let manifest = pass0_enumerate_and_validate(&mut archive, cap)?;
         pass1_verify_checksums(&mut archive, &manifest)?;
-        pass2_write_and_verify(&mut archive, &manifest, fresh_dir)
+        pass2_write_and_verify(&mut archive, &manifest, fresh_dir, cap)
     };
     match run() {
         Ok(report) => Ok(report),
@@ -109,6 +126,7 @@ fn is_symlink(mode: Option<u32>) -> bool {
 /// and validate versions/sets/signatures/caps/gaps — before any write.
 fn pass0_enumerate_and_validate(
     archive: &mut zip::ZipArchive<std::fs::File>,
+    cap: u64,
 ) -> Result<Manifest, BackupError> {
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut names: Vec<String> = Vec::new();
@@ -133,7 +151,7 @@ fn pass0_enumerate_and_validate(
                 "archive contains directory entry".to_string(),
             ));
         }
-        if entry.size() > MAX_BUNDLE_BYTES {
+        if entry.size() > cap {
             return Err(BackupError::Corrupt(
                 "archive entry exceeds cap".to_string(),
             ));
@@ -202,7 +220,7 @@ fn pass0_enumerate_and_validate(
                 "duplicate table in manifest".to_string(),
             ));
         }
-        if table.rows > MAX_TABLE_ROW_BYTES * 1024 || table.bytes > MAX_BUNDLE_BYTES {
+        if table.rows > MAX_TABLE_ROW_BYTES * 1024 || table.bytes > cap {
             return Err(BackupError::Corrupt(
                 "table declares excessive size".to_string(),
             ));
@@ -246,7 +264,7 @@ fn pass0_enumerate_and_validate(
                 "manifest media path outside pools".to_string(),
             ));
         }
-        if media.bytes > MAX_BUNDLE_BYTES {
+        if media.bytes > cap {
             return Err(BackupError::Corrupt(
                 "media declares excessive size".to_string(),
             ));
@@ -331,6 +349,7 @@ fn pass2_write_and_verify(
     archive: &mut zip::ZipArchive<std::fs::File>,
     manifest: &Manifest,
     fresh_dir: &Path,
+    cap: u64,
 ) -> Result<RestoreReport, BackupError> {
     use crate::domain::id::{AidxGenerator, SystemClock};
 
@@ -388,7 +407,7 @@ fn pass2_write_and_verify(
             std::fs::create_dir_all(parent)
                 .map_err(|e| BackupError::Storage(format!("create pool shard: {e}")))?;
         }
-        let size = extract_verified(&mut entry, &dest, media.bytes, &media.sha256)?;
+        let size = extract_verified(&mut entry, &dest, media.bytes, &media.sha256, cap)?;
         media_bytes += size;
         extracted.insert(media.path.clone(), size);
     }
@@ -576,8 +595,9 @@ fn extract_verified(
     dest: &Path,
     expected_bytes: u64,
     expected_sha: &str,
+    cap: u64,
 ) -> Result<u64, BackupError> {
-    if expected_bytes > MAX_BUNDLE_BYTES {
+    if expected_bytes > cap {
         return Err(BackupError::Corrupt(
             "media declares excessive size".to_string(),
         ));

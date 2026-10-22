@@ -1,5 +1,6 @@
 use crate::application::commands::AppServices;
 use crate::application::ports::{BlobStore, MediaClass, PortError, TimelineCursor};
+use crate::media::storage::{acquire_blob_key, acquire_media_op};
 use crate::persistence::redb::MAX_MEDIA_PAGE_ROWS;
 use std::collections::{HashMap, HashSet};
 
@@ -167,6 +168,10 @@ pub fn reconcile_media_paged(
                     // tears with that fs-direct call (no content read).
                     match pool.get(&meta.blob_key)? {
                         Some(bytes) => {
+                            // Whole-transition hold: the re-put races with
+                            // concurrent deletes/evictions of this key.
+                            let _lifecycle = acquire_media_op("reconcile_sidecar")?;
+                            let _key_lock = acquire_blob_key(&meta.blob_key)?;
                             pool.put(&meta.blob_key, &bytes)?;
                             report.sidecars_healed += 1;
                         }
@@ -199,12 +204,19 @@ pub fn reconcile_media_paged(
                             // fresh bytes + size, self-healing the anchor.
                             // The metadata row always survives: dropping it
                             // would destroy the re-fetch path.
+                            //
+                            // Whole-transition hold: the accounting write +
+                            // index zeroing commit under the same key
+                            // serialization as fetch commits, so a
+                            // concurrent refetch cannot double-count.
                             if meta.evicted {
                                 continue;
                             }
                             if !adjusted_blobs.insert(meta.blob_key.clone()) {
                                 continue;
                             }
+                            let _lifecycle = acquire_media_op("reconcile_missing")?;
+                            let _key_lock = acquire_blob_key(&meta.blob_key)?;
                             let Some(url) = meta.source_url.as_deref() else {
                                 // No index anchor exists to record the
                                 // adjustment: leave the charge in place
@@ -252,10 +264,16 @@ pub fn reconcile_media_paged(
     // (b, trait-level half): dangling remote-cache index rows — indexed but
     // the media row is gone. Drop the bytes only when nothing references
     // the key, always drop the stale accounting, and always remove the
-    // index row so the next lookup misses and re-fetches cleanly.
+    // index row so the next lookup misses and re-fetches cleanly. Each
+    // candidate is handled under the shared lifecycle gate plus the
+    // per-blob-key lock with the reference checks re-resolved under that
+    // serialization (deferred GC: a concurrent fetch may have recreated a
+    // reference after the candidate list was read).
     let mut accounted_blobs: HashSet<String> = HashSet::new();
     let candidates = services.media.remote_cache_evict_candidates(cap)?;
     for rec in &candidates {
+        let _lifecycle = acquire_media_op("reconcile_dangling")?;
+        let _key_lock = acquire_blob_key(&rec.blob_key)?;
         if services.media.get(&rec.media_id)?.is_some() {
             continue;
         }
@@ -321,12 +339,15 @@ pub fn reconcile_media_paged(
 }
 
 /// Live blob keys partitioned by pool, for
+/// [`sweep_orphan_pools`](super::heal::sweep_orphan_pools) and
 /// [`sweep_orphan_blobs_checked`](super::heal::sweep_orphan_blobs_checked).
 /// `(durable_keys, cache_keys)`. Walks the whole table newest-first with
 /// exclusive `until_id` cursors to an empty page, so the returned sets are
 /// complete by construction (see the no-snapshot disclosure in the module
-/// docs). Production sweep wiring must pass `complete = true` only after
-/// this full walk; any truncated walk must refuse via the checked entry.
+/// docs). Production sweep wiring must hold the EXCLUSIVE lifecycle
+/// barrier across both this walk and the filesystem sweep (see
+/// [`collect_live_blob_keys_under_guard`]); a truncated walk must refuse
+/// via the checked entry.
 pub fn collect_live_blob_keys(
     services: &AppServices,
 ) -> Result<(HashSet<String>, HashSet<String>), PortError> {
@@ -350,6 +371,18 @@ pub fn collect_live_blob_keys(
         after = rows.last().map(|m| m.id.clone());
     }
     Ok((durable, cache))
+}
+
+/// [`collect_live_blob_keys`] for use inside the exclusive sweep barrier:
+/// the caller must hold [`crate::media::storage::acquire_media_exclusive`]
+/// across this walk and the subsequent filesystem sweep (see
+/// [`sweep_orphan_pools`](super::heal::sweep_orphan_pools)). Collecting
+/// without the barrier is only safe as a read-only diagnostic — it must
+/// never feed a delete sweep.
+pub fn collect_live_blob_keys_under_guard(
+    services: &AppServices,
+) -> Result<(HashSet<String>, HashSet<String>), PortError> {
+    collect_live_blob_keys(services)
 }
 
 /// Pre-slice-8 rows keyed their blob by MD5 (32 hex chars) instead of

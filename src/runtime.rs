@@ -221,9 +221,10 @@ pub(crate) fn run_maintenance_op(
                 eprintln!("usage: restore --bundle=<file.zip> --target-dir=<fresh-dir>");
                 std::process::exit(2);
             };
-            match pinetree::backup::restore_bundle(
+            match pinetree::backup::restore_bundle_with_policy(
                 std::path::Path::new(&bundle),
                 std::path::Path::new(&target_dir),
+                pinetree::backup::policy_for_context(backup_ctx),
             ) {
                 Ok(report) => {
                     println!(

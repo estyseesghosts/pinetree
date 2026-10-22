@@ -256,6 +256,28 @@ pub(crate) async fn do_signin(
     if account.is_suspended {
         return Err(ApiError::user_suspended());
     }
+    if account.is_deleted {
+        // Existence-hiding order, like the wrong-password path above: a
+        // deleted handle answers exactly like an unknown one.
+        return Err(ApiError::authentication_failed());
+    }
+    // Phase 2 (P0): a verified TOTP secret ends the password-only path.
+    // The legacy endpoint has no challenge step in its contract, so it
+    // refuses outright and points at `signin-flow`; it never mints a
+    // session for a TOTP-enabled account. `usePasswordLessLogin` does not
+    // change this: without WebAuthn credentials there is no safe
+    // passwordless path, so the second factor stays mandatory.
+    if state
+        .services
+        .totp_flags(&account.id)
+        .map_err(ApiError::from_port_error)?
+        .0
+    {
+        return Err(ApiError::invalid_param(
+            "password",
+            "two-factor authentication is enabled for this account; finish sign-in with the signin-flow challenge",
+        ));
+    }
     let raw_token = generate_random_token();
     state
         .services

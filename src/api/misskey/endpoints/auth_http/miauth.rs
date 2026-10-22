@@ -301,6 +301,34 @@ pub(crate) async fn miauth_submit(
                         "This account has been suspended.",
                     ));
                 }
+                // Deleted handles read as unknown (same page as a wrong
+                // password; no oracle).
+                if account.is_deleted {
+                    state
+                        .rate_limiter
+                        .record_auth_failure("auth/miauth", &acct_key, &ip_key);
+                    return Ok(miauth_error_page(
+                        &session,
+                        &fields,
+                        "Invalid username or password.",
+                    ));
+                }
+                // Phase 2 (P0): the approval form has no TOTP input, so a
+                // TOTP-enabled account cannot approve here. Fail closed:
+                // mint nothing and say so, instead of issuing a usable
+                // session on the password alone.
+                if state
+                    .services
+                    .totp_flags(&account.id)
+                    .map_err(ApiError::from_port_error)?
+                    .0
+                {
+                    return Ok(miauth_error_page(
+                        &session,
+                        &fields,
+                        "This account has two-factor authentication enabled. Approve this sign-in from the web sign-in flow instead.",
+                    ));
+                }
                 account
             }
             _ => {

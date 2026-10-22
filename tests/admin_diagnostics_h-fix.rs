@@ -250,6 +250,9 @@ impl Harness {
             durable_pool: durable_dir.clone(),
             cache_pool: cache_dir.clone(),
             backup_dir: backup_dir.clone(),
+            max_bundle_bytes: None,
+            retention_max_count: None,
+            retention_max_bytes: None,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await

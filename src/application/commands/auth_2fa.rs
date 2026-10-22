@@ -16,6 +16,8 @@
 
 use super::AppServices;
 
+use serde::{Deserialize, Serialize};
+
 use crate::application::ports::{PortError, RegistryItem};
 use crate::domain::admin::{
     AppRecord, KEY_TOTP, SCOPE_2FA, SCOPE_APPS, SECURITY_KEY_UNSUPPORTED_REASON, TotpState,
@@ -25,6 +27,30 @@ use crate::domain::admin::{
 const TOTP_STEP_SECS: u64 = 30;
 const TOTP_DIGITS: u32 = 6;
 const B32_ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+
+/// Second-factor challenge time-to-live (Phase 2 P0). A challenge minted
+/// by a password step stays usable for five minutes, then reads as
+/// expired and is pruned on next use. Short enough to bound replay, long
+/// enough for a user to read a code off their authenticator app.
+pub(crate) const TOTP_CHALLENGE_TTL_MS: i64 = 5 * 60 * 1000;
+
+/// Registry keys under scope [`SCOPE_2FA`]: the verified secret
+/// ([`KEY_TOTP`], pre-existing), the outstanding login challenge, and the
+/// TOTP step counter the last successful second-factor login consumed
+/// (cross-challenge code-replay guard).
+const KEY_TOTP_CHALLENGE: &str = "totp_challenge";
+const KEY_TOTP_LAST_STEP: &str = "totp_last_step";
+
+/// Outstanding second-factor challenge: issued only after a password
+/// success, bound to one account, single-use, expiring. Stored as a
+/// registry row under the owning account so the binding is structural.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TotpChallenge {
+    pub challenge: String,
+    pub account_id: String,
+    pub created_at_ms: i64,
+    pub expires_at_ms: i64,
+}
 
 /// Enrolment payload (`i/2fa/register`, `i/2fa/update-key` res shape).
 /// DIVERGENCE: `qr` carries the otpauth URL text, not a PNG data URL
@@ -192,16 +218,171 @@ impl AppServices {
         self.enrol_totp(account_id, label)
     }
 
-    /// `i/2fa/authenticate` (signin-flow second step): verify `token`
-    /// against the verified secret. No session is minted here; the
-    /// dispatcher mints the token on success like the password path.
-    pub fn authenticate_2fa(&self, account_id: &str, token: &str) -> Result<(), PortError> {
+    /// `i/2fa/authenticate` (signin-flow second step): `token` is verified
+    /// against the verified secret only when bound to a live challenge
+    /// issued by a recent password success for the same account. No
+    /// session is minted here; the dispatcher mints the token on success
+    /// like the password path.
+    ///
+    /// Account gates mirror `authenticate()`: suspended refuses loudly
+    /// (403); deleted/missing accounts answer like a TOTP-less account
+    /// (400 `NO_SUCH_2FA`), so the endpoint is not a username oracle.
+    /// The challenge is consumed on success only, so a mistyped code can
+    /// be retried within the TTL; the consumed TOTP step counter stops a
+    /// code from minting a second session under a fresh challenge.
+    pub fn authenticate_2fa(
+        &self,
+        account_id: &str,
+        challenge: &str,
+        token: &str,
+    ) -> Result<(), PortError> {
         validate_totp_token_format(token)?;
+        let account = self.accounts.find_by_id(account_id)?;
+        match account {
+            None => {
+                return Err(PortError::NotFound(
+                    "NO_SUCH_2FA no second factor is enabled".to_string(),
+                ));
+            }
+            Some(account) if account.is_suspended => {
+                return Err(PortError::Validation(
+                    "USER_SUSPENDED account is suspended".to_string(),
+                ));
+            }
+            Some(account) if account.is_deleted => {
+                return Err(PortError::NotFound(
+                    "NO_SUCH_2FA no second factor is enabled".to_string(),
+                ));
+            }
+            Some(_) => {}
+        }
         let state = self.verified_totp(account_id)?;
-        if !verify_totp(&state.secret_b32, self.now_ms(), token) {
-            return Err(PortError::Validation("INVALID_TOKEN".to_string()));
+        self.check_totp_challenge(account_id, challenge)?;
+        let matched = verify_totp_step(&state.secret_b32, self.now_ms(), token)
+            .ok_or_else(|| PortError::Validation("INVALID_TOKEN invalid token".to_string()))?;
+        if let Some(last) = self.last_used_totp_step(account_id)?
+            && matched <= last
+        {
+            return Err(PortError::Validation(
+                "INVALID_TOKEN token already used".to_string(),
+            ));
+        }
+        self.store_last_used_totp_step(account_id, matched)?;
+        self.consume_totp_challenge(account_id)
+    }
+
+    /// Packed `MeDetailed` security flags: `(twoFactorEnabled,
+    /// usePasswordLessLogin)` from the persisted row. `securityKeys`
+    /// stays `false` at the packer: pinetree stores no WebAuthn
+    /// credentials, so there is nothing to reflect.
+    pub(crate) fn totp_flags(&self, account_id: &str) -> Result<(bool, bool), PortError> {
+        match self.totp_row(account_id)? {
+            Some(state) if state.verified => Ok((true, state.passwordless)),
+            _ => Ok((false, false)),
+        }
+    }
+
+    /// Issue a one-time login challenge after a password success. The
+    /// value is 128 bits of CSPRNG hex; only one challenge is live per
+    /// account (a fresh password step replaces a stale one).
+    pub fn issue_totp_challenge(&self, account_id: &str) -> Result<String, PortError> {
+        let bytes: [u8; 16] = rand::random();
+        let challenge = hex::encode(bytes);
+        let now = self.now_ms();
+        self.registry.registry_set(RegistryItem {
+            id: self.ids.generate(),
+            user_id: account_id.to_string(),
+            domain: None,
+            scope: vec![SCOPE_2FA.to_string()],
+            key: KEY_TOTP_CHALLENGE.to_string(),
+            value: serde_json::to_value(TotpChallenge {
+                challenge: challenge.clone(),
+                account_id: account_id.to_string(),
+                created_at_ms: now,
+                expires_at_ms: now + TOTP_CHALLENGE_TTL_MS,
+            })
+            .map_err(|e| PortError::Validation(format!("INVALID_PARAM 2fa challenge: {e}")))?,
+            updated_at_ms: now,
+        })?;
+        Ok(challenge)
+    }
+
+    /// Validate a presented challenge without consuming it. Missing,
+    /// mismatched, account-unbound, or expired challenges all read as
+    /// `INVALID_TOKEN`; expired rows are pruned on read.
+    fn check_totp_challenge(&self, account_id: &str, challenge: &str) -> Result<(), PortError> {
+        let scope = vec![SCOPE_2FA.to_string()];
+        let item = self
+            .registry
+            .registry_get(account_id, None, &scope, KEY_TOTP_CHALLENGE)?;
+        let Some(item) = item else {
+            return Err(PortError::Validation(
+                "INVALID_TOKEN no second-factor challenge is active".to_string(),
+            ));
+        };
+        let stored: TotpChallenge = serde_json::from_value(item.value).map_err(|e| {
+            PortError::Validation(format!("INVALID_PARAM corrupt 2fa challenge: {e}"))
+        })?;
+        if stored.account_id != account_id || stored.challenge != challenge {
+            return Err(PortError::Validation(
+                "INVALID_TOKEN invalid challenge".to_string(),
+            ));
+        }
+        if self.now_ms() > stored.expires_at_ms {
+            let _ = self
+                .registry
+                .registry_remove(account_id, None, &scope, KEY_TOTP_CHALLENGE);
+            return Err(PortError::Validation(
+                "INVALID_TOKEN challenge expired".to_string(),
+            ));
         }
         Ok(())
+    }
+
+    /// Atomically retire a challenge after a successful second factor.
+    /// `registry_remove` is idempotent, so a vanished row (concurrent
+    /// consumer) is not an error here: the consumed-step guard above
+    /// already stops the second mint.
+    fn consume_totp_challenge(&self, account_id: &str) -> Result<(), PortError> {
+        let scope = vec![SCOPE_2FA.to_string()];
+        self.registry
+            .registry_remove(account_id, None, &scope, KEY_TOTP_CHALLENGE)
+    }
+
+    /// TOTP step counter consumed by the last successful second-factor
+    /// login, if any. Kept in its own row so the [`TotpState`] shape
+    /// (parent-owned domain type) stays untouched.
+    fn last_used_totp_step(&self, account_id: &str) -> Result<Option<u64>, PortError> {
+        let scope = vec![SCOPE_2FA.to_string()];
+        let item = self
+            .registry
+            .registry_get(account_id, None, &scope, KEY_TOTP_LAST_STEP)?;
+        match item {
+            None => Ok(None),
+            Some(item) => {
+                let step = item
+                    .value
+                    .get("step")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| {
+                        PortError::Validation("INVALID_PARAM corrupt 2fa replay guard".to_string())
+                    })?;
+                Ok(Some(step))
+            }
+        }
+    }
+
+    fn store_last_used_totp_step(&self, account_id: &str, step: u64) -> Result<(), PortError> {
+        let scope = vec![SCOPE_2FA.to_string()];
+        self.registry.registry_set(RegistryItem {
+            id: self.ids.generate(),
+            user_id: account_id.to_string(),
+            domain: None,
+            scope,
+            key: KEY_TOTP_LAST_STEP.to_string(),
+            value: serde_json::json!({ "step": step }),
+            updated_at_ms: self.now_ms(),
+        })
     }
 
     /// `i/2fa/remove-key` (security-key removal): loud 400 — pinetree stores
@@ -396,18 +577,27 @@ pub fn totp_token(secret_b32: &str, unix_secs: u64) -> Result<String, PortError>
 
 /// Verify `token` at `now_ms` with a ±1 step window.
 pub fn verify_totp(secret_b32: &str, now_ms: i64, token: &str) -> bool {
+    verify_totp_step(secret_b32, now_ms, token).is_some()
+}
+
+/// Verify `token` at `now_ms` with a ±1 step window, returning the
+/// matched 30-second step counter. The counter feeds the cross-challenge
+/// replay guard: a code whose step is at or below the last consumed step
+/// is a replay, even under a fresh challenge.
+pub fn verify_totp_step(secret_b32: &str, now_ms: i64, token: &str) -> Option<u64> {
     if validate_totp_token_format(token).is_err() {
-        return false;
+        return None;
     }
     let now_secs = now_ms.div_euclid(1000) as u64;
     let step = now_secs / u64::from(TOTP_STEP_SECS);
     let key_bytes = match base32_decode(secret_b32) {
         Ok(bytes) if !bytes.is_empty() => bytes,
-        _ => return false,
+        _ => return None,
     };
     [step.saturating_sub(1), step, step.saturating_add(1)]
         .iter()
-        .any(|&s| hotp(&key_bytes, s) == token)
+        .find(|candidate| hotp(&key_bytes, **candidate) == token)
+        .copied()
 }
 
 fn hotp(key: &[u8], counter: u64) -> String {

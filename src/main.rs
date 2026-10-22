@@ -258,6 +258,15 @@ async fn async_main() {
     // ignoring `federation.rfc9421_mode` (default `permissive`).
     pinetree::activitypub::signatures::set_rfc9421_mode(cfg.federation.rfc9421_mode);
 
+    // Phase 4 P1 wiring: publish the configured DNS resolver pool size
+    // process-wide before serving (no-op once the first lookup initialized
+    // the pool; startup always wins that race).
+    if !pinetree::federation::delivery::configure_dns_pool(cfg.federation.dns_max_in_flight) {
+        eprintln!(
+            "DNS resolver pool already initialized; configured dns_max_in_flight takes effect on restart"
+        );
+    }
+
     // Batch B: conspicuous warning whenever the unsafe local-HTTP exception
     // is active. Host class only (loopback/localhost/private-lan/test-domain
     // /public) — never URLs, keys or other secrets.
@@ -361,6 +370,9 @@ async fn async_main() {
         durable_pool: cfg.durable_pool_dir(),
         cache_pool: cfg.cache_pool_dir(),
         backup_dir: cfg.backup_dir(),
+        max_bundle_bytes: Some(cfg.backup.max_bundle_bytes),
+        retention_max_count: cfg.backup.retention_max_count,
+        retention_max_bytes: cfg.backup.retention_max_bytes,
     };
     // Batch F startup cleanup: abandoned `.partial-*` bundles never look
     // final, and stale `running` records (their process is gone) fail with

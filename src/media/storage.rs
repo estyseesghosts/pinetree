@@ -149,8 +149,20 @@ impl FsBlobStore {
     /// was already healthy or the object is absent. Best-effort: callers
     /// that only have `&dyn BlobStore` (ports frozen) cannot reach this and
     /// keep the documented limitation (see the reconciler scan heal).
+    ///
+    /// Holds the shared lifecycle gate plus the per-blob-key lock across the
+    /// stat + sidecar write; see [`heal_sidecar_under_guard`] for the
+    /// lock-assumed variant used when the caller already holds both.
     pub fn heal_sidecar(&self, hash: &str) -> Result<bool, PortError> {
         let _gate = acquire_media_op("heal_sidecar")?;
+        let _key = acquire_blob_key(hash)?;
+        self.heal_sidecar_under_guard(hash)
+    }
+
+    /// [`Self::heal_sidecar`] without lock acquisition. The caller must hold
+    /// the shared lifecycle gate ([`acquire_media_op`]) and the per-blob-key
+    /// lock ([`acquire_blob_key`]) for `hash`.
+    pub fn heal_sidecar_under_guard(&self, hash: &str) -> Result<bool, PortError> {
         if self.byte_len(hash)?.is_some() {
             return Ok(false);
         }
@@ -174,10 +186,21 @@ impl FsBlobStore {
     /// length, then write the `.len` sidecar. Mirrors the `put` skip: when
     /// identical bytes are already stored the staged file is just dropped.
     /// The staged file is consumed (renamed or removed) on success.
+    ///
+    /// Holds the shared lifecycle gate plus the per-blob-key lock across the
+    /// whole import; see [`import_under_guard`] for the lock-assumed variant.
     pub fn import_file(&self, hash: &str, src: &Path) -> Result<(), PortError> {
         // Batch F backup gate: pool mutations wait behind an active backup
         // (see the gate region at the end of this file).
         let _gate = acquire_media_op("import_file")?;
+        let _key = acquire_blob_key(hash)?;
+        self.import_under_guard(hash, src)
+    }
+
+    /// [`Self::import_file`] without lock acquisition. The caller must hold
+    /// the shared lifecycle gate ([`acquire_media_op`]) and the per-blob-key
+    /// lock ([`acquire_blob_key`]) for `hash`.
+    pub fn import_under_guard(&self, hash: &str, src: &Path) -> Result<(), PortError> {
         let src_len = fs::metadata(src)
             .map(|m| m.len())
             .map_err(|e| PortError::StorageUnavailable(format!("stat staged blob file: {e}")))?;
@@ -226,12 +249,11 @@ impl FsBlobStore {
         self.write_atomic(hash, &sidecar, src_len.to_string().as_bytes())?;
         Ok(())
     }
-}
 
-impl BlobStore for FsBlobStore {
-    fn put(&self, hash: &str, bytes: &[u8]) -> Result<(), PortError> {
-        // Batch F backup gate: pool mutations wait behind an active backup.
-        let _gate = acquire_media_op("put")?;
+    /// [`BlobStore::put`] without lock acquisition. The caller must hold the
+    /// shared lifecycle gate ([`acquire_media_op`]) and the per-blob-key lock
+    /// ([`acquire_blob_key`]) for `hash`.
+    pub fn put_under_guard(&self, hash: &str, bytes: &[u8]) -> Result<(), PortError> {
         let final_path = self.object_path(hash)?;
         let sidecar = self.sidecar_path(hash)?;
         // SHA-256 keys make the skip safe (same key ⇒ same bytes): skip only
@@ -250,6 +272,48 @@ impl BlobStore for FsBlobStore {
         self.write_atomic(hash, &final_path, bytes)?;
         self.write_atomic(hash, &sidecar, bytes.len().to_string().as_bytes())?;
         Ok(())
+    }
+
+    /// [`BlobStore::delete`] without lock acquisition. The caller must hold
+    /// the shared lifecycle gate ([`acquire_media_op`]) and the per-blob-key
+    /// lock ([`acquire_blob_key`]) for `hash`, and must have proved — under
+    /// that same serialization — that no live row or index requires the key
+    /// (deferred-GC recheck of the authoritative reference count).
+    pub fn delete_under_guard(&self, hash: &str) -> Result<(), PortError> {
+        let final_path = self.object_path(hash)?;
+        match fs::remove_file(&final_path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => {
+                return Err(PortError::StorageUnavailable(format!(
+                    "delete blob file: {e}"
+                )));
+            }
+        }?;
+        let sidecar = self.sidecar_path(hash)?;
+        match fs::remove_file(&sidecar) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(PortError::StorageUnavailable(format!(
+                "delete blob sidecar: {e}"
+            ))),
+        }
+    }
+}
+
+impl BlobStore for FsBlobStore {
+    /// Content-addressed write with torn-write protection (tmp + rename for
+    /// both the object and its `.len` sidecar).
+    ///
+    /// Holds the shared lifecycle gate plus the per-blob-key lock across the
+    /// whole write; see [`FsBlobStore::put_under_guard`] for the lock-assumed
+    /// variant. Reentrant: a caller that already holds either lock nests
+    /// safely (the inner acquire is a counted no-op; see the gate region).
+    fn put(&self, hash: &str, bytes: &[u8]) -> Result<(), PortError> {
+        // Batch F backup gate: pool mutations wait behind an active backup.
+        let _gate = acquire_media_op("put")?;
+        let _key = acquire_blob_key(hash)?;
+        self.put_under_guard(hash, bytes)
     }
 
     fn get(&self, hash: &str) -> Result<Option<Vec<u8>>, PortError> {
@@ -288,24 +352,8 @@ impl BlobStore for FsBlobStore {
         // Batch F backup gate: pool deletions wait behind an active backup
         // so a snapshot can never reference bytes that vanish mid-copy.
         let _gate = acquire_media_op("delete")?;
-        let final_path = self.object_path(hash)?;
-        match fs::remove_file(&final_path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => {
-                return Err(PortError::StorageUnavailable(format!(
-                    "delete blob file: {e}"
-                )));
-            }
-        }?;
-        let sidecar = self.sidecar_path(hash)?;
-        match fs::remove_file(&sidecar) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(PortError::StorageUnavailable(format!(
-                "delete blob sidecar: {e}"
-            ))),
-        }
+        let _key = acquire_blob_key(hash)?;
+        self.delete_under_guard(hash)
     }
 }
 
@@ -469,29 +517,55 @@ mod tests {
     }
 }
 
-// ===== Batch F media-storage lifecycle gate (append-only region) ==========
+// ===== Media lifecycle coordination (Phase 1 P0 fix, append-only region) =
 // One shared gate for BOTH pools (durable + cache). The online backup holds
 // the exclusive (write) side for the whole snapshot+copy; every pool-byte
 // mutation path — `put`, `import_file`, `delete` (hence local upload,
 // transcode import, remote fetch, cache eviction via the `BlobStore` trait,
 // reconciler trait-path cleanup, and account/media deletion) — holds the
-// shared (read) side briefly and may wait behind an active backup. Reads
+// shared (read) side across the WHOLE logical transition (blob write +
+// metadata/refcount/index/quota commit; record removal + refcount decrement
+// + zero-ref delete; fetch/refetch + index updates; eviction + accounting;
+// sidecar repair), not merely around the individual filesystem op. Reads
 // (`get`/`exists`/`byte_len`) and all non-media requests never touch the
 // gate and keep serving.
 //
-// Lock order (documented, no inversions): gate → db-txn → fs. Mutation
-// paths never acquire the gate while holding a DB transaction (bytes land
-// before the metadata txn on write, after the metadata commit on delete),
-// and the backup never calls a mutating pool op while holding the exclusive
-// side (it copies via plain fs reads). Batch C's at-open backfill runs
-// inside `RedbStore::open` with write txns only — no gate, no pool
-// mutation — so it composes trivially (no backup exists before `open`).
+// Lock order (documented, no inversions):
 //
-// Orphan sweep (`reconciler::sweep_orphan_blobs_checked`) holds
-// `acquire_media_op("sweep")` for the whole walk, so filesystem deletes
-// wait behind an active backup like every other pool mutation (the sweep
-// uses direct `remove_file` on orphan keys + sidecars — key-shape-gated —
-// rather than `FsBlobStore::delete`, but under the same shared hold).
+//   global media lifecycle gate (shared for writers, exclusive for the
+//   destructive orphan sweep and the backup)
+//     → per-blob-key serialization lock (striped, bounded; same key only)
+//     → short redb transaction (never held across network I/O)
+//     → filesystem operation.
+//
+// Concretely: writers take the shared gate first, then the key lock, then
+// either write bytes before the metadata transaction (uploads, fetches,
+// imports) or run the metadata transaction before removing bytes (deletes,
+// deferred GC). No path acquires the gate or a key lock while holding a DB
+// transaction, and the backup never calls a mutating pool op while holding
+// the exclusive side (it copies via plain fs reads). Batch C's at-open
+// backfill runs inside `RedbStore::open` with write txns only — no gate, no
+// pool mutation — so it composes trivially (no backup exists before `open`).
+//
+// Reentrancy: both the shared gate and the key locks count per-thread depth,
+// so an application path that holds them across a whole transition nests
+// safely with the trait-level acquires inside `put`/`import_file`/`delete`
+// (the inner acquire is a counted no-op). The exclusive side is NOT
+// reentrant over a held shared side (that would be a self-deadlocking
+// upgrade): `acquire_media_exclusive` fails closed when the calling thread
+// already holds the shared side. Split `_under_guard` variants document the
+// held-lock precondition for direct pool implementations.
+//
+// Orphan sweep (`reconciler::sweep_orphan_pools`, `sweep_orphan_blobs_checked`)
+// holds the EXCLUSIVE side across BOTH the full live-key collection and the
+// filesystem walk, so a concurrent whole-transition writer either commits
+// before collection (sweep sees the row) or blocks the sweep until it
+// commits. Any incomplete collection deletes nothing (checked gate).
+//
+// Per-blob-key serialization is a fixed 64-stripe `Mutex<()>` array hashed
+// by FNV-1a over the key: bounded by construction (no map, no GC, no
+// unbounded growth); distinct keys usually proceed in parallel while the
+// same SHA-256 key is strictly serialized.
 
 // Batch F single-backup invariant: the exclusive gate below enforces
 // `MAX_CONCURRENT_BACKUPS == 1` (a second backup fails fast with
@@ -500,6 +574,11 @@ mod tests {
 // is reworked.
 const _: () = assert!(crate::backup::MAX_CONCURRENT_BACKUPS == 1);
 
+use std::cell::Cell;
+use std::cell::RefCell;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 
@@ -513,6 +592,20 @@ fn gate_now_ms() -> u64 {
 struct MediaGateState {
     active: bool,
     started_ms: u64,
+    sweep_active: bool,
+    sweep_started_ms: u64,
+}
+
+thread_local! {
+    /// Per-thread shared-hold depth. Non-zero means this thread already owns
+    /// the shared side, so a nested [`acquire_media_op`] is a counted no-op
+    /// instead of a self-deadlock.
+    static GATE_SHARED_DEPTH: Cell<u32> = const { Cell::new(0) };
+    /// Per-thread exclusive-hold depth (destructive sweep only).
+    static GATE_EXCLUSIVE_DEPTH: Cell<u32> = const { Cell::new(0) };
+    /// Per-thread reentry depth per key stripe (see [`BLOB_KEY_STRIPES`]).
+    static KEY_STRIPE_DEPTH: RefCell<[u32; BLOB_KEY_STRIPES]> =
+        const { RefCell::new([0; BLOB_KEY_STRIPES]) };
 }
 
 fn media_gate() -> &'static RwLock<MediaGateState> {
@@ -521,8 +614,32 @@ fn media_gate() -> &'static RwLock<MediaGateState> {
         RwLock::new(MediaGateState {
             active: false,
             started_ms: 0,
+            sweep_active: false,
+            sweep_started_ms: 0,
         })
     })
+}
+
+/// Fixed stripe count for per-blob-key serialization. Bounded by
+/// construction: no key map, no eviction, no unbounded process-memory
+/// growth. Distinct keys usually land on distinct stripes and proceed in
+/// parallel; the same key always lands on the same stripe.
+pub const BLOB_KEY_STRIPES: usize = 64;
+
+fn key_stripes() -> &'static [Mutex<()>; BLOB_KEY_STRIPES] {
+    static STRIPES: OnceLock<[Mutex<()>; BLOB_KEY_STRIPES]> = OnceLock::new();
+    STRIPES.get_or_init(|| [(); BLOB_KEY_STRIPES].map(|()| Mutex::new(())))
+}
+
+/// FNV-1a stripe for `hash`. Any string maps; key-shape validation stays at
+/// the pool boundary (`FsBlobStore::object_path`).
+fn blob_key_stripe(hash: &str) -> usize {
+    let mut hashed: u64 = 0xcbf29ce484222325;
+    for byte in hash.bytes() {
+        hashed ^= u64::from(byte);
+        hashed = hashed.wrapping_mul(0x100000001b3);
+    }
+    (hashed as usize) % BLOB_KEY_STRIPES
 }
 
 /// Active backup id, mirrored outside the `RwLock` so a rejected second
@@ -545,9 +662,11 @@ static MEDIA_GATE_WAITS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static MEDIA_GATE_WAIT_MS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static MEDIA_GATE_OPS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
-/// RAII shared hold for one pool mutation. Drop releases the gate.
+/// RAII shared hold for one logical media transition. Drop releases the
+/// gate (and decrements the thread-local reentry depth).
 pub struct MediaOpGuard {
-    _guard: RwLockReadGuard<'static, MediaGateState>,
+    _guard: Option<RwLockReadGuard<'static, MediaGateState>>,
+    owns: bool,
 }
 
 impl std::fmt::Debug for MediaOpGuard {
@@ -556,13 +675,38 @@ impl std::fmt::Debug for MediaOpGuard {
     }
 }
 
-/// Acquire the shared side for a pool mutation (`put`/`import_file`/
-/// `delete`). Blocks while a backup holds the exclusive side; the wait is
-/// counted and timed for diagnostics (see [`media_gate_snapshot`]).
-/// A poisoned lock is recovered (never a panic): poison only means a
-/// previous holder panicked, and this leaf gate carries no data that a
-/// panic could leave inconsistent.
+impl Drop for MediaOpGuard {
+    fn drop(&mut self) {
+        if self.owns {
+            GATE_SHARED_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+        }
+    }
+}
+
+/// Acquire the shared side for one logical media transition (`put` /
+/// `import_file` / `delete` and, at the application layer, the whole
+/// blob-write + metadata/refcount/index/quota commit or removal + refcount
+/// decrement + zero-ref delete). Blocks while a backup or an orphan sweep
+/// holds the exclusive side; the wait is counted and timed for diagnostics
+/// (see [`media_gate_snapshot`]).
+///
+/// Reentrant: when the calling thread already holds the shared (or the
+/// exclusive) side, this returns a counted no-op guard instead of
+/// self-deadlocking, so trait-level acquires inside a whole-transition hold
+/// nest safely. A poisoned lock is recovered (never a panic): poison only
+/// means a previous holder panicked, and this leaf gate carries no data that
+/// a panic could leave inconsistent.
 pub fn acquire_media_op(_op: &'static str) -> Result<MediaOpGuard, PortError> {
+    let reentrant = GATE_SHARED_DEPTH.with(|depth| depth.get() > 0)
+        || GATE_EXCLUSIVE_DEPTH.with(|depth| depth.get() > 0);
+    if reentrant {
+        GATE_SHARED_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+        MEDIA_GATE_OPS_TOTAL.fetch_add(1, Ordering::SeqCst);
+        return Ok(MediaOpGuard {
+            _guard: None,
+            owns: true,
+        });
+    }
     MEDIA_GATE_WAITERS.fetch_add(1, Ordering::SeqCst);
     let started = std::time::Instant::now();
     let guard = media_gate()
@@ -573,7 +717,153 @@ pub fn acquire_media_op(_op: &'static str) -> Result<MediaOpGuard, PortError> {
     MEDIA_GATE_WAITS_TOTAL.fetch_add(1, Ordering::SeqCst);
     MEDIA_GATE_WAIT_MS_TOTAL.fetch_add(waited_ms, Ordering::SeqCst);
     MEDIA_GATE_OPS_TOTAL.fetch_add(1, Ordering::SeqCst);
-    Ok(MediaOpGuard { _guard: guard })
+    GATE_SHARED_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+    Ok(MediaOpGuard {
+        _guard: Some(guard),
+        owns: true,
+    })
+}
+
+/// RAII per-blob-key serialization hold. Drop releases the stripe (and
+/// decrements the thread-local reentry depth).
+pub struct BlobKeyGuard {
+    _guard: Option<MutexGuard<'static, ()>>,
+    stripe: usize,
+    owns: bool,
+}
+
+impl std::fmt::Debug for BlobKeyGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BlobKeyGuard(..)")
+    }
+}
+
+impl Drop for BlobKeyGuard {
+    fn drop(&mut self) {
+        if self.owns {
+            KEY_STRIPE_DEPTH.with(|depths| {
+                let mut depths = depths.borrow_mut();
+                depths[self.stripe] = depths[self.stripe].saturating_sub(1);
+            });
+        }
+    }
+}
+
+/// Serialize all transitions for one content-addressed key: concurrent
+/// upload / delete / refetch / eviction / sweep operations for the same
+/// SHA-256 key cannot interleave. Reentrant for the same stripe on the same
+/// thread (counted no-op). A poisoned stripe is recovered, never a panic.
+pub fn acquire_blob_key(hash: &str) -> Result<BlobKeyGuard, PortError> {
+    let stripe = blob_key_stripe(hash);
+    let reentrant = KEY_STRIPE_DEPTH.with(|depths| depths.borrow()[stripe] > 0);
+    if reentrant {
+        KEY_STRIPE_DEPTH.with(|depths| {
+            let mut depths = depths.borrow_mut();
+            depths[stripe] = depths[stripe].saturating_add(1);
+        });
+        return Ok(BlobKeyGuard {
+            _guard: None,
+            stripe,
+            owns: true,
+        });
+    }
+    let guard = key_stripes()[stripe]
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    KEY_STRIPE_DEPTH.with(|depths| {
+        let mut depths = depths.borrow_mut();
+        depths[stripe] = depths[stripe].saturating_add(1);
+    });
+    Ok(BlobKeyGuard {
+        _guard: Some(guard),
+        stripe,
+        owns: true,
+    })
+}
+
+/// RAII exclusive hold for one destructive orphan sweep. Drop releases the
+/// barrier and clears the sweep flag.
+pub struct MediaExclusiveGuard {
+    _guard: Option<RwLockWriteGuard<'static, MediaGateState>>,
+    owns: bool,
+}
+
+impl std::fmt::Debug for MediaExclusiveGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MediaExclusiveGuard(..)")
+    }
+}
+
+impl Drop for MediaExclusiveGuard {
+    fn drop(&mut self) {
+        // The write guard releases right after this runs; clear the sweep
+        // flag through the guard we already hold (no re-acquisition, so no
+        // recursion and no inversion).
+        if self.owns {
+            if let Some(guard) = self._guard.as_mut() {
+                guard.sweep_active = false;
+                guard.sweep_started_ms = 0;
+            }
+            GATE_EXCLUSIVE_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+        }
+    }
+}
+
+/// Acquire the exclusive side for a destructive orphan sweep, blocking until
+/// all shared-side logical transitions drain. The sweep must hold this
+/// across BOTH the full live-key collection and the filesystem walk.
+///
+/// Fails closed (never blocks) when the calling thread already holds the
+/// shared side — upgrading would self-deadlock — or already holds the
+/// exclusive side (reentrant no-op is NOT granted for the destructive path,
+/// so a sweep can never run inside another sweep). A poisoned lock is
+/// recovered.
+pub fn acquire_media_exclusive(_op: &'static str) -> Result<MediaExclusiveGuard, PortError> {
+    if GATE_EXCLUSIVE_DEPTH.with(|depth| depth.get() > 0) {
+        return Err(PortError::StorageUnavailable(
+            "media lifecycle: exclusive sweep already held by this thread".to_string(),
+        ));
+    }
+    if GATE_SHARED_DEPTH.with(|depth| depth.get() > 0) {
+        return Err(PortError::StorageUnavailable(
+            "media lifecycle: release the shared hold before acquiring the exclusive sweep barrier"
+                .to_string(),
+        ));
+    }
+    let mut guard = media_gate()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.sweep_active = true;
+    guard.sweep_started_ms = gate_now_ms();
+    GATE_EXCLUSIVE_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+    Ok(MediaExclusiveGuard {
+        _guard: Some(guard),
+        owns: true,
+    })
+}
+
+/// Non-blocking exclusive probe: `Some` guard when the barrier is free,
+/// `None` when any holder (shared writer, sweep, or backup) is active or
+/// this thread already holds either side. Never blocks; for diagnostics and
+/// tests, not for the destructive path itself.
+pub fn try_acquire_media_exclusive(_op: &'static str) -> Option<MediaExclusiveGuard> {
+    if GATE_EXCLUSIVE_DEPTH.with(|depth| depth.get() > 0)
+        || GATE_SHARED_DEPTH.with(|depth| depth.get() > 0)
+    {
+        return None;
+    }
+    let mut guard = match media_gate().try_write() {
+        Ok(guard) => guard,
+        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(TryLockError::WouldBlock) => return None,
+    };
+    guard.sweep_active = true;
+    guard.sweep_started_ms = gate_now_ms();
+    GATE_EXCLUSIVE_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+    Some(MediaExclusiveGuard {
+        _guard: Some(guard),
+        owns: true,
+    })
 }
 
 /// RAII exclusive hold for one backup run. Drop releases the gate and
@@ -669,6 +959,9 @@ pub struct MediaGateSnapshot {
     pub backup_active: bool,
     pub active_backup_id: String,
     pub backup_started_ms: u64,
+    /// True while a destructive orphan sweep holds the exclusive barrier.
+    pub sweep_active: bool,
+    pub sweep_started_ms: u64,
     pub waiters: usize,
     pub ops_total: u64,
     pub waits_total: u64,
@@ -676,20 +969,32 @@ pub struct MediaGateSnapshot {
 }
 
 pub fn media_gate_snapshot() -> MediaGateSnapshot {
-    let (active, started_ms) = match media_gate().try_read() {
-        Ok(state) => (state.active, state.started_ms),
+    let (active, started_ms, sweep_active, sweep_started_ms) = match media_gate().try_read() {
+        Ok(state) => (
+            state.active,
+            state.started_ms,
+            state.sweep_active,
+            state.sweep_started_ms,
+        ),
         Err(TryLockError::Poisoned(poisoned)) => {
             let state = poisoned.into_inner();
-            (state.active, state.started_ms)
+            (
+                state.active,
+                state.started_ms,
+                state.sweep_active,
+                state.sweep_started_ms,
+            )
         }
-        // A backup holds the exclusive side right now: report active without
-        // blocking (the id cell is lock-free for readers).
-        Err(TryLockError::WouldBlock) => (true, 0),
+        // A backup or a sweep holds the exclusive side right now: report
+        // active without blocking (the id cell is lock-free for readers).
+        Err(TryLockError::WouldBlock) => (true, 0, false, 0),
     };
     MediaGateSnapshot {
         backup_active: active,
         active_backup_id: read_active_backup_id(),
         backup_started_ms: started_ms,
+        sweep_active,
+        sweep_started_ms,
         waiters: MEDIA_GATE_WAITERS.load(Ordering::SeqCst),
         ops_total: MEDIA_GATE_OPS_TOTAL.load(Ordering::SeqCst),
         waits_total: MEDIA_GATE_WAITS_TOTAL.load(Ordering::SeqCst),

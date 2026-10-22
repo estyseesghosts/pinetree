@@ -7,6 +7,28 @@ use std::sync::Mutex;
 use crate::application::ports::NewJob;
 use crate::federation::delivery::parse_http_url;
 
+// Phase 4 P1 public bridge: the bounded DNS resolver surface is implemented
+// in `delivery::url` (its natural home next to SSRF validation), but that
+// module is crate-private and `delivery/mod.rs` is owned by the parent
+// workstream. Integration tests and future config/runtime wiring name these
+// through here until `delivery/mod.rs` re-exports them directly; see the
+// Phase 4 report for the exact one-line snippet.
+pub use super::delivery::url::{
+    BoundedDnsResolver, DEFAULT_MAX_DNS_IN_FLIGHT, DnsResolver, DnsResolverPolicy, SystemResolver,
+    configure_dns_pool,
+};
+
+/// Hard cap on distinct destination hosts retained by [`DestinationTracker`].
+/// Delivery fans out per inbox host, and hosts are attacker-influenced, so
+/// unbounded cardinality must not grow process memory without bound.
+pub const MAX_DESTINATION_TRACKER_ENTRIES: usize = 4096;
+
+/// How long after a destination's cooldown ends its failure counters are
+/// still retained before opportunistic reclaim (one hour, matching
+/// [`MAX_RETRY_AFTER_MS`]). Reclaim runs only while inserting a new host at
+/// the cap, so hot-path backoff behavior is unchanged.
+pub const DESTINATION_TRACKER_STALE_MS: i64 = 3_600_000;
+
 /// Upper bound on any honored `Retry-After` delay (1 hour).
 pub const MAX_RETRY_AFTER_MS: i64 = 3_600_000;
 
@@ -123,6 +145,27 @@ impl DestinationTracker {
     pub fn record_failure(&self, inbox_url: &str, now_ms: i64, base_backoff_ms: i64) -> i64 {
         let key = Self::host_key(inbox_url);
         let mut guard = self.hosts.lock().unwrap_or_else(|e| e.into_inner());
+        if !guard.contains_key(&key) && guard.len() >= MAX_DESTINATION_TRACKER_ENTRIES {
+            // At the cap: first reclaim entries whose cooldown ended long ago
+            // (their backoff already expired), otherwise evict one arbitrary
+            // entry so a flood of distinct hosts cannot grow the map.
+            guard.retain(|_, health| {
+                health.cooldown_until_ms.is_some_and(|until| {
+                    until.saturating_add(DESTINATION_TRACKER_STALE_MS) > now_ms
+                })
+            });
+            if guard.len() >= MAX_DESTINATION_TRACKER_ENTRIES {
+                // Evict arbitrary entries until back under the cap (normally
+                // one: the stale reclaim above already dropped everything
+                // whose cooldown long expired).
+                while guard.len() >= MAX_DESTINATION_TRACKER_ENTRIES {
+                    let Some(victim) = guard.keys().next().cloned() else {
+                        break;
+                    };
+                    guard.remove(&victim);
+                }
+            }
+        }
         let entry = guard.entry(key).or_default();
         entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
         entry.last_failure_ms = Some(now_ms);
@@ -139,6 +182,17 @@ impl DestinationTracker {
         let key = Self::host_key(inbox_url);
         let guard = self.hosts.lock().unwrap_or_else(|e| e.into_inner());
         guard.get(&key).cloned().unwrap_or_default()
+    }
+
+    /// Number of destination hosts currently tracked (bounded by
+    /// [`MAX_DESTINATION_TRACKER_ENTRIES`]).
+    pub fn len(&self) -> usize {
+        self.hosts.lock().map(|guard| guard.len()).unwrap_or(0)
+    }
+
+    /// `true` when no destination host is currently tracked.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// Cooldown end for `inbox_url` when it is still in the future at `now_ms`.

@@ -22,6 +22,13 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+
+// Phase 2 (P0 TOTP) regression tests live in their own file so parallel
+// workstreams do not collide; wired here (not in the parent-owned
+// `mod.rs`) to keep the shared module list untouched.
+#[cfg(test)]
+#[path = "tests_auth_totp_p0.rs"]
+mod tests_auth_totp_p0;
 /// `signin-flow` contract (`HANDOFF_auth-signin.md`): the exact
 /// request/response shapes `MkSignin.vue` drives — username-only step
 /// returns the `captcha` hint, the password step mints a first-party

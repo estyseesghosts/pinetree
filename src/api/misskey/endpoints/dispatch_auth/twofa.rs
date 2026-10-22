@@ -310,6 +310,11 @@ pub(crate) fn i_2fa_remove_key(
 }
 
 /// `POST /api/i/2fa/authenticate` (split from `api_dispatch_blocking`).
+///
+/// Second step of the signin-flow login: `challenge` is the one-time
+/// value the password step returned for this account. Bare
+/// `userId + token` is rejected: without the challenge binding, a TOTP
+/// code alone must never mint a session.
 pub(crate) fn i_2fa_authenticate(
     state: &ApiState,
     obj: &serde_json::Map<String, serde_json::Value>,
@@ -318,16 +323,19 @@ pub(crate) fn i_2fa_authenticate(
     client_ip: &str,
     headers: &axum::http::HeaderMap,
 ) -> Result<axum::response::Response, ApiError> {
-    check_allowed_fields(&obj, &["userId", "token"])?;
+    check_allowed_fields(&obj, &["userId", "token", "challenge"])?;
     state.rate_limiter.check(&rate_key, "i/2fa/authenticate")?;
     let user_id = required_str(&obj, "userId")?;
     let token = required_str(&obj, "token")?;
+    let challenge = required_str(&obj, "challenge")?;
     let acct_key = format!("acctid:{user_id}");
     let ip_key = auth_ip_key(&client_ip);
     state
         .rate_limiter
         .check_auth_failures("auth/2fa-authenticate", &acct_key, &ip_key)?;
-    let authed = state.services.authenticate_2fa(&user_id, &token);
+    let authed = state
+        .services
+        .authenticate_2fa(&user_id, &challenge, &token);
     if let Err(err) = authed {
         state
             .rate_limiter

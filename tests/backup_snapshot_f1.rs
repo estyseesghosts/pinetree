@@ -71,6 +71,9 @@ fn harness(tag: &str) -> Harness {
         durable_pool: dir.join("blobs_durable"),
         cache_pool: dir.join("blobs_cache"),
         backup_dir: backup_dir.clone(),
+        max_bundle_bytes: None,
+        retention_max_count: None,
+        retention_max_bytes: None,
     };
     Harness {
         store,

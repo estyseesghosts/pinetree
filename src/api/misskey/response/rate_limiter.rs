@@ -279,6 +279,21 @@ impl RateLimiter {
             .with_limit("i/notifications", 30, 30_000, None)
             .with_limit("i/notifications-grouped", 30, 30_000, None)
             .with_auth_limit("auth/update-email", 10, 30, MINUTE_MS)
+            // Phase 2 P0: the TOTP endpoints were referenced by
+            // `check_auth_failures` but never registered, so every 2FA
+            // check was a silent no-op. Register the same 10/account +
+            // 30/IP per minute class as the other auth buckets, plus
+            // ordinary per-endpoint buckets for the i/2fa/* arms
+            // (`remove-key` needs none: it is an unconditional 400 stub).
+            .with_auth_limit("auth/2fa", 10, 30, MINUTE_MS)
+            .with_auth_limit("auth/2fa-authenticate", 10, 30, MINUTE_MS)
+            .with_limit("i/2fa/register", 10, HOUR_MS, None)
+            .with_limit("i/2fa/key-done", 10, HOUR_MS, None)
+            .with_limit("i/2fa/done", 10, HOUR_MS, None)
+            .with_limit("i/2fa/password-less", 10, HOUR_MS, None)
+            .with_limit("i/2fa/unregister", 10, HOUR_MS, None)
+            .with_limit("i/2fa/update-key", 10, HOUR_MS, None)
+            .with_limit("i/2fa/authenticate", 30, MINUTE_MS, None)
     }
 
     /// Failure-counted auth bucket: at most `max_per_account` failures per

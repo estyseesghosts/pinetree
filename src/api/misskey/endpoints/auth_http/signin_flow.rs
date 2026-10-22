@@ -124,28 +124,34 @@ impl From<ApiError> for SigninFlowError {
 ///
 /// 1. `{ username }` → `200 { finished: false, next: 'captcha' }`
 ///    (upstream answers `'password'` when the account has 2FA; pinetree
-///    accounts never do, so the hint is always `'captcha'` — both hints
-///    render the same password page, the flag only toggles captcha).
-/// 2. `{ username, password, [captcha responses] }` →
+///    keeps the `'captcha'` hint for the first step either way — both
+///    hints render the same password page, the flag only toggles
+///    captcha).
+/// 2. `{ username, password }` →
 ///    `200 { finished: true, id, i }` on success, `403` incorrect-password
 ///    otherwise. Unknown usernames are `404`, suspended accounts `403`,
-///    both before any password check (upstream order).
+///    deleted accounts `404`, all before any password check (upstream
+///    order; suspended/deleted record nothing).
+/// 3. TOTP-enabled accounts never finish at step 2: a correct password
+///    answers `200 { finished: false, next: '2fa', id, challenge }` where
+///    `challenge` is a one-time, account-bound, 5-minute credential. The
+///    client completes the login with `i/2fa/authenticate`
+///    `{ userId, challenge, token }`, which mints the session. A `token`
+///    (totp) field smuggled into the password step is ignored: the
+///    challenge round-trip is mandatory, never optional.
 ///
-/// `token` (totp) and `credential` (passkey) fields are accepted and
-/// ignored: no account can have 2FA/security keys yet (packers hardcode
-/// `twoFactorEnabled: false`), so upstream's `!twoFactorEnabled` branch
-/// — which ignores both and checks only the password — is the whole
-/// reachable surface. Captcha verification is skipped the same way
-/// upstream skips it when no captcha provider is configured.
+/// Captcha verification is skipped the same way upstream skips it when no
+/// captcha provider is configured.
 ///
-/// DIVERGENCES from upstream: no `2fa`/`passkey` `next` hints (nothing to
-/// enroll them with); throttling reuses the `auth/signin` failure-counted
-/// bucket (10/account + 30/IP per minute) instead of upstream's IP-only
-/// 10/hour + 1s min-interval, answering the verbatim upstream
-/// `TOO_MANY_AUTHENTICATION_FAILURES` id on 429; unknown fields are
-/// ignored rather than `UNSUPPORTED_FIELD`-rejected (upstream performs no
-/// field check on this route); the success response sets no session
-/// cookie (upstream `SigninService.signin` sets none either).
+/// DIVERGENCES from upstream: no `passkey` `next` hint (nothing to enroll
+/// it with; `securityKeys` packs `false`); throttling reuses the
+/// `auth/signin` failure-counted bucket (10/account + 30/IP per minute)
+/// instead of upstream's IP-only 10/hour + 1s min-interval, answering the
+/// verbatim upstream `TOO_MANY_AUTHENTICATION_FAILURES` id on 429;
+/// unknown fields are ignored rather than `UNSUPPORTED_FIELD`-rejected
+/// (upstream performs no field check on this route); the success response
+/// sets no session cookie (upstream `SigninService.signin` sets none
+/// either).
 pub(crate) async fn do_signin_flow(
     state: &ApiState,
     obj: &Map<String, Value>,
@@ -189,9 +195,13 @@ pub(crate) async fn do_signin_flow(
     };
     // Suspended accounts are refused before the password verifies
     // (upstream `SigninApiService.ts` order; no history row, like
-    // upstream's direct `error()` return).
+    // upstream's direct `error()` return). Deleted accounts read as
+    // unknown (404): the handle is gone, so there is nothing to reveal.
     if account.is_suspended {
         return Err(SigninFlowError::Api(ApiError::signin_suspended()));
+    }
+    if account.is_deleted {
+        return Err(SigninFlowError::Api(ApiError::signin_no_such_user()));
     }
     let password = match obj.get("password") {
         None | Some(Value::Null) => None,
@@ -212,6 +222,28 @@ pub(crate) async fn do_signin_flow(
             .record_auth_failure("auth/signin", &acct_key, &ip_key);
         record_signin_attempt(&state.services, &account.id, ip, headers, false);
         return Err(SigninFlowError::Api(ApiError::signin_incorrect_password()));
+    }
+    // Phase 2 (P0): a verified TOTP secret ends the password-only path.
+    // Mint a one-time challenge instead of a session; the client finishes
+    // with `i/2fa/authenticate`. A `token` field in this step is ignored
+    // on purpose: the challenge round-trip is mandatory. No history row:
+    // the first factor passed but the login is not complete.
+    if state
+        .services
+        .totp_flags(&account.id)
+        .map_err(ApiError::from_port_error)?
+        .0
+    {
+        let challenge = state
+            .services
+            .issue_totp_challenge(&account.id)
+            .map_err(ApiError::from_port_error)?;
+        return Ok(serde_json::json!({
+            "finished": false,
+            "next": "2fa",
+            "id": account.id,
+            "challenge": challenge,
+        }));
     }
     let raw_token = generate_random_token();
     state

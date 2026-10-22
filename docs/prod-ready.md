@@ -1,3 +1,8 @@
+> **Status: SUPERSEDED — PLAN HISTORY.** Retained for context only. The active
+> production-readiness plan is `docs/prod-ready-2.md` (audit baseline `ad4f7b8`).
+> Do not implement items from this older guide a second time; close old findings
+> only with a targeted regression test and source link per `prod-ready-2.md` §3.
+
 # Pinetree: Single-Node Production-Readiness Implementation Guide
 
 **Audience:** OpenCode / coding-agent implementers  

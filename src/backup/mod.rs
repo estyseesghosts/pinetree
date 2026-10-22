@@ -42,9 +42,10 @@ pub mod bundle;
 pub mod restore;
 
 pub use bundle::{
-    BACKUP_FORMAT_VERSION, BACKUP_REDB_VERSION, BACKUP_SCHEMA_VERSION, MAX_BUNDLE_BYTES,
+    BACKUP_FORMAT_VERSION, BACKUP_REDB_VERSION, BACKUP_SCHEMA_VERSION, BackupPolicy,
+    HARD_BUNDLE_CEILING_BYTES, MAX_BUNDLE_BYTES, create_bundle_with_policy, policy_for_context,
 };
-pub use restore::{RestoreReport, restore_bundle};
+pub use restore::{RestoreReport, restore_bundle, restore_bundle_with_policy};
 
 /// Default backup directory name under the data dir (a const default — no
 /// config-schema change in this batch; see the parent snippets for the
@@ -61,18 +62,31 @@ pub const BACKUP_STATUS_SUFFIX: &str = ".status.json";
 pub const MAX_CONCURRENT_BACKUPS: usize = 1;
 /// Bounded retries for a transient backup failure before it is failed.
 pub const MAX_BACKUP_ATTEMPTS: u32 = 5;
+
+/// Hard bound on in-memory status records. The durable status files in
+/// `backup_dir` are the source of truth; the registry is only a fast path.
+/// Terminal records (completed/failed) beyond this cap are dropped oldest
+/// first — queued/running records are never evicted, so a live job is
+/// always queryable. `list_backup_statuses` re-reads from disk and is
+/// unaffected by the bound.
+pub const MAX_STATUS_REGISTRY_ENTRIES: usize = 1024;
 /// Chunk size for restore write transactions (bounds one txn).
 pub const RESTORE_COMMIT_CHUNK_ROWS: usize = 500;
 
 /// What the backup needs. Built by the caller (admin route / CLI / tests)
 /// from the live store and pool roots; outputs stay confined to
-/// `backup_dir`.
+/// `backup_dir`. `max_bundle_bytes` carries the configured
+/// `backup.max_bundle_bytes` cap (`None` = hard ceiling); the retention
+/// fields carry the configured `backup.retention_*` bounds (`None` = keep).
 #[derive(Clone)]
 pub struct BackupContext {
     pub store: Arc<RedbStore>,
     pub durable_pool: PathBuf,
     pub cache_pool: PathBuf,
     pub backup_dir: PathBuf,
+    pub max_bundle_bytes: Option<u64>,
+    pub retention_max_count: Option<usize>,
+    pub retention_max_bytes: Option<u64>,
 }
 
 /// Backup lifecycle state (serialized into the durable status file).
@@ -259,7 +273,23 @@ fn load_status(backup_dir: &Path, job_id: &str) -> Result<Option<BackupStatus>, 
 }
 
 fn store_status(status: &BackupStatus) {
-    lock_registry().insert(status.job_id.clone(), status.clone());
+    let mut registry = lock_registry();
+    registry.insert(status.job_id.clone(), status.clone());
+    if registry.len() > MAX_STATUS_REGISTRY_ENTRIES {
+        // Drop oldest terminal records first; queued/running are never
+        // evicted so live jobs stay queryable. The durable files remain
+        // the source of truth (`backup_status` re-loads on miss).
+        let excess = registry.len() - MAX_STATUS_REGISTRY_ENTRIES;
+        let mut terminal: Vec<(u64, String)> = registry
+            .values()
+            .filter(|s| matches!(s.state, BackupState::Completed | BackupState::Failed))
+            .map(|s| (s.requested_ms, s.job_id.clone()))
+            .collect();
+        terminal.sort();
+        for (_, job_id) in terminal.into_iter().take(excess) {
+            registry.remove(&job_id);
+        }
+    }
 }
 
 /// Accepted-fast trigger: records a durable queued status and returns the
@@ -341,6 +371,100 @@ pub fn list_backup_statuses(backup_dir: &Path) -> Vec<BackupStatus> {
     out
 }
 
+/// Retention pruning outcome (best-effort counts for logs/diagnostics).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetentionReport {
+    pub bundles_removed: u64,
+    pub bytes_reclaimed: u64,
+}
+
+/// Enforce the context's configured retention (`retention_max_count` /
+/// `retention_max_bytes`; `None` = keep). Only older *completed* bundles
+/// are ever removed, newest first-kept: the newest completed bundle is
+/// never deleted even when it alone exceeds the budget, and failed/queued/
+/// running records are never touched. Each pruned bundle removes its `.zip`
+/// and its `.status.json`; the in-memory record is dropped too. I/O errors
+/// on individual files stop that file's removal only — pruning never fails
+/// the backup that triggered it (callers ignore the report).
+pub fn prune_retained_backups(ctx: &BackupContext) -> RetentionReport {
+    let mut report = RetentionReport::default();
+    let keep_count = ctx.retention_max_count.unwrap_or(usize::MAX);
+    let keep_bytes = ctx.retention_max_bytes.unwrap_or(u64::MAX);
+    if keep_count == usize::MAX && keep_bytes == u64::MAX {
+        return report;
+    }
+    // Invalid direct constructions fail safe: a zero bound would delete
+    // everything but the newest, so treat it as unset.
+    let keep_count = if keep_count == 0 {
+        usize::MAX
+    } else {
+        keep_count
+    };
+    let keep_bytes = if keep_bytes == 0 {
+        u64::MAX
+    } else {
+        keep_bytes
+    };
+    let mut completed: Vec<BackupStatus> = list_backup_statuses(&ctx.backup_dir)
+        .into_iter()
+        .filter(|s| {
+            s.state == BackupState::Completed
+                && s.output_file.as_deref().is_some_and(|f| !f.is_empty())
+        })
+        .collect();
+    // Newest first; ties keep the larger job id (monotonic suffix).
+    completed.sort_by(|a, b| {
+        b.finished_ms
+            .cmp(&a.finished_ms)
+            .then_with(|| b.job_id.cmp(&a.job_id))
+    });
+    let mut kept_bytes: u64 = 0;
+    let mut kept: usize = 0;
+    for status in &completed {
+        if kept == 0 {
+            // Never delete the newest completed bundle.
+            kept = 1;
+            kept_bytes = kept_bytes.saturating_add(bundle_bytes(&ctx.backup_dir, status));
+            continue;
+        }
+        let size = bundle_bytes(&ctx.backup_dir, status);
+        let over_count = kept >= keep_count;
+        let over_bytes = kept_bytes.saturating_add(size) > keep_bytes;
+        if !over_count && !over_bytes {
+            kept += 1;
+            kept_bytes = kept_bytes.saturating_add(size);
+            continue;
+        }
+        let Some(name) = status.output_file.clone() else {
+            continue;
+        };
+        let zip = ctx.backup_dir.join(&name);
+        let bytes = std::fs::metadata(&zip).map(|m| m.len()).unwrap_or(size);
+        if std::fs::remove_file(&zip).is_ok() {
+            report.bundles_removed += 1;
+            report.bytes_reclaimed = report.bytes_reclaimed.saturating_add(bytes);
+        }
+        let status_file = status_path(&ctx.backup_dir, &status.job_id);
+        if std::fs::remove_file(&status_file).is_ok() {
+            lock_registry().remove(&status.job_id);
+        }
+    }
+    report
+}
+
+/// Best-effort byte size of a completed bundle (recorded value, else stat).
+fn bundle_bytes(backup_dir: &Path, status: &BackupStatus) -> u64 {
+    if let Some(bytes) = status.bytes_written {
+        return bytes;
+    }
+    status
+        .output_file
+        .as_deref()
+        .and_then(|name| std::fs::metadata(backup_dir.join(name)).ok())
+        .map(|m| m.len())
+        .unwrap_or(0)
+}
+
 /// Drain one queued backup (oldest first). Called by the worker drain arm.
 /// Returns the completed job id, or `None` when nothing is queued. A
 /// transient failure re-queues with bounded attempts; anything else fails
@@ -371,6 +495,8 @@ pub fn run_next_backup(ctx: &BackupContext) -> Result<Option<String>, BackupErro
             status.gate_wait_ms = outcome.gate_wait_ms;
             persist_status(&ctx.backup_dir, &status)?;
             store_status(&status);
+            // Best-effort rotation: pruning never fails a good backup.
+            let _ = prune_retained_backups(ctx);
             Ok(Some(status.job_id))
         }
         Err(e @ BackupError::Transient(_)) | Err(e @ BackupError::Busy(_)) => {
@@ -430,6 +556,8 @@ pub fn run_backup_blocking(ctx: &BackupContext, job_id: &str) -> Result<PathBuf,
             status.gate_wait_ms = outcome.gate_wait_ms;
             persist_status(&ctx.backup_dir, &status)?;
             store_status(&status);
+            // Best-effort rotation: pruning never fails a good backup.
+            let _ = prune_retained_backups(ctx);
             Ok(ctx.backup_dir.join(outcome.file_name))
         }
         Err(e) => {

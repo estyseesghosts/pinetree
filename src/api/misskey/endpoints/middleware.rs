@@ -151,9 +151,12 @@ pub(crate) async fn request_id_middleware(req: Request, next: axum::middleware::
     let request_id = crate::observability::new_request_id();
     let started = std::time::Instant::now();
     let mut response = next.run(req).await;
+    // The request id is a locally generated uuid (alphanumeric plus `-`),
+    // so header construction cannot fail; the `unknown` fallback only
+    // exists so request correlation never panics, even in theory.
     response.headers_mut().insert(
         HeaderName::from_static("x-request-id"),
-        HeaderValue::from_str(&request_id).expect("uuid is header-safe"),
+        HeaderValue::from_str(&request_id).unwrap_or_else(|_| HeaderValue::from_static("unknown")),
     );
     crate::observability::log_request_done(
         &request_id,

@@ -66,6 +66,9 @@ pub enum SendErrorKind {
     Io,
     /// TLS handshake or certificate failure. Transient.
     Tls,
+    /// Local resource exhaustion that may clear (saturated DNS resolver
+    /// slots, shut-down pool). Transient: retry later.
+    ResourceBusy,
     /// Malformed or truncated HTTP response from the peer. Transient.
     Protocol,
     /// Local failure (signing, key lookup, spawning curl). Transient.
@@ -84,6 +87,7 @@ impl SendErrorKind {
                 | Self::Tls
                 | Self::Protocol
                 | Self::Internal
+                | Self::ResourceBusy
         )
     }
 }
@@ -233,6 +237,7 @@ mod slice10_transport_tests {
             SendErrorKind::Tls,
             SendErrorKind::Protocol,
             SendErrorKind::Internal,
+            SendErrorKind::ResourceBusy,
         ] {
             assert!(kind.is_transient(), "{kind:?} must be transient");
         }

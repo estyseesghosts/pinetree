@@ -1,5 +1,7 @@
+use super::scan::collect_live_blob_keys_under_guard;
 use crate::application::commands::AppServices;
 use crate::application::ports::PortError;
+use crate::media::storage::acquire_media_exclusive;
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -18,21 +20,66 @@ pub fn reset_in_flight(services: &AppServices) -> Result<(), PortError> {
     Ok(())
 }
 
+/// Outcome of one [`sweep_orphan_pools`] run. `complete` is true only when
+/// the live-key collection walked the whole table to an empty page before
+/// any byte was deleted; a non-complete collection deletes nothing and
+/// surfaces `Validation` instead of counts.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SweepReport {
+    /// Durable-pool (`blobs_durable/objects`) object keys removed.
+    pub durable_removed: u64,
+    /// Cache-pool (`blobs_cache/objects`) object keys removed.
+    pub cache_removed: u64,
+    /// The collection covered the whole table (always true on `Ok`; an
+    /// interrupted walk returns `Err` before deleting anything).
+    pub complete: bool,
+}
+
+/// Sweep both pools under ONE exclusive lifecycle barrier: collect the full
+/// live-key set and delete unmatched files while holding
+/// [`acquire_media_exclusive`](crate::media::storage::acquire_media_exclusive)
+/// across both phases. Concurrent whole-transition writers (shared side)
+/// either commit before collection — so the sweep sees their rows — or
+/// block the sweep until they commit. Either way a key that becomes live
+/// can never be deleted as an orphan.
+///
+/// Each key is swept only from the pool its rows reference (durable keys
+/// from the durable pool, cache keys from the cache pool); the pools are
+/// separate directory trees, so a cache-pool delete can never touch durable
+/// bytes. Any page/read/filesystem failure during collection returns before
+/// any byte is deleted; per-file delete races (`NotFound`) are ignored.
+/// Metadata is never touched here.
+pub fn sweep_orphan_pools(
+    services: &AppServices,
+    durable_objects_dir: &Path,
+    cache_objects_dir: &Path,
+) -> Result<SweepReport, PortError> {
+    let _barrier = acquire_media_exclusive("sweep_orphan_pools")?;
+    let (durable_live, cache_live) = collect_live_blob_keys_under_guard(services)?;
+    let durable_removed = sweep_orphan_blobs_under_guard(durable_objects_dir, &durable_live, true)?;
+    let cache_removed = sweep_orphan_blobs_under_guard(cache_objects_dir, &cache_live, true)?;
+    Ok(SweepReport {
+        durable_removed,
+        cache_removed,
+        complete: true,
+    })
+}
+
 /// Sweep one `objects/` pool directory (`<pool>/objects/xx/<key>` shards
 /// with `<key>.len` sidecars): delete every key file — plus its sidecar —
 /// not in `live_keys`. Returns the number of object keys removed.
+///
+/// Convenience wrapper: assumes a COMPLETE live-key set (as if
+/// `complete == true`) and takes the exclusive barrier itself. Production
+/// wiring must prefer [`sweep_orphan_pools`], which holds ONE exclusive
+/// barrier across collection and both pools; a partial set must refuse via
+/// [`sweep_orphan_blobs_checked`], never sweep.
 ///
 /// Safety: only alphanumeric keys of length 4–128 are eligible (the
 /// `FsBlobStore` key shape), `.len` sidecars are never matched directly
 /// (they die with their object), non-directories and unreadable entries
 /// are skipped, a missing pool directory sweeps nothing, and `NotFound`
 /// races on delete are ignored. Metadata is never touched here.
-///
-/// Test-only convenience wrapper: assumes a COMPLETE live-key set (as if
-/// `complete == true`). Production wiring must call
-/// [`sweep_orphan_blobs_checked`] with the completion signal from a full
-/// [`crate::media::reconcile::collect_live_blob_keys`] walk; a partial set
-/// must refuse, never sweep.
 pub fn sweep_orphan_blobs(
     objects_dir: &Path,
     live_keys: &HashSet<String>,
@@ -45,6 +92,13 @@ pub fn sweep_orphan_blobs(
 /// refuses with `Validation` and deletes nothing. This is the destructive
 /// operation's guard against truncated scans: a short page, a capped walk,
 /// or any interrupted collection must never feed a delete sweep.
+///
+/// Barrier: takes the EXCLUSIVE lifecycle side across the whole walk, so a
+/// concurrent whole-transition writer (shared side) either committed before
+/// the caller's collection — and the key is live — or blocks this sweep
+/// until it commits. Callers that already hold the shared side get a
+/// fail-closed error (upgrading would self-deadlock); use
+/// [`sweep_orphan_pools`] for the collect-and-sweep wiring.
 pub fn sweep_orphan_blobs_checked(
     objects_dir: &Path,
     live_keys: &HashSet<String>,
@@ -57,10 +111,29 @@ pub fn sweep_orphan_blobs_checked(
                 .to_string(),
         ));
     }
-    // Batch F gate (Batch H one-snippet): pool deletions wait behind an
-    // active backup so a concurrent snapshot/copy can never lose bytes the
-    // bundle's metadata references. Held for the whole sweep.
-    let _media_gate = crate::media::storage::acquire_media_op("sweep")?;
+    let _barrier = acquire_media_exclusive("sweep")?;
+    sweep_orphan_blobs_under_guard(objects_dir, live_keys, true)
+}
+
+/// [`sweep_orphan_blobs_checked`] without barrier acquisition. The caller
+/// must hold the exclusive lifecycle barrier
+/// ([`acquire_media_exclusive`](crate::media::storage::acquire_media_exclusive))
+/// and must have collected `live_keys` under that same hold (see
+/// [`collect_live_blob_keys_under_guard`](super::scan::collect_live_blob_keys_under_guard)).
+/// `complete` is re-checked here so a direct call with a partial set still
+/// refuses.
+pub fn sweep_orphan_blobs_under_guard(
+    objects_dir: &Path,
+    live_keys: &HashSet<String>,
+    complete: bool,
+) -> Result<u64, PortError> {
+    if !complete {
+        return Err(PortError::Validation(
+            "refusing orphan-blob sweep on an incomplete live-key set; \
+             finish the paged collection to an empty page first"
+                .to_string(),
+        ));
+    }
     let shards = match std::fs::read_dir(objects_dir) {
         Ok(shards) => shards,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),

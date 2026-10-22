@@ -4,6 +4,7 @@ use crate::application::ports::{CacheStats, InsertMediaInput, PortError, Timelin
 use crate::domain::media::{MediaMeta, MediaProperties, sniff_mime};
 use crate::media::ingest::{md5_hex, sanitize_filename, sha256_hex};
 use crate::media::remote_cache::validate_remote_media_url;
+use crate::media::storage::{acquire_blob_key, acquire_media_op};
 
 /// Misskey `DriveFileEntityService.validateFileName` parity: non-blank,
 /// at most 200 chars, no path separators or parent traversal.
@@ -64,6 +65,14 @@ impl AppServices {
         let media_id = self.ids.generate();
         let url = format!("{}/files/{media_id}", self.public_url.trim_end_matches('/'));
         let blob_key = sha256_hex(bytes);
+        // Whole-transition hold (Phase 1 P0): the shared lifecycle gate plus
+        // the per-blob-key lock serialize this upload against concurrent
+        // deletes, evictions, fetches, and the exclusive orphan sweep. The
+        // inner `blobs.put` re-acquire nests safely (counted no-op). Bytes
+        // land before the metadata transaction; a crash between them leaves
+        // orphan bytes the exclusive sweep collects — never a dangling row.
+        let _lifecycle = acquire_media_op("upload_media")?;
+        let _key_lock = acquire_blob_key(&blob_key)?;
         self.blobs.put(&blob_key, bytes)?;
         // Quota-checked insert: breach maps to
         // `Validation("DRIVE_CAPACITY_EXCEEDED")` (raised by the store; the
@@ -206,6 +215,11 @@ impl AppServices {
         if let Some(comment) = comment {
             meta.comment = comment;
         }
+        // Bytes never change here, but the upsert still adjusts refcounts
+        // transactionally: hold the transition locks for consistency with
+        // the upload and delete paths.
+        let _lifecycle = acquire_media_op("update_media")?;
+        let _key_lock = acquire_blob_key(&meta.blob_key)?;
         self.media.insert_metadata_with_durable_quota(
             InsertMediaInput {
                 id: Some(meta.id.clone()),
@@ -235,31 +249,70 @@ impl AppServices {
     /// [`Self::get_media_for`]. The in-transaction
     /// `delete_media_record` removes the row and decrements the refcount
     /// plus the owner's durable bytes atomically; the physical `delete`
-    /// happens outside the transaction only when `remaining == 0`, so
-    /// cross-owner identical bytes (and byte-identical remote rows, which
-    /// share SHA-256 keys) survive a sharer's delete. A crash between the
-    /// record delete and the blob delete leaves orphan bytes that the
-    /// reconciler sweeps — never a dangling reference.
+    /// happens under the same lifecycle gate + per-blob-key serialization
+    /// only after rechecking the authoritative refcount, so a concurrent
+    /// same-content upload that committed between the record delete and the
+    /// byte delete keeps its bytes (deferred GC). Cross-owner identical
+    /// bytes (and byte-identical remote rows, which share SHA-256 keys)
+    /// survive a sharer's delete. A crash between the record delete and the
+    /// blob delete leaves orphan bytes that the reconciler sweeps — never a
+    /// dangling reference.
     pub fn delete_media(&self, caller_id: &str, file_id: &str) -> Result<(), PortError> {
         let meta = self.get_media_for(caller_id, file_id)?;
+        // Whole-transition hold: serializes against concurrent uploads of
+        // identical bytes and against the exclusive orphan sweep.
+        let _lifecycle = acquire_media_op("delete_media")?;
+        let _key_lock = acquire_blob_key(&meta.blob_key)?;
         match self.media.delete_media_record(&meta.id)? {
             Some((removed, remaining)) if remaining > 0 => {
                 debug_assert_eq!(removed.blob_key, meta.blob_key);
                 Ok(())
             }
             Some((removed, _)) => {
-                // Last reference gone: drop the durable bytes. `remove` is
-                // idempotent in the filesystem backend, so a retried delete
-                // after a crash between record-delete and blob-delete still
-                // converges (the second `delete_media_record` returns
-                // `None` and we land here via `meta.blob_key`).
-                self.blobs.delete(&removed.blob_key)?;
+                // Last reference gone at record-delete time: recheck under
+                // the same key serialization before touching bytes (a
+                // concurrent upload may have recreated a reference after
+                // our transaction committed). Retried deletes after a crash
+                // between record-delete and blob-delete converge here too.
+                debug_assert_eq!(removed.blob_key, meta.blob_key);
+                let _ = self.delete_durable_bytes_if_unreferenced(&removed.blob_key)?;
                 Ok(())
             }
             // Already gone between the owner check and the record delete
             // (concurrent delete): converge to success without touching
             // bytes another row may still reference.
             None => Ok(()),
+        }
+    }
+
+    /// Deferred-GC byte delete: remove the durable object at `blob_key` only
+    /// when the authoritative reference count is zero. Holds the shared
+    /// lifecycle gate plus the per-blob-key lock, so the check and the delete
+    /// are atomic with respect to concurrent uploads, deletes, refetches,
+    /// and the exclusive orphan sweep. Returns `true` when no live reference
+    /// remains (bytes deleted when present, idempotent when absent) and
+    /// `false` when a live row still requires the bytes. Split from
+    /// [`Self::delete_media`] so crash-recovery and reconciliation paths can
+    /// reuse the exact recheck; nested calls from holders are safe
+    /// (reentrant counted no-ops).
+    pub fn delete_durable_bytes_if_unreferenced(&self, blob_key: &str) -> Result<bool, PortError> {
+        let _lifecycle = acquire_media_op("delete_unreferenced_bytes")?;
+        let _key_lock = acquire_blob_key(blob_key)?;
+        self.delete_durable_bytes_if_unreferenced_under_guard(blob_key)
+    }
+
+    /// [`Self::delete_durable_bytes_if_unreferenced`] without lock
+    /// acquisition. The caller must hold the shared lifecycle gate and the
+    /// per-blob-key lock for `blob_key`.
+    pub fn delete_durable_bytes_if_unreferenced_under_guard(
+        &self,
+        blob_key: &str,
+    ) -> Result<bool, PortError> {
+        if self.media.blob_refcount(blob_key)? == 0 {
+            self.blobs.delete(blob_key)?;
+            Ok(true)
+        } else {
+            Ok(false)
         }
     }
 

@@ -58,10 +58,13 @@ fn missing_keys_take_defaults() {
         crate::media::transcode::DEFAULT_MAX_FILE_SIZE
     );
     assert_eq!(cfg.federation.rfc9421_mode, Rfc9421Mode::Permissive);
+    assert_eq!(cfg.federation.dns_max_in_flight, 32);
     assert!(!cfg.diagnostics.detailed_admin_status);
     assert!(cfg.diagnostics.structured_logging);
     assert!(cfg.backup.dir.is_none());
     assert_eq!(cfg.backup.max_bundle_bytes, 64 << 30);
+    assert_eq!(cfg.backup.retention_max_count, None);
+    assert_eq!(cfg.backup.retention_max_bytes, None);
     // Storage overhaul defaults: 1 GiB durable quota, 512 MiB global
     // cache (128/256/128 reserved), on-demand, 30/7/3-day TTLs.
     assert_eq!(cfg.drive_capacity_per_user_bytes, 1 << 30);
@@ -303,15 +306,18 @@ fn transcode_keys_reject_bad_values() {
 fn federation_keys_round_trip() {
     let cfg: Config = serde_json::from_str("{}").expect("empty object parses");
     assert_eq!(cfg.federation.rfc9421_mode, Rfc9421Mode::Permissive);
+    assert_eq!(cfg.federation.dns_max_in_flight, 32);
     let enforced: Config = serde_json::from_str(
-        r#"{"federation": {"rfc9421_mode": "enforce"}, "transcode": {"enabled": false}}"#,
+        r#"{"federation": {"rfc9421_mode": "enforce", "dns_max_in_flight": 16}, "transcode": {"enabled": false}}"#,
     )
     .expect("parse");
     assert_eq!(enforced.federation.rfc9421_mode, Rfc9421Mode::Enforce);
+    assert_eq!(enforced.federation.dns_max_in_flight, 16);
     assert!(enforced.validate().is_ok());
-    // Serde round-trip keeps the nested key.
+    // Serde round-trip keeps the nested keys.
     let json = serde_json::to_value(&enforced).expect("serialize");
     assert_eq!(json["federation"]["rfc9421_mode"], "enforce");
+    assert_eq!(json["federation"]["dns_max_in_flight"], 16);
     let back: Config = serde_json::from_value(json).expect("deserialize");
     assert_eq!(back.federation, enforced.federation);
     // Unknown modes and unknown nested keys stay hard errors.
@@ -321,6 +327,22 @@ fn federation_keys_round_trip() {
     assert!(
         serde_json::from_str::<Config>(r#"{"federation": {"rfc9421_modes": "enforce"}}"#).is_err()
     );
+    // Pool bounds fail closed: zero and oversized values rejected, and an
+    // explicit section without the key still gets the default.
+    let no_key: Config =
+        serde_json::from_str(r#"{"federation": {"rfc9421_mode": "enforce"}}"#).expect("parse");
+    assert_eq!(no_key.federation.dns_max_in_flight, 32);
+    assert!(no_key.validate().is_ok());
+    for bad in [0, 257] {
+        let cfg = Config {
+            federation: FederationSection {
+                dns_max_in_flight: bad,
+                ..FederationSection::default()
+            },
+            ..Config::default()
+        };
+        assert!(cfg.validate().is_err(), "dns bound {bad} must fail");
+    }
 }
 
 #[test]
@@ -742,15 +764,18 @@ fn batch_h_diagnostics_section_round_trip_and_typo_safety() {
 
 #[test]
 fn batch_h_backup_section_round_trip_and_guards() {
-    // Defaults: dir unset (resolves under `data_dir`), 64 GiB cap.
+    // Defaults: dir unset (resolves under `data_dir`), 64 GiB cap, no
+    // retention bounds (keep all).
     let cfg: Config = serde_json::from_str("{}").expect("empty object parses");
     assert!(cfg.backup.dir.is_none());
     assert_eq!(cfg.backup.max_bundle_bytes, 64 << 30);
+    assert_eq!(cfg.backup.retention_max_count, None);
+    assert_eq!(cfg.backup.retention_max_bytes, None);
     assert_eq!(cfg.backup_dir(), cfg.data_dir.join("backups"));
     assert!(cfg.validate().is_ok());
     // Explicit dir round-trips (null stays unset).
     let explicit: Config = serde_json::from_str(
-        r#"{"backup": {"dir": "/var/lib/pinetree/backups", "max_bundle_bytes": 1073741824}}"#,
+        r#"{"backup": {"dir": "/var/lib/pinetree/backups", "max_bundle_bytes": 1073741824, "retention_max_count": 7, "retention_max_bytes": 1099511627776}}"#,
     )
     .expect("parse");
     assert_eq!(
@@ -758,14 +783,22 @@ fn batch_h_backup_section_round_trip_and_guards() {
         Some(PathBuf::from("/var/lib/pinetree/backups"))
     );
     assert_eq!(explicit.backup.max_bundle_bytes, 1 << 30);
+    assert_eq!(explicit.backup.retention_max_count, Some(7));
+    assert_eq!(explicit.backup.retention_max_bytes, Some(1 << 40));
     assert_eq!(
         explicit.backup_dir(),
         PathBuf::from("/var/lib/pinetree/backups")
     );
     assert!(explicit.validate().is_ok());
+    let json = serde_json::to_value(&explicit.backup).expect("serialize");
+    assert_eq!(json["retention_max_count"], 7);
+    let back: BackupSection = serde_json::from_value(json).expect("deserialize");
+    assert_eq!(back, explicit.backup);
     let nulled: Config = serde_json::from_str(r#"{"backup": {"dir": null}}"#).expect("parse");
     assert!(nulled.backup.dir.is_none());
-    // Guards: zero cap rejected, empty dir rejected.
+    // Guards: zero cap rejected, over-ceiling cap rejected (fail closed,
+    // never silently the ceiling), empty dir rejected, zero retention
+    // rejected.
     let zero_cap = Config {
         backup: BackupSection {
             max_bundle_bytes: 0,
@@ -774,6 +807,30 @@ fn batch_h_backup_section_round_trip_and_guards() {
         ..Config::default()
     };
     assert!(zero_cap.validate().is_err());
+    let over_ceiling = Config {
+        backup: BackupSection {
+            max_bundle_bytes: crate::backup::HARD_BUNDLE_CEILING_BYTES + 1,
+            ..BackupSection::default()
+        },
+        ..Config::default()
+    };
+    assert!(over_ceiling.validate().is_err());
+    let zero_count = Config {
+        backup: BackupSection {
+            retention_max_count: Some(0),
+            ..BackupSection::default()
+        },
+        ..Config::default()
+    };
+    assert!(zero_count.validate().is_err());
+    let zero_bytes = Config {
+        backup: BackupSection {
+            retention_max_bytes: Some(0),
+            ..BackupSection::default()
+        },
+        ..Config::default()
+    };
+    assert!(zero_bytes.validate().is_err());
     let empty_dir = Config {
         backup: BackupSection {
             dir: Some(PathBuf::from("")),

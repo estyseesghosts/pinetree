@@ -7,7 +7,8 @@ use super::super::errors::{
     SendError, SendErrorKind, curl_error, io_send_error, is_timeout_kind, response_error,
 };
 use super::super::url::{
-    ParsedUrl, parse_http_url, resolve_and_validate_url, resolve_redirect_url,
+    BoundedDnsResolver, ParsedUrl, default_dns_resolver, parse_http_url,
+    resolve_and_validate_url_with_resolver, resolve_redirect_url,
 };
 use super::config::{SafeHttpConfig, SafeHttpResponse};
 use super::framing::{read_http_response, remaining_budget};
@@ -101,7 +102,7 @@ impl SafeHttpClient {
     }
 
     /// Perform an HTTP GET or POST with redirect following (GET only) and
-    /// response size enforcement.
+    /// response size enforcement, using the process-wide bounded DNS pool.
     pub fn send(
         &self,
         method: &str,
@@ -110,11 +111,36 @@ impl SafeHttpClient {
         body: Option<&[u8]>,
         max_response_bytes: usize,
     ) -> Result<SafeHttpResponse, SendError> {
+        self.send_with_resolver(
+            method,
+            url,
+            extra_headers,
+            body,
+            max_response_bytes,
+            default_dns_resolver(),
+        )
+    }
+
+    /// [`send`](Self::send) over an explicit bounded resolver pool (Phase 4
+    /// P1 test seam: scripted resolvers stall, fail, or return canned
+    /// addresses without touching the network). Every hop — including
+    /// redirect targets — is re-resolved through the same pool and
+    /// re-validated against SSRF rules.
+    pub fn send_with_resolver(
+        &self,
+        method: &str,
+        url: &str,
+        extra_headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+        max_response_bytes: usize,
+        resolver: &BoundedDnsResolver,
+    ) -> Result<SafeHttpResponse, SendError> {
         let mut current_url = url.to_string();
         let mut hops = 0usize;
 
         loop {
-            let (parsed, addrs) = resolve_and_validate_url(&current_url, &self.config)?;
+            let (parsed, addrs) =
+                resolve_and_validate_url_with_resolver(&current_url, &self.config, resolver)?;
             let resp = self.send_single_hop(
                 method,
                 &current_url,

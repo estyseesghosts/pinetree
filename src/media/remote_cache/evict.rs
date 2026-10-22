@@ -1,5 +1,6 @@
 use crate::application::commands::AppServices;
 use crate::application::ports::{CacheStats, MediaClass, PortError};
+use crate::media::storage::{acquire_blob_key, acquire_media_op};
 use std::collections::HashSet;
 
 /// Bound on eviction rounds per [`ensure_cache_budget`] call: the loop
@@ -19,6 +20,16 @@ const MAX_EVICTION_ROUNDS: usize = 64;
 /// accounting drops the bytes and counts the eviction. Terminates after
 /// [`MAX_EVICTION_ROUNDS`] re-reads; whatever still does not fit fails
 /// closed at the reservation.
+///
+/// Pool/refcount semantics (Phase 1 P0): the delete targets the cache pool
+/// (`services.cache_blobs`, a separate directory tree) and therefore can
+/// never remove durable bytes — durable rows live in `services.blobs` and
+/// are unreachable here. No zero-refcount precondition applies: eviction
+/// keeps the referencing rows by design (they become byte-less and
+/// re-fetchable), so a positive refcount is the normal case, not a reason
+/// to skip. What eviction MUST hold is the shared lifecycle gate plus the
+/// per-blob-key lock across the byte delete + accounting commit, serializing
+/// against concurrent fetches, deletes, and the exclusive orphan sweep.
 pub fn ensure_cache_budget(
     services: &AppServices,
     need_bytes: u64,
@@ -53,7 +64,11 @@ pub fn ensure_cache_budget(
             if !evicted_keys.insert(rec.blob_key.clone()) {
                 continue;
             }
-            // Bytes ONLY: metadata + index bookkeeping stay for re-fetch.
+            // Bytes ONLY + accounting, under the whole-transition hold:
+            // serialized against a concurrent fetch commit or delete for
+            // this key. Metadata + index bookkeeping stay for re-fetch.
+            let _lifecycle = acquire_media_op("cache_evict")?;
+            let _key_lock = acquire_blob_key(&rec.blob_key)?;
             services.cache_blobs.delete(&rec.blob_key)?;
             services.media.cache_accounting_apply(
                 -(rec.size_bytes as i64),

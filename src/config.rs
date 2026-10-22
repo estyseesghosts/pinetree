@@ -47,11 +47,36 @@ pub enum Rfc9421Mode {
 }
 
 /// Federation settings (nested `federation` section of the JSON config).
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FederationSection {
     /// RFC 9421 HTTP signature handling (`"permissive"` default, `"enforce"`).
     pub rfc9421_mode: Rfc9421Mode,
+    /// Hard maximum of concurrent in-flight DNS resolver calls/threads
+    /// (default 32). Saturation fails fast with a transient resource-busy
+    /// error instead of spawning another thread.
+    #[serde(default = "default_dns_max_in_flight")]
+    pub dns_max_in_flight: usize,
+}
+
+/// Default DNS resolver pool size (mirrors
+/// `federation::delivery::DEFAULT_MAX_DNS_IN_FLIGHT` without a dependency
+/// from the config crate surface).
+fn default_dns_max_in_flight() -> usize {
+    32
+}
+
+/// Maximum accepted DNS pool size (operator sanity bound; the resolver
+/// itself enforces the hard thread bound at whatever value is set).
+const MAX_DNS_MAX_IN_FLIGHT: usize = 256;
+
+impl Default for FederationSection {
+    fn default() -> Self {
+        Self {
+            rfc9421_mode: Rfc9421Mode::default(),
+            dns_max_in_flight: default_dns_max_in_flight(),
+        }
+    }
 }
 
 /// Diagnostic detail + log shape (nested `diagnostics` section of the JSON
@@ -89,8 +114,22 @@ pub struct BackupSection {
     /// Backup bundle + status directory override. `None` (default)
     /// resolves to `<data_dir>/backups`.
     pub dir: Option<PathBuf>,
-    /// Per-bundle staging cap in bytes (default 64 GiB). Must be `> 0`.
+    /// Per-bundle staging cap in bytes (default 64 GiB). Must be `> 0` and
+    /// within the immutable hard ceiling
+    /// (`backup::HARD_BUNDLE_CEILING_BYTES`); the enforced value is the
+    /// configured cap, never silently the ceiling.
     pub max_bundle_bytes: u64,
+    /// Backup rotation: keep at most this many completed bundles (`None`
+    /// default = keep all). When set, must be `>= 1`; pruning deletes only
+    /// older completed bundles and never the newest completed one, and a
+    /// failed backup never deletes anything. No age-based deletion is
+    /// implemented (retention is count/bytes only).
+    pub retention_max_count: Option<usize>,
+    /// Backup rotation: keep completed bundles within this total byte
+    /// budget (`None` default = unbounded). When set, must be `>= 1`;
+    /// pruning deletes the oldest completed bundles first and never the
+    /// newest completed one.
+    pub retention_max_bytes: Option<u64>,
 }
 
 fn default_backup_max_bundle_bytes() -> u64 {
@@ -102,6 +141,8 @@ impl Default for BackupSection {
         Self {
             dir: None,
             max_bundle_bytes: default_backup_max_bundle_bytes(),
+            retention_max_count: None,
+            retention_max_bytes: None,
         }
     }
 }
@@ -667,12 +708,29 @@ impl Config {
             .validate_ranges()
             .map_err(|err| format!("transcode: {err}"))?;
         // Backup output policy (Batch H): the staging cap must be
-        // positive, and an explicit dir must be a non-empty path. The cap
-        // is enforced again at bundle-creation time against the same
-        // constant family (`backup::bundle::MAX_BUNDLE_BYTES`); the config
-        // value lets operators tighten it per install.
-        if self.backup.max_bundle_bytes == 0 {
-            return Err("backup.max_bundle_bytes must be > 0".to_string());
+        // positive and within the immutable hard ceiling, and an explicit
+        // dir must be a non-empty path. The cap is enforced at
+        // bundle-creation and restore time against the same policy object;
+        // the config value lets operators tighten it per install. Retention
+        // bounds only shrink storage when explicitly set (`None` = keep).
+        if self.backup.max_bundle_bytes == 0
+            || self.backup.max_bundle_bytes > crate::backup::HARD_BUNDLE_CEILING_BYTES
+        {
+            return Err(
+                "backup.max_bundle_bytes must be within the hard bundle ceiling".to_string(),
+            );
+        }
+        if self.backup.retention_max_count == Some(0) {
+            return Err("backup.retention_max_count must be >= 1".to_string());
+        }
+        if self.backup.retention_max_bytes == Some(0) {
+            return Err("backup.retention_max_bytes must be >= 1".to_string());
+        }
+        // Federation DNS pool (Phase 4): a hard thread bound, always >= 1.
+        if self.federation.dns_max_in_flight == 0
+            || self.federation.dns_max_in_flight > MAX_DNS_MAX_IN_FLIGHT
+        {
+            return Err("federation.dns_max_in_flight must be within 1..=256".to_string());
         }
         if let Some(dir) = self.backup.dir.as_deref()
             && dir.as_os_str().is_empty()
@@ -771,11 +829,14 @@ impl Config {
             "transcode_enabled": self.transcode.enabled,
             "transcode_ffmpeg_path_set": !self.transcode.ffmpeg_path.is_empty(),
             "rfc9421_mode": sig_mode,
+            "dns_max_in_flight": self.federation.dns_max_in_flight,
             "allow_local_http_for_testing": self.r#unsafe.allow_local_http_for_testing,
             "public_host_class": self.public_host_class().as_str(),
             "detailed_admin_status": self.diagnostics.detailed_admin_status,
             "structured_logging": self.diagnostics.structured_logging,
             "backup_max_bundle_bytes": self.backup.max_bundle_bytes,
+            "backup_retention_max_count": self.backup.retention_max_count,
+            "backup_retention_max_bytes": self.backup.retention_max_bytes,
             "backup_dir_configured": self.backup.dir.is_some(),
             "rate_limit_max_buckets": self.rate_limit.max_buckets,
             "rate_limit_max_auth_failures": self.rate_limit.max_auth_failures,

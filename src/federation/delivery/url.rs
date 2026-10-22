@@ -20,7 +20,12 @@
 //! - Response size limit (default 64 KiB for ActivityPub JSON, configurable
 //!   cap for media downloads).
 
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::Duration;
 
@@ -166,42 +171,264 @@ pub(crate) fn is_ip_literal_host(host: &str) -> bool {
     bare.parse::<std::net::IpAddr>().is_ok()
 }
 
-/// Resolve a host on a helper thread and wait at most `timeout`. A lookup
-/// that outlives the deadline is abandoned; its thread ends on its own when
-/// the system resolver returns.
-pub(crate) fn resolve_host_with_timeout(
-    host: &str,
-    port: u16,
-    timeout: Duration,
-) -> Result<Vec<SocketAddr>, SendError> {
-    let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<Vec<SocketAddr>>>();
-    let lookup = format!("{host}:{port}");
-    let _lookup_thread = std::thread::Builder::new()
-        .name("pinetree-dns".to_string())
-        .spawn(move || {
-            let result = lookup
-                .to_socket_addrs()
-                .map(|addrs| addrs.collect::<Vec<SocketAddr>>());
-            let _ = tx.send(result);
-        })
-        .map_err(|e| {
-            SendError::new(
-                SendErrorKind::Internal,
-                format!("spawn DNS lookup for {host}: {e}"),
-            )
-        })?;
-    match rx.recv_timeout(timeout) {
-        Ok(Ok(addrs)) => Ok(addrs),
-        Ok(Err(err)) => Err(classify_dns_error(host, &err)),
-        Err(RecvTimeoutError::Timeout) => Err(SendError::new(
-            SendErrorKind::Timeout,
-            format!("DNS resolution timed out for {host} after {timeout:?}"),
-        )),
-        Err(RecvTimeoutError::Disconnected) => Err(SendError::new(
-            SendErrorKind::Dns,
-            format!("DNS resolution failed for {host}"),
-        )),
+/// Hard ceiling on concurrent blocking resolver calls (Phase 4 P1).
+///
+/// Every outbound federation request resolves its host on a helper thread
+/// because the system resolver has no async cancel. Without a bound, hostile
+/// traffic that stalls DNS accumulates one live thread per request. The
+/// process-wide default pool caps that at this many threads; callers that
+/// need isolation (tests, dedicated workers) construct their own
+/// [`BoundedDnsResolver`].
+pub const DEFAULT_MAX_DNS_IN_FLIGHT: usize = 32;
+
+/// Policy for [`BoundedDnsResolver`]: the hard maximum of concurrent
+/// in-flight resolver calls. There is intentionally no unbounded queue: once
+/// every slot is held, new lookups fail fast with a transient
+/// [`SendErrorKind::ResourceBusy`] "saturated" error instead of spawning work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DnsResolverPolicy {
+    /// Hard maximum of concurrent resolver calls holding a slot.
+    pub max_in_flight: usize,
+}
+
+impl DnsResolverPolicy {
+    /// Build a policy, clamping degenerate values up to one slot (zero would
+    /// reject every lookup; there is no unbounded setting).
+    pub fn new(max_in_flight: usize) -> Self {
+        Self {
+            max_in_flight: max_in_flight.max(1),
+        }
     }
+}
+
+impl Default for DnsResolverPolicy {
+    fn default() -> Self {
+        Self {
+            max_in_flight: DEFAULT_MAX_DNS_IN_FLIGHT,
+        }
+    }
+}
+
+/// Injectable blocking hostname resolver (Phase 4 P1 test seam).
+///
+/// Production uses [`SystemResolver`]; tests substitute scripted resolvers
+/// that stall, fail, or return canned addresses without touching the network
+/// or the system resolver.
+pub trait DnsResolver: Send + Sync {
+    /// Blocking resolution, mirroring `ToSocketAddrs` failure modes
+    /// (NXDOMAIN vs. transient) so [`classify_dns_error`] keeps classifying
+    /// scripted failures exactly like real ones.
+    fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>>;
+}
+
+/// [`DnsResolver`] backed by the OS resolver (`ToSocketAddrs`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemResolver;
+
+impl DnsResolver for SystemResolver {
+    fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+        format!("{host}:{port}")
+            .to_socket_addrs()
+            .map(Iterator::collect)
+    }
+}
+
+#[derive(Debug)]
+struct ResolverSlots {
+    in_flight: usize,
+    shutdown: bool,
+}
+
+/// Permit holding one resolver slot until the blocking OS call actually
+/// returns. The guard moves into the resolver thread, so a caller timeout
+/// abandons only the wait on the result channel: the slot stays occupied
+/// while the stale thread is still blocked inside the resolver.
+#[derive(Debug)]
+struct ResolverSlotGuard {
+    slots: Arc<Mutex<ResolverSlots>>,
+}
+
+impl Drop for ResolverSlotGuard {
+    fn drop(&mut self) {
+        if let Ok(mut slots) = self.slots.lock() {
+            slots.in_flight = slots.in_flight.saturating_sub(1);
+        }
+    }
+}
+
+/// Bounded blocking-resolver pool (Phase 4 P1).
+///
+/// `resolve` acquires a slot *before* spawning, so saturation never creates
+/// a thread: at most `max_in_flight` resolver threads exist per pool, and
+/// every excess lookup fails fast without spawning replacement work.
+/// IP-literal hosts never reach the pool (see
+/// [`resolve_and_validate_url_with_resolver`]).
+pub struct BoundedDnsResolver {
+    resolver: Arc<dyn DnsResolver>,
+    max_in_flight: usize,
+    slots: Arc<Mutex<ResolverSlots>>,
+}
+
+impl std::fmt::Debug for BoundedDnsResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("BoundedDnsResolver");
+        debug.field("max_in_flight", &self.max_in_flight);
+        match self.slots.try_lock() {
+            Ok(slots) => {
+                debug
+                    .field("in_flight", &slots.in_flight)
+                    .field("shutdown", &slots.shutdown);
+            }
+            Err(_) => {
+                debug.field("slots", &"locked");
+            }
+        }
+        debug.finish()
+    }
+}
+
+impl BoundedDnsResolver {
+    /// Pool over the system resolver with the given policy.
+    pub fn new(policy: DnsResolverPolicy) -> Self {
+        Self::with_resolver(Arc::new(SystemResolver), policy)
+    }
+
+    /// Pool over an injectable resolver (scripted resolvers in tests).
+    pub fn with_resolver(resolver: Arc<dyn DnsResolver>, policy: DnsResolverPolicy) -> Self {
+        Self {
+            resolver,
+            max_in_flight: policy.max_in_flight.max(1),
+            slots: Arc::new(Mutex::new(ResolverSlots {
+                in_flight: 0,
+                shutdown: false,
+            })),
+        }
+    }
+
+    /// Number of resolver calls currently holding a slot (blocked inside the
+    /// resolver or racing a caller timeout).
+    pub fn in_flight(&self) -> usize {
+        self.slots.lock().map(|slots| slots.in_flight).unwrap_or(0)
+    }
+
+    /// Permanently reject new lookups with a transient error. In-flight calls
+    /// are unaffected and still drain their slots on completion. Idempotent.
+    pub fn shutdown(&self) {
+        if let Ok(mut slots) = self.slots.lock() {
+            slots.shutdown = true;
+        }
+    }
+
+    /// Resolve `host` with a caller-side deadline.
+    ///
+    /// The slot is acquired before any thread exists, so a saturated pool
+    /// fails fast here. After the spawn, `timeout` bounds only the caller's
+    /// wait: on expiry the caller gets [`SendErrorKind::Timeout`] while the
+    /// worker keeps its slot until the resolver returns, and its late answer
+    /// is discarded.
+    pub fn resolve(
+        &self,
+        host: &str,
+        port: u16,
+        timeout: Duration,
+    ) -> Result<Vec<SocketAddr>, SendError> {
+        {
+            let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+            if slots.shutdown {
+                return Err(SendError::new(
+                    SendErrorKind::ResourceBusy,
+                    format!("DNS resolver is shut down; rejecting lookup for {host}"),
+                ));
+            }
+            if slots.in_flight >= self.max_in_flight {
+                return Err(SendError::new(
+                    SendErrorKind::ResourceBusy,
+                    format!(
+                        "DNS resolver saturated ({}/{}); rejecting lookup for {host}",
+                        slots.in_flight, self.max_in_flight
+                    ),
+                ));
+            }
+            slots.in_flight += 1;
+        }
+        // The guard travels with the work: a caller timeout below drops only
+        // the channel receiver, never this permit.
+        let guard = ResolverSlotGuard {
+            slots: Arc::clone(&self.slots),
+        };
+        let (tx, rx) = std::sync::mpsc::channel::<io::Result<Vec<SocketAddr>>>();
+        let resolver = Arc::clone(&self.resolver);
+        let lookup_host = host.to_string();
+        std::thread::Builder::new()
+            .name("pinetree-dns".to_string())
+            .spawn(move || {
+                let _guard = guard;
+                let result = resolver.resolve(&lookup_host, port);
+                let _ = tx.send(result);
+            })
+            .map_err(|e| {
+                // The closure (and its guard) drops here without running, so
+                // the slot acquired above is released by `Drop`.
+                SendError::new(
+                    SendErrorKind::ResourceBusy,
+                    format!("spawn DNS lookup for {host}: {e}"),
+                )
+            })?;
+        match rx.recv_timeout(timeout) {
+            Ok(Ok(addrs)) => Ok(addrs),
+            Ok(Err(err)) => Err(classify_dns_error(host, &err)),
+            Err(RecvTimeoutError::Timeout) => Err(SendError::new(
+                SendErrorKind::Timeout,
+                format!("DNS resolution timed out for {host} after {timeout:?}"),
+            )),
+            Err(RecvTimeoutError::Disconnected) => Err(SendError::new(
+                SendErrorKind::Dns,
+                format!("DNS resolution failed for {host}"),
+            )),
+        }
+    }
+}
+
+/// Process-wide resolver pool behind the default
+/// [`SafeHttpClient`](super::client::SafeHttpClient) path, so every
+/// production lookup shares one hard thread bound.
+///
+/// The pool size comes from `Config::federation.dns_max_in_flight`, published
+/// here by the binary startup path ([`configure_dns_pool`]) before serving.
+/// Tests and binaries that never configure it get [`DEFAULT_MAX_DNS_IN_FLIGHT`].
+static DNS_POOL_SIZE_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
+
+/// Publish the configured DNS resolver pool size for the process-wide pool.
+///
+/// Must be called before the first lookup (the binary calls it at startup
+/// from the validated config; a late call after the pool initialized is a
+/// no-op returning `false`). Values below 1 clamp to 1; there is no
+/// unbounded setting.
+pub fn configure_dns_pool(max_in_flight: usize) -> bool {
+    if dns_pool_cell().get().is_some() {
+        return false;
+    }
+    DNS_POOL_SIZE_OVERRIDE.store(max_in_flight.max(1), Ordering::SeqCst);
+    true
+}
+
+fn dns_pool_cell() -> &'static OnceLock<BoundedDnsResolver> {
+    static GLOBAL: OnceLock<BoundedDnsResolver> = OnceLock::new();
+    &GLOBAL
+}
+
+/// Pool size for the process-wide resolver: the configured override when
+/// set before first use, else [`DEFAULT_MAX_DNS_IN_FLIGHT`].
+fn default_pool_size() -> usize {
+    match DNS_POOL_SIZE_OVERRIDE.load(Ordering::SeqCst) {
+        0 => DEFAULT_MAX_DNS_IN_FLIGHT,
+        configured => configured,
+    }
+}
+
+pub(crate) fn default_dns_resolver() -> &'static BoundedDnsResolver {
+    dns_pool_cell()
+        .get_or_init(|| BoundedDnsResolver::new(DnsResolverPolicy::new(default_pool_size())))
 }
 
 /// Map a resolver failure to a kind. NXDOMAIN is permanent; every other
@@ -224,10 +451,24 @@ pub(crate) fn classify_dns_error(host: &str, err: &std::io::Error) -> SendError 
 }
 
 /// Resolve a URL's host and validate that none of its resolved socket
-/// addresses violate SSRF rules.
+/// addresses violate SSRF rules, using the process-wide bounded resolver
+/// pool.
 pub fn resolve_and_validate_url(
     url: &str,
     cfg: &SafeHttpConfig,
+) -> Result<(ParsedUrl, Vec<SocketAddr>), SendError> {
+    resolve_and_validate_url_with_resolver(url, cfg, default_dns_resolver())
+}
+
+/// [`resolve_and_validate_url`] over an explicit bounded pool (Phase 4 P1
+/// test seam: redirect targets are re-resolved through the same pool).
+/// SSRF and IP-literal validation are identical to the default path:
+/// literals never touch DNS, and every resolved address of a DNS name is
+/// checked unless the host is allowlisted.
+pub fn resolve_and_validate_url_with_resolver(
+    url: &str,
+    cfg: &SafeHttpConfig,
+    resolver: &BoundedDnsResolver,
 ) -> Result<(ParsedUrl, Vec<SocketAddr>), SendError> {
     let parsed = parse_http_url(url).map_err(|e| SendError::new(SendErrorKind::InvalidUrl, e))?;
     let host_allowed = cfg.allow_private_ips
@@ -246,7 +487,7 @@ pub fn resolve_and_validate_url(
         return Ok((parsed.clone(), vec![SocketAddr::new(ip, parsed.port)]));
     }
 
-    let addrs = resolve_host_with_timeout(&parsed.host, parsed.port, cfg.dns_timeout)?;
+    let addrs = resolver.resolve(&parsed.host, parsed.port, cfg.dns_timeout)?;
     if addrs.is_empty() {
         return Err(SendError::new(
             SendErrorKind::Dns,

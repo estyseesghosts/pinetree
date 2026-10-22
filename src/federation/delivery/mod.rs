@@ -36,7 +36,9 @@ pub use self::resolve::{
 };
 pub use self::sign::{format_http_date, signed_get_json, signed_post_activity};
 pub use self::url::{
-    ParsedUrl, is_private_or_reserved_ip, parse_http_url, resolve_and_validate_url,
+    BoundedDnsResolver, DEFAULT_MAX_DNS_IN_FLIGHT, DnsResolver, DnsResolverPolicy, ParsedUrl,
+    SystemResolver, configure_dns_pool, is_private_or_reserved_ip, parse_http_url,
+    resolve_and_validate_url,
 };
 
 pub use self::client::set_extra_ca;

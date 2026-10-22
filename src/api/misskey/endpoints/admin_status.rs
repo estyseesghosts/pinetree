@@ -191,7 +191,13 @@ pub(crate) fn build_admin_status(state: &ApiState, detailed: bool) -> Value {
     let redb_readable = state.services.instance_settings.get().is_ok();
     let cache = state.services.media.cache_stats().ok();
     let pending_jobs = state.services.jobs.pending_count().ok();
-    let (backups, last_backup_success_ms) = match read_backup_context() {
+    let (
+        backups,
+        last_backup_success_ms,
+        last_backup_failure_ms,
+        last_backup_duration_ms,
+        last_backup_bytes_written,
+    ) = match read_backup_context() {
         Some(context) => {
             let mut statuses = crate::backup::list_backup_statuses(&context.backup_dir);
             statuses.truncate(STATUS_BACKUP_LIST_CAP * 4);
@@ -200,18 +206,57 @@ pub(crate) fn build_admin_status(state: &ApiState, detailed: bool) -> Value {
                 .filter(|s| s.state == crate::backup::BackupState::Completed)
                 .filter_map(|s| s.finished_ms)
                 .max();
+            let last_failure = statuses
+                .iter()
+                .filter(|s| s.state == crate::backup::BackupState::Failed)
+                .filter_map(|s| s.finished_ms)
+                .max();
             let recent: Vec<Value> = statuses
                 .iter()
                 .rev()
                 .take(STATUS_BACKUP_LIST_CAP)
                 .map(pack_backup_status)
                 .collect();
+            // Duration of the most recently finished terminal run
+            // (success or failure) and output bytes of the most recently
+            // completed run: bounded scans over the same loaded statuses,
+            // no extra I/O. `None` until a run finishes / completes.
+            let mut last_duration_ms: Option<u64> = None;
+            let mut last_finished_ms: Option<u64> = None;
+            for candidate in statuses.iter().filter_map(|s| {
+                s.finished_ms.map(|finished| {
+                    (
+                        finished,
+                        s.started_ms.map(|started| finished.saturating_sub(started)),
+                    )
+                })
+            }) {
+                if last_finished_ms.is_none_or(|best| candidate.0 >= best) {
+                    last_finished_ms = Some(candidate.0);
+                    last_duration_ms = candidate.1;
+                }
+            }
+            let last_completed_bytes: Option<u64> = statuses
+                .iter()
+                .filter(|s| s.state == crate::backup::BackupState::Completed)
+                .filter_map(|s| s.finished_ms.map(|finished| (finished, s.bytes_written)))
+                .max_by_key(|(finished, _)| *finished)
+                .and_then(|(_, bytes)| bytes);
             (
                 Value::Array(recent),
                 last_success.map(Value::from).unwrap_or(Value::Null),
+                last_failure.map(Value::from).unwrap_or(Value::Null),
+                last_duration_ms.map(Value::from).unwrap_or(Value::Null),
+                last_completed_bytes.map(Value::from).unwrap_or(Value::Null),
             )
         }
-        None => (Value::Null, Value::Null),
+        None => (
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ),
     };
     let mut status = serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
@@ -244,16 +289,30 @@ pub(crate) fn build_admin_status(state: &ApiState, detailed: bool) -> Value {
             }),
             None => Value::Null,
         },
-        // Honest nulls (unknown is data, never a guess): no
-        // total-durable-bytes or free-disk API exists on the current ports
-        // (no new dependency or pool walk per request), no maintained
-        // backfill/reconcile timestamp is kept yet, and per-kind job
-        // breakdowns, oldest-pending age, quarantine counts, delivery
-        // aggregates, and redb file bytes all need parent-owned port
-        // getters (see the Batch H report snippets). `DestinationTracker`
-        // exposes per-host health only (no aggregate export on the
-        // parent-owned type): destination detail stays per-host and out of
-        // this surface.
+        // Honest nulls (unknown is data, never a guess). Each unavailable
+        // aggregate names the parent-owned port getter that would be needed
+        // to compute it without a walk/scan per request; until those land,
+        // the key stays an explicit null so UI/docs must say "unavailable":
+        // - `durableUsedBytes`: needs a total-durable-bytes getter
+        //   (`MediaStore::durable_bytes` is per-owner only).
+        // - `freeDiskBytes`: needs a filesystem-space probe (no dependency
+        //   for it; a pool walk per request is refused).
+        // - `accountingDrift`: needs persisted reconciler drift counters
+        //   (the reconciler only returns ephemeral reports today).
+        // - `lastBackfill` / `lastReconcile`: need persisted run
+        //   timestamps for the storage jobs (none are recorded yet).
+        // - `jobBreakdown` / `oldestPendingMs`: need job enumeration by
+        //   kind/age (`JobQueue` exposes `pending_count` only).
+        // - `quarantine`: needs quarantine enumeration/reasons
+        //   (`JobQueue` keeps quarantined rows inspectable via `get_job`
+        //   by id only).
+        // - `federationDelivery`: needs an aggregate export on the
+        //   parent-owned `DestinationTracker` (per-host health only).
+        // `lastBackup*` below ARE actionable: they derive from the same
+        // bounded status-file load as `backups` (already capped), and the
+        // cache `*Bytes`/`evictions` arms expose per-class use plus
+        // pressure. No table walk, `check_integrity`, network fetch, or
+        // recursive hash runs per request.
         "durableUsedBytes": Value::Null,
         "freeDiskBytes": Value::Null,
         "accountingDrift": Value::Null,
@@ -284,6 +343,9 @@ pub(crate) fn build_admin_status(state: &ApiState, detailed: bool) -> Value {
         }),
         "backups": backups,
         "lastBackupSuccessMs": last_backup_success_ms,
+        "lastBackupFailureMs": last_backup_failure_ms,
+        "lastBackupDurationMs": last_backup_duration_ms,
+        "lastBackupBytesWritten": last_backup_bytes_written,
         "transcode": { "enabled": ops.transcode_enabled, "status": ops.ffmpeg_status },
     });
     if detailed {

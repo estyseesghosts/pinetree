@@ -7,6 +7,7 @@ use crate::domain::media::{MediaMeta, MediaProperties, sniff_mime};
 use crate::federation::delivery::{SafeHttpClient, parse_http_url, resolve_and_validate_url};
 use crate::media::fetch_stream::stream_response_to_store;
 use crate::media::ingest::{md5_hex, sanitize_filename, sha256_hex};
+use crate::media::storage::{acquire_blob_key, acquire_media_op};
 
 /// Variant key for the original bytes (what the `GET /files/:id` handler
 /// asks for and what the fetch job caches).
@@ -165,13 +166,22 @@ pub(crate) fn fetch_and_index_remote_media(
     };
     let actual = prepared.bytes.len() as u64;
 
-    // Stage to disk under the cap, then import into the cache pool.
+    // Stage to disk under the cap (no locks held: pure fs + hashing of the
+    // already-fetched bytes). The coordinated commit below is the only
+    // section that touches shared pool/accounting state, and no redb
+    // transaction ever spans the network fetch above.
     // (`SafeHttpClient` still buffers the body; the disk stage + cap
     // re-enforcement + `import_file` are real, the end-to-end streaming
     // transport is a follow-up.) The staging directory is a process-temp
     // fallback: a pool-owned staging dir needs a `BlobStore` tmp-dir
     // accessor the trait does not expose yet.
-    let staged = match (|| -> Result<crate::media::fetch_stream::StreamFetchResult, PortError> {
+    let (tmp_path, staged) = match (|| -> Result<
+        (
+            std::path::PathBuf,
+            crate::media::fetch_stream::StreamFetchResult,
+        ),
+        PortError,
+    > {
         let tmp_dir = std::env::temp_dir().join("pinetree-remote-cache");
         let (tmp_path, staged) =
             stream_response_to_store(&prepared.bytes[..], max_bytes, &tmp_dir)?;
@@ -181,15 +191,7 @@ pub(crate) fn fetch_and_index_remote_media(
                 "staged remote-media bytes failed hash check".to_string(),
             ));
         }
-        // `BlobStore::import_file` dispatches to the filesystem rename
-        // path on `FsBlobStore`; the staged file is removed either way
-        // (post-rename the remove is a harmless miss).
-        let out = services
-            .cache_blobs
-            .import_file(&prepared.blob_key, &tmp_path);
-        let _ = std::fs::remove_file(&tmp_path);
-        out?;
-        Ok(staged)
+        Ok((tmp_path, staged))
     })() {
         Ok(staged) => staged,
         Err(e) => {
@@ -199,11 +201,43 @@ pub(crate) fn fetch_and_index_remote_media(
     };
     let class = force_class.unwrap_or_else(|| MediaClass::classify_mime(&staged.mime));
 
+    // Coordinated commit under the shared lifecycle gate + per-blob-key
+    // lock: the stage above ran unlocked, so a concurrent fetch of the same
+    // URL may have completed meanwhile — recheck the index and reuse the
+    // winner instead of double-installing and double-accounting. The inner
+    // `import_file` re-acquire nests safely (counted no-op). Bytes always
+    // land in the cache pool (`cache_blobs`), never the durable pool.
+    let _lifecycle = acquire_media_op("fetch_commit")?;
+    let _key_lock = acquire_blob_key(&prepared.blob_key)?;
+    if let Some(rec) = services.media.remote_cache_lookup(source_url, variant)?
+        && services.cache_blobs.byte_len(&rec.blob_key)?.is_some()
+    {
+        let _ = std::fs::remove_file(&tmp_path);
+        services
+            .media
+            .remote_cache_touch(source_url, variant, services.clock.now_ms())?;
+        services
+            .media
+            .cache_accounting_apply(0, rec.class, 0, 1, 0, 0, 0, 0)?;
+        if let Some(meta) = services.media.get(&rec.media_id)? {
+            let _ = services.media.release_cache_reservation(max_bytes);
+            return Ok(meta);
+        }
+    }
+
     // Metadata + index + accounting. These are separate store calls (no
     // cross-table transaction on the trait): a crash between them heals
     // via the reconciler (dangling meta without index re-fetches on next
     // lookup miss; production backends should co-locate them).
     let stored = (|| -> Result<MediaMeta, PortError> {
+        // `BlobStore::import_file` dispatches to the filesystem rename
+        // path on `FsBlobStore`; the staged file is removed either way
+        // (post-rename the remove is a harmless miss).
+        let out = services
+            .cache_blobs
+            .import_file(&prepared.blob_key, &tmp_path);
+        let _ = std::fs::remove_file(&tmp_path);
+        out?;
         let media_id = services.ids.generate();
         let local_url = format!(
             "{}/files/{media_id}",

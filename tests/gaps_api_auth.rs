@@ -97,6 +97,12 @@ fn make_user(services: &AppServices, username: &str, password: &str) -> String {
     account.id
 }
 
+/// Issue a one-time second-factor challenge (Phase 2 P0: `authenticate_2fa`
+/// never accepts a bare `account + token` pair).
+fn issue_challenge(services: &AppServices, account_id: &str) -> String {
+    services.issue_totp_challenge(account_id).unwrap()
+}
+
 fn code_of(err: PortError) -> String {
     match err {
         PortError::Validation(msg) | PortError::Conflict(msg) | PortError::NotFound(msg) => {
@@ -142,10 +148,18 @@ fn totp_register_and_done_flow() {
         "INVALID_PARAM"
     );
 
-    // authenticate_2fa accepts the live token.
-    services.authenticate_2fa(&alice, &token).unwrap();
+    // authenticate_2fa accepts the live token under an issued challenge.
+    let challenge = issue_challenge(&services, &alice);
+    services
+        .authenticate_2fa(&alice, &challenge, &token)
+        .unwrap();
+    let challenge = issue_challenge(&services, &alice);
     assert_eq!(
-        code_of(services.authenticate_2fa(&alice, bad).unwrap_err()),
+        code_of(
+            services
+                .authenticate_2fa(&alice, &challenge, bad)
+                .unwrap_err()
+        ),
         "INVALID_TOKEN"
     );
 }
@@ -173,17 +187,27 @@ fn totp_key_done_passwordless_unregister_rotate() {
     let enrol2 = services.rotate_2fa_key(&bob, "s3cret!").unwrap();
     assert_ne!(enrol.secret, enrol2.secret);
     assert_eq!(
-        code_of(services.authenticate_2fa(&bob, &token).unwrap_err()),
+        code_of(
+            services
+                .authenticate_2fa(&bob, &issue_challenge(&services, &bob), &token)
+                .unwrap_err()
+        ),
         "NO_SUCH_2FA"
     );
     let token2 = totp_token(&enrol2.secret, now_secs).unwrap();
     services.done_2fa(&bob, &token2).unwrap();
-    services.authenticate_2fa(&bob, &token2).unwrap();
+    services
+        .authenticate_2fa(&bob, &issue_challenge(&services, &bob), &token2)
+        .unwrap();
 
     // unregister drops the row; further use is NO_SUCH_2FA.
     services.unregister_2fa(&bob, "s3cret!").unwrap();
     assert_eq!(
-        code_of(services.authenticate_2fa(&bob, &token).unwrap_err()),
+        code_of(
+            services
+                .authenticate_2fa(&bob, &issue_challenge(&services, &bob), &token)
+                .unwrap_err()
+        ),
         "NO_SUCH_2FA"
     );
     assert_eq!(
@@ -273,7 +297,11 @@ fn admin_unset_2fa_clears_without_password() {
     assert_eq!(
         code_of(
             services
-                .authenticate_2fa(&erin, &totp_token(&enrol.secret, now_secs).unwrap())
+                .authenticate_2fa(
+                    &erin,
+                    &issue_challenge(&services, &erin),
+                    &totp_token(&enrol.secret, now_secs).unwrap()
+                )
                 .unwrap_err()
         ),
         "NO_SUCH_2FA"

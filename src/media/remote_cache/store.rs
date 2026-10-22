@@ -151,7 +151,11 @@ fn fetch_and_attach_remote_media(
     )?;
     // Per-note row sharing the canonical bytes (new id + note-local URL,
     // same blob key; the backend refcounts the key). No cache accounting
-    // here: the bytes were already counted once by the fetch core.
+    // here: the bytes were already counted once by the fetch core. The
+    // whole-transition hold serializes this insert against concurrent
+    // deletes, evictions, and the exclusive sweep for the same key.
+    let _lifecycle = crate::media::storage::acquire_media_op("fetch_attach")?;
+    let _key_lock = crate::media::storage::acquire_blob_key(&canonical.blob_key)?;
     let media_id = services.ids.generate();
     let local_url = format!(
         "{}/files/{media_id}",

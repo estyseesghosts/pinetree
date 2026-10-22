@@ -1,6 +1,18 @@
 //! Admin dispatcher arms (roles).
 //!
 //! Split from `endpoints/dispatch_admin.rs` (decomposition). Pure move, no behavior change.
+//!
+//! STORAGE-ONLY CONTRACT: custom roles are persisted metadata (name,
+//! membership, display policy documents) and are NOT an authorization
+//! boundary. Authorization stays on the built-in `is_admin` /
+//! `is_moderator` flags (`require_admin` / `require_moderator` plus
+//! token-permission checks). Assigning a role — even one whose `policies`
+//! claim broad powers — grants no API capability, and no protected action
+//! consults role membership. See
+//! [`crate::domain::admin::ROLE_POLICY_UNENFORCED_NOTE`]. If enforcement is
+//! ever implemented it must go through one central permission evaluator
+//! with negative tests per protected action, never sprinkled per-handler
+//! role checks.
 
 #![allow(unused_imports)]
 use super::super::ApiState;
@@ -104,7 +116,9 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Pack one role row (admin `roles/*` shape).
+/// Pack one role row (admin `roles/*` shape). `policies` round-trips
+/// verbatim and is storage-only: see the module contract — clients must
+/// never present it as enforced access control.
 pub(crate) fn pack_role_record(record: &crate::domain::admin::RoleRecord) -> Value {
     serde_json::json!({
         "id": record.id,
@@ -123,6 +137,8 @@ pub(crate) fn pack_role_record(record: &crate::domain::admin::RoleRecord) -> Val
 }
 
 /// `POST /api/admin/roles/create` (split from `api_dispatch_blocking`).
+/// Storage-only: the returned `policies` document is recorded, not
+/// enforced (module contract).
 pub(crate) fn admin_roles_create(
     state: &ApiState,
     obj: &serde_json::Map<String, serde_json::Value>,
@@ -296,6 +312,8 @@ pub(crate) fn admin_roles_update(
 }
 
 /// `POST /api/admin/roles/assign` (split from `api_dispatch_blocking`).
+/// Storage-only: records membership, grants no authorization (module
+/// contract). A role assignee gains no admin capability from this call.
 pub(crate) fn admin_roles_assign(
     state: &ApiState,
     obj: &serde_json::Map<String, serde_json::Value>,

@@ -51,6 +51,10 @@ pub const MAX_TABLE_ROW_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_TABLE_FILE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// Whole-bundle cap (also bounds restore reads).
 pub const MAX_BUNDLE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+/// Immutable hard safety ceiling for any bundle: no configuration may raise
+/// it. [`MAX_BUNDLE_BYTES`] is the ceiling; [`BackupPolicy`] may only
+/// tighten the enforced cap.
+pub const HARD_BUNDLE_CEILING_BYTES: u64 = MAX_BUNDLE_BYTES;
 /// Manifest cap (counts + checksums only; a larger manifest is corrupt).
 pub const MAX_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
 /// Table-entry file magic.
@@ -64,6 +68,56 @@ pub fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     hex::encode(hasher.finalize())
+}
+
+/// Effective bundle-size policy: the configured `backup.max_bundle_bytes`
+/// cap clamped to the immutable hard ceiling. Construct via
+/// [`BackupPolicy::from_config_value`]; the writer and restore paths consult
+/// [`BackupPolicy::cap`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackupPolicy {
+    pub max_bundle_bytes: u64,
+}
+
+impl Default for BackupPolicy {
+    fn default() -> Self {
+        Self {
+            max_bundle_bytes: MAX_BUNDLE_BYTES,
+        }
+    }
+}
+
+impl BackupPolicy {
+    /// Resolve the configured file value (`None` = unset) into an enforced
+    /// cap. `0` and anything above the hard ceiling fail closed instead of
+    /// silently ignoring the setting.
+    pub fn from_config_value(configured: Option<u64>) -> Result<Self, BackupError> {
+        match configured {
+            None => Ok(Self::default()),
+            Some(0) => Err(BackupError::Invalid(
+                "backup.max_bundle_bytes must be > 0".to_string(),
+            )),
+            Some(v) if v > MAX_BUNDLE_BYTES => Err(BackupError::Invalid(
+                "backup.max_bundle_bytes exceeds the hard bundle ceiling".to_string(),
+            )),
+            Some(v) => Ok(Self {
+                max_bundle_bytes: v,
+            }),
+        }
+    }
+
+    /// Enforced cap, clamped to the hard ceiling even for a literally
+    /// constructed policy.
+    pub fn cap(&self) -> u64 {
+        self.max_bundle_bytes.min(MAX_BUNDLE_BYTES)
+    }
+}
+
+/// Policy for a [`BackupContext`]: the configured `max_bundle_bytes` when
+/// present and valid, else the hard ceiling. Invalid direct constructions
+/// fail closed to the ceiling (startup `validate()` rejects them first).
+pub fn policy_for_context(ctx: &BackupContext) -> BackupPolicy {
+    BackupPolicy::from_config_value(ctx.max_bundle_bytes).unwrap_or_default()
 }
 
 /// One table's manifest line.
@@ -148,6 +202,7 @@ pub fn compute_overall(
 }
 
 /// Outcome of [`create_bundle`] (safe to log: names/counts only).
+#[derive(Debug, Clone)]
 pub struct BundleOutcome {
     pub file_name: String,
     pub bytes_written: u64,
@@ -233,8 +288,8 @@ fn zip_options_deflated() -> zip::write::SimpleFileOptions {
 }
 
 /// Estimate source bytes (db file + pool trees) for the pre-flight disk
-/// guard. This bounds the staging output against [`MAX_BUNDLE_BYTES`]; true
-/// free-space probing is the operator's job (see the cutover snippet).
+/// guard. This bounds the staging output against the [`BackupPolicy`] cap;
+/// true free-space probing is the operator's job (see the cutover snippet).
 fn estimate_source_bytes(ctx: &BackupContext) -> Result<u64, BackupError> {
     let mut total = std::fs::metadata(ctx.store.path())
         .map(|m| m.len())
@@ -251,9 +306,12 @@ fn estimate_source_bytes(ctx: &BackupContext) -> Result<u64, BackupError> {
 /// Incremental per-table sink: one open zip entry per table plus a running
 /// hasher, so memory stays flat regardless of table size. Tables must arrive
 /// in registry order without interleaving (guaranteed by
-/// `export_backup_snapshot`, enforced here).
+/// `export_backup_snapshot`, enforced here). Every streamed byte also
+/// counts against the bundle [`BackupPolicy`] cap.
 struct TableSink<'w> {
     writer: &'w mut zip::ZipWriter<std::fs::File>,
+    cap: u64,
+    grand_total: u64,
     current_name: Option<String>,
     current_hasher: Sha256,
     current_bytes: u64,
@@ -263,9 +321,11 @@ struct TableSink<'w> {
 }
 
 impl<'w> TableSink<'w> {
-    fn new(writer: &'w mut zip::ZipWriter<std::fs::File>) -> Self {
+    fn new(writer: &'w mut zip::ZipWriter<std::fs::File>, cap: u64) -> Self {
         Self {
             writer,
+            cap,
+            grand_total: 0,
             current_name: None,
             current_hasher: Sha256::new(),
             current_bytes: 0,
@@ -273,6 +333,17 @@ impl<'w> TableSink<'w> {
             seen: BTreeSet::new(),
             manifests: Vec::new(),
         }
+    }
+
+    fn budget(&mut self, n: u64) -> Result<(), crate::application::ports::PortError> {
+        use crate::application::ports::PortError;
+        self.grand_total = self.grand_total.saturating_add(n);
+        if self.grand_total > self.cap {
+            return Err(PortError::StorageUnavailable(
+                "backup bundle exceeds size cap".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     fn emit(
@@ -312,6 +383,7 @@ impl<'w> TableSink<'w> {
         rec.extend_from_slice(&(value.len() as u32).to_le_bytes());
         rec.extend_from_slice(&key);
         rec.extend_from_slice(&value);
+        self.budget(rec.len() as u64)?;
         self.writer
             .write_all(&rec)
             .map_err(|e| PortError::StorageUnavailable(format!("write table row: {e}")))?;
@@ -352,7 +424,7 @@ impl<'w> TableSink<'w> {
         Ok(())
     }
 
-    fn finish(mut self) -> Result<Vec<TableManifest>, BackupError> {
+    fn finish(mut self) -> Result<(Vec<TableManifest>, u64), BackupError> {
         self.finish_current()
             .map_err(|e| BackupError::Storage(format!("finish table stream: {e}")))?;
         // Materialize every registry table, even empty ones: restore
@@ -383,15 +455,40 @@ impl<'w> TableSink<'w> {
                 bytes: TABLE_MAGIC.len() as u64,
                 sha256: hex::encode(hasher.finalize()),
             });
+            self.grand_total = self.grand_total.saturating_add(TABLE_MAGIC.len() as u64);
+            if self.grand_total > self.cap {
+                return Err(BackupError::Storage(
+                    "backup bundle exceeds size cap".to_string(),
+                ));
+            }
         }
-        Ok(self.manifests)
+        Ok((self.manifests, self.grand_total))
     }
 }
 
-/// Build the bundle: exclusive gate → one consistent redb snapshot → pool
-/// copies → manifest → sync+verify → atomic publish. Any failure leaves the
-/// staging file (never the final name) for startup cleanup.
+/// Build the bundle: exclusive gate → one consistent redb snapshot (tables
+/// plus media inventory from the SAME read transaction) → pool copies →
+/// manifest → sync+verify → atomic publish. Any failure removes the staging
+/// file (never the final name) so a failed backup is never listed as
+/// completed; startup cleanup handles only process-kill leftovers.
 pub fn create_bundle(ctx: &BackupContext, job_id: &str) -> Result<BundleOutcome, BackupError> {
+    create_bundle_with_policy(ctx, job_id, policy_for_context(ctx))
+}
+
+/// [`create_bundle`] with an explicit [`BackupPolicy`] (tests and the future
+/// `config.rs`/`main.rs` wiring; [`create_bundle`] defaults to the hard
+/// ceiling until the context carries the setting).
+pub fn create_bundle_with_policy(
+    ctx: &BackupContext,
+    job_id: &str,
+    policy: BackupPolicy,
+) -> Result<BundleOutcome, BackupError> {
+    let cap = policy.cap();
+    if cap == 0 || cap > MAX_BUNDLE_BYTES {
+        return Err(BackupError::Invalid(
+            "backup policy exceeds the hard bundle ceiling".to_string(),
+        ));
+    }
     let wait_before = media_gate_snapshot().wait_ms_total;
     let _gate = crate::media::storage::acquire_backup_gate(job_id).map_err(|busy| {
         BackupError::Busy(format!(
@@ -400,7 +497,7 @@ pub fn create_bundle(ctx: &BackupContext, job_id: &str) -> Result<BundleOutcome,
         ))
     })?;
     let estimated = estimate_source_bytes(ctx)?;
-    if estimated > MAX_BUNDLE_BYTES {
+    if estimated > cap {
         return Err(BackupError::Invalid(
             "backup source estimate exceeds bundle cap".to_string(),
         ));
@@ -410,34 +507,82 @@ pub fn create_bundle(ctx: &BackupContext, job_id: &str) -> Result<BundleOutcome,
         super::BACKUP_PARTIAL_PREFIX,
         super::BACKUP_FILE_SUFFIX
     ));
-    let file = std::fs::File::create(&staging)
+    let outcome = build_and_publish(ctx, job_id, &staging, cap, wait_before);
+    if outcome.is_err() {
+        // Ordinary failures clean their staging file synchronously (the
+        // writer is dropped by now, so the Windows delete cannot hit a live
+        // handle); only a killed process leaves partials for startup
+        // cleanup.
+        let _ = std::fs::remove_file(&staging);
+    }
+    outcome
+}
+
+/// Best-effort containing-directory sync after publication (durable rename).
+/// Failures are ignored: the rename itself is the atomic commit, and this
+/// best-effort call must not fail a verified bundle on platforms where a
+/// directory handle cannot be opened for syncing.
+fn sync_parent_dir(path: &Path) {
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+}
+
+fn build_and_publish(
+    ctx: &BackupContext,
+    job_id: &str,
+    staging: &Path,
+    cap: u64,
+    wait_before: u64,
+) -> Result<BundleOutcome, BackupError> {
+    let file = std::fs::File::create(staging)
         .map_err(|e| BackupError::Storage(format!("create staging bundle: {e}")))?;
     let mut writer = zip::ZipWriter::new(file);
 
-    // --- Tables: one consistent read txn, streamed entry by entry. ---
-    let mut table_manifests = {
-        let mut sink = TableSink::new(&mut writer);
+    // --- Tables + media inventory from ONE consistent read transaction. ---
+    // `export_backup_snapshot` streams every registry table inside a single
+    // redb read transaction; the emit closure additionally collects every
+    // non-evicted media reference it sees, so the inventory describes the
+    // exported rows exactly (no second paged scan that could describe a
+    // different database state). A durable owner anywhere on a shared key
+    // makes the key durable (bytes must live in the durable pool).
+    let mut referenced: BTreeSet<String> = BTreeSet::new();
+    let mut durable_keys: BTreeSet<String> = BTreeSet::new();
+    let (mut table_manifests, mut grand_total) = {
+        let mut sink = TableSink::new(&mut writer, cap);
         ctx.store
-            .export_backup_snapshot(&mut |table, key, value| sink.emit(table, key, value))
+            .export_backup_snapshot(&mut |table, key, value| {
+                if table == "media_meta"
+                    && let Ok(meta) =
+                        serde_json::from_slice::<crate::domain::media::MediaMeta>(&value)
+                    && !meta.evicted
+                    && !meta.blob_key.is_empty()
+                {
+                    referenced.insert(meta.blob_key.clone());
+                    if meta.owner_id.is_some() {
+                        durable_keys.insert(meta.blob_key.clone());
+                    }
+                }
+                sink.emit(table, key, value)
+            })
             .map_err(|e| BackupError::Storage(format!("export snapshot: {e}")))?;
         sink.finish()?
     };
 
-    // Snapshot-referenced blob keys: every non-evicted `blob_key` across
-    // the media table (small projection walk, not full-row retention).
-    let referenced_blobs = collect_referenced_blobs(ctx)?;
-
     // --- Media pools: full copy under the same deletion barrier. ---
     // A full-pool copy may carry harmless orphan bytes; it must never miss
     // a blob the snapshot references (deletions are barred by the gate, so
-    // any gap predates the run and is recorded, not hidden).
+    // any gap means pre-existing damage, and creation fails instead of
+    // publishing a bundle that restore would refuse).
     let mut media_files: Vec<MediaFileManifest> = Vec::new();
     let mut durable_files = 0u64;
     let mut durable_bytes = 0u64;
     let mut cache_files = 0u64;
     let mut cache_bytes = 0u64;
     let mut skipped = 0u64;
-    let mut present: BTreeSet<String> = BTreeSet::new();
+    let mut archived: BTreeSet<String> = BTreeSet::new();
     let pools: [(&Path, &str); 2] = [
         (&ctx.durable_pool, MEDIA_DURABLE_PREFIX),
         (&ctx.cache_pool, MEDIA_CACHE_PREFIX),
@@ -445,7 +590,9 @@ pub fn create_bundle(ctx: &BackupContext, job_id: &str) -> Result<BundleOutcome,
     for (pool, prefix) in pools {
         for (rel, fs_path) in walk_pool_objects(pool, &mut skipped)? {
             let archive_path = format!("{prefix}objects/{rel}");
-            let (size, sha) = stream_file_into_zip(&mut writer, &archive_path, &fs_path)?;
+            let (size, sha) =
+                stream_file_into_zip(&mut writer, &archive_path, &fs_path, &mut grand_total, cap)?;
+            archived.insert(archive_path.clone());
             media_files.push(MediaFileManifest {
                 path: archive_path,
                 bytes: size,
@@ -458,22 +605,48 @@ pub fn create_bundle(ctx: &BackupContext, job_id: &str) -> Result<BundleOutcome,
                 cache_files += 1;
                 cache_bytes = cache_bytes.saturating_add(size);
             }
-            let stem = rel
-                .rsplit('/')
-                .next()
-                .unwrap_or(&rel)
-                .strip_suffix(".len")
-                .unwrap_or(rel.rsplit('/').next().unwrap_or(&rel))
-                .to_string();
-            present.insert(stem);
         }
     }
     // Keep table lines in registry order (deterministic manifest).
     table_manifests.sort_by(|a, b| a.name.cmp(&b.name));
-    let media_gaps: Vec<String> = referenced_blobs.difference(&present).cloned().collect();
+    // Every non-evicted reference must resolve to an archived object plus
+    // its `.len` sidecar in the appropriate pool (owner rows need the
+    // durable pool; owner-less cache rows need the cache pool). A placement
+    // in the other pool still restores (restore tolerates it with a pool
+    // warning), so it is accepted here; anything missing from both pools
+    // fails creation and prevents publication.
+    for key in &referenced {
+        let Some(shard) = key.get(..2) else {
+            return Err(BackupError::Corrupt(
+                "backup snapshot references a malformed blob key".to_string(),
+            ));
+        };
+        let needs_durable = durable_keys.contains(key);
+        let (primary_prefix, fallback_prefix) = if needs_durable {
+            (MEDIA_DURABLE_PREFIX, MEDIA_CACHE_PREFIX)
+        } else {
+            (MEDIA_CACHE_PREFIX, MEDIA_DURABLE_PREFIX)
+        };
+        let primary_obj = format!("{primary_prefix}objects/{shard}/{key}");
+        let primary_sidecar = format!("{primary_obj}.len");
+        if archived.contains(&primary_obj) && archived.contains(&primary_sidecar) {
+            continue;
+        }
+        let fallback_obj = format!("{fallback_prefix}objects/{shard}/{key}");
+        let fallback_sidecar = format!("{fallback_obj}.len");
+        if archived.contains(&fallback_obj) && archived.contains(&fallback_sidecar) {
+            continue;
+        }
+        return Err(BackupError::Corrupt(
+            "backup snapshot references a blob missing from its pools".to_string(),
+        ));
+    }
 
     // --- Manifest (written last; counts + checksums only). ---
     let created_ms = now_ms();
+    // Gaps can no longer be published: the check above fails creation when
+    // any required blob is absent. The field stays (wire compatibility;
+    // restore still refuses non-empty gaps) and is always empty here.
     let manifest = Manifest {
         format_version: BACKUP_FORMAT_VERSION,
         app_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -491,7 +664,7 @@ pub fn create_bundle(ctx: &BackupContext, job_id: &str) -> Result<BundleOutcome,
         media_cache_bytes: cache_bytes,
         media_files: media_files.clone(),
         media_skipped_files: skipped,
-        media_gaps,
+        media_gaps: Vec::new(),
         overall_sha256: String::new(),
     };
     let overall = compute_overall(job_id, &manifest.tables, &manifest.media_files);
@@ -501,6 +674,12 @@ pub fn create_bundle(ctx: &BackupContext, job_id: &str) -> Result<BundleOutcome,
     };
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)
         .map_err(|e| BackupError::Storage(format!("encode manifest: {e}")))?;
+    grand_total = grand_total.saturating_add(manifest_bytes.len() as u64);
+    if grand_total > cap {
+        return Err(BackupError::Invalid(
+            "backup bundle exceeds size cap".to_string(),
+        ));
+    }
     writer
         .start_file(MANIFEST_NAME, zip_options_deflated())
         .map_err(|e| BackupError::Storage(format!("stage manifest: {e}")))?;
@@ -516,12 +695,13 @@ pub fn create_bundle(ctx: &BackupContext, job_id: &str) -> Result<BundleOutcome,
     drop(staging_file);
 
     // --- Verify the staging bundle before it may look final. ---
-    verify_staging_bundle(&staging, &manifest)?;
+    verify_staging_bundle(staging, &manifest)?;
 
-    let bytes_written = std::fs::metadata(&staging).map(|m| m.len()).unwrap_or(0);
-    if bytes_written > MAX_BUNDLE_BYTES {
-        let _ = std::fs::remove_file(&staging);
-        return Err(BackupError::Invalid("bundle exceeds size cap".to_string()));
+    let bytes_written = std::fs::metadata(staging).map(|m| m.len()).unwrap_or(0);
+    if bytes_written > cap {
+        return Err(BackupError::Invalid(
+            "backup bundle exceeds size cap".to_string(),
+        ));
     }
     let file_name = format!(
         "pinetree-backup-{created_ms}-{job_id}{}",
@@ -529,11 +709,11 @@ pub fn create_bundle(ctx: &BackupContext, job_id: &str) -> Result<BundleOutcome,
     );
     let final_path = ctx.backup_dir.join(&file_name);
     if final_path.exists() {
-        let _ = std::fs::remove_file(&staging);
         return Err(BackupError::Invalid("backup output collision".to_string()));
     }
-    std::fs::rename(&staging, &final_path)
+    std::fs::rename(staging, &final_path)
         .map_err(|e| BackupError::Storage(format!("publish bundle: {e}")))?;
+    sync_parent_dir(&final_path);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -551,41 +731,12 @@ pub fn create_bundle(ctx: &BackupContext, job_id: &str) -> Result<BundleOutcome,
     })
 }
 
-/// Snapshot-referenced blob keys: every non-evicted `blob_key` in the media
-/// table, walked newest-first with exclusive `until_id` cursors. Only an
-/// empty page terminates — never a short page (see
-/// `crate::media::reconcile::scan::collect_live_blob_keys`, lines 320-335):
-/// a short page can be concurrent deletes, and an exact multiple needs the
-/// trailing empty read.
-fn collect_referenced_blobs(ctx: &BackupContext) -> Result<BTreeSet<String>, BackupError> {
-    use crate::application::ports::{MediaStore, TimelineCursor};
-    use crate::persistence::redb::MAX_MEDIA_PAGE_ROWS;
-    let mut out = BTreeSet::new();
-    let mut cursor = TimelineCursor::with_limit(MAX_MEDIA_PAGE_ROWS);
-    loop {
-        let page = ctx
-            .store
-            .list_all_media(&cursor)
-            .map_err(|e| BackupError::Storage(format!("read media for blob refs: {e}")))?;
-        if page.is_empty() {
-            break;
-        }
-        for meta in &page {
-            if !meta.evicted && !meta.blob_key.is_empty() {
-                out.insert(meta.blob_key.clone());
-            }
-        }
-        let last = page.last().map(|m| m.id.clone()).unwrap_or_default();
-        cursor = TimelineCursor::with_limit(MAX_MEDIA_PAGE_ROWS);
-        cursor.until_id = Some(last);
-    }
-    Ok(out)
-}
-
 fn stream_file_into_zip(
     writer: &mut zip::ZipWriter<std::fs::File>,
     archive_path: &str,
     fs_path: &Path,
+    budget: &mut u64,
+    cap: u64,
 ) -> Result<(u64, String), BackupError> {
     let mut file = std::fs::File::open(fs_path)
         .map_err(|e| BackupError::Storage(format!("open pool file: {e}")))?;
@@ -607,8 +758,11 @@ fn stream_file_into_zip(
             .map_err(|e| BackupError::Storage(format!("write blob: {e}")))?;
         hasher.update(&buf[..n]);
         bytes = bytes.saturating_add(n as u64);
-        if bytes > MAX_BUNDLE_BYTES {
-            return Err(BackupError::Invalid("pool file exceeds cap".to_string()));
+        *budget = budget.saturating_add(n as u64);
+        if bytes > cap || *budget > cap {
+            return Err(BackupError::Invalid(
+                "backup bundle exceeds size cap".to_string(),
+            ));
         }
     }
     Ok((bytes, hex::encode(hasher.finalize())))
