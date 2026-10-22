@@ -7,8 +7,8 @@ use crate::api::misskey::packers::{
 use crate::application::commands::AppServices;
 use crate::application::events::{EmojiBroadcastOp, MainEventKind, MainMessage, NotifyJobPayload, StreamingEvent};
 use crate::application::ports::{
-    BackfillDurablePayload, CacheEvictPayload, Clock, IdGenerator, Job, JobKind, JobQueue,
-    NewJob, NotificationStore, PortError, ReconcileStoragePayload, RemoteMediaFetchPayload,
+    CacheEvictPayload, Clock, IdGenerator, Job, JobKind, JobQueue,
+    NewJob, NotificationStore, PortError, RemoteMediaFetchPayload,
     StreamingSink, TimelineCursor, MAX_JOBS_PER_TXN, MAX_JOB_ATTEMPTS,
 };
 use crate::domain::antenna::ANTENNA_NOTES_CAP;
@@ -335,51 +335,124 @@ impl JobWorker {
                     }
                 }
             }
-            // Storage overhaul: one bounded reconciler scan (orphan sweep,
-            // missing-bytes heal, accounting-drift detect, legacy flag,
-            // sidecar heal). Bad payloads quarantine; storage faults retry.
+            // Storage overhaul: one bounded reconciler run (orphan sweep,
+            // missing-bytes heal, accounting-drift detect/repair, legacy
+            // flag, sidecar heal). The run pages newest-first and returns a
+            // continuation cursor when the table exceeds the cap; the cursor
+            // is enqueued durably so the chain walks monotonically to the
+            // oldest row (never "complete" after one page). Bad payloads
+            // quarantine; storage faults retry.
             JobKind::ReconcileStorage => {
-                match serde_json::from_slice::<ReconcileStoragePayload>(&job.payload) {
+                match serde_json::from_slice::<crate::media::reconciler::ReconcileStorageJobPayload>(
+                    &job.payload,
+                ) {
                     Err(e) => Ok(Disposition::Quarantine(format!(
                         "bad-payload: reconcile-storage invalid: {e}"
                     ))),
                     Ok(payload) => {
-                        match crate::media::reconciler::reconcile_media_with_cap(
+                        match crate::media::reconciler::reconcile_media_paged(
                             &self.services,
-                            payload.scan_cap.unwrap_or(
-                                crate::media::reconciler::RECONCILE_SCAN_CAP,
-                            ),
+                            payload.after.as_deref(),
+                            payload
+                                .scan_cap
+                                .unwrap_or(crate::media::reconciler::RECONCILE_SCAN_CAP),
                         ) {
-                            Ok(_) => Ok(Disposition::Done),
+                            Ok((_, Some(next_after))) => {
+                                let cont = crate::media::reconciler::ReconcileStorageJobPayload {
+                                    scan_cap: payload.scan_cap,
+                                    after: Some(next_after.clone()),
+                                };
+                                match NewJob::new_json(
+                                    JobKind::ReconcileStorage,
+                                    &cont,
+                                    format!("storage-reconcile:{next_after}"),
+                                    self.clock.now_ms(),
+                                ) {
+                                    Ok(job) => Ok(Disposition::Fanout(vec![job])),
+                                    Err(e) => Ok(Disposition::Quarantine(format!(
+                                        "bad-payload: reconcile continuation invalid: {e}"
+                                    ))),
+                                }
+                            }
+                            Ok((_, None)) => Ok(Disposition::Done),
                             Err(PortError::Validation(reason)) => {
                                 Ok(Disposition::Quarantine(format!("bad-payload: {reason}")))
                             }
-                            Err(_) => Ok(Disposition::Retry { retry_after_ms: None }),
+                            Err(_) => Ok(Disposition::Retry {
+                                retry_after_ms: None,
+                            }),
                         }
                     }
                 }
             }
             // Storage overhaul: recompute durable owner bytes + blob
-            // refcounts from a bounded metadata scan (post-upgrade
-            // backfill). Bad payloads quarantine; storage faults retry.
+            // refcounts in bounded page runs (post-upgrade backfill). Each
+            // run scans at most BACKFILL_PAGES_PER_RUN pages and either
+            // persists exact sums (walk ended — the only path that writes
+            // counters) or enqueues a durable continuation carrying the
+            // staged prefix sums plus the resume cursor. Counters are never
+            // overwritten from a partial scan. Bad payloads quarantine;
+            // storage faults retry.
             JobKind::BackfillDurableAccounting => {
-                match serde_json::from_slice::<BackfillDurablePayload>(&job.payload) {
+                match serde_json::from_slice::<crate::media::reconciler::BackfillDurableJobPayload>(
+                    &job.payload,
+                ) {
                     Err(e) => Ok(Disposition::Quarantine(format!(
                         "bad-payload: backfill-durable invalid: {e}"
                     ))),
                     Ok(payload) => {
-                        match crate::media::reconciler::backfill_durable_accounting(
+                        match crate::media::reconciler::backfill_durable_step(
                             &self.services,
+                            payload.staged,
                             payload.after,
-                            payload.batch_size.unwrap_or(
-                                crate::media::reconciler::BACKFILL_PAGE_SIZE,
-                            ),
+                            payload
+                                .batch_size
+                                .unwrap_or(crate::media::reconciler::BACKFILL_PAGE_SIZE),
+                            crate::media::reconciler::BACKFILL_PAGES_PER_RUN,
                         ) {
-                            Ok(_) => Ok(Disposition::Done),
+                            Ok(crate::media::reconciler::BackfillStep::Continue {
+                                staged,
+                                next_after,
+                            }) => {
+                                let cont = crate::media::reconciler::BackfillDurableJobPayload {
+                                    after: Some(next_after.clone()),
+                                    batch_size: payload.batch_size,
+                                    staged,
+                                };
+                                match NewJob::new_json(
+                                    JobKind::BackfillDurableAccounting,
+                                    &cont,
+                                    format!("storage-backfill:{next_after}"),
+                                    self.clock.now_ms(),
+                                ) {
+                                    Ok(job) => Ok(Disposition::Fanout(vec![job])),
+                                    Err(e) => Ok(Disposition::Quarantine(format!(
+                                        "bad-payload: backfill continuation invalid: {e}"
+                                    ))),
+                                }
+                            }
+                            Ok(crate::media::reconciler::BackfillStep::Complete {
+                                staged, ..
+                            }) => {
+                                match crate::media::reconciler::apply_backfill_sums(
+                                    &self.services,
+                                    &staged,
+                                ) {
+                                    Ok(()) => Ok(Disposition::Done),
+                                    Err(PortError::Validation(reason)) => Ok(
+                                        Disposition::Quarantine(format!("bad-payload: {reason}")),
+                                    ),
+                                    Err(_) => Ok(Disposition::Retry {
+                                        retry_after_ms: None,
+                                    }),
+                                }
+                            }
                             Err(PortError::Validation(reason)) => {
                                 Ok(Disposition::Quarantine(format!("bad-payload: {reason}")))
                             }
-                            Err(_) => Ok(Disposition::Retry { retry_after_ms: None }),
+                            Err(_) => Ok(Disposition::Retry {
+                                retry_after_ms: None,
+                            }),
                         }
                     }
                 }
@@ -1117,6 +1190,38 @@ fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> String {
         s.clone()
     } else {
         "unknown panic".to_string()
+    }
+}
+
+// ===== Batch F backup drain (append-only region) ==========================
+// Batch C owns the `ReconcileStorage` / `BackfillDurableAccounting` arms
+// above; this region only drains backup jobs. Backup requests are durable
+// status files in the backup dir (see `crate::backup`); the drain claims
+// the oldest queued request and runs it synchronously with bounded retries.
+// `JobKind` lives in `application::ports` (owned by the parent), so backup
+// intentionally reuses no `JobKind` variant: the parent wires this drain
+// into the worker tick / maintenance loop (see the returned snippet).
+
+impl JobWorker {
+    /// Drain up to `max_steps` queued backup jobs. Returns completed jobs.
+    /// A transient failure keeps the request queued (bounded attempts in
+    /// the status record); anything terminal fails it with a redacted
+    /// reason. Stops early when the queue is empty.
+    pub fn drain_pending_backups(
+        &self,
+        ctx: &crate::backup::BackupContext,
+        max_steps: usize,
+    ) -> Result<usize, PortError> {
+        let _ = self.clock.now_ms();
+        let mut done = 0;
+        for _ in 0..max_steps {
+            match crate::backup::run_next_backup(ctx) {
+                Ok(None) => break,
+                Ok(Some(_)) => done += 1,
+                Err(e) => return Err(e.to_port_error()),
+            }
+        }
+        Ok(done)
     }
 }
 

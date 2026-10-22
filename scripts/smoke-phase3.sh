@@ -10,7 +10,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 pinetree_bin() {
-  if [[ -n "${PINETREE_BIN:-}" ]]; then echo "$BIN"; return; fi
+  if [[ -n "${PINETREE_BIN:-}" ]]; then echo "$PINETREE_BIN"; return; fi
   local dir
   dir="$(cd "$ROOT" && cargo metadata --format-version 1 --offline --no-deps 2>/dev/null \
     | python3 -c 'import json,sys;print(json.load(sys.stdin).get("target_directory",""))' 2>/dev/null)"
@@ -32,9 +32,14 @@ trap cleanup EXIT
 
 if [[ ! -x "$BIN" ]]; then
   echo "[smoke3] building pinetree binary..." >&2
-  (cd "$ROOT" && cargo build)
+  (cd "$ROOT" && cargo build --offline) || { echo "SMOKE_FAIL: cargo build failed" >&2; exit 1; }
 fi
 [[ -x "$BIN" ]] || { echo "SMOKE_FAIL: binary missing at $BIN" >&2; exit 1; }
+# Warn (never fail) when a source file is newer than the binary: a stale
+# binary can pass while the current tree is broken.
+if [[ -z "${PINETREE_BIN:-}" ]] && newer="$(find "$ROOT/src" -name '*.rs' -newer "$BIN" -print 2>/dev/null | head -1)" && [[ -n "$newer" ]]; then
+  echo "[smoke3] WARNING: binary $BIN predates $newer; rebuild to test the current tree" >&2
+fi
 
 if [[ -n "${BUN_BIN:-}" ]]; then
   BUN="$BUN_BIN"
@@ -66,7 +71,7 @@ pick_port() {
 
 PORT="$(pick_port)"
 ORIGIN="http://127.0.0.1:$PORT"
-"$BIN" --data-dir="$DATA_DIR" --listen="127.0.0.1:$PORT" --public-url="$ORIGIN" --no-transcode &
+"$BIN" --data-dir="$DATA_DIR" --listen="127.0.0.1:$PORT" --public-url="$ORIGIN" --no-transcode --allow-local-http-for-testing &
 SERVER_PID=$!
 for _ in $(seq 1 100); do
   if curl -fs -o /dev/null -m 2 "$ORIGIN/healthz" 2>/dev/null; then break; fi

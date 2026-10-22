@@ -115,8 +115,15 @@ pinetree_bin() {
   if [[ -n "$dir" ]]; then echo "$dir/debug/pinetree"; else echo "$ROOT/target/debug/pinetree"; fi
 }
 BIN="$(pinetree_bin)"
-[[ -x "$BIN" ]] || (cd "$ROOT" && cargo build --offline)
+if [[ ! -x "$BIN" ]]; then
+  (cd "$ROOT" && cargo build --offline) || { echo "SMOKE_FAIL: cargo build failed" >&2; exit 1; }
+fi
 [[ -x "$BIN" ]] || { echo "SMOKE_FAIL: pinetree binary missing at $BIN" >&2; exit 1; }
+# Warn (never fail) when a source file is newer than the binary: a stale
+# binary can pass while the current tree is broken.
+if [[ -z "${PINETREE_BIN:-}" ]] && newer="$(find "$ROOT/src" -name '*.rs' -newer "$BIN" -print 2>/dev/null | head -1)" && [[ -n "$newer" ]]; then
+  echo "[interop] WARNING: binary $BIN predates $newer; rebuild to test the current tree" >&2
+fi
 
 # --- backing services ------------------------------------------------------
 "${COMPOSE[@]}" up -d >/dev/null
@@ -159,7 +166,7 @@ start_bg sharkey "$ROOT/sharkey/packages/backend" \
 for n in 3 4; do
   rm -rf "$WORK/pt$n"; mkdir -p "$WORK/pt$n"
   start_bg "pt$n" "$ROOT" PINETREE_ALLOW_PRIVATE_IPS=1 -- \
-    "$BIN" --public-url="http://127.0.1.$n" --data-dir="$WORK/pt$n" --listen="127.0.0.1:310$n" --no-transcode
+    "$BIN" --public-url="http://127.0.1.$n" --data-dir="$WORK/pt$n" --listen="127.0.0.1:310$n" --no-transcode --allow-local-http-for-testing
 done
 start_bg proxy "$ROOT" -- node scripts/interop/proxy.mjs 127.0.1.1=3101 127.0.1.2=3102 127.0.1.3=3103 127.0.1.4=3104
 
@@ -192,10 +199,22 @@ done
 # --- the interop test ------------------------------------------------------
 echo "[interop] running tests/federation_interop.rs..."
 cd "$ROOT"
-PINETREE_INTEROP=1 cargo test --offline --test federation_interop -- --nocapture 2>&1 | tee "$WORK/test.log" | grep -v '^warning\|^ *|\|^ *=\|^$\|-->' || true
+# Run cargo without a display filter in the pipeline so its exit code is
+# captured exactly (a `cargo | tee | grep -v || true` pipeline gates only on
+# the INTEROP_OK string and masks cargo failure). The full log stays in
+# $WORK/test.log; the filtered reprint below keeps the console short.
+set +e
+PINETREE_INTEROP=1 cargo test --offline --test federation_interop -- --nocapture >"$WORK/test.log" 2>&1
+cargo_status=$?
+set -e
+grep -v '^warning\|^ *|\|^ *=\|^$\|-->' "$WORK/test.log" || true
+if [[ $cargo_status -ne 0 ]]; then
+  echo "SMOKE_FAIL: cargo test exited $cargo_status (see $WORK/test.log and $WORK/*.log)" >&2
+  exit "$cargo_status"
+fi
 if grep -q INTEROP_OK "$WORK/test.log"; then
   echo "SMOKE_OK"
 else
-  echo "SMOKE_FAIL: see $WORK/test.log and $WORK/*.log" >&2
+  echo "SMOKE_FAIL: INTEROP_OK missing despite cargo exit 0 (see $WORK/test.log and $WORK/*.log)" >&2
   exit 1
 fi

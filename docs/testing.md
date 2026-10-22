@@ -18,17 +18,29 @@ dirs, ephemeral ports, fresh containers) — never the play/browser rig:
 | `cargo test --offline` | unit + contract + integration (live count is in the `cargo test` output; older text said 349/351, not re-counted 2026-10-20) | ~15 s |
 | `scripts/smoke-phase1.sh` | core flows via real `misskey-js` (+ restart durability) | ~10 s |
 | `scripts/smoke-phase3.sh` | profile REST + streaming via real `misskey-js` `Stream` | ~10 s |
-| `scripts/keystone-sweep.sh` | Keystone's exact calls (the script's own PASS/FAIL summary is authoritative; `scripts/smoke-all.sh` header says 38, not reconciled 2026-10-20) | ~10 s |
+| `scripts/keystone-sweep.sh` | Keystone's exact calls (the script's own `KEYSWEEP` PASS/FAIL summary line is authoritative for the count) | ~10 s |
 | `scripts/smoke-phase2.sh` | four-server federation, fresh pg/redis (hermetic: tears down after) | ~15–25 min |
 
+Gate result vocabulary (Batch A, 2026-10-21): `SMOKE_ALL_OK` (exit 0) means
+every required phase actually ran and passed; `SMOKE_ALL_PARTIAL` (exit 2)
+means a dev-mode run skipped a prerequisite-gated phase and is **not** a
+release pass; `SMOKE_ALL_FAIL` (exit 1) means a phase ran and failed, or a
+strict-mode run skipped a required phase. `SMOKE_ALL_REQUIRED=1` selects
+strict mode for CI/release (missing Docker, Node versions, or
+Misskey/Sharkey reference checkouts fail the gate). Step 1 pipes cargo
+output through `tail` with `bash -o pipefail` plus a full log at
+`/tmp/smoke-cargo-full.log`, so a failing `cargo test` cannot be masked.
+The runner's own failure paths are pinned by
+`scripts/tests/test-smoke-runner.sh` (11 checks, run under Git Bash).
+
 Each step streams its own progress live (`[smoke1]` / `[smoke3]` / `[PASS]`
-/ `[interop]` lines); the wrapper adds per-step timing and is meant to end with
-`SMOKE_ALL_OK` or `SMOKE_ALL_FAIL` plus a results table (full log of the
-last step at `/tmp/smoke-all-step.log`). **Open:** on a failing step the
-wrapper exits 1 right after its `FAIL:` line and prints neither the table nor
-`SMOKE_ALL_FAIL`; and a SKIP still ends with `SMOKE_ALL_OK`. See "Known gaps"
-below. Do not treat `SMOKE_ALL_OK` as proof that step 1 or the federation
-step ran.
+/ `[interop]` lines); the wrapper adds per-step timing and always ends with
+a results table plus exactly one of `SMOKE_ALL_OK` / `SMOKE_ALL_PARTIAL` /
+`SMOKE_ALL_FAIL` (full log of the last step at `/tmp/smoke-all-step.log`).
+Every serve step builds the binary from the current checkout (or honors
+`PINETREE_BIN`) and fails on build error, and the run header logs the source
+SHA, tool versions, and phases run — a stale binary cannot claim a pass.
+Do not treat `SMOKE_ALL_PARTIAL` as a release pass.
 
 Environment:
 
@@ -120,22 +132,21 @@ in dev builds and peers may time out).
 
 ## Known gaps (open, verified 2026-10-20 by reading the script text)
 
-Tracked in `docs/TODOS.md` "Smoke gate". The script is **not** fixed here.
+Items 1–4 were fixed 2026-10-21 (Batch A): pipefail cargo step with full
+log, strict `SMOKE_ALL_REQUIRED=1` mode, `SMOKE_ALL_PARTIAL` for dev skips,
+guarded steps so the table + sentinel always print, fresh-build binary
+resolution, run-metadata header. Historical notes retained below for the
+record; the `scripts/tests/test-smoke-runner.sh` harness (11 checks) pins
+the new behavior.
 
-1. **Step 1 masks cargo failure.** `scripts/smoke-all.sh:53` runs
-   `bash -c "cd … && cargo test --offline 2>&1 | tail -30"`. The inner shell
-   does not inherit `pipefail`, so the step's exit status is `tail`'s (0).
-   Checked: `bash -c 'exit 7 | tail -30'` exits 0.
-2. **SKIP prints `SMOKE_ALL_OK`.** `scripts/smoke-all.sh:77-83` records a
-   `SKIP` row for the federation step, and the final check (`:88`) only greps
-   for `^FAIL`, so a skipped federation step still prints `SMOKE_ALL_OK`.
-3. **Failure exit is silent.** `step()` returns 1 under `set -e`, so the script
-   exits 1 right after `[smoke-all] FAIL: …` and never prints the results table
-   or `SMOKE_ALL_FAIL` (header comment `:16` and this doc say it does). Checked
-   with a faithful copy of `step()`.
-4. **Keystone count** differs between `smoke-all.sh:12` (38) and this doc (41);
-   a static count of `scripts/keystone-sweep.sh` does not settle it. Use the
-   script's own summary line.
+1. ~~**Step 1 masks cargo failure.**~~ Fixed: `bash -o pipefail -c` +
+   `/tmp/smoke-cargo-full.log`.
+2. ~~**SKIP prints `SMOKE_ALL_OK`.**~~ Fixed: dev skip ⇒
+   `SMOKE_ALL_PARTIAL` (exit 2); strict skip ⇒ `SMOKE_ALL_FAIL` (exit 1).
+3. ~~**Failure exit is silent.**~~ Fixed: all step calls guarded, table +
+   sentinel always print.
+4. ~~**Keystone count** differs …~~ Fixed: no static count remains; the
+   sweep's own `KEYSWEEP` summary is authoritative.
 5. **Env-only knobs** `PINETREE_ELIXIR_INTEROP`, `PINETREE_ELIXIR_STRESS`, and
    `PINETREE_REPLY_REPAIR_LIMIT` (above) are not in the JSON config, which
    `AGENTS.md` forbids for new settings (TODOS P3).

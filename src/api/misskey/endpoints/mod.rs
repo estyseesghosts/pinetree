@@ -9,8 +9,11 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
     body::{Body, Bytes},
@@ -175,8 +178,18 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/clips/{id}", get(ap_collections::get_clip_collection))
         .route("/users/{id}/clips", get(ap_collections::get_clips_index))
         .route("/pages/{id}", get(ap_collections::get_page_article))
-        .route("/inbox", post(fed_inbox::inbox_handler))
-        .route("/users/{id}/inbox", post(fed_inbox::user_inbox_handler))
+        // Batch G: the 64 KiB inbox business cap is enforced at
+        // body-extraction time (per-route `DefaultBodyLimit`, owned by
+        // `fed_inbox::inbox_body_limit`), so oversized bodies answer 413
+        // before the handler buffers anything.
+        .route(
+            "/inbox",
+            post(fed_inbox::inbox_handler).layer(fed_inbox::inbox_body_limit()),
+        )
+        .route(
+            "/users/{id}/inbox",
+            post(fed_inbox::user_inbox_handler).layer(fed_inbox::inbox_body_limit()),
+        )
         .with_state(services);
     Router::new()
         .route("/healthz", get(healthz))
@@ -209,16 +222,20 @@ pub fn build_router(state: ApiState) -> Router {
         // No `DefaultBodyLimit::disable()`: the Misskey JSON dispatcher
         // enforces its own 1 MiB cap in `api_dispatch_blocking` (testable
         // without router layers), `drive/files/create` enforces its own
-        // streaming cap in the handler, and everything else keeps axum's
-        // 2 MiB default extraction limit.
+        // streaming cap in the handler, the inbox routes carry a per-route
+        // 64 KiB `DefaultBodyLimit` (see `fed_inbox::inbox_body_limit`),
+        // and everything else keeps axum's 2 MiB default extraction limit.
         .with_state(state)
         .merge(federation_routes)
         // Slice 7 (H2): every response carries `nosniff`, including error
         // bodies and redirects. CORS (`*`, Misskey `@fastify/cors`
         // `origin: '*'` parity — the frontend sends `credentials: 'omit'`,
         // so no allow-credentials is needed) rides a second layer.
+        // Batch H: request correlation + durations ride outermost so the
+        // timer covers the whole inner stack.
         .layer(axum::middleware::from_fn(nosniff_middleware))
         .layer(axum::middleware::from_fn(cors_middleware))
+        .layer(axum::middleware::from_fn(request_id_middleware))
 }
 
 /// Slice 7 (H2): global `X-Content-Type-Options: nosniff` for all
@@ -244,6 +261,34 @@ async fn cors_middleware(req: Request, next: axum::middleware::Next) -> Response
     response.headers_mut().insert(
         HeaderName::from_static("access-control-allow-origin"),
         HeaderValue::from_static("*"),
+    );
+    response
+}
+
+/// Batch H request correlation (H3): one uuid per request, echoed in
+/// `x-request-id` and in the `http.request.start/done` structured lines
+/// (method + path only — never query, headers, or bodies). The timer
+/// covers the inner stack; status + duration make slow endpoints visible
+/// without touching handler code.
+async fn request_id_middleware(req: Request, next: axum::middleware::Next) -> Response {
+    // One structured line per request at info level (id + duration); the
+    // debug `http.request.start` helper exists for deep dives but stays
+    // off the normal path so steady-state volume is one line per request.
+    let method = req.method().to_string();
+    let path = req.uri().path().to_string();
+    let request_id = crate::observability::new_request_id();
+    let started = std::time::Instant::now();
+    let mut response = next.run(req).await;
+    response.headers_mut().insert(
+        HeaderName::from_static("x-request-id"),
+        HeaderValue::from_str(&request_id).expect("uuid is header-safe"),
+    );
+    crate::observability::log_request_done(
+        &request_id,
+        &method,
+        &path,
+        response.status().as_u16(),
+        started.elapsed().as_millis() as u64,
     );
     response
 }
@@ -277,22 +322,391 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
-/// Readiness probe: the durable store can serve a read.
+/// Readiness probe: the durable store can serve a read AND the critical
+/// storage roots are present.
 ///
 /// The liveness probe (`/healthz`) answers as long as the process is up.
 /// Readiness additionally proves storage is readable, so an orchestrator
 /// stops routing traffic to a node whose database has gone bad instead of
-/// serving 500s. The read is a single-row lookup in the instance-settings
-/// table: cheap, side-effect free, and it exercises the same redb read path
-/// the API uses.
+/// serving 500s. Checks are bounded and cheap: one single-row redb read
+/// (`instance_settings`, the same read path the API uses) plus
+/// existence/is-dir checks on the durable + cache pool roots captured at
+/// boot. No table walks, no integrity checks, no network probes. Bodies
+/// stay tiny (`ready` / `not ready`); detail lives behind the admin
+/// status surface.
 async fn ready(State(state): State<ApiState>) -> (StatusCode, &'static str) {
-    match state.services.instance_settings.get() {
-        Ok(_) => (StatusCode::OK, "ready"),
-        Err(err) => {
-            eprintln!("readiness probe failed: {err}");
+    match readiness_check(&state) {
+        Ok(()) => {
+            record_readiness(true, "ok");
+            (StatusCode::OK, "ready")
+        }
+        Err(class) => {
+            record_readiness(false, class);
+            crate::observability::record_error("readiness.probe");
+            crate::observability::log_event(
+                crate::observability::LogLevel::Warn,
+                "readiness.probe_failed",
+                &[("error_class", class)],
+            );
             (StatusCode::SERVICE_UNAVAILABLE, "not ready")
         }
     }
+}
+
+/// One bounded readiness evaluation. Returns `Ok` only when the redb read
+/// path works and every configured pool root is a directory. Error classes
+/// are stable strings (safe for status surfaces and logs).
+fn readiness_check(state: &ApiState) -> Result<(), &'static str> {
+    if state.services.instance_settings.get().is_err() {
+        return Err("storage-unavailable");
+    }
+    let ops = read_ops_config();
+    for root in [&ops.durable_dir, &ops.cache_dir] {
+        if root.as_os_str().is_empty() {
+            continue;
+        }
+        if !root.is_dir() {
+            return Err("storage-root-missing");
+        }
+    }
+    Ok(())
+}
+
+// --- Batch H ops state ------------------------------------------------------
+// Process-wide operations wiring (`prod-ready.md` §9 H1/H4/H5), published
+// once by `main` at boot and read by the probes + admin status arms.
+//
+// `ApiState` is intentionally untouched: integration tests construct it
+// literally, so new required fields would break every test harness.
+// These `Mutex` cells default to safe, honest `unknown` values, which is
+// exactly what hermetic tests assert until `main` (or a test) publishes
+// real roots.
+
+/// Boot-published operations context for probes + admin status. All fields
+/// are non-secret by construction (booleans, counts, host class, version
+/// strings); raw paths stay inside `main`, only presence booleans leave.
+#[derive(Debug, Clone)]
+pub struct OpsConfig {
+    /// `diagnostics.detailed_admin_status` file value.
+    pub detailed_admin_status: bool,
+    /// Durable pool root (presence-checked by `/ready`).
+    pub durable_dir: PathBuf,
+    /// Cache pool root (presence-checked by `/ready`).
+    pub cache_dir: PathBuf,
+    /// Backup bundle + status directory (admin backup routes read it).
+    pub backup_dir: PathBuf,
+    /// `transcode.enabled` file value.
+    pub transcode_enabled: bool,
+    /// Validated toolchain line (`ffmpeg version ...`), `"disabled"`, or
+    /// `"unavailable: <redacted cause>"` — never a binary dump.
+    pub ffmpeg_status: String,
+    /// [`crate::config::Config::config_summary`] snapshot (no secrets).
+    pub config_fingerprint: serde_json::Value,
+    /// Boot wall-clock millis (uptime base).
+    pub started_ms: i64,
+}
+
+impl Default for OpsConfig {
+    fn default() -> Self {
+        Self {
+            detailed_admin_status: false,
+            durable_dir: PathBuf::new(),
+            cache_dir: PathBuf::new(),
+            backup_dir: PathBuf::new(),
+            transcode_enabled: false,
+            ffmpeg_status: "unknown".to_string(),
+            config_fingerprint: serde_json::Value::Null,
+            started_ms: 0,
+        }
+    }
+}
+
+fn ops_state() -> &'static Mutex<OpsConfig> {
+    static OPS: OnceLock<Mutex<OpsConfig>> = OnceLock::new();
+    OPS.get_or_init(|| Mutex::new(OpsConfig::default()))
+}
+
+/// Publish the boot operations context. Called once by `main` before
+/// serving (and by hermetic tests to stage roots/flags).
+pub fn set_ops_config(config: OpsConfig) {
+    *ops_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = config;
+}
+
+fn read_ops_config() -> OpsConfig {
+    ops_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// Boot wall-clock millis for uptime math.
+pub fn ops_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn backup_slot() -> &'static Mutex<Option<crate::backup::BackupContext>> {
+    static SLOT: OnceLock<Mutex<Option<crate::backup::BackupContext>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// Publish the live backup context (store handle + pool roots + backup
+/// dir). Called once by `main`; unset means backup routes answer 503.
+pub fn set_backup_context(context: crate::backup::BackupContext) {
+    *backup_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(context);
+}
+
+fn read_backup_context() -> Option<crate::backup::BackupContext> {
+    backup_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// Last readiness outcome for the admin status surface: `(ok, error_class,
+/// checked_ms)`. Updated by every `/ready` evaluation.
+#[derive(Debug, Clone)]
+struct ReadinessProbe {
+    ok: bool,
+    error_class: String,
+    checked_ms: u64,
+}
+
+fn readiness_slot() -> &'static Mutex<ReadinessProbe> {
+    static SLOT: OnceLock<Mutex<ReadinessProbe>> = OnceLock::new();
+    SLOT.get_or_init(|| {
+        Mutex::new(ReadinessProbe {
+            ok: true,
+            error_class: "ok".to_string(),
+            checked_ms: 0,
+        })
+    })
+}
+
+fn record_readiness(ok: bool, error_class: &str) {
+    *readiness_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = ReadinessProbe {
+        ok,
+        error_class: error_class.to_string(),
+        checked_ms: ops_now_ms(),
+    };
+}
+
+/// Last readiness outcome (`ok`, stable error class). Starts optimistic;
+/// every `/ready` evaluation overwrites it.
+pub fn last_readiness() -> (bool, String) {
+    let probe = readiness_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    (probe.ok, probe.error_class.clone())
+}
+
+// --- Batch H admin status builders -------------------------------------------
+// Authenticated admin surface (`prod-ready.md` §9 H4/H5). Every value comes
+// from a maintained counter or a single bounded read — never a full table
+// walk, `check_integrity`, recursive hash, or network fetch per request.
+// Unavailable values are explicit `null` (stale/unknown is data, not an
+// error here); lists are capped (response size limit); expensive detail
+// stays behind `diagnostics.detailed_admin_status` (time limit by
+// construction: nothing here can run for minutes).
+
+/// Newest backup statuses exposed on one status response (size limit).
+pub const STATUS_BACKUP_LIST_CAP: usize = 20;
+
+/// Page budget for the `admin/drive/show-file` url fallback walk: 20
+/// pages × 500 rows bounds one lookup (same order as the old 10k clamp,
+/// with correct empty-page termination).
+pub const SHOW_FILE_WALK_PAGES: usize = 20;
+
+/// Bounded `url` fallback walk for `admin/drive/show-file`: 500-row pages
+/// newest-first, exclusive `until_id` advance, only an empty page ends the
+/// walk, at most [`SHOW_FILE_WALK_PAGES`] pages. A short page (concurrent
+/// deletes) never masquerades as end-of-scan.
+fn walk_media_for_url(
+    services: &AppServices,
+    url: &str,
+) -> Result<Option<crate::domain::media::MediaMeta>, ApiError> {
+    let mut until_id: Option<String> = None;
+    for _ in 0..SHOW_FILE_WALK_PAGES {
+        let mut cursor = TimelineCursor::with_limit(500);
+        cursor.until_id = until_id.clone();
+        let page = services
+            .media
+            .list_all_media(&cursor)
+            .map_err(ApiError::from_port_error)?;
+        if page.is_empty() {
+            break;
+        }
+        if let Some(hit) = page.iter().find(|m| m.url == url) {
+            return Ok(Some(hit.clone()));
+        }
+        until_id = page.last().map(|m| m.id.clone());
+    }
+    Ok(None)
+}
+
+/// Safe subset of one [`crate::backup::BackupStatus`]: lifecycle, times,
+/// sizes, and the redacted failure. No contents, no paths, no secrets
+/// (the failure string is already redacted at write time).
+fn pack_backup_status(status: &crate::backup::BackupStatus) -> Value {
+    serde_json::json!({
+        "jobId": status.job_id,
+        "state": status.state,
+        "requestedMs": status.requested_ms,
+        "startedMs": status.started_ms,
+        "finishedMs": status.finished_ms,
+        "attempts": status.attempts,
+        "outputFile": status.output_file,
+        "bytesWritten": status.bytes_written,
+        "tablesExported": status.tables_exported,
+        "mediaFiles": status.media_files,
+        "gateWaitMs": status.gate_wait_ms,
+        "failureRedacted": status.failure_redacted,
+    })
+}
+
+/// Pool-root presence without leaking layout: configured + is-dir only.
+fn pack_pool_presence(dir: &PathBuf) -> Value {
+    serde_json::json!({
+        "configured": !dir.as_os_str().is_empty(),
+        "present": !dir.as_os_str().is_empty() && dir.is_dir(),
+    })
+}
+
+/// Basic admin status: always available to an authenticated admin,
+/// detailed flag off or on. See the H4 field list in the module docs.
+fn build_admin_status(state: &ApiState, detailed: bool) -> Value {
+    let ops = read_ops_config();
+    let now_ms = ops_now_ms();
+    let uptime_ms = if ops.started_ms <= 0 {
+        Value::Null
+    } else {
+        Value::from(now_ms.saturating_sub(ops.started_ms as u64))
+    };
+    let (ready_ok, ready_class) = last_readiness();
+    let redb_readable = state.services.instance_settings.get().is_ok();
+    let cache = state.services.media.cache_stats().ok();
+    let pending_jobs = state.services.jobs.pending_count().ok();
+    let (backups, last_backup_success_ms) = match read_backup_context() {
+        Some(context) => {
+            let mut statuses = crate::backup::list_backup_statuses(&context.backup_dir);
+            statuses.truncate(STATUS_BACKUP_LIST_CAP * 4);
+            let last_success = statuses
+                .iter()
+                .filter(|s| s.state == crate::backup::BackupState::Completed)
+                .filter_map(|s| s.finished_ms)
+                .max();
+            let recent: Vec<Value> = statuses
+                .iter()
+                .rev()
+                .take(STATUS_BACKUP_LIST_CAP)
+                .map(pack_backup_status)
+                .collect();
+            (
+                Value::Array(recent),
+                last_success.map(Value::from).unwrap_or(Value::Null),
+            )
+        }
+        None => (Value::Null, Value::Null),
+    };
+    let mut status = serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "commit": option_env!("PINETREE_COMMIT").unwrap_or("unknown"),
+        "uptimeMs": uptime_ms,
+        "safeMode": {
+            "transcodeEnabled": ops.transcode_enabled,
+            "detailedAdminStatus": ops.detailed_admin_status,
+            "structuredLogging": crate::observability::structured_logging(),
+        },
+        "readiness": { "ready": ready_ok, "lastProbeErrorClass": ready_class },
+        "redb": { "open": true, "readable": redb_readable },
+        "pools": {
+            "durable": pack_pool_presence(&ops.durable_dir),
+            "cache": pack_pool_presence(&ops.cache_dir),
+            "backup": pack_pool_presence(&ops.backup_dir),
+        },
+        "cache": match &cache {
+            Some(stats) => serde_json::json!({
+                "usedBytes": stats.total_bytes,
+                "capBytes": state.services.remote_cache_max_bytes,
+                "avatarBytes": stats.avatar_bytes,
+                "previewBytes": stats.preview_bytes,
+                "fullBytes": stats.full_bytes,
+                "inFlightBytes": stats.in_flight_bytes,
+                "hits": stats.hits,
+                "misses": stats.misses,
+                "bytesFetched": stats.bytes_fetched,
+                "evictions": stats.evictions,
+            }),
+            None => Value::Null,
+        },
+        // No total-durable-bytes or free-disk API on the current ports, and
+        // no maintained backfill/reconcile timestamp yet: explicit nulls
+        // (stale/unknown is data) until the parent-owned traits expose them.
+        "durableUsedBytes": Value::Null,
+        "freeDiskBytes": Value::Null,
+        "accountingDrift": Value::Null,
+        "lastBackfill": Value::Null,
+        "lastReconcile": Value::Null,
+        "jobs": match pending_jobs {
+            Some(pending) => serde_json::json!({ "pending": pending }),
+            None => serde_json::json!({ "pending": Value::Null }),
+        },
+        "jobBreakdown": Value::Null,
+        "oldestPendingMs": Value::Null,
+        "quarantine": Value::Null,
+        // `DestinationTracker` exposes per-host health only (no aggregate
+        // export on the parent-owned type): destination detail stays
+        // per-host and out of this surface.
+        "federationDelivery": Value::Null,
+        "http": {
+            "rateLimitBuckets": state.rate_limiter.bucket_count(),
+            "authFailureKeys": state.rate_limiter.failure_count(),
+            "uploadSlotIps": state.upload_slots.slot_ip_count(),
+        },
+        "webSocket": Value::Null,
+        "backups": backups,
+        "lastBackupSuccessMs": last_backup_success_ms,
+        "transcode": { "enabled": ops.transcode_enabled, "status": ops.ffmpeg_status },
+    });
+    if detailed {
+        let recent: Vec<Value> = crate::observability::recent_errors()
+            .iter()
+            .map(|sample| {
+                serde_json::json!({
+                    "recordedMs": sample.recorded_ms,
+                    "category": sample.category,
+                })
+            })
+            .collect();
+        if let Some(map) = status.as_object_mut() {
+            map.insert("recentErrors".to_string(), Value::Array(recent));
+            map.insert(
+                "errorCounts".to_string(),
+                serde_json::to_value(crate::observability::error_counts()).unwrap_or(Value::Null),
+            );
+            map.insert(
+                "configFingerprint".to_string(),
+                ops.config_fingerprint.clone(),
+            );
+            map.insert(
+                "startupProbes".to_string(),
+                serde_json::json!({
+                    "transcode": ops.ffmpeg_status,
+                    "backupDirReady": !ops.backup_dir.as_os_str().is_empty()
+                        && ops.backup_dir.is_dir(),
+                }),
+            );
+        }
+    }
+    status
 }
 
 fn session_cookie_value(raw_token: &str) -> String {
@@ -5572,14 +5986,23 @@ fn api_dispatch_blocking(
                     .get(&file_id)
                     .map_err(ApiError::from_port_error)?
             } else {
+                // Batch H/C: the old `list_all_media(limit: 10_000)` single
+                // read truncated at the adapter clamp and could miss rows.
+                // Prefer the bounded `find_by_source_url` lookup; fall back
+                // to a bounded cursor walk matching the served `url` too.
                 let url = url.unwrap_or_default();
-                let rows = state
+                let indexed = state
                     .services
                     .media
-                    .list_all_media(&TimelineCursor { limit: 10_000, ..Default::default() })
+                    .find_by_source_url(&url)
                     .map_err(ApiError::from_port_error)?;
-                rows.into_iter()
+                match indexed
+                    .into_iter()
                     .find(|m| m.url == url || m.source_url.as_deref() == Some(url.as_str()))
+                {
+                    Some(meta) => Some(meta),
+                    None => walk_media_for_url(&state.services, &url)?,
+                }
             };
             match meta {
                 Some(meta) => Ok(Json(pack_drive_file(&meta, &state.services)).into_response()),
@@ -6614,6 +7037,85 @@ fn api_dispatch_blocking(
                 .map_err(ApiError::from_port_error)?;
             // Upstream has a void res (204), like the export endpoints.
             Ok(StatusCode::NO_CONTENT.into_response())
+        }
+
+        // --- Batch H admin diagnostics + Batch F admin backup routes --------
+        // (`prod-ready.md` §9 H4/H5, §7 F4). All four arms sit behind the
+        // EXISTING admin-auth helper chain (`require_caller` +
+        // `require_permission` + `require_admin`) — no weaker second path:
+        // anonymous callers get 401, non-admins 403, same as `admin/meta`.
+        // Permission names reuse the established `admin:meta` read/write
+        // pair (same sensitivity class) instead of inventing a new
+        // namespace. `POST /api/admin/backup` dispatches here as endpoint
+        // `admin/backup` and answers 202 + job id (accepted-fast; the
+        // worker drain in `main` builds the bundle off-request).
+        "admin/status" => {
+            check_allowed_fields(&obj, &["detailed"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:admin:meta")?;
+            require_admin(&caller)?;
+            let detailed = opt_bool(&obj, "detailed", false)?;
+            if detailed && !read_ops_config().detailed_admin_status {
+                // Flag off hides the expensive/private fields (H2): same
+                // 403 as any other unauthorized admin read.
+                return Err(ApiError::permission_denied());
+            }
+            crate::observability::log_event(
+                crate::observability::LogLevel::Info,
+                "admin.status",
+                &[("detailed", if detailed { "true" } else { "false" })],
+            );
+            Ok(Json(build_admin_status(&state, detailed)).into_response())
+        }
+
+        "admin/backup" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("write:admin:meta")?;
+            require_admin(&caller)?;
+            let context = read_backup_context().ok_or_else(ApiError::internal)?;
+            let job_id = crate::backup::request_backup(&context)
+                .map_err(|err| ApiError::invalid_param("backup", &err.to_string()))?;
+            crate::observability::log_event(
+                crate::observability::LogLevel::Info,
+                "backup.requested",
+                &[("job_id", job_id.as_str())],
+            );
+            Ok((
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({ "jobId": job_id })),
+            )
+                .into_response())
+        }
+
+        "admin/backups" => {
+            check_allowed_fields(&obj, &[])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:admin:meta")?;
+            require_admin(&caller)?;
+            let context = read_backup_context().ok_or_else(ApiError::internal)?;
+            let mut statuses = crate::backup::list_backup_statuses(&context.backup_dir);
+            statuses.truncate(STATUS_BACKUP_LIST_CAP * 4);
+            let recent: Vec<Value> = statuses
+                .iter()
+                .rev()
+                .take(STATUS_BACKUP_LIST_CAP)
+                .map(pack_backup_status)
+                .collect();
+            Ok(Json(Value::Array(recent)).into_response())
+        }
+
+        "admin/backup-status" => {
+            check_allowed_fields(&obj, &["jobId"])?;
+            let caller = require_caller(caller)?;
+            caller.require_permission("read:admin:meta")?;
+            require_admin(&caller)?;
+            let context = read_backup_context().ok_or_else(ApiError::internal)?;
+            let job_id = required_str(&obj, "jobId")?;
+            match crate::backup::backup_status(&context, &job_id) {
+                Some(status) => Ok(Json(pack_backup_status(&status)).into_response()),
+                None => Err(ApiError::invalid_param("jobId", "unknown backup job")),
+            }
         }
 
         // §13 profile import/export (Misskey `i/export-*` + `i/import-*`

@@ -22,7 +22,16 @@ use pinetree::media::storage::FsBlobStore;
 use pinetree::persistence::redb::RedbStore;
 use pinetree::services::email::{EmailSender, SmtpEmailSender};
 
-fn build_services(cfg: &Config) -> Result<(Arc<AppServices>, pinetree::streaming::hub::Hub), String> {
+fn build_services(
+    cfg: &Config,
+) -> Result<
+    (
+        Arc<AppServices>,
+        pinetree::streaming::hub::Hub,
+        Arc<RedbStore>,
+    ),
+    String,
+> {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let ids: Arc<dyn IdGenerator> = Arc::new(AidxGenerator::new(clock.clone()));
     let store = RedbStore::open(cfg.data_dir.join("pinetree.redb"), clock.clone(), ids.clone())
@@ -116,7 +125,7 @@ fn build_services(cfg: &Config) -> Result<(Arc<AppServices>, pinetree::streaming
     // in-flight reservation. Clear it before serving (idempotent).
     pinetree::media::reconciler::reset_in_flight(&services)
         .map_err(|err| format!("reset cache in-flight: {err}"))?;
-    Ok((services, hub))
+    Ok((services, hub, store))
 }
 
 /// `create-account --username=<name> --password=<pw>`: create a local
@@ -395,8 +404,27 @@ async fn async_main() {
             cfg.durable_dir = Some(dir.into());
         } else if let Some(dir) = arg.strip_prefix("--cache-dir=") {
             cfg.cache_dir = Some(dir.into());
+        } else if let Some(dir) = arg.strip_prefix("--backup-dir=") {
+            // Batch H: CLI override of the `backup.dir` file value (same
+            // merged-then-validated flow as every other setting).
+            cfg.backup.dir = Some(dir.into());
         } else if arg == "--no-transcode" {
             cfg.transcode.enabled = false;
+        } else if let Some(rest) = arg.strip_prefix("--allow-local-http-for-testing") {
+            // Per-invocation override of the JSON `unsafe` section (throwaway
+            // smoke rigs only): bare flag means true, `=true|false|1|0`
+            // explicit. `validate()` still restricts http:// to local/test
+            // host classes.
+            cfg.r#unsafe.allow_local_http_for_testing = match rest {
+                "" | "=true" | "=1" => true,
+                "=false" | "=0" => false,
+                other => {
+                    eprintln!(
+                        "invalid --allow-local-http-for-testing{other} (want bare flag or =true|=false)"
+                    );
+                    std::process::exit(2);
+                }
+            };
         } else {
             positional.push(arg);
         }
@@ -407,6 +435,35 @@ async fn async_main() {
         std::process::exit(1);
     }
 
+    // Batch H: publish the configured log shape process-wide before any
+    // structured line is emitted.
+    pinetree::observability::set_structured_logging(cfg.diagnostics.structured_logging);
+
+    // Batch H/F/C maintenance ops: store-backed one-shots that run instead
+    // of serving (`backup`, `backup-status`, `restore`, `storage-backfill`).
+    // Named early so typos fail fast; executed after `build_services`
+    // below (they need the store but not the worker or listener).
+    const MAINTENANCE_OPS: &[&str] = &["backup", "backup-status", "restore", "storage-backfill"];
+    let maintenance_op: Option<String> = positional
+        .first()
+        .filter(|cmd| MAINTENANCE_OPS.contains(&cmd.as_str()))
+        .cloned();
+
+    // Batch E wiring: publish the configured RFC 9421 mode process-wide so
+    // the inbox/fetch signature gates enforce it instead of silently
+    // ignoring `federation.rfc9421_mode` (default `permissive`).
+    pinetree::activitypub::signatures::set_rfc9421_mode(cfg.federation.rfc9421_mode);
+
+    // Batch B: conspicuous warning whenever the unsafe local-HTTP exception
+    // is active. Host class only (loopback/localhost/private-lan/test-domain
+    // /public) — never URLs, keys or other secrets.
+    if cfg.r#unsafe.allow_local_http_for_testing {
+        eprintln!(
+            "WARNING: unsafe.allow_local_http_for_testing=true with an http:// public_url \
+             (host class: {}): local/test rigs only, never enable in production",
+            cfg.public_host_class().as_str()
+        );
+    }
 
     // Federation debug lines (accept/reject, delivery). Off unless the flag or
     // PINETREE_DEBUG_FEDERATION is set. See `pinetree::observability`.
@@ -424,8 +481,10 @@ async fn async_main() {
     } else if positional.first().is_some_and(|cmd| cmd == "set-role") {
         run_set_role(&positional[1..], &cfg);
     } else if let Some(cmd) = positional.first() {
-        eprintln!("unknown subcommand: {cmd}");
-        std::process::exit(2);
+        if maintenance_op.is_none() {
+            eprintln!("unknown subcommand: {cmd}");
+            std::process::exit(2);
+        }
     }
 
     // Transcode startup gate (gaps WP1): when enabled, the ffmpeg
@@ -438,11 +497,27 @@ async fn async_main() {
     // checks static ranges, this probe checks the live toolchain and
     // prints the running version for the logs.
     let transcode_config = cfg.transcode.to_runtime();
+    // The validated toolchain line feeds the admin status surface; disabled
+    // installs report `"disabled"`.
+    let mut ffmpeg_status = "disabled".to_string();
     if transcode_config.enabled {
         match transcode_config.validate() {
-            Ok(info) => eprintln!("transcode toolchain: {}", info.version),
+            Ok(info) => {
+                ffmpeg_status = info.version.to_string();
+                eprintln!("transcode toolchain: {}", info.version);
+            }
             Err(err) => {
-                eprintln!("transcode toolchain unavailable: {err}");
+                // Fail closed: never enter serve mode with an explicitly
+                // enabled but unusable toolchain (no silent untranscoded
+                // passthrough). The probe below names the binary and the
+                // checks run against it.
+                eprintln!(
+                    "transcode toolchain unavailable (probe: `{0} -version` plus \
+                     `-encoders`/`-decoders` for {1}; set transcode.enabled=false \
+                     or pass --no-transcode to start without FFmpeg): {err}",
+                    transcode_config.ffmpeg_path,
+                    pinetree::media::transcode::REQUIRED_ENCODERS.join(", ")
+                );
                 std::process::exit(1);
             }
         }
@@ -461,11 +536,65 @@ async fn async_main() {
         eprintln!("transcode temp sweep: removed {swept} stale files");
     }
 
-
-    let (services, hub) = build_services(&cfg).unwrap_or_else(|err| {
+    let (services, hub, store) = build_services(&cfg).unwrap_or_else(|err| {
         eprintln!("{err}");
         std::process::exit(1);
     });
+    // Batch F/H: the live backup context (store handle + pool roots +
+    // confined backup dir). Published for the admin backup routes; the
+    // worker drain below and the maintenance CLI ops share it.
+    let backup_ctx = pinetree::backup::BackupContext {
+        store: store.clone(),
+        durable_pool: cfg.durable_pool_dir(),
+        cache_pool: cfg.cache_pool_dir(),
+        backup_dir: cfg.backup_dir(),
+    };
+    // Batch F startup cleanup: abandoned `.partial-*` bundles never look
+    // final, and stale `running` records (their process is gone) fail with
+    // `abandoned-restart`. Queued records stay for the drain.
+    match pinetree::backup::cleanup_abandoned_partials(&backup_ctx.backup_dir) {
+        Ok(report) if report.partials_removed > 0 || report.stale_running_failed > 0 => {
+            eprintln!(
+                "backup cleanup: removed {} partial files, failed {} stale running records",
+                report.partials_removed, report.stale_running_failed
+            );
+        }
+        Ok(_) => {}
+        Err(err) => eprintln!("backup cleanup failed (continuing to serve): {err}"),
+    }
+    // Batch H maintenance CLI ops (run instead of serving; the store is
+    // already open — if the server holds it, the open above fails with the
+    // lock error, which is the actionable message).
+    if let Some(op) = maintenance_op.as_deref() {
+        run_maintenance_op(op, &positional[1..], &services, &backup_ctx);
+    }
+    // Batch H ops surface: probes + admin status read this (never raw
+    // paths, secrets, or key material — see `OpsConfig`).
+    pinetree::api::misskey::endpoints::set_ops_config(
+        pinetree::api::misskey::endpoints::OpsConfig {
+            detailed_admin_status: cfg.diagnostics.detailed_admin_status,
+            durable_dir: cfg.durable_pool_dir(),
+            cache_dir: cfg.cache_pool_dir(),
+            backup_dir: cfg.backup_dir(),
+            transcode_enabled: transcode_config.enabled,
+            ffmpeg_status,
+            config_fingerprint: cfg.config_summary(),
+            started_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0),
+        },
+    );
+    pinetree::api::misskey::endpoints::set_backup_context(backup_ctx.clone());
+    // Batch C boot trigger: one bounded reconcile job at startup (the
+    // worker drains it within its normal polling). Safe to re-run; a
+    // failure here is loud but not fatal (readiness still gates traffic).
+    if let Err(err) = pinetree::media::reconciler::enqueue_storage_reconcile(
+        services.jobs.as_ref(),
+        services.clock.now_ms(),
+    ) {
+        eprintln!("boot storage reconcile enqueue failed (continuing to serve): {err}");
+    }
     // Opt-in bounded repair for pre-Slice-B historical remote notes whose
     // original `inReplyTo` was discarded (`docs/replies.md` §6.1). Off by
     // default (no network I/O at startup); set
@@ -523,6 +652,40 @@ async fn async_main() {
     // work is lost across a restart.
     let stop = Arc::new(AtomicBool::new(false));
     let _worker_handle = worker.clone().spawn_until(Duration::from_millis(50), stop.clone());
+    // Batch F backup drain: the worker tick owns durable jobs; backup
+    // requests are durable status files, so a slow-interval task claims the
+    // oldest queued request and builds its bundle (exclusive gate, bounded
+    // retries inside `run_next_backup`). Stops with the worker.
+    {
+        let worker = worker.clone();
+        let backup_ctx = backup_ctx.clone();
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            loop {
+                interval.tick().await;
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                match worker.drain_pending_backups(&backup_ctx, 1) {
+                    Ok(0) => {}
+                    Ok(done) => pinetree::observability::log_event(
+                        pinetree::observability::LogLevel::Info,
+                        "backup.drained",
+                        &[("completed", done.to_string().as_str())],
+                    ),
+                    Err(err) => pinetree::observability::log_event(
+                        pinetree::observability::LogLevel::Warn,
+                        "backup.drain_failed",
+                        &[(
+                            "error_class",
+                            pinetree::observability::error_class(&err.to_string()),
+                        )],
+                    ),
+                }
+            }
+        });
+    }
     let mut rate_limiter = RateLimiter::with_misskey_defaults(services.clock.clone());
     if debug_weak_rate_limits_flag {
         // Load tests only: 10x the endpoint bucket counts (same factor as birchtree).
@@ -586,6 +749,142 @@ fn parse_csv_list(list: &str) -> Vec<String> {
         .filter(|part| !part.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+/// Batch H/F/C maintenance CLI ops. These diverge (never return): they run
+/// one store-backed one-shot instead of serving. The store is already open
+/// (a running server holds the redb lock, so the open above fails first
+/// with the actionable error); the worker and listener never start here.
+fn run_maintenance_op(
+    op: &str,
+    args: &[String],
+    services: &Arc<AppServices>,
+    backup_ctx: &pinetree::backup::BackupContext,
+) -> ! {
+    match op {
+        // Batch F: queue one backup and build it synchronously, then print
+        // the final bundle path. Same engine as the admin route + drain.
+        "backup" => {
+            if !args.is_empty() {
+                eprintln!("usage: backup (no arguments)");
+                std::process::exit(2);
+            }
+            let job_id = pinetree::backup::request_backup(backup_ctx).unwrap_or_else(|err| {
+                eprintln!("backup request failed: {err}");
+                std::process::exit(1);
+            });
+            match pinetree::backup::run_backup_blocking(backup_ctx, &job_id) {
+                Ok(path) => {
+                    println!("backup {} complete: {}", job_id, path.display());
+                    std::process::exit(0);
+                }
+                Err(err) => {
+                    eprintln!("backup {job_id} failed: {err}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        // Batch F: read durable backup statuses (`--id=<job>` for one).
+        // Offline-safe: status files only, no store access.
+        "backup-status" => {
+            let mut id: Option<String> = None;
+            for arg in args {
+                if let Some(value) = arg.strip_prefix("--id=") {
+                    id = Some(value.to_string());
+                } else {
+                    eprintln!("usage: backup-status [--id=<backup-job-id>]");
+                    std::process::exit(2);
+                }
+            }
+            match id {
+                Some(job_id) => match pinetree::backup::backup_status(backup_ctx, &job_id) {
+                    Some(status) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&status)
+                                .unwrap_or_else(|_| format!("{status:?}"))
+                        );
+                        std::process::exit(0);
+                    }
+                    None => {
+                        eprintln!("unknown backup job: {job_id}");
+                        std::process::exit(1);
+                    }
+                },
+                None => {
+                    let statuses = pinetree::backup::list_backup_statuses(&backup_ctx.backup_dir);
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&statuses)
+                            .unwrap_or_else(|_| "[]".to_string())
+                    );
+                    std::process::exit(0);
+                }
+            }
+        }
+        // Batch F: validate a bundle and restore it into a FRESH directory
+        // (never the live data dir). Operator cutover stays manual; see
+        // `docs/prod-ready.md` §7 F5.
+        "restore" => {
+            let mut bundle: Option<String> = None;
+            let mut target_dir: Option<String> = None;
+            for arg in args {
+                if let Some(value) = arg.strip_prefix("--bundle=") {
+                    bundle = Some(value.to_string());
+                } else if let Some(value) = arg.strip_prefix("--target-dir=") {
+                    target_dir = Some(value.to_string());
+                } else {
+                    eprintln!("usage: restore --bundle=<file.zip> --target-dir=<fresh-dir>");
+                    std::process::exit(2);
+                }
+            }
+            let (Some(bundle), Some(target_dir)) = (bundle, target_dir) else {
+                eprintln!("usage: restore --bundle=<file.zip> --target-dir=<fresh-dir>");
+                std::process::exit(2);
+            };
+            match pinetree::backup::restore_bundle(
+                std::path::Path::new(&bundle),
+                std::path::Path::new(&target_dir),
+            ) {
+                Ok(report) => {
+                    println!(
+                        "restore complete: dir={} tables={} rows={} media_files={} media_bytes={}",
+                        report.restored_dir.display(),
+                        report.tables_restored,
+                        report.rows_total,
+                        report.media_files,
+                        report.media_bytes,
+                    );
+                    std::process::exit(0);
+                }
+                Err(err) => {
+                    eprintln!("restore failed: {err}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        // Batch C: enqueue one backfill repair job (the worker drains it at
+        // next boot/serve). Explicit operator trigger, never automatic.
+        "storage-backfill" => {
+            if !args.is_empty() {
+                eprintln!("usage: storage-backfill (no arguments)");
+                std::process::exit(2);
+            }
+            if let Err(err) = pinetree::media::reconciler::enqueue_storage_backfill(
+                services.jobs.as_ref(),
+                services.clock.now_ms(),
+            ) {
+                eprintln!("storage-backfill enqueue failed: {err}");
+                std::process::exit(1);
+            }
+            println!("storage backfill enqueued (drains on next serve)");
+            std::process::exit(0);
+        }
+        _ => {
+            eprintln!("unknown subcommand: {op}");
+            std::process::exit(2);
+        }
+    }
 }
 
 /// Base configuration: the `--config=PATH` JSON file over the compiled

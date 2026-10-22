@@ -1,12 +1,29 @@
-//! Misskey API fixed-window rate limiting (Slice D1).
+//! Misskey API fixed-window rate limiting (Slice D1; Batch D bounded).
 //!
 //! Keyed by `(account_id_or_ip, endpoint_bucket)` with a window count
 //! (`max_per_window` requests per `window_ms`) plus an optional
 //! `min_interval_ms` between requests in the same bucket. Uses an
 //! injected [`Clock`] so tests control time. Exceeding either limit
 //! returns `Err(ApiError::rate_limit_exceeded(retry_secs))`.
+//!
+//! Batch D bound: both in-memory maps ([`RateLimiter::state`] ordinary
+//! buckets and [`RateLimiter::failures`] auth-failure state) and the
+//! [`UploadSlots`] per-IP table are hard-bounded
+//! ([`MAX_RATE_LIMIT_BUCKETS`], [`MAX_AUTH_FAILURE_BUCKETS`],
+//! [`MAX_UPLOAD_SLOT_IPS`]). Expired entries are pruned by periodic
+//! time-gated full scans (at most one per [`PRUNE_INTERVAL_MS`] per map),
+//! under cap pressure, and — for auth-failure entries — also on the read
+//! path; if the map is still full, the stalest entries are evicted with
+//! keys that would currently refuse a request evicted last, so eviction
+//! can never silently un-throttle a key that is currently being abusive.
+//!
+//! TODO(config): wire these bounds through the JSON `Config` once the
+//! shared config schema is settled (config.rs is owned by another agent).
+//! Until then these hardcoded, documented constants are the bounds; do
+//! not add env-var/CLI-only knobs for them.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -25,6 +42,29 @@ const HOUR_MS: u64 = 3_600_000;
 /// [`AUTH_BACKOFF_CAP_MS`].
 pub const AUTH_BACKOFF_BASE_MS: u64 = 1_000;
 pub const AUTH_BACKOFF_CAP_MS: u64 = 60_000;
+
+/// Batch D bounds on client-keyed in-memory state.
+///
+/// `MAX_RATE_LIMIT_BUCKETS` caps ordinary `(key, bucket)` window entries,
+/// `MAX_AUTH_FAILURE_BUCKETS` caps `(key, bucket)` auth-failure entries,
+/// and [`MAX_UPLOAD_SLOT_IPS`] caps distinct per-IP upload-slot entries.
+/// All three comfortably exceed single-node legitimate cardinality (tens of
+/// distinct local callers) while keeping worst-case memory bounded: each
+/// entry is two short strings plus a few integers, so even a full map is
+/// on the order of megabytes. Eviction always prefers stale entries and
+/// evicts active abuse keys last; see the module docs.
+///
+/// TODO(config): make these JSON-configurable once the shared config
+/// schema is settled (config.rs is owned by another agent).
+pub const MAX_RATE_LIMIT_BUCKETS: usize = 32_768;
+pub const MAX_AUTH_FAILURE_BUCKETS: usize = 32_768;
+
+/// At most one full expiry scan per map per this interval of clock time.
+/// Steady-state cost is negligible (a ≤32k-entry scan once a minute), and
+/// churn with a frozen clock pays for at most one scan: entries can only
+/// expire as the clock advances. Cap-pressure pruning and eviction apply
+/// regardless of time, so the bounds hold even if the clock stalls.
+pub const PRUNE_INTERVAL_MS: i64 = 60_000;
 
 /// Configured limits for one endpoint bucket.
 #[derive(Debug, Clone, Copy)]
@@ -63,6 +103,8 @@ pub struct RateLimiter {
     state: Mutex<HashMap<(String, String), BucketState>>,
     auth_limits: HashMap<String, AuthLimit>,
     failures: Mutex<HashMap<(String, String), FailureState>>,
+    bucket_prune_at: AtomicI64,
+    failure_prune_at: AtomicI64,
 }
 
 impl RateLimiter {
@@ -73,6 +115,8 @@ impl RateLimiter {
             state: Mutex::new(HashMap::new()),
             auth_limits: HashMap::new(),
             failures: Mutex::new(HashMap::new()),
+            bucket_prune_at: AtomicI64::new(i64::MIN),
+            failure_prune_at: AtomicI64::new(i64::MIN),
         }
     }
 
@@ -213,17 +257,24 @@ impl RateLimiter {
             Some(limit) => *limit,
         };
         let now = self.clock.now_ms();
-        let states = self.failures.lock().unwrap_or_else(|e| e.into_inner());
-        let account = failure_retry_secs(
-            states.get(&(account_key.to_string(), bucket.to_string())).copied(),
-            limit.account,
-            now,
-        );
-        let ip = failure_retry_secs(
-            states.get(&(ip_key.to_string(), bucket.to_string())).copied(),
-            limit.ip,
-            now,
-        );
+        self.prune_failures_if_due(now);
+        let mut states = self.failures.lock().unwrap_or_else(|e| e.into_inner());
+        let account_key_pair = (account_key.to_string(), bucket.to_string());
+        let ip_key_pair = (ip_key.to_string(), bucket.to_string());
+        let account_state = states.get(&account_key_pair).copied();
+        let ip_state = states.get(&ip_key_pair).copied();
+        let account = failure_retry_secs(account_state, limit.account, now);
+        let ip = failure_retry_secs(ip_state, limit.ip, now);
+        // Opportunistic expiry on the read path: an entry whose window has
+        // fully elapsed is dropped instead of lingering until cap pressure.
+        // An entry merely past its progressive backoff is retained: its
+        // failure count must survive until the window ends for the cap.
+        if !failure_key_retained(&limit, account_state, now) {
+            states.remove(&account_key_pair);
+        }
+        if !failure_key_retained(&limit, ip_state, now) {
+            states.remove(&ip_key_pair);
+        }
         match account.into_iter().chain(ip).max() {
             Some(retry_secs) => Err(ApiError::rate_limit_exceeded(retry_secs)),
             None => Ok(()),
@@ -237,7 +288,16 @@ impl RateLimiter {
             Some(limit) => *limit,
         };
         let now = self.clock.now_ms();
+        self.prune_failures_if_due(now);
         let mut states = self.failures.lock().unwrap_or_else(|e| e.into_inner());
+        // Bound the map before growing it: prune expired entries, then
+        // evict stalest-first with actively blocking keys evicted last.
+        if states.len() >= MAX_AUTH_FAILURE_BUCKETS {
+            prune_failure_states(&mut states, &self.auth_limits, now);
+            if states.len() >= MAX_AUTH_FAILURE_BUCKETS {
+                evict_stalest_failures(&mut states, &self.auth_limits, now);
+            }
+        }
         for (key, bucket_limit) in [(account_key, limit.account), (ip_key, limit.ip)] {
             let entry_key = (key.to_string(), bucket.to_string());
             let next = match states.get(&entry_key).copied() {
@@ -297,16 +357,24 @@ impl RateLimiter {
             Some(limit) => *limit,
         };
         let now = self.clock.now_ms();
+        self.prune_buckets_if_due(now);
         let key = (account_id_or_ip.to_string(), endpoint_bucket.to_string());
         let mut states = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let mut entry = states
-            .get(&key)
-            .copied()
-            .unwrap_or(BucketState {
-                window_start_ms: now,
-                count: 0,
-                last_ms: None,
-            });
+        // Bound the map before growing it: prune expired entries, then
+        // evict stalest-first with keys at their window cap evicted last.
+        // Only new keys can grow the map, so existing keys skip the scan
+        // and stay on the fast path.
+        if !states.contains_key(&key) && states.len() >= MAX_RATE_LIMIT_BUCKETS {
+            prune_bucket_states(&mut states, &self.limits, now);
+            if states.len() >= MAX_RATE_LIMIT_BUCKETS {
+                evict_stalest_buckets(&mut states, &self.limits, now);
+            }
+        }
+        let mut entry = states.get(&key).copied().unwrap_or(BucketState {
+            window_start_ms: now,
+            count: 0,
+            last_ms: None,
+        });
         // Roll the fixed window when it has elapsed.
         if now.saturating_sub(entry.window_start_ms) as u64 >= limit.window_ms {
             entry.window_start_ms = now;
@@ -323,13 +391,235 @@ impl RateLimiter {
             let reset_in =
                 (entry.window_start_ms as u64).saturating_add(limit.window_ms) as i64 - now;
             return Err(ApiError::rate_limit_exceeded(ceil_secs(
-                reset_in.max(0) as u64,
+                reset_in.max(0) as u64
             )));
         }
         entry.count += 1;
         entry.last_ms = Some(now);
         states.insert(key, entry);
         Ok(())
+    }
+
+    /// Full expiry scan of the ordinary-bucket map, at most once per
+    /// [`PRUNE_INTERVAL_MS`] of clock time. Lock-free gate: concurrent
+    /// callers may rarely prune twice, which is harmless and idempotent.
+    fn prune_buckets_if_due(&self, now: i64) {
+        if now.saturating_sub(self.bucket_prune_at.load(Ordering::Relaxed)) < PRUNE_INTERVAL_MS {
+            return;
+        }
+        let mut states = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        prune_bucket_states(&mut states, &self.limits, now);
+        self.bucket_prune_at.store(now, Ordering::Relaxed);
+    }
+
+    /// Full expiry scan of the auth-failure map, at most once per
+    /// [`PRUNE_INTERVAL_MS`] of clock time. See [`RateLimiter::prune_buckets_if_due`].
+    fn prune_failures_if_due(&self, now: i64) {
+        if now.saturating_sub(self.failure_prune_at.load(Ordering::Relaxed)) < PRUNE_INTERVAL_MS {
+            return;
+        }
+        let mut states = self.failures.lock().unwrap_or_else(|e| e.into_inner());
+        prune_failure_states(&mut states, &self.auth_limits, now);
+        self.failure_prune_at.store(now, Ordering::Relaxed);
+    }
+
+    /// Retained ordinary bucket entries, bounded by
+    /// [`MAX_RATE_LIMIT_BUCKETS`]. Diagnostic/test hook.
+    pub fn bucket_count(&self) -> usize {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// Retained auth-failure entries, bounded by
+    /// [`MAX_AUTH_FAILURE_BUCKETS`]. Diagnostic/test hook.
+    pub fn failure_count(&self) -> usize {
+        self.failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+    }
+}
+
+/// An ordinary bucket entry is live while its fixed window has not elapsed,
+/// or while its `min_interval_ms` state can still reject a request. Anything
+/// else is expired and safe to drop: the next request for that key simply
+/// starts a fresh window, which is exactly what the rollover path in
+/// [`RateLimiter::check`] would do.
+fn bucket_state_is_live(
+    limits: &HashMap<String, BucketLimit>,
+    key: &(String, String),
+    state: &BucketState,
+    now: i64,
+) -> bool {
+    let limit = match limits.get(&key.1) {
+        None => return false,
+        Some(limit) => *limit,
+    };
+    if (now.saturating_sub(state.window_start_ms) as u64) < limit.window_ms {
+        return true;
+    }
+    match (limit.min_interval_ms, state.last_ms) {
+        (Some(min_interval), Some(last)) => (now.saturating_sub(last) as u64) < min_interval,
+        _ => false,
+    }
+}
+
+/// Drop every expired ordinary bucket entry. Called by the periodic
+/// time-gated scan and under cap pressure; see
+/// [`RateLimiter::prune_buckets_if_due`].
+fn prune_bucket_states(
+    states: &mut HashMap<(String, String), BucketState>,
+    limits: &HashMap<String, BucketLimit>,
+    now: i64,
+) {
+    states.retain(|key, state| bucket_state_is_live(limits, key, state, now));
+}
+
+/// Eviction protection class of an ordinary bucket entry. Only the last
+/// class — a key currently at its window cap inside a live window, i.e. an
+/// actively abusive key — is strongly protected. Interval-only entries
+/// (window gone, `min_interval_ms` still pending) are never *pruned* early,
+/// but under hard cap pressure they compete by age like any other idle
+/// key: with every entry live, something must go, and the stalest entry is
+/// the throttle-safest victim (a hot abuse key always has a fresh window).
+fn bucket_eviction_rank(
+    limits: &HashMap<String, BucketLimit>,
+    key: &(String, String),
+    state: &BucketState,
+    now: i64,
+) -> (bool, i64) {
+    let at_cap_live = match limits.get(&key.1) {
+        None => false,
+        Some(limit) => {
+            (now.saturating_sub(state.window_start_ms) as u64) < limit.window_ms
+                && state.count >= limit.max_per_window
+        }
+    };
+    (at_cap_live, state.window_start_ms)
+}
+
+/// Evict stalest-first until the map fits under [`MAX_RATE_LIMIT_BUCKETS`].
+/// Entries for unknown buckets and idle keys go first (oldest window
+/// first); keys currently at their cap inside a live window are evicted
+/// only if nothing else remains, so eviction under churn discards idle
+/// keys while an actively abusive key keeps throttling.
+/// Eviction runs in a single pass down to a below-cap target so sustained
+/// churn amortizes to O(1) per insert instead of one O(map) scan per key.
+fn evict_stalest_buckets(
+    states: &mut HashMap<(String, String), BucketState>,
+    limits: &HashMap<String, BucketLimit>,
+    now: i64,
+) {
+    if states.len() < MAX_RATE_LIMIT_BUCKETS {
+        return;
+    }
+    let target = MAX_RATE_LIMIT_BUCKETS * 7 / 8;
+    let mut ranked: Vec<(bool, i64, (String, String))> = states
+        .iter()
+        .map(|(key, state)| {
+            let (at_cap_live, window_start) = bucket_eviction_rank(limits, key, state, now);
+            (at_cap_live, window_start, key.clone())
+        })
+        .collect();
+    ranked.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    let excess = states.len().saturating_sub(target).max(1);
+    for (_, _, key) in ranked.into_iter().take(excess) {
+        states.remove(&key);
+    }
+}
+
+/// Whether an auth-failure entry must be retained: its window is still open
+/// under either of the bucket's limits (account or IP — the map key does
+/// not record which role a key was inserted under, so openness under either
+/// limit retains it). An entry merely past its progressive backoff is still
+/// retained: dropping it would reset its failure count and let an attacker
+/// stretch failures past the window cap by waiting out each backoff.
+/// Deletion is safe only once the window has fully elapsed, at which point
+/// a fresh attempt starts a new window anyway.
+fn failure_key_retained(limit: &AuthLimit, state: Option<FailureState>, now: i64) -> bool {
+    match state {
+        None => false,
+        Some(state) => {
+            let age = now.saturating_sub(state.window_start_ms).max(0) as u64;
+            age < limit.account.window_ms || age < limit.ip.window_ms
+        }
+    }
+}
+
+/// An auth-failure entry is live while [`failure_key_retained`] holds for
+/// its bucket: the map key does not record whether the key was inserted in
+/// the account or IP role, so liveness under either limit retains it — the
+/// safe direction, since it can only keep throttling, never drop it early.
+fn failure_state_is_live(
+    auth_limits: &HashMap<String, AuthLimit>,
+    key: &(String, String),
+    state: &FailureState,
+    now: i64,
+) -> bool {
+    match auth_limits.get(&key.1) {
+        None => false,
+        Some(limit) => failure_key_retained(limit, Some(*state), now),
+    }
+}
+
+/// Whether an auth-failure entry would currently refuse an attempt under
+/// either of the bucket's limits. Eviction protection is keyed on this —
+/// not mere window-openness — so discarding entries under cap pressure can
+/// never silently un-throttle an actively blocked key in favor of a live
+/// but non-blocking one.
+fn failure_is_blocking(
+    auth_limits: &HashMap<String, AuthLimit>,
+    key: &(String, String),
+    state: &FailureState,
+    now: i64,
+) -> bool {
+    match auth_limits.get(&key.1) {
+        None => false,
+        Some(limit) => {
+            failure_retry_secs(Some(*state), limit.account, now).is_some()
+                || failure_retry_secs(Some(*state), limit.ip, now).is_some()
+        }
+    }
+}
+
+/// Drop every expired auth-failure entry. Called by the periodic
+/// time-gated scan and under cap pressure; see
+/// [`RateLimiter::prune_failures_if_due`].
+fn prune_failure_states(
+    states: &mut HashMap<(String, String), FailureState>,
+    auth_limits: &HashMap<String, AuthLimit>,
+    now: i64,
+) {
+    states.retain(|key, state| failure_state_is_live(auth_limits, key, state, now));
+}
+
+/// Evict until the map fits under [`MAX_AUTH_FAILURE_BUCKETS`].
+/// Non-blocking entries go first (fewest failures, oldest first);
+/// entries that would currently refuse an attempt are evicted last.
+/// Single-pass down to a below-cap target; see [`evict_stalest_buckets`].
+fn evict_stalest_failures(
+    states: &mut HashMap<(String, String), FailureState>,
+    auth_limits: &HashMap<String, AuthLimit>,
+    now: i64,
+) {
+    if states.len() < MAX_AUTH_FAILURE_BUCKETS {
+        return;
+    }
+    let target = MAX_AUTH_FAILURE_BUCKETS * 7 / 8;
+    let mut ranked: Vec<(bool, u64, i64, (String, String))> = states
+        .iter()
+        .map(|(key, state)| {
+            (
+                failure_is_blocking(auth_limits, key, state, now),
+                state.failures,
+                state.last_failure_ms,
+                key.clone(),
+            )
+        })
+        .collect();
+    ranked.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    let excess = states.len().saturating_sub(target).max(1);
+    for (_, _, _, key) in ranked.into_iter().take(excess) {
+        states.remove(&key);
     }
 }
 
@@ -378,36 +668,118 @@ pub const MAX_CONCURRENT_UPLOADS_PER_IP: usize = 2;
 pub const MAX_CONCURRENT_UPLOADS_GLOBAL: usize = 16;
 pub const UPLOAD_BUSY_RETRY_AFTER_SECS: u64 = 5;
 
+/// Batch D bound: at most this many distinct client-IP entries are retained
+/// in the upload-slot map. Idle entries (no live or in-flight permits) are
+/// evicted under pressure; entries with active permits are never evicted,
+/// so the per-IP cap cannot split across two semaphores. If every retained
+/// entry is active — only possible under extreme concurrent-upload churn —
+/// one extra entry is allowed rather than breaking an active cap, so this
+/// is a soft bound under load and a hard bound at rest.
+///
+/// TODO(config): make this JSON-configurable once the shared config schema
+/// is settled (config.rs is owned by another agent).
+pub const MAX_UPLOAD_SLOT_IPS: usize = 4_096;
+
 /// Held for the duration of one upload handler; dropping it frees both
 /// the per-IP and the global slot.
+///
+/// Field order matters: fields drop in declaration order, so the two
+/// semaphore permits release before `_guard` decrements the IP's active
+/// count. That ordering is what makes map eviction safe — an entry with
+/// `active == 0` provably has no live permit referencing its semaphore.
 #[derive(Debug)]
 pub struct UploadPermit {
-    _global: OwnedSemaphorePermit,
     _ip: OwnedSemaphorePermit,
+    _global: OwnedSemaphorePermit,
+    _guard: IpActiveGuard,
+}
+
+/// Decrements its IP entry's active count on drop. Always the last field of
+/// [`UploadPermit`] so the count reaches zero only after both semaphore
+/// permits are released.
+#[derive(Debug)]
+struct IpActiveGuard {
+    inner: Arc<SlotInner>,
+    ip: String,
+}
+
+impl Drop for IpActiveGuard {
+    fn drop(&mut self) {
+        let mut slots = self.inner.slots.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = slots.get_mut(&self.ip) {
+            entry.active = entry.active.saturating_sub(1);
+        }
+        // Deliberately no removal here: eviction happens only in
+        // `acquire` under the same lock that hands out permits, so a
+        // racing acquire can never observe a removed entry while a permit
+        // for that IP is still alive (a naive `remove(ip)` on drop would
+        // let the next acquire mint a second semaphore and double the
+        // effective per-IP cap).
+    }
+}
+
+/// One retained per-IP upload semaphore plus its outstanding-permit count.
+#[derive(Debug)]
+struct IpSlot {
+    semaphore: Arc<Semaphore>,
+    /// Permits checked out plus acquires currently in flight between the
+    /// count increment and the semaphore `try_acquire`. The map entry may
+    /// be evicted only while this is zero.
+    active: usize,
+}
+
+#[derive(Debug)]
+struct SlotInner {
+    per_ip: usize,
+    global: Arc<Semaphore>,
+    slots: Mutex<HashMap<String, IpSlot>>,
 }
 
 /// Concurrent-upload slots; see [`MAX_CONCURRENT_UPLOADS_PER_IP`].
+///
+/// The per-IP table is bounded by [`MAX_UPLOAD_SLOT_IPS`] without ever
+/// breaking the per-IP cap under races: every live permit for an IP shares
+/// the single semaphore in that IP's map entry, entries are evicted only
+/// while their `active` count is zero, and the count itself is incremented
+/// under the map lock before any permit is handed out.
 pub struct UploadSlots {
-    per_ip: usize,
-    global: Arc<Semaphore>,
-    per_ip_slots: Mutex<HashMap<String, Arc<Semaphore>>>,
+    inner: Arc<SlotInner>,
 }
 
 impl UploadSlots {
     pub fn new(per_ip: usize, global: usize) -> Self {
         Self {
-            per_ip,
-            global: Arc::new(Semaphore::new(global)),
-            per_ip_slots: Mutex::new(HashMap::new()),
+            inner: Arc::new(SlotInner {
+                per_ip,
+                global: Arc::new(Semaphore::new(global)),
+                slots: Mutex::new(HashMap::new()),
+            }),
         }
     }
 
     /// Production defaults: 2 concurrent uploads per IP, 16 globally.
     pub fn with_defaults() -> Self {
-        Self::new(
-            MAX_CONCURRENT_UPLOADS_PER_IP,
-            MAX_CONCURRENT_UPLOADS_GLOBAL,
-        )
+        Self::new(MAX_CONCURRENT_UPLOADS_PER_IP, MAX_CONCURRENT_UPLOADS_GLOBAL)
+    }
+
+    /// Retained per-IP slot entries, bounded by [`MAX_UPLOAD_SLOT_IPS`]
+    /// at rest. Diagnostic/test hook.
+    pub fn slot_ip_count(&self) -> usize {
+        self.inner
+            .slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+    }
+
+    /// Decrement the in-flight count after a failed acquire (the entry is
+    /// kept: only idle entries are evicted, and only under cap pressure in
+    /// [`UploadSlots::acquire`]).
+    fn release_inflight(&self, ip: &str) {
+        let mut slots = self.inner.slots.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = slots.get_mut(ip) {
+            entry.active = entry.active.saturating_sub(1);
+        }
     }
 
     /// Take one upload slot for `ip`, or fail 429 `RATE_LIMIT_EXCEEDED`.
@@ -415,19 +787,43 @@ impl UploadSlots {
     pub fn acquire(&self, ip: &str) -> Result<UploadPermit, ApiError> {
         let busy = || ApiError::rate_limit_exceeded(UPLOAD_BUSY_RETRY_AFTER_SECS);
         let slot = {
-            let mut slots = self.per_ip_slots.lock().unwrap_or_else(|e| e.into_inner());
-            slots
-                .entry(ip.to_string())
-                .or_insert_with(|| Arc::new(Semaphore::new(self.per_ip)))
-                .clone()
+            let mut slots = self.inner.slots.lock().unwrap_or_else(|e| e.into_inner());
+            if !slots.contains_key(ip) && slots.len() >= MAX_UPLOAD_SLOT_IPS {
+                // Evict idle entries (no live or in-flight permits). If
+                // every entry is active, inserting one extra entry keeps
+                // the per-IP caps correct; the bound is re-established as
+                // soon as permits drain.
+                slots.retain(|_, entry| entry.active > 0);
+            }
+            let per_ip = self.inner.per_ip;
+            let entry = slots.entry(ip.to_string()).or_insert_with(|| IpSlot {
+                semaphore: Arc::new(Semaphore::new(per_ip)),
+                active: 0,
+            });
+            entry.active += 1;
+            entry.semaphore.clone()
         };
-        let global = self.global.clone().try_acquire_owned().map_err(|_| busy())?;
+        let global = match self.inner.global.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.release_inflight(ip);
+                return Err(busy());
+            }
+        };
         match slot.try_acquire_owned() {
             Ok(ip_permit) => Ok(UploadPermit {
-                _global: global,
                 _ip: ip_permit,
+                _global: global,
+                _guard: IpActiveGuard {
+                    inner: self.inner.clone(),
+                    ip: ip.to_string(),
+                },
             }),
-            Err(_) => Err(busy()),
+            Err(_) => {
+                drop(global);
+                self.release_inflight(ip);
+                Err(busy())
+            }
         }
     }
 }
@@ -499,8 +895,7 @@ mod tests {
     fn auth_limiter_at(now_ms: i64) -> (RateLimiter, Arc<ManualClock>) {
         let clock = Arc::new(ManualClock::new(now_ms));
         // 3 failures per account and 5 per IP within 60 s.
-        let limiter =
-            RateLimiter::new(clock.clone()).with_auth_limit("auth/signin", 3, 5, 60_000);
+        let limiter = RateLimiter::new(clock.clone()).with_auth_limit("auth/signin", 3, 5, 60_000);
         (limiter, clock)
     }
 
@@ -520,14 +915,20 @@ mod tests {
         // Failure 2 (t=1 s): the delay doubles to 2 s.
         assert!(limiter.check_auth_failures("auth/signin", acct, ip).is_ok());
         limiter.record_auth_failure("auth/signin", acct, ip);
-        assert!(limiter.check_auth_failures("auth/signin", acct, ip).is_err());
+        assert!(
+            limiter
+                .check_auth_failures("auth/signin", acct, ip)
+                .is_err()
+        );
         clock.advance_ms(2_000);
         // Failure 3 (t=3 s) reaches the per-account cap of 3.
         assert!(limiter.check_auth_failures("auth/signin", acct, ip).is_ok());
         limiter.record_auth_failure("auth/signin", acct, ip);
         clock.advance_ms(30_000);
         assert!(
-            limiter.check_auth_failures("auth/signin", acct, ip).is_err(),
+            limiter
+                .check_auth_failures("auth/signin", acct, ip)
+                .is_err(),
             "count cap holds until the window ends"
         );
         // The window expires at 60 s: no lockout beyond the window.
@@ -548,12 +949,16 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, "RATE_LIMIT_EXCEEDED");
         // Other IPs are unaffected.
-        assert!(limiter
-            .check_auth_failures("auth/signin", "acct:fresh", "ip:3.3.3.3")
-            .is_ok());
+        assert!(
+            limiter
+                .check_auth_failures("auth/signin", "acct:fresh", "ip:3.3.3.3")
+                .is_ok()
+        );
         clock.advance_ms(60_000);
-        assert!(limiter
-            .check_auth_failures("auth/signin", "acct:fresh", "ip:2.2.2.2")
-            .is_ok());
+        assert!(
+            limiter
+                .check_auth_failures("auth/signin", "acct:fresh", "ip:2.2.2.2")
+                .is_ok()
+        );
     }
 }

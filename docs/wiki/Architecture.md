@@ -105,6 +105,23 @@ Bytes live outside the DB (`FsBlobStore {objects/xx/hash + tmp/, atomic rename, 
 
 Conformance `tests/conformance.rs` 119 green on redb; `tests/crash_recovery.rs` 2/2 kill -9; storage quota/cache/evict/reconcile 22 green. TimelineMaterialize reserved (timelines built on read from stored notes — simpler, fine at small scale; Phase 5 optimizes).
 
+Prod-readiness (2026-10-21, single-node milestone): media paging is a real
+contract (`MAX_MEDIA_PAGE_ROWS = 500`, newest-first exclusive cursors,
+empty-page termination); accounting backfill is an at-open migration;
+reconciliation is paged with a completeness-gated sweep; online backup
+(versioned ZIP + both pools, single consistent read txn) and offline restore
+into a fresh dir are implemented (`src/backup/`); inbound signatures honor
+`federation.rfc9421_mode`; inbox ingress is per-route capped (64 KiB, 413 at
+extraction); rate-limit/upload-slot maps are bounded; health/readiness/status
+are split (`/healthz` liveness, `/ready` bounded readiness, admin-only
+status + detailed diagnostics). Explicitly still out of scope for this
+milestone: FoundationDB/cluster routing/multi-node ownership, shared rate
+limiting, cross-node WebSocket delivery, S3/object storage, account movement
+between nodes, multi-node HA. Live `cargo test` + Docker + federation
+verification of the new suites is pending a provisioned host (this dev box
+has no C toolchain: `ring` cannot rebuild), so release status stays
+**unqualified**, not green.
+
 ### 4.2 FoundationDB (planned, Phase 4)
 
 `persistence/foundationdb/mod.rs` is 0 bytes; `cluster/*` (account_directory, routing, internal_protocol) empty; `jobs/queue.rs` empty (real queue lives in redb facet). `Config::Cluster` is hard-rejected. Open per `docs/database.md` order: FDB adapter → account directory/routing/internal protocol → shared limiter/tracker → migration tool. No cross-node transport today; `Hub` is in-process, `DestinationTracker` per-process.
@@ -116,6 +133,6 @@ JSON file `--config` + CLI overrides + `validate()` once. Every key optional wit
 ## 6. What this buys you / costs you
 
 - Buy: one binary + one file to back up; predictable layering; crash-safe jobs; FDB-safe bounds from day one.
-- Cost: no multi-node yet; in-process streaming only; bounded-scan pagination (search/hashtags 10k window, list timelines ≤50×100); transport buffers bodies (socket-to-disk follow-up open); observability is `eprintln!` + `fed_debug!` gate (no metrics/tracing yet).
+- Cost: no multi-node yet; in-process streaming only; bounded-scan pagination (search/hashtags 10k window, list timelines ≤50×100); structured logging + admin status exist but federation/quarantine/oldest-pending aggregates are explicit nulls until the ports expose them.
 
 Read more: [Federation](Federation.md), [Client API](Client-API.md), [Administration](Administration.md), [Operations](Operations.md), [Security](Security.md), [Developer Guide](Developer-Guide.md).

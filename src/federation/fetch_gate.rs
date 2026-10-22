@@ -6,7 +6,9 @@
 //! The gate does two things and nothing else:
 //!
 //! 1. **Authenticate the fetcher** ([`authenticate_fetch_viewer`]): verify
-//!    the HTTP Signature on an inbound GET and resolve the signing key to
+//!    the HTTP signature(s) on an inbound GET — legacy draft-cavanaugh
+//!    and/or RFC 9421 per the configured `federation.rfc9421_mode` — and
+//!    resolve the signing key to
 //!    its owner actor URI (same key-lookup path as the inbox: local cache,
 //!    fetch on miss, one refresh on rotation). This step never rejects by
 //!    itself — missing/unparsable signatures, unresolvable keys, and bad
@@ -29,7 +31,10 @@
 
 use axum::http::{HeaderMap, StatusCode};
 
-use crate::activitypub::signatures::{parse_signature_header, verify_http_signature};
+use crate::activitypub::signatures::{
+    apply_sig_mode, parse_first_legacy_signature, parse_signature_input, rfc9421_mode,
+    scheme_of_public_url, verify_http_signature, verify_rfc9421_signature, VerifyOutcome,
+};
 use crate::application::commands::AppServices;
 use crate::federation::delivery::resolve_remote_public_key;
 use crate::federation::inbox::MAX_CLOCK_SKEW_SECS;
@@ -72,36 +77,89 @@ impl FetchViewer {
     }
 }
 
-/// Verify the HTTP Signature on an inbound GET and resolve the signer.
+/// Verify the HTTP signature(s) on an inbound GET and resolve the signer.
 /// `path_and_query` is the origin-form request target (e.g. `/clips/{id}`
 /// plus query string). Any failure — no header, unparsable header,
 /// unresolvable key (even after refresh), bad signature — yields an
 /// anonymous viewer; the resource callback + [`decide_fetch`] turn that
 /// into 404 for non-public objects.
+///
+/// Batch E modes (`federation.rfc9421_mode`, read process-wide): in
+/// `permissive` a valid legacy signature identifies the fetcher and RFC 9421
+/// fields, when present, are verified rather than merely ignored (either
+/// valid scheme identifies dual-signed fetchers). In `enforce` only a valid
+/// RFC 9421 signature identifies the fetcher — a legacy-only signature
+/// collapses to anonymous (gated objects 404), preserving existence-hiding
+/// instead of leaking the mode through a new status code.
 pub fn authenticate_fetch_viewer(
     services: &AppServices,
     path_and_query: &str,
     headers: &HeaderMap,
 ) -> FetchViewer {
-    let raw = headers
-        .get("signature")
-        .and_then(|v| v.to_str().ok())
-        .or_else(|| {
-            headers
-                .get("authorization")
-                .and_then(|v| v.to_str().ok())
-        });
-    let Some(raw) = raw else {
-        return FetchViewer::anonymous();
-    };
-    let parsed = match parse_signature_header(raw) {
-        Ok(p) => p,
-        Err(_) => return FetchViewer::anonymous(),
-    };
-    let key_id = parsed.key_id.clone();
-    let now_ms = services.clock.now_ms();
+    authenticate_fetch_viewer_with_mode(services, path_and_query, headers, rfc9421_mode())
+}
+
+/// [`authenticate_fetch_viewer`] with an explicit mode (lets tests pin the
+/// mode without touching the process-wide cell).
+pub fn authenticate_fetch_viewer_with_mode(
+    services: &AppServices,
+    path_and_query: &str,
+    headers: &HeaderMap,
+    mode: crate::config::Rfc9421Mode,
+) -> FetchViewer {
+    let legacy = attempt_legacy_fetch_signature(services, path_and_query, headers);
+    let rfc9421 = attempt_rfc9421_fetch_signature(services, path_and_query, headers);
+    match apply_sig_mode(mode, legacy, rfc9421) {
+        Ok(owner) => FetchViewer::identified(owner),
+        Err(_) => FetchViewer::anonymous(),
+    }
+}
+
+/// Resolve `key_id` (cached key, fetch on miss, one refresh on rotation)
+/// and run `verify` against the resolved PEM. Same lookup discipline as the
+/// inbox; every failure collapses to [`VerifyOutcome::Failed`] (the caller
+/// maps that to anonymous — never a 401/403 here — so existence-hiding is
+/// the resource's decision).
+fn resolve_and_verify_fetch(
+    services: &AppServices,
+    key_id: &str,
+    verify: &dyn Fn(&str) -> Result<(), String>,
+) -> VerifyOutcome {
     let client = &services.federation_http;
-    let verify = |pem: &str| {
+    match resolve_remote_public_key(services, client, key_id, false) {
+        Ok((owner, pem)) => match verify(&pem) {
+            Ok(()) => VerifyOutcome::Verified(owner),
+            Err(_) => {
+                match resolve_remote_public_key(services, client, key_id, true) {
+                    Ok((fresh_owner, fresh_pem)) => match verify(&fresh_pem) {
+                        Ok(()) => VerifyOutcome::Verified(fresh_owner),
+                        Err(detail) => VerifyOutcome::Failed(detail),
+                    },
+                    Err(_) => VerifyOutcome::Failed(format!("key unresolvable: {key_id}")),
+                }
+            }
+        },
+        Err(_) => VerifyOutcome::Failed(format!("key unresolvable: {key_id}")),
+    }
+}
+
+/// Legacy draft-cavanaugh attempt for a GET: `None` when no
+/// `Signature`/`Authorization` header is present.
+fn attempt_legacy_fetch_signature(
+    services: &AppServices,
+    path_and_query: &str,
+    headers: &HeaderMap,
+) -> Option<VerifyOutcome> {
+    let key_id = match parse_first_legacy_signature(headers)? {
+        Ok(parsed) => parsed.key_id,
+        Err(err) => {
+            return Some(VerifyOutcome::Failed(format!(
+                "legacy signature unparsable: {err}"
+            )));
+        }
+    };
+    let now_ms = services.clock.now_ms();
+    Some(resolve_and_verify_fetch(services, &key_id, &|pem| {
         verify_http_signature(
             "GET",
             path_and_query,
@@ -111,26 +169,43 @@ pub fn authenticate_fetch_viewer(
             Some(now_ms),
             MAX_CLOCK_SKEW_SECS,
         )
+        .map(|_| ())
+    }))
+}
+
+/// RFC 9421 attempt for a GET: `None` when no `Signature-Input` header is
+/// present, otherwise the verification outcome under the supported profile.
+fn attempt_rfc9421_fetch_signature(
+    services: &AppServices,
+    path_and_query: &str,
+    headers: &HeaderMap,
+) -> Option<VerifyOutcome> {
+    let raw = headers
+        .get("signature-input")
+        .and_then(|v| v.to_str().ok())?;
+    let key_id = match parse_signature_input(raw) {
+        Ok(parsed) => parsed.key_id,
+        Err(err) => {
+            return Some(VerifyOutcome::Failed(format!(
+                "Signature-Input unparsable: {err}"
+            )));
+        }
     };
-    // Same lookup discipline as the inbox: cached key, fetch on miss, one
-    // refresh on rotation. Every failure collapses to anonymous (never a
-    // 401/403 here — existence-hiding is the resource's decision).
-    let resolved = resolve_remote_public_key(services, client, &key_id, false);
-    match resolved {
-        Ok((owner, pem)) => match verify(&pem) {
-            Ok(_) => FetchViewer::identified(owner),
-            Err(_) => {
-                match resolve_remote_public_key(services, client, &key_id, true) {
-                    Ok((fresh_owner, fresh_pem)) => match verify(&fresh_pem) {
-                        Ok(_) => FetchViewer::identified(fresh_owner),
-                        Err(_) => FetchViewer::anonymous(),
-                    },
-                    Err(_) => FetchViewer::anonymous(),
-                }
-            }
-        },
-        Err(_) => FetchViewer::anonymous(),
-    }
+    let scheme = scheme_of_public_url(&services.public_url);
+    let now_ms = services.clock.now_ms();
+    Some(resolve_and_verify_fetch(services, &key_id, &|pem| {
+        verify_rfc9421_signature(
+            "GET",
+            path_and_query,
+            scheme,
+            headers,
+            None,
+            pem,
+            Some(now_ms),
+            MAX_CLOCK_SKEW_SECS,
+        )
+        .map(|_| ())
+    }))
 }
 
 /// Map the resource's [`FetchDecision`] to the fetch outcome: `Ok(())`
@@ -156,8 +231,9 @@ mod tests {
     use super::*;
     use crate::activitypub::signatures::{
         generate_rsa_keypair_2048, private_key_to_pkcs8_pem, public_key_to_spki_pem,
-        sign_request_headers,
+        sign_request_headers, sign_rfc9421_headers,
     };
+    use crate::config::Rfc9421Mode;
 
     fn test_services() -> AppServices {
         crate::application::commands::tests::test_services("fetch-gate")
@@ -263,11 +339,21 @@ mod tests {
             .unwrap();
         let now_ms = services.clock.now_ms();
         let headers = signed_get_headers("/x/1", "example.local", &key_id, &priv_pem, &http_date(now_ms));
-        let viewer = authenticate_fetch_viewer(&services, "/x/1", &headers);
+        // Permissive (the process default): the legacy signature identifies.
+        let viewer = authenticate_fetch_viewer_with_mode(&services, "/x/1", &headers, Rfc9421Mode::Permissive);
         assert_eq!(viewer.actor_uri.as_deref(), Some(actor_uri));
         assert_eq!(
             decide_fetch(&viewer, stub_authorize("approved", &viewer)),
             Ok(())
+        );
+        // Enforce: the same legacy-only request collapses to anonymous, so
+        // the gated object 404s instead of serving.
+        let enforced =
+            authenticate_fetch_viewer_with_mode(&services, "/x/1", &headers, Rfc9421Mode::Enforce);
+        assert!(enforced.is_anonymous());
+        assert_eq!(
+            decide_fetch(&enforced, stub_authorize("approved", &enforced)),
+            Err(StatusCode::NOT_FOUND)
         );
     }
 
@@ -286,7 +372,7 @@ mod tests {
         // Signed for /x/1, fetched as /x/2: the signature must not verify
         // (fail closed → anonymous → gated objects 404).
         let headers = signed_get_headers("/x/1", "example.local", &key_id, &priv_pem, &http_date(now_ms));
-        let viewer = authenticate_fetch_viewer(&services, "/x/2", &headers);
+        let viewer = authenticate_fetch_viewer_with_mode(&services, "/x/2", &headers, Rfc9421Mode::Permissive);
         assert!(viewer.is_anonymous());
         assert_eq!(
             decide_fetch(&viewer, stub_authorize("approved", &viewer)),
@@ -301,5 +387,112 @@ mod tests {
         headers.insert("signature", "not-a-valid-signature".parse().unwrap());
         let viewer = authenticate_fetch_viewer(&services, "/x/1", &headers);
         assert!(viewer.is_anonymous());
+    }
+
+    /// Build `Signature-Input`/`Signature` headers for a signed GET under
+    /// this crate's RFC 9421 profile.
+    fn signed_rfc9421_get_headers(
+        services: &AppServices,
+        path: &str,
+        host: &str,
+        key_id: &str,
+        private_key_pem: &str,
+    ) -> HeaderMap {
+        let now_ms = services.clock.now_ms();
+        let signed = sign_rfc9421_headers(
+            "GET",
+            path,
+            "https",
+            host,
+            None,
+            key_id,
+            private_key_pem,
+            now_ms.div_euclid(1000),
+        )
+        .unwrap();
+        let mut map = HeaderMap::new();
+        map.insert("host", host.parse().unwrap());
+        map.insert("signature-input", signed.signature_input.parse().unwrap());
+        map.insert("signature", signed.signature.parse().unwrap());
+        map
+    }
+
+    #[test]
+    fn rfc9421_signed_get_mode_selection() {
+        let services = test_services();
+        let (priv_key, pub_key) = generate_rsa_keypair_2048().unwrap();
+        let priv_pem = private_key_to_pkcs8_pem(&priv_key);
+        let pub_pem = public_key_to_spki_pem(&pub_key);
+        let actor_uri = "https://remote.example/users/rfc9421";
+        let key_id = format!("{actor_uri}#main-key");
+        services
+            .cache_remote_public_key(&key_id, actor_uri, None, &pub_pem)
+            .unwrap();
+        let headers = signed_rfc9421_get_headers(&services, "/x/1", "example.local", &key_id, &priv_pem);
+        // RFC 9421-only identifies under both modes.
+        for mode in [Rfc9421Mode::Permissive, Rfc9421Mode::Enforce] {
+            let viewer = authenticate_fetch_viewer_with_mode(&services, "/x/1", &headers, mode);
+            assert_eq!(viewer.actor_uri.as_deref(), Some(actor_uri));
+        }
+        // Wrong path fails closed under both modes.
+        for mode in [Rfc9421Mode::Permissive, Rfc9421Mode::Enforce] {
+            let viewer = authenticate_fetch_viewer_with_mode(&services, "/x/2", &headers, mode);
+            assert!(viewer.is_anonymous());
+        }
+    }
+
+    #[test]
+    fn dual_signer_mismatch_is_anonymous() {
+        // Two keys, two owners, both cryptographically valid on one request:
+        // owner disagreement fails closed (anonymous) in both modes.
+        let services = test_services();
+        let (priv_a, pub_a) = generate_rsa_keypair_2048().unwrap();
+        let (priv_b, pub_b) = generate_rsa_keypair_2048().unwrap();
+        let owner_a = "https://remote.example/users/signer-a";
+        let owner_b = "https://remote.example/users/signer-b";
+        let key_a = format!("{owner_a}#main-key");
+        let key_b = format!("{owner_b}#main-key");
+        services
+            .cache_remote_public_key(&key_a, owner_a, None, &public_key_to_spki_pem(&pub_a))
+            .unwrap();
+        services
+            .cache_remote_public_key(&key_b, owner_b, None, &public_key_to_spki_pem(&pub_b))
+            .unwrap();
+        let now_ms = services.clock.now_ms();
+        let legacy = sign_request_headers(
+            "GET",
+            "/x/1",
+            "example.local",
+            &http_date(now_ms),
+            None,
+            &key_a,
+            &private_key_to_pkcs8_pem(&priv_a),
+        )
+        .unwrap();
+        let rfc9421 = sign_rfc9421_headers(
+            "GET",
+            "/x/1",
+            "https",
+            "example.local",
+            None,
+            &key_b,
+            &private_key_to_pkcs8_pem(&priv_b),
+            now_ms.div_euclid(1000),
+        )
+        .unwrap();
+        // Legacy occupies `authorization` so both schemes travel at once.
+        let mut headers = HeaderMap::new();
+        headers.insert("date", http_date(now_ms).parse().unwrap());
+        headers.insert("host", "example.local".parse().unwrap());
+        headers.insert(
+            "authorization",
+            format!("Signature {}", legacy.signature).parse().unwrap(),
+        );
+        headers.insert("signature-input", rfc9421.signature_input.parse().unwrap());
+        headers.insert("signature", rfc9421.signature.parse().unwrap());
+        for mode in [Rfc9421Mode::Permissive, Rfc9421Mode::Enforce] {
+            let viewer = authenticate_fetch_viewer_with_mode(&services, "/x/1", &headers, mode);
+            assert!(viewer.is_anonymous());
+        }
     }
 }

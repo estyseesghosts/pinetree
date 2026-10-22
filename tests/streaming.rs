@@ -509,7 +509,8 @@ async fn main_channel_gets_follow_followed_and_notification() {
     }
     assert!(saw_follow);
 
-    // Followee's main: followed + notification (+ maybe meUpdated), any order.
+    // Followee's main: followed + notification (+ maybe meUpdated and the
+    // Misskey-parity unreadNotification badge nudge), any order.
     let mut saw_followed = false;
     let mut saw_notification = false;
     for _ in 0..3 {
@@ -525,7 +526,7 @@ async fn main_channel_gets_follow_followed_and_notification() {
                 saw_notification = true;
                 assert_eq!(body["type"], "follow");
             }
-            "meUpdated" => {}
+            "meUpdated" | "unreadNotification" => {}
             other => panic!("unexpected main event {other}: {frame}"),
         }
         if saw_followed && saw_notification {

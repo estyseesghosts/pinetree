@@ -1679,9 +1679,9 @@ impl AppServices {
                     drive_remote += meta.size_bytes;
                 }
             }
-            if page.len() < 500 {
-                break;
-            }
+            // Empty-page termination only (Batch C/H): a short page means
+            // concurrent deletes, not end-of-scan, and an exact-multiple
+            // dataset needs the trailing empty read.
             media_cursor.until_id = page.last().map(|m| m.id.clone());
         }
         Ok((

@@ -233,6 +233,21 @@ parity plan if it affects `docs/misskey-parity-plan.md`.
   single oversize-first attachment → attempted then rejected.
 - Evicted media re-fetches while source remains available.
 
+## 9. Prod-readiness addendum (2026-10-21, Batch C)
+
+Reconciliation is now paged with continuation cursors (`reconcile_media_paged`,
+monotonic `until_id`, repair only on from-newest complete walks) and reports
+detection counters separately from actually-repaired counters. Missing durable
+bytes stay visible (`durable_missing` + id sample, never silent-delete);
+evicted cache rows keep their `(source_url, variant)` index row with zeroed
+size so they stay re-fetchable without phantom-byte charges. `collect_live_blob_keys`
+fully walks; the destructive sweep requires a completeness flag and refuses
+partial key sets. Durable and cache pools are never mixed. Production wiring:
+boot-time `enqueue_storage_reconcile` (repeatable) + operator
+`storage-backfill` CLI op (explicit). Crash-window tests (stage→import,
+pool-write→meta-insert, txn→blob-delete, evict→physical-delete, scan→state,
+scan→marker) pin the restart invariant in `tests/storage_paging_c1.rs`.
+
 ## 8. Sequencing vs Birchtree
 
 > **[OPEN]** Cross-repo sequencing; `birchtree/` not audited in this pass.

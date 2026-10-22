@@ -54,7 +54,165 @@ pub struct FederationSection {
     pub rfc9421_mode: Rfc9421Mode,
 }
 
-/// Transcode settings (nested `transcode` section of the JSON config).
+/// Diagnostic detail + log shape (nested `diagnostics` section of the JSON
+/// config; Batch H). `detailed_admin_status: false` (default) means the
+/// expensive/private status fields are unavailable; enabling it does NOT
+/// remove the admin-authentication requirement. `structured_logging: true`
+/// (default) emits stable `key=value` event lines; `false` emits only
+/// `level=` + `event=` (see `crate::observability`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DiagnosticsSection {
+    /// Gate the expensive/detailed admin status fields. Default `false`.
+    pub detailed_admin_status: bool,
+    /// Emit structured `key=value` event lines. Default `true`.
+    pub structured_logging: bool,
+}
+
+impl Default for DiagnosticsSection {
+    /// Batch H default: detail off, structured lines on.
+    fn default() -> Self {
+        Self {
+            detailed_admin_status: false,
+            structured_logging: true,
+        }
+    }
+}
+
+/// Backup output policy (nested `backup` section of the JSON config;
+/// Batch H wires the Batch F engine). `dir: null` (default) resolves to
+/// `<data_dir>/backups`; `max_bundle_bytes` (default 64 GiB, mirroring
+/// `backup::bundle::MAX_BUNDLE_BYTES`) bounds one staging bundle.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BackupSection {
+    /// Backup bundle + status directory override. `None` (default)
+    /// resolves to `<data_dir>/backups`.
+    pub dir: Option<PathBuf>,
+    /// Per-bundle staging cap in bytes (default 64 GiB). Must be `> 0`.
+    pub max_bundle_bytes: u64,
+}
+
+fn default_backup_max_bundle_bytes() -> u64 {
+    64 << 30
+}
+
+impl Default for BackupSection {
+    fn default() -> Self {
+        Self {
+            dir: None,
+            max_bundle_bytes: default_backup_max_bundle_bytes(),
+        }
+    }
+}
+
+/// Unsafe test-only HTTP opt-in (nested `unsafe` section of the JSON
+/// config; Batch B). The Rust field uses a raw identifier (`r#unsafe`,
+/// since `unsafe` is a keyword); the JSON key is exactly `"unsafe"`,
+/// matching the field name per the Configuration rule in `AGENTS.md`.
+///
+/// Default is `false`: production `public_url` values must be `https://`.
+/// When `true`, `http://` `public_url` values are accepted **only** for
+/// local/test hosts ([`PublicHostClass`]): loopback IP literals, `localhost`
+/// / `*.localhost`, RFC 1918 private-IP literals, and the RFC 2606 reserved
+/// `.test` suffix used by the local bench rigs. Arbitrary public HTTP origins
+/// stay rejected. This is JSON-controlled only (plus the per-invocation CLI
+/// override, like every other setting); there is no environment-only toggle.
+///
+/// This is deliberately SEPARATE from the outbound federation SSRF control
+/// (`SafeHttpConfig::allow_private_ips`, fed via `PINETREE_ALLOW_PRIVATE_IPS`
+/// in test rigs): that flag exempts outbound fetch address checks, while this
+/// flag exempts the inbound canonical-origin scheme check. Do not conflate
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UnsafeSection {
+    /// Allow `http://` `public_url` for local/test hosts only. `false`
+    /// (default) rejects every `http://` `public_url` at validation.
+    pub allow_local_http_for_testing: bool,
+}
+
+/// Host class of the configured `public_url` (Batch B). Used by
+/// [`Config::validate`] to gate `http://` origins and by the startup warning
+/// in `main` (class only, never secrets).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicHostClass {
+    /// `127.0.0.0/8` or `::1` literal.
+    Loopback,
+    /// `localhost` or `*.localhost`.
+    LocalhostName,
+    /// RFC 1918 private IPv4 literal (`10/8`, `172.16/12`, `192.168/16`).
+    PrivateLan,
+    /// RFC 2606 reserved `.test` suffix (local bench/interop rigs; can never
+    /// collide with a public origin).
+    TestDomain,
+    /// Anything else (public IPs, public DNS, unparseable literals).
+    Public,
+}
+
+impl PublicHostClass {
+    /// Short stable label for logs (no hostnames, no secrets).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PublicHostClass::Loopback => "loopback",
+            PublicHostClass::LocalhostName => "localhost",
+            PublicHostClass::PrivateLan => "private-lan",
+            PublicHostClass::TestDomain => "test-domain",
+            PublicHostClass::Public => "public",
+        }
+    }
+
+    /// True for the host classes the unsafe local-HTTP flag covers.
+    pub fn is_local_test(&self) -> bool {
+        !matches!(self, PublicHostClass::Public)
+    }
+}
+
+/// Strip a `:port` suffix from a `public_host()` value for classification.
+/// Bracketed IPv6 (`[::1]:3000`) unwraps to `::1`; a bare IPv6 literal
+/// (several colons, no brackets) is returned whole; other single-colon
+/// values split at the last colon.
+fn host_without_port(hostport: &str) -> &str {
+    let hostport = hostport.trim();
+    if let Some(rest) = hostport.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return rest[..end].trim();
+        }
+        return hostport;
+    }
+    if hostport.chars().filter(|c| *c == ':').count() == 1
+        && let Some((host, _)) = hostport.rsplit_once(':')
+    {
+        return host.trim();
+    }
+    hostport
+}
+
+/// Classify a bare (port-stripped) `public_url` host. DNS names are never
+/// resolved here: only IP literals, `localhost` names and the reserved
+/// `.test` suffix count as local/test; everything else is `Public`
+/// (conservative — e.g. IPv6 ULAs and link-local literals are `Public`).
+fn classify_host(bare: &str) -> PublicHostClass {
+    let lower = bare.trim().trim_end_matches('.').to_lowercase();
+    if lower == "localhost" || lower.ends_with(".localhost") {
+        return PublicHostClass::LocalhostName;
+    }
+    if lower.len() > ".test".len() && lower.ends_with(".test") {
+        return PublicHostClass::TestDomain;
+    }
+    if let Ok(addr) = lower.parse::<IpAddr>() {
+        if addr.is_loopback() {
+            return PublicHostClass::Loopback;
+        }
+        if let IpAddr::V4(v4) = addr
+            && v4.is_private()
+        {
+            return PublicHostClass::PrivateLan;
+        }
+        return PublicHostClass::Public;
+    }
+    PublicHostClass::Public
+}
 ///
 /// Mirrors [`crate::media::transcode::TranscodeConfig`] field for field;
 /// [`TranscodeSection::to_runtime`] converts without loss, and
@@ -91,7 +249,13 @@ pub struct TranscodeSection {
 impl Default for TranscodeSection {
     fn default() -> Self {
         Self {
-            enabled: true,
+            // Batch B policy (flipped Batch H): a new install must start
+            // without FFmpeg, so the section default is disabled. `{}`-JSON
+            // must not opt into transcoding; enabling it is explicit
+            // (`transcode.enabled: true` plus a working toolchain, probed
+            // once at startup). `Config::default()` pins the same value
+            // below so both defaults agree.
+            enabled: false,
             ffmpeg_path: "ffmpeg".to_string(),
             webp_quality: 80,
             vp9_crf: 30,
@@ -226,6 +390,16 @@ pub struct Config {
     pub transcode: TranscodeSection,
     /// Federation settings (nested `federation` section; gaps WP5).
     pub federation: FederationSection,
+    /// Unsafe test-only HTTP opt-in (nested `unsafe` section; Batch B).
+    /// Rust field name uses a raw identifier so the JSON key is exactly
+    /// `"unsafe"`. Default disables every `http://` `public_url`.
+    pub r#unsafe: UnsafeSection,
+    /// Diagnostics detail + log shape (nested `diagnostics` section;
+    /// Batch H). Unknown keys rejected; see [`DiagnosticsSection`].
+    pub diagnostics: DiagnosticsSection,
+    /// Backup output policy (nested `backup` section; Batch H). Unknown
+    /// keys rejected; see [`BackupSection`].
+    pub backup: BackupSection,
 }
 
 impl Default for Config {
@@ -267,8 +441,16 @@ impl Default for Config {
             smtp_password: String::new(),
             smtp_from: String::new(),
             email_required_for_signup: false,
-            transcode: TranscodeSection::default(),
+            // Batch B policy (section default flipped Batch H):
+            // `TranscodeSection::default()` carries `enabled: false`, so
+            // `{}`-JSON never opts into transcoding. The explicit field
+            // here keeps the Config-level default obvious; the shipped
+            // Docker default pins this explicitly too.
+            transcode: TranscodeSection { enabled: false, ..TranscodeSection::default() },
             federation: FederationSection::default(),
+            r#unsafe: UnsafeSection::default(),
+            diagnostics: DiagnosticsSection::default(),
+            backup: BackupSection::default(),
         }
     }
 }
@@ -280,12 +462,46 @@ impl Config {
             return Err("cluster mode is not implemented (Phase 4)".to_string());
         }
         let url = self.public_url.trim_end_matches('/');
-        if !url.starts_with("http://") && !url.starts_with("https://") {
+        let is_http = url.starts_with("http://");
+        if !is_http && !url.starts_with("https://") {
             return Err("public_url must start with http:// or https://".to_string());
         }
         let host = self.public_host();
         if host.is_empty() {
             return Err("public_url must include a host".to_string());
+        }
+        // Batch B forcing function: the shipped Docker default carries an
+        // RFC 2606 `.invalid` host so a fresh checkout refuses to start until
+        // the operator sets a canonical URL. `.invalid` can never resolve
+        // publicly, so this rejects no real deployment.
+        let bare = host_without_port(&host).to_lowercase();
+        if bare == "invalid" || bare.ends_with(".invalid") {
+            return Err(format!(
+                "public_url host {host:?} is a placeholder: set public_url to your canonical https:// URL"
+            ));
+        }
+        // Batch B unsafe-HTTP gate: `http://` origins need the explicit JSON
+        // opt-in, and even then only for local/test host classes. The
+        // outbound federation SSRF control (`allow_private_ips`) is separate
+        // and does not affect this check.
+        if is_http && !self.r#unsafe.allow_local_http_for_testing {
+            return Err(
+                "public_url uses http:// but unsafe.allow_local_http_for_testing is false: \
+                 use an https:// public_url, or set {\"unsafe\": \
+                 {\"allow_local_http_for_testing\": true}} for a local/test host only"
+                    .to_string(),
+            );
+        }
+        if is_http {
+            let class = self.public_host_class();
+            if !class.is_local_test() {
+                return Err(format!(
+                    "public_url uses http:// for a non-local host (class: {}): \
+                     unsafe.allow_local_http_for_testing covers loopback, localhost, \
+                     private-LAN literals and .test names only — serve public origins over https://",
+                    class.as_str()
+                ));
+            }
         }
         if self.data_dir.as_os_str().is_empty() {
             return Err("data_dir must not be empty".to_string());
@@ -370,6 +586,19 @@ impl Config {
             .to_runtime()
             .validate_ranges()
             .map_err(|err| format!("transcode: {err}"))?;
+        // Backup output policy (Batch H): the staging cap must be
+        // positive, and an explicit dir must be a non-empty path. The cap
+        // is enforced again at bundle-creation time against the same
+        // constant family (`backup::bundle::MAX_BUNDLE_BYTES`); the config
+        // value lets operators tighten it per install.
+        if self.backup.max_bundle_bytes == 0 {
+            return Err("backup.max_bundle_bytes must be > 0".to_string());
+        }
+        if let Some(dir) = self.backup.dir.as_deref()
+            && dir.as_os_str().is_empty()
+        {
+            return Err("backup.dir must not be empty".to_string());
+        }
         Ok(())
     }
 
@@ -401,6 +630,57 @@ impl Config {
             .unwrap_or_else(|| self.data_dir.join("blobs_cache"))
     }
 
+    /// Backup bundle + status directory: explicit `backup.dir` or
+    /// `<data_dir>/backups` (Batch H; mirrors
+    /// `backup::DEFAULT_BACKUP_DIR_NAME`).
+    pub fn backup_dir(&self) -> PathBuf {
+        self.backup
+            .dir
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join(crate::backup::DEFAULT_BACKUP_DIR_NAME))
+    }
+
+    /// Safe config fingerprint for the detailed admin surface (Batch H):
+    /// mode/feature flags, pool caps, and host *class* — never secrets
+    /// (`smtp_password`, tokens, keys), never addresses, never whole
+    /// secrets-bearing sections. Counts, not contents, for name lists.
+    pub fn config_summary(&self) -> serde_json::Value {
+        // Mode enums serialize through their serde impls so the fingerprint
+        // uses the same wire names as the config file (`on_demand`, ...).
+        let mode = serde_json::to_value(&self.mode).unwrap_or(serde_json::Value::Null);
+        let cache_mode =
+            serde_json::to_value(&self.remote_cache_mode).unwrap_or(serde_json::Value::Null);
+        let sig_mode =
+            serde_json::to_value(&self.federation.rfc9421_mode).unwrap_or(serde_json::Value::Null);
+        serde_json::json!({
+            "mode": mode,
+            "max_file_size": self.max_file_size,
+            "preserved_usernames": self.preserved_usernames.len(),
+            "prohibited_words": self.prohibited_words.len(),
+            "sensitive_words": self.sensitive_words.len(),
+            "trusted_proxies": self.trusted_proxies.len(),
+            "note_draft_limit": self.note_draft_limit,
+            "scheduled_note_limit": self.scheduled_note_limit,
+            "pin_limit": self.pin_limit,
+            "default_like_set": self.default_like.is_some(),
+            "drive_capacity_per_user_bytes": self.drive_capacity_per_user_bytes,
+            "remote_cache_max_bytes": self.remote_cache_max_bytes,
+            "remote_cache_mode": cache_mode,
+            "remote_cache_warming_enabled": self.remote_cache_warming_enabled,
+            "transcode_enabled": self.transcode.enabled,
+            "transcode_ffmpeg_path_set": !self.transcode.ffmpeg_path.is_empty(),
+            "rfc9421_mode": sig_mode,
+            "allow_local_http_for_testing": self.r#unsafe.allow_local_http_for_testing,
+            "public_host_class": self.public_host_class().as_str(),
+            "detailed_admin_status": self.diagnostics.detailed_admin_status,
+            "structured_logging": self.diagnostics.structured_logging,
+            "backup_max_bundle_bytes": self.backup.max_bundle_bytes,
+            "backup_dir_configured": self.backup.dir.is_some(),
+            "email_configured": self.smtp_config().is_configured(),
+            "email_required_for_signup": self.email_required_for_signup,
+        })
+    }
+
     /// Build the [`SmtpConfig`] mirror of the flattened `smtp_*` fields.
     /// The worker hands this to the email sender; [`Config::validate`]
     /// runs the same value through [`SmtpConfig::validate`] so the file
@@ -424,6 +704,13 @@ impl Config {
             .or_else(|| self.public_url.trim_end_matches('/').strip_prefix("http://"))
             .unwrap_or("");
         stripped.split('/').next().unwrap_or("").to_string()
+    }
+
+    /// Host class of the configured `public_url` (port-stripped; see
+    /// [`PublicHostClass`]). Used by [`Config::validate`] and the unsafe-HTTP
+    /// startup warning. Reports the class only, never secrets.
+    pub fn public_host_class(&self) -> PublicHostClass {
+        classify_host(host_without_port(&self.public_host()))
     }
 }
 
@@ -451,8 +738,11 @@ mod tests {
         assert_eq!(cfg.note_draft_limit, crate::domain::draft::DEFAULT_NOTE_DRAFT_LIMIT);
         assert!(cfg.trusted_proxies.is_empty());
         // Email transport dormant by default (empty host/from, port 25,
-        // signup gate off); transcode on with the runtime defaults;
-        // federation signatures permissive.
+        // signup gate off); transcode OFF with the runtime defaults (Batch B
+        // policy: `{}`-JSON must not opt into transcoding — the section
+        // default carries `enabled: false`, flipped Batch H);
+        // federation signatures permissive; diagnostics detail off with
+        // structured lines on; backup dir unset with the 64 GiB cap.
         assert!(cfg.smtp_host.is_empty());
         assert_eq!(cfg.smtp_port, 25);
         assert!(cfg.smtp_username.is_empty());
@@ -460,7 +750,7 @@ mod tests {
         assert!(cfg.smtp_from.is_empty());
         assert!(!cfg.email_required_for_signup);
         assert!(!cfg.smtp_config().is_configured());
-        assert!(cfg.transcode.enabled);
+        assert!(!cfg.transcode.enabled);
         assert_eq!(cfg.transcode.ffmpeg_path, "ffmpeg");
         assert_eq!(cfg.transcode.webp_quality, 80);
         assert_eq!(cfg.transcode.vp9_crf, 30);
@@ -483,6 +773,10 @@ mod tests {
             crate::media::transcode::DEFAULT_MAX_FILE_SIZE
         );
         assert_eq!(cfg.federation.rfc9421_mode, Rfc9421Mode::Permissive);
+        assert!(!cfg.diagnostics.detailed_admin_status);
+        assert!(cfg.diagnostics.structured_logging);
+        assert!(cfg.backup.dir.is_none());
+        assert_eq!(cfg.backup.max_bundle_bytes, 64 << 30);
         // Storage overhaul defaults: 1 GiB durable quota, 512 MiB global
         // cache (128/256/128 reserved), on-demand, 30/7/3-day TTLs.
         assert_eq!(cfg.drive_capacity_per_user_bytes, 1 << 30);
@@ -584,10 +878,14 @@ mod tests {
     #[test]
     fn transcode_section_defaults_match_runtime() {
         // The section default converts field-for-field to the runtime
-        // default (single source of truth for quality/cap values).
+        // default for every quality/cap knob (single source of truth).
+        // The master switch differs by Batch B policy: the section default
+        // is disabled (fresh installs start without FFmpeg) while the
+        // runtime `TranscodeConfig::default()` keeps `enabled: true`.
         let runtime = TranscodeSection::default().to_runtime();
         let expected = crate::media::transcode::TranscodeConfig::default();
-        assert_eq!(runtime.enabled, expected.enabled);
+        assert!(!TranscodeSection::default().enabled);
+        assert!(!runtime.enabled);
         assert_eq!(runtime.ffmpeg_path, expected.ffmpeg_path);
         assert_eq!(runtime.webp_quality, expected.webp_quality);
         assert_eq!(runtime.vp9_crf, expected.vp9_crf);
@@ -658,9 +956,12 @@ mod tests {
         // Enabled with an unexecutable binary fails the STARTUP probe
         // (`TranscodeConfig::validate`), not `Config::validate()` (which
         // stays hermetic so defaults validate anywhere). No binary runs
-        // for a missing path — the spawn error is the gate.
+        // for a missing path — the spawn error is the gate. The section
+        // default is disabled (Batch B/H), so this case opts in
+        // explicitly.
         let missing_toolchain = Config {
             transcode: TranscodeSection {
+                enabled: true,
                 ffmpeg_path: "/nonexistent/pinetree-ffmpeg-xyz".to_string(),
                 ..Default::default()
             },
@@ -855,6 +1156,117 @@ mod tests {
     }
 
     #[test]
+    fn batch_b_default_disables_transcode_and_unsafe_http() {
+        let cfg = Config::default();
+        assert!(!cfg.transcode.enabled, "new installs must start without FFmpeg");
+        assert!(!cfg.r#unsafe.allow_local_http_for_testing);
+        assert!(cfg.validate().is_ok());
+        // Serialized defaults carry both policies.
+        let json = serde_json::to_value(&cfg).expect("serialize");
+        assert_eq!(json["transcode"]["enabled"], false);
+        assert_eq!(json["unsafe"]["allow_local_http_for_testing"], false);
+        let back: Config = serde_json::from_value(json).expect("deserialize");
+        assert!(!back.transcode.enabled);
+        assert!(!back.r#unsafe.allow_local_http_for_testing);
+    }
+
+    #[test]
+    fn batch_b_unsafe_section_round_trip_and_typo_safety() {
+        let cfg: Config = serde_json::from_str("{}").expect("empty object parses");
+        assert!(!cfg.r#unsafe.allow_local_http_for_testing);
+        let on: Config =
+            serde_json::from_str(r#"{"unsafe": {"allow_local_http_for_testing": true}}"#)
+                .expect("parse");
+        assert!(on.r#unsafe.allow_local_http_for_testing);
+        let json = serde_json::to_value(&on).expect("serialize");
+        assert_eq!(json["unsafe"]["allow_local_http_for_testing"], true);
+        let back: Config = serde_json::from_value(json).expect("deserialize");
+        assert!(back.r#unsafe.allow_local_http_for_testing);
+        assert!(serde_json::from_str::<Config>(r#"{"unsafe": {"allow_local_http": true}}"#).is_err());
+        assert!(serde_json::from_str::<Config>(r#"{"unsaf": {}}"#).is_err());
+    }
+
+    #[test]
+    fn batch_b_http_public_url_gating() {
+        fn with_url(url: &str, allow: bool) -> Config {
+            Config {
+                public_url: url.to_string(),
+                r#unsafe: UnsafeSection { allow_local_http_for_testing: allow },
+                transcode: TranscodeSection { enabled: false, ..TranscodeSection::default() },
+                ..Config::default()
+            }
+        }
+        // Default HTTPS accepted with the flag off.
+        assert!(with_url("https://social.example.com/", false).validate().is_ok());
+        // Default HTTP rejected with the flag off (message names the flag).
+        for url in ["http://localhost:3000/", "http://127.0.0.1:3000/", "http://example.com/"] {
+            let err = with_url(url, false).validate().expect_err("http rejected by default");
+            assert!(err.contains("unsafe.allow_local_http_for_testing"), "{err}");
+        }
+        // Flag on: local/test hosts accepted...
+        for url in [
+            "http://localhost:3000/",
+            "http://LOCALHOST/",
+            "http://app.localhost/",
+            "http://127.0.0.1:3000/",
+            "http://127.0.1.20/",
+            "http://[::1]:3000/",
+            "http://10.0.0.5/",
+            "http://192.168.1.10:3000/",
+            "http://172.16.0.2/",
+            "http://pt-a.test/",
+        ] {
+            assert!(with_url(url, true).validate().is_ok(), "{url}");
+        }
+        // ...but public HTTP stays rejected, with the host class reported.
+        for url in [
+            "http://example.com/",
+            "http://mastodon.social/",
+            "http://8.8.8.8/",
+            "http://169.254.169.254/",
+            "http://[fd00::1]/",
+        ] {
+            let err = with_url(url, true).validate().expect_err("public http rejected");
+            assert!(err.contains("non-local host"), "{err}");
+        }
+    }
+
+    #[test]
+    fn batch_b_placeholder_public_url_refuses_to_start() {
+        let cfg = Config {
+            public_url: "https://REPLACE-ME.invalid".to_string(),
+            ..Config::default()
+        };
+        let err = cfg.validate().expect_err("placeholder must fail closed");
+        assert!(err.contains("placeholder"), "{err}");
+        assert!(err.contains("public_url"), "{err}");
+    }
+
+    #[test]
+    fn batch_b_public_host_class_cases() {
+        fn class(url: &str) -> PublicHostClass {
+            Config { public_url: url.to_string(), ..Config::default() }.public_host_class()
+        }
+        assert_eq!(class("https://example.com/"), PublicHostClass::Public);
+        assert_eq!(class("http://127.0.0.1:3000/"), PublicHostClass::Loopback);
+        assert_eq!(class("http://127.0.1.20/"), PublicHostClass::Loopback);
+        assert_eq!(class("http://[::1]:3000/"), PublicHostClass::Loopback);
+        assert_eq!(class("http://localhost:3000/"), PublicHostClass::LocalhostName);
+        assert_eq!(class("http://APP.LOCALHOST/"), PublicHostClass::LocalhostName);
+        assert_eq!(class("http://10.1.2.3/"), PublicHostClass::PrivateLan);
+        assert_eq!(class("http://192.168.0.1:8080/x"), PublicHostClass::PrivateLan);
+        assert_eq!(class("http://172.31.255.255/"), PublicHostClass::PrivateLan);
+        assert_eq!(class("http://172.15.0.1/"), PublicHostClass::Public);
+        assert_eq!(class("http://pt-a.test/"), PublicHostClass::TestDomain);
+        assert_eq!(class("http://8.8.8.8/"), PublicHostClass::Public);
+        assert_eq!(class("http://example.com/"), PublicHostClass::Public);
+        assert!(PublicHostClass::Loopback.is_local_test());
+        assert!(PublicHostClass::TestDomain.is_local_test());
+        assert!(!PublicHostClass::Public.is_local_test());
+        assert_eq!(PublicHostClass::PrivateLan.as_str(), "private-lan");
+    }
+
+    #[test]
     fn rejects_bad_values() {
         for cfg in [
             Config { public_url: "ftp://example.local".into(), ..Config::default() },
@@ -869,5 +1281,110 @@ mod tests {
         }
         let empty_dir = Config { data_dir: PathBuf::from(""), ..Config::default() };
         assert!(empty_dir.validate().is_err());
+    }
+
+    #[test]
+    fn batch_h_diagnostics_section_round_trip_and_typo_safety() {
+        // Defaults: detail off, structured lines on.
+        let cfg: Config = serde_json::from_str("{}").expect("empty object parses");
+        assert!(!cfg.diagnostics.detailed_admin_status);
+        assert!(cfg.diagnostics.structured_logging);
+        assert!(cfg.validate().is_ok());
+        // Explicit opt-in round-trips through file + serde value.
+        let on: Config = serde_json::from_str(
+            r#"{"diagnostics": {"detailed_admin_status": true, "structured_logging": false}}"#,
+        )
+        .expect("parse");
+        assert!(on.diagnostics.detailed_admin_status);
+        assert!(!on.diagnostics.structured_logging);
+        assert!(on.validate().is_ok());
+        let json = serde_json::to_value(&on).expect("serialize");
+        assert_eq!(json["diagnostics"]["detailed_admin_status"], true);
+        assert_eq!(json["diagnostics"]["structured_logging"], false);
+        let back: Config = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back.diagnostics, on.diagnostics);
+        // Typo safety at both levels.
+        assert!(
+            serde_json::from_str::<Config>(r#"{"diagnostics": {"detailed_admin": true}}"#).is_err()
+        );
+        assert!(serde_json::from_str::<Config>(r#"{"diagnostic": {}}"#).is_err());
+    }
+
+    #[test]
+    fn batch_h_backup_section_round_trip_and_guards() {
+        // Defaults: dir unset (resolves under `data_dir`), 64 GiB cap.
+        let cfg: Config = serde_json::from_str("{}").expect("empty object parses");
+        assert!(cfg.backup.dir.is_none());
+        assert_eq!(cfg.backup.max_bundle_bytes, 64 << 30);
+        assert_eq!(cfg.backup_dir(), cfg.data_dir.join("backups"));
+        assert!(cfg.validate().is_ok());
+        // Explicit dir round-trips (null stays unset).
+        let explicit: Config = serde_json::from_str(
+            r#"{"backup": {"dir": "/var/lib/pinetree/backups", "max_bundle_bytes": 1073741824}}"#,
+        )
+        .expect("parse");
+        assert_eq!(
+            explicit.backup.dir,
+            Some(PathBuf::from("/var/lib/pinetree/backups"))
+        );
+        assert_eq!(explicit.backup.max_bundle_bytes, 1 << 30);
+        assert_eq!(
+            explicit.backup_dir(),
+            PathBuf::from("/var/lib/pinetree/backups")
+        );
+        assert!(explicit.validate().is_ok());
+        let nulled: Config = serde_json::from_str(r#"{"backup": {"dir": null}}"#).expect("parse");
+        assert!(nulled.backup.dir.is_none());
+        // Guards: zero cap rejected, empty dir rejected.
+        let zero_cap = Config {
+            backup: BackupSection {
+                max_bundle_bytes: 0,
+                ..BackupSection::default()
+            },
+            ..Config::default()
+        };
+        assert!(zero_cap.validate().is_err());
+        let empty_dir = Config {
+            backup: BackupSection {
+                dir: Some(PathBuf::from("")),
+                ..BackupSection::default()
+            },
+            ..Config::default()
+        };
+        assert!(empty_dir.validate().is_err());
+        // Typo safety at both levels.
+        assert!(serde_json::from_str::<Config>(r#"{"backup": {"directory": "x"}}"#).is_err());
+        assert!(serde_json::from_str::<Config>(r#"{"backups": {}}"#).is_err());
+    }
+
+    #[test]
+    fn batch_h_config_summary_carries_no_secrets() {
+        let cfg = Config {
+            smtp_username: "pinetree".to_string(),
+            smtp_password: "hunter2".to_string(),
+            smtp_host: "relay.local".to_string(),
+            smtp_from: "noreply@example.com".to_string(),
+            preserved_usernames: vec!["admin".to_string()],
+            trusted_proxies: vec!["10.0.0.1".parse().expect("ip")],
+            ..Config::default()
+        };
+        assert!(cfg.validate().is_ok());
+        let summary = cfg.config_summary();
+        let text = serde_json::to_string(&summary).expect("serialize");
+        for secret in [
+            "hunter2",
+            "pinetree",
+            "relay.local",
+            "noreply@example.com",
+            "10.0.0.1",
+        ] {
+            assert!(!text.contains(secret), "summary leaks {secret:?}: {text}");
+        }
+        // ...but the safe flags survive.
+        assert_eq!(summary["email_configured"], true);
+        assert_eq!(summary["transcode_enabled"], false);
+        assert_eq!(summary["detailed_admin_status"], false);
+        assert_eq!(summary["structured_logging"], true);
+        assert_eq!(summary["trusted_proxies"], 1);
     }
 }

@@ -134,3 +134,25 @@ bash scripts/smoke-all.sh
 
 Plus: fill cache to 110% with concurrent jobs → stays ≤cap; `rm` a blob file → reconciler re-fetches or marks missing; over-quota user → upload 413-style error, delete then upload succeeds. Paste real output into `state/logs/YYYY-MM-DD-storage-overhaul.md`, update `TODOS.md` + cache plan in place, never rewrite old logs.
 
+## Prod-readiness addendum (2026-10-21, Batches C + F)
+
+Media paging contract: `MAX_MEDIA_PAGE_ROWS = 500` (redb/mod.rs), newest-first
+exclusive cursors, requested page size honored up to the max, empty-page
+termination only — a short page is never end-of-scan. At-open one-time
+accounting migration (`migration:storage_accounting:v1` progress/done keys,
+bounded 500-row batches, restartable/idempotent) runs before serve/worker so
+nothing races it; job-path backfill/reconcile chains are convergent repair for
+quiet periods. Reconcile separates detection vs repaired counters, never
+deletes durable rows, keeps evicted cache re-fetchable, and the orphan sweep
+refuses incomplete key sets. Boot enqueues a bounded `ReconcileStorage`;
+`storage-backfill` CLI op is the explicit backfill trigger.
+
+Backup registry: `export_backup_snapshot` / `import_backup_rows` form the
+canonical 103-table typed registry (no multimaps; `live_table_names` vs the
+registry is test-enforced). Export streams every table inside ONE read
+transaction; restore re-imports in bounded write transactions, then
+`check_integrity` (no active txns) plus accounting verification. Lock order:
+media gate, then db-txn, then fs. `src/backup/` owns the versioned ZIP bundle
+(manifest plus tables plus both pools), the shared media gate, the
+trigger/status API, and offline restore.
+

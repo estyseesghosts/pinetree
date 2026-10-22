@@ -1,0 +1,10 @@
+{
+  "public_url": "https://REPLACE-ME.invalid",
+  "data_dir": "/data",
+  "listen": "0.0.0.0:3000",
+  "mode": "single",
+  "max_file_size": 262144000,
+  "preserved_usernames": ["admin", "root", "system", "i"],
+  "transcode": {"enabled": true},
+  "unsafe": {"allow_local_http_for_testing": false}
+}

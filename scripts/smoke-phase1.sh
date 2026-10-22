@@ -55,9 +55,14 @@ trap cleanup EXIT
 
 if [[ ! -x "$BIN" ]]; then
   echo "[smoke] building pinetree binary..." >&2
-  (cd "$ROOT" && cargo build)
+  (cd "$ROOT" && cargo build --offline) || { echo "SMOKE_FAIL: cargo build failed" >&2; exit 1; }
 fi
 [[ -x "$BIN" ]] || { echo "SMOKE_FAIL: binary missing at $BIN" >&2; exit 1; }
+# Warn (never fail) when a source file is newer than the binary: a stale
+# binary can pass while the current tree is broken.
+if [[ -z "${PINETREE_BIN:-}" ]] && newer="$(find "$ROOT/src" -name '*.rs' -newer "$BIN" -print 2>/dev/null | head -1)" && [[ -n "$newer" ]]; then
+  echo "[smoke] WARNING: binary $BIN predates $newer; rebuild to test the current tree" >&2
+fi
 
 if [[ -n "${BUN_BIN:-}" ]]; then
   BUN="$BUN_BIN"
@@ -100,7 +105,7 @@ wait_for_health() {
 start_server() {
   local port="$1"
   ORIGIN="http://127.0.0.1:$port"
-  "$BIN" --data-dir="$DATA_DIR" --listen="127.0.0.1:$port" --public-url="$ORIGIN" --no-transcode &
+  "$BIN" --data-dir="$DATA_DIR" --listen="127.0.0.1:$port" --public-url="$ORIGIN" --no-transcode --allow-local-http-for-testing &
   SERVER_PID=$!
   SERVER_STARTED=1
   wait_for_health "$ORIGIN" || {
@@ -426,7 +431,15 @@ assert(
   `mention notification: ${JSON.stringify(bobNotifs.map((n: any) => n.type))}`,
 );
 const aliceNotifs: any = await aliceClient.request("i/notifications", { limit: 20 });
-const aliceTypes: string[] = aliceNotifs.map((n: any) => n.type);
+let aliceTypes: string[] = aliceNotifs.map((n: any) => n.type);
+// Post-restart the worker redrains queued Notify jobs in the background;
+// poll briefly so a slow drain under load cannot flake the durability
+// assertion (the invariant — both rows durable — is unchanged).
+for (let i = 0; i < 10 && !(aliceTypes.includes("follow") && aliceTypes.includes("reaction")); i++) {
+  await new Promise((r) => setTimeout(r, 1000));
+  const retry: any = await aliceClient.request("i/notifications", { limit: 20 });
+  aliceTypes = retry.map((n: any) => n.type);
+}
 assert(aliceTypes.includes("follow"), `follow notification: ${JSON.stringify(aliceTypes)}`);
 assert(aliceTypes.includes("reaction"), `reaction notification: ${JSON.stringify(aliceTypes)}`);
 

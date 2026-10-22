@@ -43,16 +43,19 @@ File `--config path/to/pinetree.json` + CLI flags override + `validate()` once. 
   "smtp_host": null, "smtp_port": 587, "smtp_username": null,
   "smtp_password": null, "smtp_from": null,
   "email_required_for_signup": false,
-  "transcode": { "enabled": true /* ranges validated */ },
-  "federation": { "rfc9421_mode": "permissive" } // enforce = future
+  "transcode": { "enabled": false /* ranges validated; true needs the runtime-ffmpeg image + toolchain probe at boot */ },
+  "federation": { "rfc9421_mode": "permissive" }, // or "enforce" (requires valid RFC 9421, rejects legacy-only)
+  "unsafe": { "allow_local_http_for_testing": false }, // true allows ONLY loopback/localhost/RFC1918/.test http public_url (throwaway labs; never production)
+  "diagnostics": { "detailed_admin_status": false, "structured_logging": true },
+  "backup": { "dir": null /* default <data_dir>/backups */, "max_bundle_bytes": 68719476736 }
 }
 ```
 
-Rules enforced: `durable_dir != cache_dir`, class budgets ≤ global and sum ≤ global, SMTP all-or-nothing + `from` shape + split-auth reject, transcode ranges hermetic + toolchain probe at boot. CLI: `--mode/--public-url/--data-dir/--listen/--trusted-proxies/--max-file-size/.../--durable-dir/--cache-dir/--no-transcode`.
+Rules enforced: `durable_dir != cache_dir`, class budgets ≤ global and sum ≤ global, SMTP all-or-nothing + `from` shape + split-auth reject, transcode ranges hermetic + toolchain probe at boot (enabled + missing/broken ffmpeg ⇒ startup exits non-zero, never serve), `public_url` must be `https://` unless `unsafe.allow_local_http_for_testing=true` (then loopback/`localhost`/RFC1918/`.test` hosts only, with a conspicuous startup warning; the shipped container uses `https://REPLACE-ME.invalid` so a fresh install cannot boot without being configured). CLI: `--mode/--public-url/--data-dir/--listen/--trusted-proxies/--max-file-size/.../--durable-dir/--cache-dir/--no-transcode/--allow-local-http-for-testing/--backup-dir`.
 
 Exceptions (env-only, tracked TODOS P3, no exception granted): `PINETREE_ALLOW_PRIVATE_IPS`, `PINETREE_DEBUG_FEDERATION`, `PINETREE_REPLY_REPAIR_LIMIT`; lease/retry numbers hardcoded; timeouts/SSRF/redirects/proxy-8MiB/log/metrics knobs hardcoded. Timeouts: 10 s op / 20 s total / 5 s DNS, ≤3 redirects, 64 KiB AP/WebFinger, 32 KiB headers.
 
-Docker: multi-stage Debian (curl+OpenSSL3, `tini`, unprivileged `pinetree`, `700 /data`, `EXPOSE 3000`, `CMD --config --data-dir --listen`). Known bug: image lacks `ffmpeg` but default `transcode.enabled=true` refuses to boot — pass `--no-transcode` or add layer. `HEALTHCHECK` probes `/healthz` (static `ok`); `/ready` does a real redb read but is unprobed.
+Docker: `runtime` (no FFmpeg) and `runtime-ffmpeg` (Debian `ffmpeg` + build-time probe) targets from a shared base; bare `docker build` yields the minimal image. Both use an opt-in transcode config (`docker/pinetree.container.json` disabled default; `docker/pinetree.transcode-enabled.example.json` for the FFmpeg image). Debian (curl+OpenSSL3, `tini`, unprivileged `pinetree`, `700 /data`, `EXPOSE 3000`, `CMD --config --data-dir --listen`). `HEALTHCHECK` probes `/healthz` (liveness); `/ready` does bounded readiness (redb read + storage roots) — switch the probe to `/ready` once accepted for traffic.
 
 ## 3. Moderation tools (how to use them)
 

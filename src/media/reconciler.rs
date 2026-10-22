@@ -3,10 +3,40 @@
 //! Heals what the database/filesystem split cannot make atomic: orphan
 //! bytes from crashes between blob writes and metadata commits, stale
 //! cache bytes, drifted accounting, pre-slice-8 MD5-keyed rows, and `.len`
-//! sidecar mismatches. Runs bounded ([`RECONCILE_SCAN_CAP`] rows per scan)
-//! and converges: every step is safe to re-run, and nothing here ever
-//! deletes metadata (durable-missing bytes are reported by omission and
-//! left for an operator; legacy rows are flagged, never purged).
+//! sidecar mismatches.
+//!
+//! Batch C (`prod-ready.md` §4) paging contract:
+//!
+//! * Every metadata walk pages newest-first through `list_all_media` with
+//!   exclusive `until_id` cursors bounded by
+//!   [`crate::persistence::redb::MAX_MEDIA_PAGE_ROWS`]. Pages advance
+//!   monotonically (strictly older ids), so repeated runs make forward
+//!   progress and never revisit the newest page. Completion means an empty
+//!   page — never a short page.
+//! * One [`reconcile_media`] run examines at most [`RECONCILE_SCAN_CAP`]
+//!   rows and returns a continuation cursor when the table is larger; the
+//!   worker enqueues it durably (`ReconcileStorageJobPayload.after`), so a
+//!   multi-page reconcile reaches the oldest row across jobs.
+//! * [`backfill_durable_accounting`] walks the whole table (empty-page
+//!   termination) and persists sums once; [`backfill_durable_step`] bounds
+//!   one job run to [`BACKFILL_PAGES_PER_RUN`] pages and carries staged sums
+//!   in the durable continuation payload, so counters are overwritten only
+//!   from a complete accumulation — never from a partial scan.
+//! * Detection vs repair are separate counters: `*_drift_detected` counts
+//!   compared-but-untouched rows (truncated scans and chained suffix
+//!   continuations), `*_repaired` counts rows actually overwritten via the
+//!   setters (from-newest complete walks only — suffix sums must never
+//!   repair, they under-count).
+//!
+//! Safety model: the exact one-time rebuild is the at-open
+//! `run_storage_accounting_backfill` migration (runs before requests are
+//! served and before the worker starts, so nothing races it). The job paths
+//! here are convergent repair for quiet periods: a run that observes a
+//! concurrent mutation may write slightly stale sums, and the next
+//! detection pass flags the residual drift. Operators should trigger the
+//! backfill during low traffic (see [`enqueue_storage_backfill`]); the boot
+//! reconcile job ([`enqueue_storage_reconcile`]) is bounded and always safe
+//! to run.
 //!
 //! Split of labour for orphan bytes (task §5.4, item b):
 //!
@@ -21,42 +51,67 @@
 //!   roots, `blobs_durable/` + `blobs_cache/` under the data dir) calls it
 //!   with the live key sets from [`collect_live_blob_keys`].
 //!
-//! Accounting/refcount healing (items c–d) is detection-only through the
-//! current traits: `blob_refcount`/`durable_bytes` are read-only and there
-//! is no compare-and-set setter, so drift is counted in `refcounts_healed`
-//! and documented for the backend owner to overwrite. Nothing is fabricated
-//! to look healed.
+//! No-snapshot disclosure: separate pages are separate reads. Rows inserted
+//! after a walk starts (larger ids, already passed) are not revisited, and
+//! rows deleted mid-walk are skipped. Destructive operations must never run
+//! on a partial key set: [`sweep_orphan_blobs_checked`] refuses an
+//! explicitly incomplete set, and production wiring must only sweep the
+//! fully walked sets (durable/cache pools strictly separate — a key is
+//! swept only from the pool its rows reference).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
-use crate::application::commands::AppServices;
-use crate::application::ports::{BlobStore, MediaClass, PortError, TimelineCursor};
+use serde::{Deserialize, Serialize};
 
-/// Rows examined per [`reconcile_media`] scan. The scan is a single bounded
-/// `list_all_media` page; larger instances converge over repeated runs
-/// (newest-first ordering keeps the hot rows in every window).
+use crate::application::commands::AppServices;
+use crate::application::ports::{
+    BlobStore, JobKind, JobQueue, MediaClass, NewJob, PortError, TimelineCursor,
+};
+use crate::persistence::redb::MAX_MEDIA_PAGE_ROWS;
+
+/// Rows examined per [`reconcile_media`] run. The run pages newest-first
+/// with `until_id` cursors; larger instances continue across jobs via the
+/// returned cursor (monotonic forward progress, never re-scanning the
+/// newest page).
 pub const RECONCILE_SCAN_CAP: usize = 5000;
 
-/// Outcome of one [`reconcile_media`] scan. All counters saturate at
+/// Outcome of one [`reconcile_media`] run. All counters saturate at
 /// `u64::MAX` in principle; in practice they are small.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReconcileReport {
-    /// Media rows examined this scan.
+    /// Media rows examined this run.
     pub examined: u64,
+    /// True when the walk reached the oldest row (empty-page termination).
+    /// False means more rows remain past the returned continuation cursor.
+    pub complete: bool,
     /// Dangling-index cache bytes deleted (index row without a media row
     /// and `refcount == 0`). Filesystem-level orphans are swept by
     /// [`sweep_orphan_blobs`] and counted by its caller.
     pub orphans_removed: u64,
-    /// Owner-less (cache) rows whose bytes were absent: accounting
-    /// adjusted down and the row left byte-less for on-demand re-fetch.
-    /// The remote-cache index row is kept (bookkeeping for re-fetch);
-    /// flipping a metadata `evicted` flag lands with agent A's
-    /// `MediaMeta.evicted` field.
+    /// Owner-less (cache) rows whose bytes were absent: the row is marked
+    /// evicted (metadata + re-fetch index kept) and accounting adjusted
+    /// down exactly once per row. Re-runs skip already-evicted rows, so the
+    /// adjustment is idempotent and no phantom bytes are charged.
     pub missing_marked_evicted: u64,
-    /// Blob-refcount and durable-bytes accounting drifts detected
-    /// (detection-only until the backend exposes setters — see module docs).
-    pub refcounts_healed: u64,
+    /// Durable rows whose bytes are unreadable in the durable pool.
+    /// Metadata is NEVER deleted: the rows stay visible and are reported
+    /// here (plus a bounded id sample) for operator repair.
+    pub durable_missing: u64,
+    /// Ids (at most [`DURABLE_MISSING_SAMPLE_CAP`]) backing
+    /// `durable_missing`, oldest-sampled first, for operator triage.
+    pub durable_missing_sample: Vec<String>,
+    /// Blob-refcount drifts seen on a truncated run (compared only — the
+    /// scan did not cover the whole table, so nothing was overwritten).
+    pub refcount_drift_detected: u64,
+    /// Durable-bytes drifts seen on a truncated run (compared only).
+    pub durable_drift_detected: u64,
+    /// Blob-refcount rows actually overwritten via `set_blob_refcount`
+    /// after a complete scan (expected sums covered every row).
+    pub refcounts_repaired: u64,
+    /// Owner byte-counter rows actually overwritten via
+    /// `set_durable_bytes` after a complete scan.
+    pub durable_repaired: u64,
     /// Missing/corrupt `.len` sidecars regenerated by re-putting bytes
     /// that were still readable.
     pub sidecars_healed: u64,
@@ -64,6 +119,10 @@ pub struct ReconcileReport {
     /// are never deleted by the reconciler).
     pub md5_rows_purged_or_flagged: u64,
 }
+
+/// Cap on [`ReconcileReport::durable_missing_sample`] (operator triage
+/// sample, not a paging bound).
+pub const DURABLE_MISSING_SAMPLE_CAP: usize = 32;
 
 /// Run one bounded reconciliation scan. Idempotent: re-running converges
 /// (every mutation moves state toward accounted, indexed, present bytes).
@@ -73,82 +132,173 @@ pub fn reconcile_media(services: &AppServices) -> Result<ReconcileReport, PortEr
 
 /// [`reconcile_media`] with an explicit scan cap (storage job payload).
 /// Caps above [`RECONCILE_SCAN_CAP`] are clamped — one run never exceeds
-/// the bound the reconciler was designed around.
+/// the bound the reconciler was designed around. Single-page entry point
+/// kept for callers that want one run: pages newest-first from the start
+/// and discards the continuation cursor (use [`reconcile_media_paged`]
+/// when the table may exceed the cap).
 pub fn reconcile_media_with_cap(
     services: &AppServices,
     scan_cap: usize,
 ) -> Result<ReconcileReport, PortError> {
+    Ok(reconcile_media_paged(services, None, scan_cap)?.0)
+}
+
+/// [`reconcile_media`] starting after `after` (`None` = newest), examining
+/// at most `scan_cap` rows (clamped to [`RECONCILE_SCAN_CAP`]).
+///
+/// Returns the report plus the continuation cursor: `Some(last id)` when
+/// more rows may remain (the run hit the cap without an empty page),
+/// `None` when the walk reached the oldest row (`report.complete` is the
+/// same signal as a bool). Cursors are exclusive and monotonic — a resume
+/// passes the returned id as the next `after` and never re-examines a row.
+/// Only an empty page terminates the walk: short pages (concurrent deletes)
+/// and exact-multiple datasets both continue to the trailing empty read.
+/// Counter repair runs only on from-newest complete walks (see below);
+/// chained continuations detect drift but never overwrite.
+///
+/// Per-row semantics: durable rows with missing bytes are counted in
+/// `durable_missing` (+ sample) and otherwise untouched; cache rows with
+/// missing bytes are charged off once (index-anchored, idempotent);
+/// readable bytes with a missing/corrupt sidecar are re-put. Drift repair
+/// runs only on from-newest complete walks; truncated walks and chained
+/// suffix continuations count detections.
+pub fn reconcile_media_paged(
+    services: &AppServices,
+    after: Option<&str>,
+    scan_cap: usize,
+) -> Result<(ReconcileReport, Option<String>), PortError> {
     let cap = scan_cap.clamp(1, RECONCILE_SCAN_CAP);
+    // One adapter page per read: never exceed the run cap per page, and
+    // never exceed the adapter contract maximum.
+    let page = cap.min(MAX_MEDIA_PAGE_ROWS);
     let mut report = ReconcileReport::default();
-    let rows = services
-        .media
-        .list_all_media(&TimelineCursor::with_limit(cap))?;
-    report.examined = rows.len() as u64;
+    let mut cursor_after: Option<String> = after.map(ToOwned::to_owned);
+    // Blob keys whose missing-bytes adjustment was already applied this
+    // run (shared blobs adjust once, not once per row).
+    let mut adjusted_blobs: HashSet<String> = HashSet::new();
 
-    let report_truncated = rows.len() >= cap;
-
-    // Expected state recomputed from the scan: per-key reference counts
+    // Expected state recomputed from the walk: per-key reference counts
     // and per-owner durable sums, compared against the stored counters.
     let mut expected_ref: HashMap<String, u64> = HashMap::new();
     let mut expected_durable: HashMap<String, u64> = HashMap::new();
 
-    for meta in &rows {
-        *expected_ref.entry(meta.blob_key.clone()).or_insert(0) += 1;
-        let legacy = is_legacy_md5_row(&meta.blob_key);
-        if legacy {
-            // Flag only: never delete metadata or bytes for legacy rows
-            // (the key may be shared; §5.4 says purge-or-migrate, and the
-            // safe half is the flag + this count).
-            report.md5_rows_purged_or_flagged += 1;
+    loop {
+        let mut cursor = TimelineCursor::with_limit(page);
+        cursor.until_id = cursor_after.clone();
+        let rows = services.media.list_all_media(&cursor)?;
+        if rows.is_empty() {
+            report.complete = true;
+            break;
         }
-        // Durable pool for owned rows, cache pool for owner-less rows.
-        // Never touch the wrong pool (local uploads must survive any
-        // amount of cache pressure, and cache sweeps must never eat
-        // durable bytes).
-        let pool: &dyn BlobStore = match &meta.owner_id {
-            Some(owner) => {
-                let entry = expected_durable.entry(owner.clone()).or_insert(0);
-                *entry = entry.saturating_add(meta.size_bytes);
-                services.blobs.as_ref()
+        for meta in &rows {
+            *expected_ref.entry(meta.blob_key.clone()).or_insert(0) += 1;
+            let legacy = is_legacy_md5_row(&meta.blob_key);
+            if legacy {
+                // Flag only: never delete metadata or bytes for legacy rows
+                // (the key may be shared; §5.4 says purge-or-migrate, and the
+                // safe half is the flag + this count).
+                report.md5_rows_purged_or_flagged += 1;
             }
-            None => services.cache_blobs.as_ref(),
-        };
-        match pool.byte_len(&meta.blob_key)? {
-            Some(_) => {}
-            None => {
-                // Bytes unreadable through this pool: try the sidecar heal
-                // (a backend whose `get` still serves bytes while the
-                // sidecar is missing/corrupt gets a regenerated sidecar),
-                // else pool-appropriate missing handling.
-                match pool.get(&meta.blob_key)? {
-                    Some(bytes) => {
-                        pool.put(&meta.blob_key, &bytes)?;
-                        report.sidecars_healed += 1;
-                    }
-                    None if legacy => {
-                        // Flagged above; never account or delete legacy rows.
-                    }
-                    None if meta.owner_id.is_some() => {
-                        // Durable bytes missing: NEVER auto-delete metadata.
-                        // Left for an operator (counted via `examined`
-                        // only, by design).
-                    }
-                    None => {
-                        report.missing_marked_evicted += 1;
-                        let class = MediaClass::classify_mime(&meta.mime);
-                        services.media.cache_accounting_apply(
-                            -(meta.size_bytes as i64),
-                            class,
-                            -(meta.size_bytes as i64),
-                            0,
-                            0,
-                            0,
-                            0,
-                            0,
-                        )?;
+            // Durable pool for owned rows, cache pool for owner-less rows.
+            // Never touch the wrong pool (local uploads must survive any
+            // amount of cache pressure, and cache sweeps must never eat
+            // durable bytes).
+            let pool: &dyn BlobStore = match &meta.owner_id {
+                Some(owner) => {
+                    let entry = expected_durable.entry(owner.clone()).or_insert(0);
+                    *entry = entry.saturating_add(meta.size_bytes);
+                    services.blobs.as_ref()
+                }
+                None => services.cache_blobs.as_ref(),
+            };
+            match pool.byte_len(&meta.blob_key)? {
+                Some(_) => {}
+                None => {
+                    // Bytes unreadable through this pool: try the sidecar heal
+                    // (a backend whose `get` still serves bytes while the
+                    // sidecar is missing/corrupt gets a regenerated sidecar),
+                    // else pool-appropriate missing handling.
+                    match pool.get(&meta.blob_key)? {
+                        Some(bytes) => {
+                            pool.put(&meta.blob_key, &bytes)?;
+                            report.sidecars_healed += 1;
+                        }
+                        None if legacy => {
+                            // Flagged above; never account or delete legacy rows.
+                        }
+                        None if meta.owner_id.is_some() => {
+                            // Durable bytes missing: NEVER auto-delete
+                            // metadata. Count it and sample the id so the
+                            // row stays visible to operators for repair.
+                            report.durable_missing += 1;
+                            if report.durable_missing_sample.len() < DURABLE_MISSING_SAMPLE_CAP {
+                                report.durable_missing_sample.push(meta.id.clone());
+                            }
+                        }
+                        None => {
+                            // Cache bytes missing: adjust accounting down
+                            // exactly once per blob per run (several rows
+                            // can share one blob key), anchored on the
+                            // `(source_url, variant)` index row so re-runs
+                            // stay idempotent. The trait has no persisted
+                            // evicted flag (`InsertMediaInput` carries none
+                            // and the backend derives the field), so the
+                            // index record doubles as the adjustment
+                            // record: its `size_bytes` is zeroed when the
+                            // missing bytes are charged off (a zero size
+                            // adjusts nothing on re-runs), while the index
+                            // row itself is KEPT for re-fetch bookkeeping.
+                            // A later re-fetch overwrites the record with
+                            // fresh bytes + size, self-healing the anchor.
+                            // The metadata row always survives: dropping it
+                            // would destroy the re-fetch path.
+                            if meta.evicted {
+                                continue;
+                            }
+                            if !adjusted_blobs.insert(meta.blob_key.clone()) {
+                                continue;
+                            }
+                            let Some(url) = meta.source_url.as_deref() else {
+                                // No index anchor exists to record the
+                                // adjustment: leave the charge in place
+                                // (bounded, non-ratcheting) rather than
+                                // double-subtracting on every run.
+                                continue;
+                            };
+                            let Some(mut rec) =
+                                services.media.remote_cache_lookup(url, &meta.variant)?
+                            else {
+                                // Already adjusted on an earlier run (anchor
+                                // zeroed) — skip so re-runs never
+                                // double-subtract.
+                                continue;
+                            };
+                            if rec.size_bytes == 0 {
+                                continue;
+                            }
+                            let class = MediaClass::classify_mime(&meta.mime);
+                            services.media.cache_accounting_apply(
+                                -(meta.size_bytes as i64),
+                                class,
+                                -(meta.size_bytes as i64),
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                            )?;
+                            rec.size_bytes = 0;
+                            services.media.remote_cache_insert(&rec)?;
+                            report.missing_marked_evicted += 1;
+                        }
                     }
                 }
             }
+        }
+        report.examined += rows.len() as u64;
+        cursor_after = rows.last().map(|m| m.id.clone());
+        if report.examined >= cap as u64 {
+            break;
         }
     }
 
@@ -157,9 +307,7 @@ pub fn reconcile_media_with_cap(
     // the key, always drop the stale accounting, and always remove the
     // index row so the next lookup misses and re-fetches cleanly.
     let mut accounted_blobs: HashSet<String> = HashSet::new();
-    let candidates = services
-        .media
-        .remote_cache_evict_candidates(cap)?;
+    let candidates = services.media.remote_cache_evict_candidates(cap)?;
     for rec in &candidates {
         if services.media.get(&rec.media_id)?.is_some() {
             continue;
@@ -187,26 +335,72 @@ pub fn reconcile_media_with_cap(
             .remote_cache_remove(&rec.source_url, &rec.variant)?;
     }
 
-    // (c) refcount drift: expected (from the scan) vs stored. Skipped when
-    // the scan hit the cap: a truncated scan under-counts references and
-    // would false-positive on every key.
-    if !report_truncated {
+    // (c-d) refcount + durable-bytes drift. Repaired only when THIS run
+    // walked the whole table from the newest row (`after == None` plus an
+    // empty page): only then are the expected sums exact. Chained suffix
+    // runs and truncated runs count detections, so a partial view can
+    // never overwrite live counters. (Suffix sums must not repair: they
+    // under-count shared keys and multi-page owners. Global rewrites go
+    // through the backfill chain, which accumulates staged sums across
+    // continuations.)
+    if report.complete && after.is_none() {
         for (key, expected) in &expected_ref {
             if services.media.blob_refcount(key)? != *expected {
-                report.refcounts_healed += 1;
+                services.media.set_blob_refcount(key, *expected)?;
+                report.refcounts_repaired += 1;
             }
         }
-        // (d) durable-bytes drift per owner. Folded into `refcounts_healed`
-        // (one accounting-drift counter; see module docs for why this is
-        // detection-only through the current traits).
         for (owner, expected) in &expected_durable {
             if services.media.durable_bytes(owner)? != *expected {
-                report.refcounts_healed += 1;
+                services.media.set_durable_bytes(owner, *expected)?;
+                report.durable_repaired += 1;
+            }
+        }
+    } else {
+        for (key, expected) in &expected_ref {
+            if services.media.blob_refcount(key)? != *expected {
+                report.refcount_drift_detected += 1;
+            }
+        }
+        for (owner, expected) in &expected_durable {
+            if services.media.durable_bytes(owner)? != *expected {
+                report.durable_drift_detected += 1;
             }
         }
     }
 
-    Ok(report)
+    let next = if report.complete { None } else { cursor_after };
+    Ok((report, next))
+}
+
+/// Live blob keys partitioned by pool, for [`sweep_orphan_blobs`].
+/// `(durable_keys, cache_keys)`. Walks the whole table newest-first with
+/// exclusive `until_id` cursors to an empty page, so the returned sets are
+/// complete by construction (see the no-snapshot disclosure in the module
+/// docs).
+pub fn collect_live_blob_keys(
+    services: &AppServices,
+) -> Result<(HashSet<String>, HashSet<String>), PortError> {
+    let mut durable = HashSet::new();
+    let mut cache = HashSet::new();
+    let mut after: Option<String> = None;
+    loop {
+        let mut cursor = TimelineCursor::with_limit(MAX_MEDIA_PAGE_ROWS);
+        cursor.until_id = after;
+        let rows = services.media.list_all_media(&cursor)?;
+        if rows.is_empty() {
+            break;
+        }
+        for meta in &rows {
+            if meta.owner_id.is_some() {
+                durable.insert(meta.blob_key.clone());
+            } else {
+                cache.insert(meta.blob_key.clone());
+            }
+        }
+        after = rows.last().map(|m| m.id.clone());
+    }
+    Ok((durable, cache))
 }
 
 /// Reset a leaked in-flight reservation (crash-heal). Call at startup:
@@ -224,26 +418,6 @@ pub fn reset_in_flight(services: &AppServices) -> Result<(), PortError> {
     Ok(())
 }
 
-/// Live blob keys partitioned by pool, for [`sweep_orphan_blobs`].
-/// `(durable_keys, cache_keys)`.
-pub fn collect_live_blob_keys(
-    services: &AppServices,
-) -> Result<(HashSet<String>, HashSet<String>), PortError> {
-    let rows = services
-        .media
-        .list_all_media(&TimelineCursor::with_limit(RECONCILE_SCAN_CAP))?;
-    let mut durable = HashSet::new();
-    let mut cache = HashSet::new();
-    for meta in &rows {
-        if meta.owner_id.is_some() {
-            durable.insert(meta.blob_key.clone());
-        } else {
-            cache.insert(meta.blob_key.clone());
-        }
-    }
-    Ok((durable, cache))
-}
-
 /// Sweep one `objects/` pool directory (`<pool>/objects/xx/<key>` shards
 /// with `<key>.len` sidecars): delete every key file — plus its sidecar —
 /// not in `live_keys`. Returns the number of object keys removed.
@@ -253,10 +427,40 @@ pub fn collect_live_blob_keys(
 /// (they die with their object), non-directories and unreadable entries
 /// are skipped, a missing pool directory sweeps nothing, and `NotFound`
 /// races on delete are ignored. Metadata is never touched here.
+///
+/// The caller vouches that `live_keys` is COMPLETE (a fully walked set
+/// from [`collect_live_blob_keys`): this function cannot tell a partial
+/// set from a full one. Callers that cannot vouch completeness must use
+/// [`sweep_orphan_blobs_checked`] and pass their completion signal.
+/// Prefer leaking an orphan over deleting live media.
 pub fn sweep_orphan_blobs(
     objects_dir: &Path,
     live_keys: &HashSet<String>,
 ) -> Result<u64, PortError> {
+    sweep_orphan_blobs_checked(objects_dir, live_keys, true)
+}
+
+/// [`sweep_orphan_blobs`] with an explicit completeness gate: `complete`
+/// must be true — the result of a fully walked live-key set — or the sweep
+/// refuses with `Validation` and deletes nothing. This is the destructive
+/// operation's guard against truncated scans: a short page, a capped walk,
+/// or any interrupted collection must never feed a delete sweep.
+pub fn sweep_orphan_blobs_checked(
+    objects_dir: &Path,
+    live_keys: &HashSet<String>,
+    complete: bool,
+) -> Result<u64, PortError> {
+    if !complete {
+        return Err(PortError::Validation(
+            "refusing orphan-blob sweep on an incomplete live-key set; \
+             finish the paged collection to an empty page first"
+                .to_string(),
+        ));
+    }
+    // Batch F gate (Batch H one-snippet): pool deletions wait behind an
+    // active backup so a concurrent snapshot/copy can never lose bytes the
+    // bundle's metadata references. Held for the whole sweep.
+    let _media_gate = crate::media::storage::acquire_media_op("sweep")?;
     let shards = match std::fs::read_dir(objects_dir) {
         Ok(shards) => shards,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -323,8 +527,23 @@ fn is_legacy_md5_row(blob_key: &str) -> bool {
 
 /// Rows per page for [`backfill_durable_accounting`]. Every page is one
 /// bounded `list_all_media` read (FDB-safe); the in-memory sums stay
-/// small (one entry per owner/blob key).
+/// small (one entry per owner/blob key). Capped by
+/// [`MAX_MEDIA_PAGE_ROWS`], the adapter contract maximum.
 pub const BACKFILL_PAGE_SIZE: usize = 500;
+
+/// Pages scanned by one [`backfill_durable_step`] job run before it yields
+/// a durable continuation. Bounds one job's work to
+/// `BACKFILL_PAGES_PER_RUN * BACKFILL_PAGE_SIZE` rows (2000 by default)
+/// while the staged sums still fit a job payload (see
+/// [`BACKFILL_STAGED_BUDGET_BYTES`]).
+pub const BACKFILL_PAGES_PER_RUN: usize = 4;
+
+/// Serialized-size budget for staged backfill sums carried in a
+/// continuation job payload. Well under the 64 KiB job cap (leaves room
+/// for the cursor + envelope). When a run's staged sums exceed this, the
+/// run extends in memory instead of yielding — payloads stay small, and
+/// only genuinely large tables run longer per job.
+pub const BACKFILL_STAGED_BUDGET_BYTES: usize = 32 * 1024;
 
 /// Outcome of one [`backfill_durable_accounting`] run.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -337,57 +556,254 @@ pub struct BackfillReport {
     pub refcounts_updated: u64,
 }
 
-/// Recompute `DURABLE_BYTES_BY_OWNER` (and `BLOB_REFCOUNT`) from the
-/// metadata rows and overwrite the stored counters. Idempotent: a re-run
-/// over unchanged rows writes the same sums. `after_media_id` sets the
-/// start cursor (`None` = newest); `page_size` is clamped to
-/// `1..=BACKFILL_PAGE_SIZE`. The scan pages to the newest-to-oldest end
-/// (one bounded `list_all_media` read per page) and persists the sums
-/// once; the returned cursor is always `None` (done). Partial pages are
-/// never written: sums accumulate in memory (one entry per owner/blob
-/// key) and are persisted only after the final page, so an interrupted
-/// run simply re-runs from the start and converges to the same counters.
-pub fn backfill_durable_accounting(
+/// Staged backfill accumulation carried across durable continuations: exact
+/// per-owner durable sums and per-key refcounts for the walked prefix, plus
+/// the walked row count. Serialized into continuation job payloads
+/// ([`BackfillDurableJobPayload`]); deterministic key order keeps retries
+/// byte-identical.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackfillStaged {
+    /// Exact durable bytes per owner for rows walked so far.
+    #[serde(default)]
+    pub durable_sums: BTreeMap<String, u64>,
+    /// Exact live-reference count per blob key for rows walked so far
+    /// (durable AND cache rows — every row references its bytes).
+    #[serde(default)]
+    pub ref_sums: BTreeMap<String, u64>,
+    /// Rows walked so far (observability only).
+    #[serde(default)]
+    pub scanned: u64,
+}
+
+/// One bounded backfill step: either more pages remain (durable
+/// continuation state) or the walk ended (exact final sums to persist).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackfillStep {
+    /// More rows may remain: resume by passing `staged` + `next_after` to
+    /// the next [`backfill_durable_step`]. Counters are NOT written yet —
+    /// the accumulation covers only a prefix, and overwriting from a
+    /// partial scan is never allowed.
+    Continue {
+        /// Accumulated prefix sums (durable across jobs via the
+        /// continuation payload).
+        staged: BackfillStaged,
+        /// Exclusive resume cursor (last walked id).
+        next_after: String,
+    },
+    /// The walk reached the oldest row: `staged` covers every walked row
+    /// and is exact. Persist it with [`apply_backfill_sums`].
+    Complete {
+        /// Final report inputs (filled from `staged`).
+        report: BackfillReport,
+        /// Exact final sums.
+        staged: BackfillStaged,
+    },
+}
+
+/// Walk at most `max_pages` media pages from `after` (`None` = newest),
+/// accumulating exact sums into `staged`. Only an empty page ends the walk
+/// — short pages (concurrent deletes) and exact-multiple datasets both
+/// continue to the trailing empty read, so a truncated adapter page can
+/// never masquerade as end-of-scan.
+///
+/// When the page budget is spent mid-table, the step yields `Continue`
+/// provided the staged sums still fit [`BACKFILL_STAGED_BUDGET_BYTES`];
+/// otherwise the run extends in memory (payloads stay small, large tables
+/// just run longer per job). A crashed run writes nothing (the worker
+/// persists only on `Complete`), so any interruption restarts safely from
+/// the last durable continuation — or from scratch, converging to the same
+/// sums.
+pub fn backfill_durable_step(
     services: &AppServices,
-    after_media_id: Option<String>,
+    mut staged: BackfillStaged,
+    after: Option<String>,
     page_size: usize,
-) -> Result<(BackfillReport, Option<String>), PortError> {
-    let page = page_size.clamp(1, BACKFILL_PAGE_SIZE);
-    let mut cursor_after = after_media_id;
-    let mut durable_sums: HashMap<String, u64> = HashMap::new();
-    let mut ref_sums: HashMap<String, u64> = HashMap::new();
-    let mut scanned: u64 = 0;
+    max_pages: usize,
+) -> Result<BackfillStep, PortError> {
+    let page = page_size
+        .clamp(1, BACKFILL_PAGE_SIZE)
+        .min(MAX_MEDIA_PAGE_ROWS);
+    let mut cursor_after = after;
+    let mut pages: usize = 0;
     loop {
         let mut cursor = TimelineCursor::with_limit(page);
         cursor.until_id = cursor_after.clone();
         let rows = services.media.list_all_media(&cursor)?;
         if rows.is_empty() {
-            break;
+            let mut report = BackfillReport::default();
+            report.media_scanned = staged.scanned;
+            report.owners_updated = staged.durable_sums.len() as u64;
+            report.refcounts_updated = staged.ref_sums.len() as u64;
+            return Ok(BackfillStep::Complete { report, staged });
         }
         for meta in &rows {
-            *ref_sums.entry(meta.blob_key.clone()).or_insert(0) += 1;
+            let entry = staged.ref_sums.entry(meta.blob_key.clone()).or_insert(0);
+            *entry = entry.saturating_add(1);
             if let Some(owner) = meta.owner_id.as_deref() {
-                let entry = durable_sums.entry(owner.to_string()).or_insert(0);
+                let entry = staged.durable_sums.entry(owner.to_string()).or_insert(0);
                 *entry = entry.saturating_add(meta.size_bytes);
             }
         }
-        scanned += rows.len() as u64;
-        if rows.len() < page {
-            break;
-        }
+        staged.scanned += rows.len() as u64;
+        pages += 1;
         cursor_after = rows.last().map(|m| m.id.clone());
+        if pages >= max_pages.max(1) {
+            let staged_bytes = serde_json::to_vec(&staged)
+                .map(|v| v.len())
+                .unwrap_or(usize::MAX);
+            if staged_bytes <= BACKFILL_STAGED_BUDGET_BYTES {
+                // Non-empty page ⇒ `cursor_after` is `Some` (the last id).
+                let next_after = cursor_after.expect("non-empty page has a last row id");
+                return Ok(BackfillStep::Continue { staged, next_after });
+            }
+            // Staged sums no longer fit a durable continuation payload:
+            // extend this run in memory instead of yielding.
+        }
     }
-    let mut report = BackfillReport::default();
-    report.media_scanned = scanned;
-    for (owner, sum) in &durable_sums {
+}
+
+/// Persist exact backfill sums: overwrite one owner counter + one refcount
+/// row per accumulated entry. Call ONLY with a `Complete` step's staged
+/// state (full-table accumulation). Idempotent: re-applying the same sums
+/// writes the same rows.
+pub fn apply_backfill_sums(
+    services: &AppServices,
+    staged: &BackfillStaged,
+) -> Result<(), PortError> {
+    for (owner, sum) in &staged.durable_sums {
         services.media.set_durable_bytes(owner, *sum)?;
-        report.owners_updated += 1;
     }
-    for (key, count) in &ref_sums {
+    for (key, count) in &staged.ref_sums {
         services.media.set_blob_refcount(key, *count)?;
-        report.refcounts_updated += 1;
     }
-    Ok((report, None))
+    Ok(())
+}
+
+/// Recompute `DURABLE_BYTES_BY_OWNER` (and `BLOB_REFCOUNT`) from the
+/// metadata rows and overwrite the stored counters. Idempotent: a re-run
+/// over unchanged rows writes the same sums. `page_size` is clamped to
+/// `1..=BACKFILL_PAGE_SIZE`. The walk runs to the oldest row (only an empty
+/// page ends it) and persists the sums once; the returned cursor is always
+/// `None` (done). Sums accumulate in memory (one entry per owner/blob key)
+/// and are persisted only after the final page, so an interrupted run
+/// writes nothing and simply re-runs from the start.
+///
+/// `after_media_id` must be `None` (global rebuild). A mid-table start
+/// would accumulate suffix-only sums that must never overwrite global
+/// counters, so it is rejected loudly — resumed walks go through
+/// [`backfill_durable_step`] with staged state instead.
+pub fn backfill_durable_accounting(
+    services: &AppServices,
+    after_media_id: Option<String>,
+    page_size: usize,
+) -> Result<(BackfillReport, Option<String>), PortError> {
+    if after_media_id.is_some() {
+        return Err(PortError::Validation(
+            "backfill_durable_accounting takes after=None (global rebuild); \
+             use backfill_durable_step for resumed walks"
+                .to_string(),
+        ));
+    }
+    let mut staged = BackfillStaged::default();
+    let mut after: Option<String> = None;
+    loop {
+        match backfill_durable_step(services, staged, after, page_size, usize::MAX)? {
+            BackfillStep::Continue {
+                staged: next,
+                next_after,
+            } => {
+                staged = next;
+                after = Some(next_after);
+            }
+            BackfillStep::Complete {
+                report,
+                staged: sums,
+            } => {
+                apply_backfill_sums(services, &sums)?;
+                return Ok((report, None));
+            }
+        }
+    }
+}
+
+/// Forward-compatible worker payload for `JobKind::BackfillDurableAccounting`:
+/// the contract shape (`after`, `batch_size`) plus staged prefix sums for
+/// durable continuations. Old payloads decode (staged defaults empty);
+/// payloads carrying staged state are still valid JSON for old readers
+/// (unknown fields ignored), but old handlers would walk the suffix and
+/// overwrite partial sums — operators must not downgrade mid-chain. The
+/// formal contract addition is proposed in the Batch C report.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackfillDurableJobPayload {
+    /// Exclusive resume cursor (`None` = newest). The initial job uses
+    /// `None`; continuations carry the last walked id.
+    #[serde(default)]
+    pub after: Option<String>,
+    /// Adapter page size (clamped to `1..=BACKFILL_PAGE_SIZE`).
+    #[serde(default)]
+    pub batch_size: Option<usize>,
+    /// Prefix sums accumulated by previous runs in this chain.
+    #[serde(default)]
+    pub staged: BackfillStaged,
+}
+
+/// Forward-compatible worker payload for `JobKind::ReconcileStorage`: the
+/// contract shape (`scan_cap`) plus the resume cursor that turns repeated
+/// bounded runs into one monotonic walk to the oldest row. Same
+/// compatibility notes as [`BackfillDurableJobPayload`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReconcileStorageJobPayload {
+    /// Rows examined per run (clamped to `1..=RECONCILE_SCAN_CAP`).
+    #[serde(default)]
+    pub scan_cap: Option<usize>,
+    /// Exclusive resume cursor (`None` = newest).
+    #[serde(default)]
+    pub after: Option<String>,
+}
+
+/// Build the repeatable bounded reconcile job (boot path + operator path).
+/// Idempotent and always safe to run: one run examines at most
+/// `RECONCILE_SCAN_CAP` rows, repairs only from complete walks, and chains
+/// a durable continuation otherwise.
+pub fn new_reconcile_job(now_ms: i64) -> Result<NewJob, PortError> {
+    NewJob::new_json(
+        JobKind::ReconcileStorage,
+        &ReconcileStorageJobPayload {
+            scan_cap: None,
+            after: None,
+        },
+        format!("storage-reconcile:{now_ms}"),
+        now_ms,
+    )
+}
+
+/// Build the explicit backfill repair job (operator path only — NOT
+/// boot-enqueued: it rewrites counters and belongs in a quiet maintenance
+/// window; see the module safety model).
+pub fn new_backfill_job(now_ms: i64) -> Result<NewJob, PortError> {
+    NewJob::new_json(
+        JobKind::BackfillDurableAccounting,
+        &BackfillDurableJobPayload::default(),
+        format!("storage-backfill:{now_ms}"),
+        now_ms,
+    )
+}
+
+/// Production trigger, repeatable side: enqueue one bounded reconcile job.
+/// Intended call site: server startup after services are built (before
+/// serving), so every boot heals what the previous run left behind; the
+/// worker drains it within its normal polling. Safe to call repeatedly
+/// (idempotent runs, timestamped idempotency key).
+pub fn enqueue_storage_reconcile(jobs: &dyn JobQueue, now_ms: i64) -> Result<(), PortError> {
+    jobs.enqueue_jobs(vec![new_reconcile_job(now_ms)?])
+}
+
+/// Production trigger, explicit side: enqueue one backfill repair job.
+/// Intended call site: an explicit operator maintenance operation (CLI;
+/// patch proposed in the Batch C report) — never automatic, per the module
+/// safety model.
+pub fn enqueue_storage_backfill(jobs: &dyn JobQueue, now_ms: i64) -> Result<(), PortError> {
+    jobs.enqueue_jobs(vec![new_backfill_job(now_ms)?])
 }
 
 #[cfg(test)]
@@ -484,10 +900,25 @@ mod tests {
                 .collect())
         }
         fn list_all_media(&self, cursor: &TimelineCursor) -> Result<Vec<MediaMeta>, PortError> {
-            let mut out: Vec<MediaMeta> =
-                self.rows.lock().unwrap().values().cloned().collect();
+            let mut out: Vec<MediaMeta> = self.rows.lock().unwrap().values().cloned().collect();
             out.sort_by(|a, b| b.id.cmp(&a.id));
-            out.truncate(cursor.limit);
+            // Exclusive cursor bounds, mirroring the production adapter
+            // contract (newest-first, `until_id` walks to an empty page).
+            out.retain(|m| {
+                if let Some(since) = cursor.since_id.as_deref() {
+                    if m.id.as_str() <= since {
+                        return false;
+                    }
+                }
+                if let Some(until) = cursor.until_id.as_deref() {
+                    if m.id.as_str() >= until {
+                        return false;
+                    }
+                }
+                true
+            });
+            let limit = if cursor.limit == 0 { 10 } else { cursor.limit };
+            out.truncate(limit);
             Ok(out)
         }
         fn durable_bytes(&self, owner_id: &str) -> Result<u64, PortError> {
@@ -754,28 +1185,77 @@ mod tests {
     fn reconcile_heals_missing_cache_bytes_and_counts_legacy_rows() {
         let (services, _, _dir) = fake_services();
         // Durable row with present bytes: untouched.
-        let durable_key =
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let durable_key = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
         services.blobs.put(durable_key, b"durable").unwrap();
-        insert_row(&services, "mid00000000000001", Some("aid00000000000001"), durable_key, 7, None);
+        insert_row(
+            &services,
+            "mid00000000000001",
+            Some("aid00000000000001"),
+            durable_key,
+            7,
+            None,
+        );
         // Cache row with present bytes: untouched.
-        let live_key =
-            "abababababababababababababababababababababababababababababababab";
+        let live_key = "abababababababababababababababababababababababababababababababab";
         services.cache_blobs.put(live_key, b"live").unwrap();
-        insert_row(&services, "mid00000000000002", None, live_key, 4, Some("https://r.example/a"));
-        // Cache row with MISSING bytes: accounting adjusted, row kept.
-        let gone_key =
-            "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
-        insert_row(&services, "mid00000000000003", None, gone_key, 9, Some("https://r.example/b"));
+        insert_row(
+            &services,
+            "mid00000000000002",
+            None,
+            live_key,
+            4,
+            Some("https://r.example/a"),
+        );
+        // Cache row with MISSING bytes: accounting adjusted, row kept. The
+        // production fetch path always writes the `(source_url, variant)`
+        // index row alongside the metadata row, so the fixture does too —
+        // the reconciler anchors its exactly-once adjustment on it.
+        let gone_key = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+        insert_row(
+            &services,
+            "mid00000000000003",
+            None,
+            gone_key,
+            9,
+            Some("https://r.example/b"),
+        );
+        services
+            .media
+            .remote_cache_insert(&RemoteCacheRecord {
+                source_url: "https://r.example/b".to_string(),
+                variant: "original".to_string(),
+                media_id: "mid00000000000003".to_string(),
+                blob_key: gone_key.to_string(),
+                size_bytes: 9,
+                class: MediaClass::Preview,
+                fetched_at_ms: 1,
+                last_access_ms: 1,
+                access_count: 1,
+            })
+            .unwrap();
         // Legacy MD5-keyed row: flagged, never deleted.
-        insert_row(&services, "mid00000000000004", None, "d41d8cd98f00b204e9800998ecf8427e", 0, None);
+        insert_row(
+            &services,
+            "mid00000000000004",
+            None,
+            "d41d8cd98f00b204e9800998ecf8427e",
+            0,
+            None,
+        );
 
         let report = reconcile_media(&services).unwrap();
         assert_eq!(report.examined, 4);
+        assert!(report.complete);
         assert_eq!(report.missing_marked_evicted, 1);
         assert_eq!(report.md5_rows_purged_or_flagged, 1);
         // Missing cache bytes were accounted down (fake starts at 0, so the
         // signed delta saturates — the call itself must succeed).
+        assert!(services.media.get("mid00000000000003").unwrap().is_some());
+        assert!(services.media.get("mid00000000000004").unwrap().is_some());
+        // Re-running is idempotent: the zeroed index anchor suppresses a
+        // second adjustment, and neither metadata row is ever deleted.
+        let again = reconcile_media(&services).unwrap();
+        assert_eq!(again.missing_marked_evicted, 0);
         assert!(services.media.get("mid00000000000003").unwrap().is_some());
         assert!(services.media.get("mid00000000000004").unwrap().is_some());
     }

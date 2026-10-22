@@ -146,6 +146,9 @@ impl FsBlobStore {
     /// identical bytes are already stored the staged file is just dropped.
     /// The staged file is consumed (renamed or removed) on success.
     pub fn import_file(&self, hash: &str, src: &Path) -> Result<(), PortError> {
+        // Batch F backup gate: pool mutations wait behind an active backup
+        // (see the gate region at the end of this file).
+        let _gate = acquire_media_op("import_file")?;
         let src_len = fs::metadata(src).map(|m| m.len()).map_err(|e| {
             PortError::StorageUnavailable(format!("stat staged blob file: {e}"))
         })?;
@@ -198,6 +201,8 @@ impl FsBlobStore {
 
 impl BlobStore for FsBlobStore {
     fn put(&self, hash: &str, bytes: &[u8]) -> Result<(), PortError> {
+        // Batch F backup gate: pool mutations wait behind an active backup.
+        let _gate = acquire_media_op("put")?;
         let final_path = self.object_path(hash)?;
         let sidecar = self.sidecar_path(hash)?;
         // SHA-256 keys make the skip safe (same key ⇒ same bytes): skip only
@@ -251,6 +256,9 @@ impl BlobStore for FsBlobStore {
     }
 
     fn delete(&self, hash: &str) -> Result<(), PortError> {
+        // Batch F backup gate: pool deletions wait behind an active backup
+        // so a snapshot can never reference bytes that vanish mid-copy.
+        let _gate = acquire_media_op("delete")?;
         let final_path = self.object_path(hash)?;
         match fs::remove_file(&final_path) {
             Ok(()) => Ok(()),
@@ -431,5 +439,222 @@ mod tests {
         assert!(store.import_file("../etc/passwd", &staged).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ===== Batch F media-storage lifecycle gate (append-only region) ==========
+// One shared gate for BOTH pools (durable + cache). The online backup holds
+// the exclusive (write) side for the whole snapshot+copy; every pool-byte
+// mutation path — `put`, `import_file`, `delete` (hence local upload,
+// transcode import, remote fetch, cache eviction via the `BlobStore` trait,
+// reconciler trait-path cleanup, and account/media deletion) — holds the
+// shared (read) side briefly and may wait behind an active backup. Reads
+// (`get`/`exists`/`byte_len`) and all non-media requests never touch the
+// gate and keep serving.
+//
+// Lock order (documented, no inversions): gate → db-txn → fs. Mutation
+// paths never acquire the gate while holding a DB transaction (bytes land
+// before the metadata txn on write, after the metadata commit on delete),
+// and the backup never calls a mutating pool op while holding the exclusive
+// side (it copies via plain fs reads). Batch C's at-open backfill runs
+// inside `RedbStore::open` with write txns only — no gate, no pool
+// mutation — so it composes trivially (no backup exists before `open`).
+//
+// Known gap (for the parent merge): `reconciler::sweep_orphan_blobs` deletes
+// orphan bytes with direct `std::fs::remove_file` calls, bypassing
+// `FsBlobStore::delete` and therefore this gate. Either route the sweep
+// through `BlobStore::delete` or wrap it in `acquire_media_op("sweep")`;
+// the parent snippet covers it. Failing that, never schedule a sweep
+// concurrently with a backup.
+
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
+use std::sync::atomic::AtomicUsize;
+
+fn gate_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+struct MediaGateState {
+    active: bool,
+    started_ms: u64,
+}
+
+fn media_gate() -> &'static RwLock<MediaGateState> {
+    static GATE: std::sync::OnceLock<RwLock<MediaGateState>> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| {
+        RwLock::new(MediaGateState {
+            active: false,
+            started_ms: 0,
+        })
+    })
+}
+
+/// Active backup id, mirrored outside the `RwLock` so a rejected second
+/// backup can name the holder without blocking on the write guard.
+/// Lock order: write-guard → id-mutex; readers take the id-mutex alone.
+fn active_backup_id_cell() -> &'static std::sync::Mutex<String> {
+    static CELL: std::sync::OnceLock<std::sync::Mutex<String>> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| std::sync::Mutex::new(String::new()))
+}
+
+fn read_active_backup_id() -> String {
+    active_backup_id_cell()
+        .try_lock()
+        .map(|id| id.clone())
+        .unwrap_or_default()
+}
+
+static MEDIA_GATE_WAITERS: AtomicUsize = AtomicUsize::new(0);
+static MEDIA_GATE_WAITS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static MEDIA_GATE_WAIT_MS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static MEDIA_GATE_OPS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// RAII shared hold for one pool mutation. Drop releases the gate.
+pub struct MediaOpGuard {
+    _guard: RwLockReadGuard<'static, MediaGateState>,
+}
+
+impl std::fmt::Debug for MediaOpGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MediaOpGuard(..)")
+    }
+}
+
+/// Acquire the shared side for a pool mutation (`put`/`import_file`/
+/// `delete`). Blocks while a backup holds the exclusive side; the wait is
+/// counted and timed for diagnostics (see [`media_gate_snapshot`]).
+/// A poisoned lock is recovered (never a panic): poison only means a
+/// previous holder panicked, and this leaf gate carries no data that a
+/// panic could leave inconsistent.
+pub fn acquire_media_op(_op: &'static str) -> Result<MediaOpGuard, PortError> {
+    MEDIA_GATE_WAITERS.fetch_add(1, Ordering::SeqCst);
+    let started = std::time::Instant::now();
+    let guard = media_gate().read().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let waited_ms = started.elapsed().as_millis() as u64;
+    MEDIA_GATE_WAITERS.fetch_sub(1, Ordering::SeqCst);
+    MEDIA_GATE_WAITS_TOTAL.fetch_add(1, Ordering::SeqCst);
+    MEDIA_GATE_WAIT_MS_TOTAL.fetch_add(waited_ms, Ordering::SeqCst);
+    MEDIA_GATE_OPS_TOTAL.fetch_add(1, Ordering::SeqCst);
+    Ok(MediaOpGuard { _guard: guard })
+}
+
+/// RAII exclusive hold for one backup run. Drop releases the gate and
+/// clears the holder flag.
+pub struct BackupGateGuard {
+    _guard: RwLockWriteGuard<'static, MediaGateState>,
+}
+
+impl std::fmt::Debug for BackupGateGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BackupGateGuard(..)")
+    }
+}
+
+/// The backup that currently holds the gate.
+#[derive(Debug)]
+pub struct BackupBusy {
+    pub active_backup_id: String,
+}
+
+/// Acquire the exclusive side for `backup_id`. At most one backup runs at a
+/// time (`MAX_CONCURRENT_BACKUPS == 1`); a second request gets [`BackupBusy`]
+/// and must surface "already running" (or retry later) — never block behind
+/// the lock, so admin status stays truthful about what is actually running.
+/// A poisoned lock is recovered; a stale `active` flag observed under an
+/// exclusively held guard is repaired (exclusive ownership proves no live
+/// holder exists).
+///
+/// Momentary contention with in-flight media ops (shared holders) is NOT a
+/// second backup: acquisition waits for readers to drain (bounded), failing
+/// fast with [`BackupBusy`] only when a live backup holds the write side or
+/// the drain times out.
+pub fn acquire_backup_gate(backup_id: &str) -> Result<BackupGateGuard, BackupBusy> {
+    /// Upper bound for waiting out in-flight media ops at backup start.
+    const BACKUP_GATE_DRAIN_TIMEOUT_MS: u64 = 30_000;
+    /// Poll interval while draining readers.
+    const BACKUP_GATE_DRAIN_POLL_MS: u64 = 5;
+    let deadline = gate_now_ms().saturating_add(BACKUP_GATE_DRAIN_TIMEOUT_MS);
+    loop {
+        let mut guard = match media_gate().try_write() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                // Write side is held. If a *reader* can still be acquired,
+                // no writer exists, so this is only in-flight media ops:
+                // wait for them to drain. If even a read lock is refused, a
+                // live backup holds the write side: fail fast.
+                let writer_held = media_gate().try_read().is_err();
+                if writer_held {
+                    return Err(BackupBusy {
+                        active_backup_id: read_active_backup_id(),
+                    });
+                }
+                if gate_now_ms() >= deadline {
+                    return Err(BackupBusy {
+                        active_backup_id: read_active_backup_id(),
+                    });
+                }
+                std::thread::sleep(std::time::Duration::from_millis(
+                    BACKUP_GATE_DRAIN_POLL_MS,
+                ));
+                continue;
+            }
+        };
+        guard.active = true;
+        guard.started_ms = gate_now_ms();
+        if let Ok(mut cell) = active_backup_id_cell().try_lock() {
+            *cell = backup_id.to_string();
+        }
+        return Ok(BackupGateGuard { _guard: guard });
+    }
+}
+
+impl Drop for BackupGateGuard {
+    fn drop(&mut self) {
+        // The write guard releases right after this runs; clear the flag
+        // through the guard we already hold (no re-acquisition, so no
+        // recursion and no inversion).
+        self._guard.active = false;
+        self._guard.started_ms = 0;
+        if let Ok(mut cell) = active_backup_id_cell().try_lock() {
+            cell.clear();
+        }
+    }
+}
+
+/// Point-in-time gate diagnostics for status surfaces (counts only).
+#[derive(Debug, Clone)]
+pub struct MediaGateSnapshot {
+    pub backup_active: bool,
+    pub active_backup_id: String,
+    pub backup_started_ms: u64,
+    pub waiters: usize,
+    pub ops_total: u64,
+    pub waits_total: u64,
+    pub wait_ms_total: u64,
+}
+
+pub fn media_gate_snapshot() -> MediaGateSnapshot {
+    let (active, started_ms) = match media_gate().try_read() {
+        Ok(state) => (state.active, state.started_ms),
+        Err(TryLockError::Poisoned(poisoned)) => {
+            let state = poisoned.into_inner();
+            (state.active, state.started_ms)
+        }
+        // A backup holds the exclusive side right now: report active without
+        // blocking (the id cell is lock-free for readers).
+        Err(TryLockError::WouldBlock) => (true, 0),
+    };
+    MediaGateSnapshot {
+        backup_active: active,
+        active_backup_id: read_active_backup_id(),
+        backup_started_ms: started_ms,
+        waiters: MEDIA_GATE_WAITERS.load(Ordering::SeqCst),
+        ops_total: MEDIA_GATE_OPS_TOTAL.load(Ordering::SeqCst),
+        waits_total: MEDIA_GATE_WAITS_TOTAL.load(Ordering::SeqCst),
+        wait_ms_total: MEDIA_GATE_WAIT_MS_TOTAL.load(Ordering::SeqCst),
     }
 }

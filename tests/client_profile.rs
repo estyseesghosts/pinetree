@@ -16,12 +16,24 @@ fn client_profile_live_binary_and_misskey_js() {
         return;
     }
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/smoke-phase3.sh");
-    let status = std::process::Command::new("bash")
+    // Same Windows/WSL rule as client_smoke: bare `bash` is the WSL stub.
+    #[cfg(windows)]
+    let shell = {
+        let git_bash = r"C:\Program Files\Git\bin\bash.exe";
+        if std::path::Path::new(git_bash).is_file() {
+            git_bash.to_string()
+        } else {
+            "bash".to_string()
+        }
+    };
+    #[cfg(not(windows))]
+    let shell = "bash".to_string();
+    let status = std::process::Command::new(&shell)
         .arg(script)
         .status()
         .expect("run scripts/smoke-phase3.sh");
     assert!(
         status.success(),
-        "scripts/smoke-phase3.sh failed with {status}"
+        "scripts/smoke-phase3.sh failed with {status} (shell: {shell})"
     );
 }

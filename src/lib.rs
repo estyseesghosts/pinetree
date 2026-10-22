@@ -1,6 +1,7 @@
 pub mod activitypub;
 pub mod api;
 pub mod application;
+pub mod backup;
 pub mod cluster;
 pub mod config;
 pub mod domain;

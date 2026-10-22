@@ -20,13 +20,13 @@ Canonical `https://{domain}/users/{id}` (`domain/account.rs`), never node hostna
 
 Keys: lazy RSA-2048 `ensure_actor_keypair` (first-wins), `rotate`, `ensure_system_actor` signs outbound GETs. Remote `cache_remote_public_key` refuses keyId→different-actor rebinding. Parse enforces `publicKey.id` under actor origin + `owner==id`, sharedInbox same-host else personal fallback. Stricter than upstream.
 
-Signatures (`signatures.rs`): GET signs `(request-target) date host`; POST + `Digest: SHA-256=...` (byte-identical to Misskey `ApRequestService`). Verify requires target+host+date (+Digest), Digest-match, ±300 s skew, `rsa-sha256|hs2019`, `(created)/(expires)` supported. Inbox: cached-key → refresh-once → owner URI; enforces `actor==signer`. Fetch-gate: same but anon-fallback with Serve/403/404 map. RFC 9421 `Signature-Input` only logged; `config.federation.rfc9421_mode permissive|enforce` exists but Enforce is future work.
+Signatures (`signatures.rs`): GET signs `(request-target) date host`; POST + `Digest: SHA-256=...` (byte-identical to Misskey `ApRequestService`). Verify requires target+host+date (+Digest), Digest-match, ±300 s skew, `rsa-sha256|hs2019`, `(created)/(expires)` supported. Inbox: cached-key → refresh-once → owner URI; enforces `actor==signer`. Fetch-gate: same but anon-fallback with Serve/403/404 map. RFC 9421 verified per `config.federation.rfc9421_mode` (`permissive` default accepts either valid scheme with owner agreement; `enforce` requires valid RFC 9421, rejects legacy-only); `rsa-v1_5-sha256` only, required components and freshness enforced, exercised by `tests/federation_sig_mode_e5.rs`.
 
 Collections: `outbox|followers|following|featured` paged `OrderedCollection` 40/page opaque cursor, no `prev`, outbox omits `totalItems`, followers/following 403 unless Public (no follower-exemption yet — see doubts).
 
 ## 3. Inboxes (what we accept)
 
-`POST /inbox`, `POST /users/{id}/inbox` → 64 KiB cap → 413; bad JSON/type/id → 400; personal target must exist local else 404; signature 401; `actor==signer` 401; object-authority gate (Create object same-host, Update(Person) self-only). Dispatch: `Follow, Accept, Reject, Undo, Block, Create, Announce, Like, EmojiReact→Like, Delete, Update, Add/Remove, Move, QuoteRequest, Flag`; else 202 ignore (relays refused).
+`POST /inbox`, `POST /users/{id}/inbox` → per-route 64 KiB extraction cap → 413 before handler buffering (framework `BytesRejection`; status unchanged, body text is the framework's); bad JSON/type/id → 400; personal target must exist local else 404; signature 401 (legacy-only 401s under `enforce`); `actor==signer` 401; object-authority gate (Create object same-host, Update(Person) self-only). Dispatch: `Follow, Accept, Reject, Undo, Block, Create, Announce, Like, EmojiReact→Like, Delete, Update, Add/Remove, Move, QuoteRequest, Flag`; else 202 ignore (relays refused).
 
 All funnel to the same `AppServices::handle_inbound_*` as the REST API. Dedup: `ActivityDedup check_and_record` in-state-txn; replays ⇒ 202. Tombstones + `NOTES_BY_URI` uniqueness. Local commit never undone on remote failure.
 
@@ -61,4 +61,4 @@ Generic AP: implement `Create|Update|Delete(Note|Article|Page|Question)`, `Follo
 
 ## 8. Open / non-goals
 
-RFC 9421 enforce, Mastodon/Pixelfed/Akkoma/Pleroma live round-trips, public-internet soak, bench 0-fail, `D-c/D-e` items. No relay forward, no reversi/channels/chat streaming, no C2S outbox. Ephemeral `ActivityIdIndex/ReplyCoalescer/StampNegativeCache` lost on restart (best-effort). `host_caps` HTTPS-only probe fails for `http://` labs (benign fallback). See `docs/TODOS.md` P2/P3.
+Mastodon/Pixelfed/Akkoma/Pleroma live round-trips, public-internet soak, bench 0-fail, `D-c/D-e` items. No relay forward, no reversi/channels/chat streaming, no C2S outbox. Ephemeral `ActivityIdIndex/ReplyCoalescer/StampNegativeCache` lost on restart (best-effort). `host_caps` HTTPS-only probe fails for `http://` labs (benign fallback). See `docs/TODOS.md` P2/P3.

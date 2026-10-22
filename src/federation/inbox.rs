@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use axum::{
     body::Bytes,
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
@@ -25,7 +25,10 @@ use crate::activitypub::objects::{
     parse_note_audience, parse_question_poll, parse_remote_note, sanitize_html_to_mfm,
     tombstone_inner_id,
 };
-use crate::activitypub::signatures::{parse_signature_header, verify_http_signature};
+use crate::activitypub::signatures::{
+    apply_sig_mode, parse_first_legacy_signature, parse_signature_input, rfc9421_mode,
+    scheme_of_public_url, verify_http_signature, verify_rfc9421_signature, VerifyOutcome,
+};
 use crate::application::commands::AppServices;
 use crate::application::ports::{CreateNoteInput, PortError, TimelineCursor, UpdateAccountPatch};
 use crate::domain::account::Account;
@@ -44,6 +47,15 @@ use crate::media::remote_cache::build_remote_media_fetch_job;
 pub const MAX_INBOX_BODY_BYTES: usize = MAX_AP_JSON_BYTES;
 /// Maximum allowed `Date` header skew in either direction (5 minutes).
 pub const MAX_CLOCK_SKEW_SECS: i64 = 300;
+
+/// Extraction-layer cap for both inbox routes (Batch G): the router applies
+/// this as a per-route [`DefaultBodyLimit`], so oversized bodies fail with
+/// 413 while Axum is still collecting the body — before the handler buffers
+/// anything. `process_inbox` keeps its own length check as a backstop for
+/// direct (non-router) callers.
+pub fn inbox_body_limit() -> DefaultBodyLimit {
+    DefaultBodyLimit::max(MAX_INBOX_BODY_BYTES)
+}
 
 // ---------------------------------------------------------------------------
 // Axum handlers
@@ -178,57 +190,100 @@ fn process_inbox(
 // ---------------------------------------------------------------------------
 
 /// True when the request carries RFC 9421 (`httpbis`) signature fields.
-/// Pinetree verifies the legacy draft-cavanaugh `Signature` header; RFC 9421
-/// is detected here for permissive-first logging (see [`authenticate`]) and
-/// ignored for auth until the tightener lands (WP5 report proposes the
-/// verifier + strict-mode knob).
+/// Either `Signature-Input` (real RFC 9421 input) or the non-standard
+/// `Signature-Agent` marker counts: the former drives verification, the
+/// latter only permissive logging (kept for backwards-compatible
+/// detection; it never authenticates on its own).
 pub fn has_rfc9421_headers(headers: &HeaderMap) -> bool {
     headers.contains_key("signature-input") || headers.contains_key("signature-agent")
 }
 
-/// Verify the HTTP signature, resolving the signer `keyId` against the cached
-/// remote public key (refreshing once from the network on failure).
+/// Verify the HTTP signature(s), resolving each signer `keyId` against the
+/// cached remote public key (refreshing once from the network on failure).
 /// Returns the key owner's actor URI on success (from the cache, or from the
 /// freshly fetched document after the same parse checks are re-applied by
 /// the fetch-and-upsert path). Callers must compare `activity.actor` against
 /// this owner, never against a string derived from the keyId (Slice 2, C1).
 ///
-/// RFC 9421 permissive-first (WP5): when `Signature-Input`/`Signature`
-/// (httpbis) fields are present they are LOGGED and auth proceeds on the
-/// legacy header. Rationale: Mastodon 4.3+ dual-signs during migration;
-/// rejecting the new fields outright would break interop before any pinetree
-/// verifier exists. The tightener (verify-if-present, then require) is a
-/// proposed follow-up — see the WP5 report.
+/// Batch E modes (`federation.rfc9421_mode`, read process-wide): in
+/// `permissive` a valid legacy signature authenticates and RFC 9421 fields,
+/// when present, are verified rather than merely logged (either valid
+/// scheme authenticates dual-signed requests; dual-owner disagreement fails
+/// closed). In `enforce` a valid RFC 9421 signature under the supported
+/// profile (`signatures` module docs) is required and legacy-only requests
+/// are rejected.
 fn authenticate(
     services: &AppServices,
     path_and_query: &str,
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<String, Response> {
+    let mode = rfc9421_mode();
     if has_rfc9421_headers(headers) {
-        crate::fed_debug!("in  rfc9421-present permissive-fallback (logged, legacy-verified)");
+        crate::fed_debug!("in  rfc9421-present mode={mode:?} (verifying per configured mode)");
     }
-    // Parse the Signature header first to learn the keyId (no verification yet).
-    let raw = headers
-        .get("signature")
-        .and_then(|v| v.to_str().ok())
-        .or_else(|| headers.get("authorization").and_then(|v| v.to_str().ok()));
-    let Some(raw) = raw else {
-        crate::fed_debug!("in  reject reason=no-signature-header");
-        return Err(unauthorized());
-    };
-    let parsed = match parse_signature_header(raw) {
-        Ok(p) => p,
-        Err(_) => {
-            crate::fed_debug!("in  reject reason=signature-header-unparseable");
-            return Err(unauthorized());
+    let legacy = attempt_legacy_signature(services, path_and_query, headers, body);
+    let rfc9421 = attempt_rfc9421_signature(services, path_and_query, headers, body);
+    match apply_sig_mode(mode, legacy, rfc9421) {
+        Ok(owner) => Ok(owner),
+        Err(detail) => {
+            crate::fed_debug!("in  reject reason=signature-invalid mode={mode:?} detail={detail:?}");
+            Err(unauthorized())
+        }
+    }
+}
+
+/// Resolve `key_id` (cached key, fetch on miss, one refresh on rotation)
+/// and run `verify` against the resolved PEM. Returns the key owner's actor
+/// URI on success; every failure shape collapses to [`VerifyOutcome::Failed`]
+/// with a log-safe detail (the caller maps it to 401).
+fn resolve_and_verify(
+    services: &AppServices,
+    key_id: &str,
+    verify: &dyn Fn(&str) -> Result<(), String>,
+) -> VerifyOutcome {
+    let client = &services.federation_http;
+    match resolve_remote_public_key(services, client, key_id, false) {
+        Ok((owner, pem)) => match verify(&pem) {
+            Ok(()) => VerifyOutcome::Verified(owner),
+            Err(_) => {
+                // Stale cached key (e.g. rotated): refresh once and re-verify.
+                crate::fed_debug!("in  signature-retry keyId={key_id:?} (cached key failed; refreshing)");
+                match resolve_remote_public_key(services, client, key_id, true) {
+                    Ok((fresh_owner, fresh_pem)) => match verify(&fresh_pem) {
+                        Ok(()) => VerifyOutcome::Verified(fresh_owner),
+                        Err(detail) => VerifyOutcome::Failed(detail),
+                    },
+                    Err(_) => {
+                        VerifyOutcome::Failed(format!("key unresolvable: {key_id}"))
+                    }
+                }
+            }
+        },
+        Err(_) => VerifyOutcome::Failed(format!("key unresolvable: {key_id}")),
+    }
+}
+
+/// Legacy draft-cavanaugh attempt: `None` when no `Signature`/`Authorization`
+/// header is present, otherwise the verification outcome (unparsable values
+/// are `Failed`, never skipped).
+fn attempt_legacy_signature(
+    services: &AppServices,
+    path_and_query: &str,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Option<VerifyOutcome> {
+    let parsed = match parse_first_legacy_signature(headers)? {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            return Some(VerifyOutcome::Failed(format!(
+                "legacy signature unparsable: {err}"
+            )));
         }
     };
     let key_id = parsed.key_id.clone();
-
     let now_ms = services.clock.now_ms();
-    let client = &services.federation_http;
-    let verify = |pem: &str| {
+    Some(resolve_and_verify(services, &key_id, &|pem| {
         verify_http_signature(
             "POST",
             path_and_query,
@@ -238,34 +293,46 @@ fn authenticate(
             Some(now_ms),
             MAX_CLOCK_SKEW_SECS,
         )
-    };
+        .map(|_| ())
+    }))
+}
 
-    match resolve_remote_public_key(services, client, &key_id, false) {
-        Ok((owner, pem)) => match verify(&pem) {
-            Ok(_) => Ok(owner),
-            Err(_) => {
-                // Stale cached key (e.g. rotated): refresh once and re-verify.
-                crate::fed_debug!("in  signature-retry keyId={key_id:?} (cached key failed; refreshing)");
-                match resolve_remote_public_key(services, client, &key_id, true) {
-                    Ok((fresh_owner, fresh_pem)) => match verify(&fresh_pem) {
-                        Ok(_) => Ok(fresh_owner),
-                        Err(detail) => {
-                            crate::fed_debug!("in  reject reason=signature-invalid keyId={key_id:?} detail={detail:?}");
-                            Err(unauthorized())
-                        }
-                    },
-                    Err(_) => {
-                        crate::fed_debug!("in  reject reason=key-unresolvable keyId={key_id:?}");
-                        Err(unauthorized())
-                    }
-                }
-            }
-        },
-        Err(_) => {
-            crate::fed_debug!("in  reject reason=key-unresolvable keyId={key_id:?}");
-            Err(unauthorized())
+/// RFC 9421 attempt: `None` when no `Signature-Input` header is present,
+/// otherwise the verification outcome under the supported profile.
+fn attempt_rfc9421_signature(
+    services: &AppServices,
+    path_and_query: &str,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Option<VerifyOutcome> {
+    let raw = headers
+        .get("signature-input")
+        .and_then(|v| v.to_str().ok())?;
+    // Parse first for the keyId (no verification yet); the full check below
+    // re-parses, keeping the verifier self-contained.
+    let key_id = match parse_signature_input(raw) {
+        Ok(parsed) => parsed.key_id,
+        Err(err) => {
+            return Some(VerifyOutcome::Failed(format!(
+                "Signature-Input unparsable: {err}"
+            )));
         }
-    }
+    };
+    let scheme = scheme_of_public_url(&services.public_url);
+    let now_ms = services.clock.now_ms();
+    Some(resolve_and_verify(services, &key_id, &|pem| {
+        verify_rfc9421_signature(
+            "POST",
+            path_and_query,
+            scheme,
+            headers,
+            Some(body),
+            pem,
+            Some(now_ms),
+            MAX_CLOCK_SKEW_SECS,
+        )
+        .map(|_| ())
+    }))
 }
 
 // ---------------------------------------------------------------------------
