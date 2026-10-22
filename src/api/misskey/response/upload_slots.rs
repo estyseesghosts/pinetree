@@ -22,10 +22,12 @@
 //! keys that would currently refuse a request evicted last, so eviction
 //! can never silently un-throttle a key that is currently being abusive.
 //!
-//! TODO(config): wire these bounds through the JSON `Config` once the
-//! shared config schema is settled (config.rs is owned by another agent).
-//! Until then these hardcoded, documented constants are the bounds; do
-//! not add env-var/CLI-only knobs for them.
+//! Batch D6: the upload bounds are JSON-configurable via
+//! `Config::uploads` (`uploads { per_ip, global, max_ips }`; see
+//! `crate::config::UploadsSection`). The constants below remain the
+//! defaults so `UploadSlots::new` preserves current behavior; use
+//! `UploadSlots::with_limits` / `with_config` for file values. There
+//! are no env-var/CLI-only knobs for these bounds.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -59,9 +61,46 @@ pub const UPLOAD_BUSY_RETRY_AFTER_SECS: u64 = 5;
 /// one extra entry is allowed rather than breaking an active cap, so this
 /// is a soft bound under load and a hard bound at rest.
 ///
-/// TODO(config): make this JSON-configurable once the shared config schema
-/// is settled (config.rs is owned by another agent).
+/// Batch D6: this constant is the default for the JSON-configurable
+/// `uploads.max_ips` (`crate::config::UploadsSection`). Prefer
+/// `UploadSlotBounds::default()` in new code.
 pub const MAX_UPLOAD_SLOT_IPS: usize = 4_096;
+/// JSON-configurable concurrent-upload bounds (Batch D6).
+///
+/// Mirrors `crate::config::UploadsSection` field for field without
+/// importing the config crate. `Default` mirrors the documented
+/// constants above so existing callers keep current behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UploadSlotBounds {
+    /// Concurrent uploads per client IP.
+    pub per_ip: usize,
+    /// Global concurrent-upload cap.
+    pub global: usize,
+    /// Distinct per-IP slot entries retained.
+    pub max_ips: usize,
+}
+
+impl Default for UploadSlotBounds {
+    fn default() -> Self {
+        Self {
+            per_ip: MAX_CONCURRENT_UPLOADS_PER_IP,
+            global: MAX_CONCURRENT_UPLOADS_GLOBAL,
+            max_ips: MAX_UPLOAD_SLOT_IPS,
+        }
+    }
+}
+
+impl UploadSlotBounds {
+    /// Explicit bounds; all three must be `> 0` (checked by
+    /// `Config::validate` on the JSON path).
+    pub fn new(per_ip: usize, global: usize, max_ips: usize) -> Self {
+        Self {
+            per_ip,
+            global,
+            max_ips,
+        }
+    }
+}
 /// Held for the duration of one upload handler; dropping it frees both
 /// the per-IP and the global slot.
 ///
@@ -110,28 +149,61 @@ pub(crate) struct IpSlot {
 #[derive(Debug)]
 pub(crate) struct SlotInner {
     per_ip: usize,
+    global_cap: usize,
     global: Arc<Semaphore>,
+    max_ips: usize,
     slots: Mutex<HashMap<String, IpSlot>>,
 }
 /// Concurrent-upload slots; see [`MAX_CONCURRENT_UPLOADS_PER_IP`].
 ///
-/// The per-IP table is bounded by [`MAX_UPLOAD_SLOT_IPS`] without ever
-/// breaking the per-IP cap under races: every live permit for an IP shares
-/// the single semaphore in that IP's map entry, entries are evicted only
-/// while their `active` count is zero, and the count itself is incremented
-/// under the map lock before any permit is handed out.
+/// The per-IP table is bounded without ever breaking the per-IP cap under
+/// races: every live permit for an IP shares the single semaphore in that
+/// IP's map entry, entries are evicted only while their `active` count is
+/// zero, and the count itself is incremented under the map lock before any
+/// permit is handed out.
 pub struct UploadSlots {
     inner: Arc<SlotInner>,
 }
 impl UploadSlots {
     pub fn new(per_ip: usize, global: usize) -> Self {
+        Self::with_limits(per_ip, global, MAX_UPLOAD_SLOT_IPS)
+    }
+
+    /// Explicit bounds (Batch D6 JSON path).
+    pub fn with_limits(per_ip: usize, global: usize, max_ips: usize) -> Self {
         Self {
             inner: Arc::new(SlotInner {
                 per_ip,
+                global_cap: global,
                 global: Arc::new(Semaphore::new(global)),
+                max_ips,
                 slots: Mutex::new(HashMap::new()),
             }),
         }
+    }
+
+    /// Builder installing a JSON `uploads` bound triple (Batch D6).
+    pub fn with_config(mut self, bounds: UploadSlotBounds) -> Self {
+        // `SlotInner` lives behind `Arc`; rebuild when already shared is
+        // unnecessary here because `with_config` runs at construction time
+        // (single owner). Migrate the caps in place for clarity.
+        let inner = Arc::get_mut(&mut self.inner).expect("with_config on sole owner");
+        inner.per_ip = bounds.per_ip;
+        inner.max_ips = bounds.max_ips;
+        // `global` is a semaphore: replace it so the cap takes effect.
+        inner.global_cap = bounds.global;
+        inner.global = Arc::new(Semaphore::new(bounds.global));
+        self
+    }
+
+    /// Bounds from a [`UploadSlotBounds`] value (Batch D6 JSON path).
+    pub fn from_bounds(bounds: UploadSlotBounds) -> Self {
+        Self::with_limits(bounds.per_ip, bounds.global, bounds.max_ips)
+    }
+
+    /// Active bounds (diagnostic/test hook).
+    pub fn bounds(&self) -> UploadSlotBounds {
+        UploadSlotBounds::new(self.inner.per_ip, self.inner.global_cap, self.inner.max_ips)
     }
 
     /// Production defaults: 2 concurrent uploads per IP, 16 globally.
@@ -139,8 +211,8 @@ impl UploadSlots {
         Self::new(MAX_CONCURRENT_UPLOADS_PER_IP, MAX_CONCURRENT_UPLOADS_GLOBAL)
     }
 
-    /// Retained per-IP slot entries, bounded by [`MAX_UPLOAD_SLOT_IPS`]
-    /// at rest. Diagnostic/test hook.
+    /// Retained per-IP slot entries, bounded by the configured `max_ips`
+    /// (default [`MAX_UPLOAD_SLOT_IPS`]) at rest. Diagnostic/test hook.
     pub fn slot_ip_count(&self) -> usize {
         self.inner
             .slots
@@ -165,7 +237,7 @@ impl UploadSlots {
         let busy = || ApiError::rate_limit_exceeded(UPLOAD_BUSY_RETRY_AFTER_SECS);
         let slot = {
             let mut slots = self.inner.slots.lock().unwrap_or_else(|e| e.into_inner());
-            if !slots.contains_key(ip) && slots.len() >= MAX_UPLOAD_SLOT_IPS {
+            if !slots.contains_key(ip) && slots.len() >= self.inner.max_ips {
                 // Evict idle entries (no live or in-flight permits). If
                 // every entry is active, inserting one extra entry keeps
                 // the per-IP caps correct; the bound is re-established as

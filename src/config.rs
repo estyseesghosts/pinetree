@@ -106,6 +106,63 @@ impl Default for BackupSection {
     }
 }
 
+/// Fixed-window rate-limiter memory bounds (nested `rate_limit` section
+/// of the JSON config; Batch D). All three mirror the hardcoded
+/// documented constants in
+/// `crate::api::misskey::response` (`MAX_RATE_LIMIT_BUCKETS`,
+/// `MAX_AUTH_FAILURE_BUCKETS`, `PRUNE_INTERVAL_MS`): 32 768 ordinary
+/// buckets, 32 768 auth-failure buckets, one expiry scan per 60 000 ms
+/// of clock time. Every entry is a few short strings plus integers, so
+/// a full map stays on the order of megabytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RateLimitSection {
+    /// Cap on ordinary `(key, bucket)` window entries. Must be `> 0`.
+    pub max_buckets: usize,
+    /// Cap on `(key, bucket)` auth-failure entries. Must be `> 0`.
+    pub max_auth_failures: usize,
+    /// At most one full expiry scan per map per this interval of clock
+    /// time (ms). Must be `> 0`.
+    pub prune_interval_ms: i64,
+}
+
+impl Default for RateLimitSection {
+    fn default() -> Self {
+        Self {
+            max_buckets: 32_768,
+            max_auth_failures: 32_768,
+            prune_interval_ms: 60_000,
+        }
+    }
+}
+
+/// Concurrent-upload slot bounds (nested `uploads` section of the JSON
+/// config; Batch D + Slice 6 H1). Defaults mirror the hardcoded
+/// documented constants in `crate::api::misskey::response`
+/// (`MAX_CONCURRENT_UPLOADS_PER_IP`, `MAX_CONCURRENT_UPLOADS_GLOBAL`,
+/// `MAX_UPLOAD_SLOT_IPS`): 2 concurrent uploads per IP, 16 globally,
+/// at most 4 096 distinct per-IP slot entries retained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UploadsSection {
+    /// Concurrent uploads per client IP. Must be `> 0`.
+    pub per_ip: usize,
+    /// Global concurrent-upload cap. Must be `> 0`.
+    pub global: usize,
+    /// Distinct per-IP slot entries retained. Must be `> 0`.
+    pub max_ips: usize,
+}
+
+impl Default for UploadsSection {
+    fn default() -> Self {
+        Self {
+            per_ip: 2,
+            global: 16,
+            max_ips: 4_096,
+        }
+    }
+}
+
 /// Unsafe test-only HTTP opt-in (nested `unsafe` section of the JSON
 /// config; Batch B). The Rust field uses a raw identifier (`r#unsafe`,
 /// since `unsafe` is a keyword); the JSON key is exactly `"unsafe"`,
@@ -400,6 +457,12 @@ pub struct Config {
     /// Backup output policy (nested `backup` section; Batch H). Unknown
     /// keys rejected; see [`BackupSection`].
     pub backup: BackupSection,
+    /// Rate-limiter memory bounds (nested `rate_limit` section; Batch D).
+    /// Unknown keys rejected; see [`RateLimitSection`].
+    pub rate_limit: RateLimitSection,
+    /// Concurrent-upload slot bounds (nested `uploads` section; Batch D).
+    /// Unknown keys rejected; see [`UploadsSection`].
+    pub uploads: UploadsSection,
 }
 
 impl Default for Config {
@@ -454,6 +517,8 @@ impl Default for Config {
             r#unsafe: UnsafeSection::default(),
             diagnostics: DiagnosticsSection::default(),
             backup: BackupSection::default(),
+            rate_limit: RateLimitSection::default(),
+            uploads: UploadsSection::default(),
         }
     }
 }
@@ -614,6 +679,28 @@ impl Config {
         {
             return Err("backup.dir must not be empty".to_string());
         }
+        // Batch D bounds (JSON-configurable; defaults mirror the
+        // documented constants in `api::misskey::response`). Every bound
+        // must be positive so a zero silently disabling throttling or
+        // pruning fails closed at startup.
+        if self.rate_limit.max_buckets == 0 {
+            return Err("rate_limit.max_buckets must be > 0".to_string());
+        }
+        if self.rate_limit.max_auth_failures == 0 {
+            return Err("rate_limit.max_auth_failures must be > 0".to_string());
+        }
+        if self.rate_limit.prune_interval_ms <= 0 {
+            return Err("rate_limit.prune_interval_ms must be > 0".to_string());
+        }
+        if self.uploads.per_ip == 0 {
+            return Err("uploads.per_ip must be > 0".to_string());
+        }
+        if self.uploads.global == 0 {
+            return Err("uploads.global must be > 0".to_string());
+        }
+        if self.uploads.max_ips == 0 {
+            return Err("uploads.max_ips must be > 0".to_string());
+        }
         Ok(())
     }
 
@@ -690,6 +777,12 @@ impl Config {
             "structured_logging": self.diagnostics.structured_logging,
             "backup_max_bundle_bytes": self.backup.max_bundle_bytes,
             "backup_dir_configured": self.backup.dir.is_some(),
+            "rate_limit_max_buckets": self.rate_limit.max_buckets,
+            "rate_limit_max_auth_failures": self.rate_limit.max_auth_failures,
+            "rate_limit_prune_interval_ms": self.rate_limit.prune_interval_ms,
+            "uploads_per_ip": self.uploads.per_ip,
+            "uploads_global": self.uploads.global,
+            "uploads_max_ips": self.uploads.max_ips,
             "email_configured": self.smtp_config().is_configured(),
             "email_required_for_signup": self.email_required_for_signup,
         })

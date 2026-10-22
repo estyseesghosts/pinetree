@@ -108,11 +108,14 @@ pub fn structured_logging() -> bool {
 
 /// True when `key` names a secret or personal value that must never reach
 /// logs: `Authorization`/cookies/tokens, passwords, SMTP credentials,
-/// private key material, request bodies, and personal data. Matching is
-/// case-insensitive substring on the lowercased key.
+/// private key material, request bodies, and personal data. Multi-word
+/// needles match case-insensitively by substring; bare `ip` and bare
+/// `key` match only as standalone tokens (split on non-alphanumeric
+/// characters) so operational `*_id` fields (`request_id`, `job_id`,
+/// `backup_id`, `media_id`) and `destination` stay visible.
 pub fn is_sensitive_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
-    [
+    if [
         "authorization",
         "cookie",
         "set-cookie",
@@ -137,6 +140,15 @@ pub fn is_sensitive_key(key: &str) -> bool {
     ]
     .iter()
     .any(|needle| lower.contains(needle))
+    {
+        return true;
+    }
+    for token in lower.split(|c: char| !c.is_ascii_alphanumeric()) {
+        if token == "ip" || token == "key" {
+            return true;
+        }
+    }
+    false
 }
 
 /// Redact one `key=value` field value: sensitive keys become `[redacted]`,
@@ -384,9 +396,19 @@ mod tests {
             "email",
             "request_body",
             "body",
+            "ip",
+            "IP",
+            "key",
+            "KEY",
+            "client-ip",
+            "api.key",
         ] {
             assert!(is_sensitive_key(key), "{key} must be treated as sensitive");
             assert_eq!(redact_value(key, "hunter2-super-secret"), "[redacted]");
+        }
+        // Bare-word boundary: substrings inside other words stay visible.
+        for key in ["stripe", "monkey", "turkey", "skip"] {
+            assert!(!is_sensitive_key(key), "{key} must stay visible");
         }
         // Operational ids stay visible so logs remain correlatable.
         for key in [
@@ -404,6 +426,42 @@ mod tests {
             assert!(!is_sensitive_key(key), "{key} must stay visible");
             assert_eq!(redact_value(key, "bk-123"), "bk-123");
         }
+    }
+
+    #[test]
+    fn remote_body_never_logged_verbatim() {
+        // Batch H3: remote response bodies must never reach `log_event`
+        // verbatim — callers log `error_class` + a short cause instead.
+        let remote_body = "REMOTE-BODY-SENTINEL-9f3a<html>evil-payload</html>";
+        // Bodies are sensitive: even a direct `body`/`payload` field
+        // redacts instead of echoing the remote text.
+        assert_eq!(redact_value("body", remote_body), "[redacted]");
+        assert_eq!(redact_value("payload", remote_body), "[redacted]");
+        // The sanctioned path is `error_class`: the class label never
+        // contains the remote text verbatim.
+        let class = error_class(remote_body);
+        assert!(
+            !class.contains(remote_body),
+            "error class must not echo remote body"
+        );
+        assert!(
+            !class.contains("evil-payload"),
+            "error class must not leak remote fragment"
+        );
+        // And the class label itself is a small fixed set, never the body.
+        assert!(
+            [
+                "storage-unavailable",
+                "validation",
+                "conflict",
+                "not-found",
+                "timeout",
+                "auth",
+                "internal"
+            ]
+            .contains(&class),
+            "unexpected error class {class}"
+        );
     }
 
     #[test]

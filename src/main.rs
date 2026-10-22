@@ -4,7 +4,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use pinetree::api::misskey::auth::hash_password;
-use pinetree::api::misskey::response::{RateLimiter, UploadSlots};
+use pinetree::api::misskey::response::{
+    RateLimitBounds, RateLimiter, UploadSlotBounds, UploadSlots,
+};
 use pinetree::api::misskey::{ApiState, build_router};
 use pinetree::application::commands::AppServices;
 use pinetree::application::ports::{
@@ -501,7 +503,13 @@ async fn async_main() {
             }
         });
     }
-    let mut rate_limiter = RateLimiter::with_misskey_defaults(services.clock.clone());
+    let rate_bounds = RateLimitBounds::new(
+        cfg.rate_limit.max_buckets,
+        cfg.rate_limit.max_auth_failures,
+        cfg.rate_limit.prune_interval_ms,
+    );
+    let mut rate_limiter =
+        RateLimiter::with_misskey_defaults(services.clock.clone()).with_config(rate_bounds);
     if debug_weak_rate_limits_flag {
         // Load tests only: 10x the endpoint bucket counts (same factor as birchtree).
         rate_limiter = rate_limiter.with_weakened_limits(10);
@@ -510,11 +518,13 @@ async fn async_main() {
         );
     }
     let rate_limiter = Arc::new(rate_limiter);
+    let upload_bounds =
+        UploadSlotBounds::new(cfg.uploads.per_ip, cfg.uploads.global, cfg.uploads.max_ips);
     let api_state = ApiState {
         services,
         worker,
         rate_limiter,
-        upload_slots: Arc::new(UploadSlots::with_defaults()),
+        upload_slots: Arc::new(UploadSlots::from_bounds(upload_bounds)),
         hub,
         trusted_proxies: Arc::new(cfg.trusted_proxies.clone()),
         featured_cache: Arc::new(pinetree::application::commands::pins::FeaturedCache::default()),

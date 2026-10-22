@@ -817,3 +817,192 @@ fn batch_h_config_summary_carries_no_secrets() {
     assert_eq!(summary["structured_logging"], true);
     assert_eq!(summary["trusted_proxies"], 1);
 }
+
+#[test]
+fn batch_d6_rate_limit_section_round_trip_and_guards() {
+    // Defaults mirror the documented response constants.
+    let cfg: Config = serde_json::from_str("{}").expect("empty object parses");
+    assert_eq!(cfg.rate_limit.max_buckets, 32_768, "default max_buckets");
+    assert_eq!(
+        cfg.rate_limit.max_auth_failures, 32_768,
+        "default max_auth_failures"
+    );
+    assert_eq!(
+        cfg.rate_limit.prune_interval_ms, 60_000,
+        "default prune_interval_ms"
+    );
+    assert_eq!(
+        cfg.rate_limit.max_buckets,
+        crate::api::misskey::response::MAX_RATE_LIMIT_BUCKETS,
+        "default tracks response constant"
+    );
+    assert_eq!(
+        cfg.rate_limit.max_auth_failures,
+        crate::api::misskey::response::MAX_AUTH_FAILURE_BUCKETS,
+        "default tracks response constant"
+    );
+    assert_eq!(
+        cfg.rate_limit.prune_interval_ms,
+        crate::api::misskey::response::PRUNE_INTERVAL_MS,
+        "default tracks response constant"
+    );
+    assert!(cfg.validate().is_ok(), "defaults validate");
+    // Explicit values round-trip through file + serde value.
+    let custom: Config = serde_json::from_str(
+        r#"{"rate_limit": {"max_buckets": 1024, "max_auth_failures": 512, "prune_interval_ms": 5000}}"#,
+    )
+    .expect("parse custom rate_limit");
+    assert_eq!(custom.rate_limit.max_buckets, 1024, "custom max_buckets");
+    assert_eq!(
+        custom.rate_limit.max_auth_failures, 512,
+        "custom max_auth_failures"
+    );
+    assert_eq!(
+        custom.rate_limit.prune_interval_ms, 5000,
+        "custom prune_interval_ms"
+    );
+    assert!(custom.validate().is_ok(), "custom values validate");
+    let json = serde_json::to_value(&custom).expect("serialize custom");
+    assert_eq!(
+        json["rate_limit"]["max_buckets"], 1024,
+        "round-trip buckets"
+    );
+    assert_eq!(
+        json["rate_limit"]["max_auth_failures"], 512,
+        "round-trip failures"
+    );
+    assert_eq!(
+        json["rate_limit"]["prune_interval_ms"], 5000,
+        "round-trip prune"
+    );
+    let back: Config = serde_json::from_value(json).expect("deserialize round-trip");
+    assert_eq!(back.rate_limit, custom.rate_limit, "round-trip equality");
+    // Typo safety at both levels.
+    assert!(
+        serde_json::from_str::<Config>(r#"{"rate_limit": {"max_bucket": 1}}"#).is_err(),
+        "nested typo rejected"
+    );
+    assert!(
+        serde_json::from_str::<Config>(r#"{"rate_limits": {}}"#).is_err(),
+        "section typo rejected"
+    );
+    // Guards: every bound must be positive (zero / negative rejected).
+    for section in [
+        RateLimitSection {
+            max_buckets: 0,
+            ..RateLimitSection::default()
+        },
+        RateLimitSection {
+            max_auth_failures: 0,
+            ..RateLimitSection::default()
+        },
+        RateLimitSection {
+            prune_interval_ms: 0,
+            ..RateLimitSection::default()
+        },
+        RateLimitSection {
+            prune_interval_ms: -1,
+            ..RateLimitSection::default()
+        },
+    ] {
+        let cfg = Config {
+            rate_limit: section,
+            ..Config::default()
+        };
+        assert!(cfg.validate().is_err(), "rate_limit guard {section:?}");
+    }
+}
+
+#[test]
+fn batch_d6_uploads_section_round_trip_and_guards() {
+    // Defaults mirror the documented response constants.
+    let cfg: Config = serde_json::from_str("{}").expect("empty object parses");
+    assert_eq!(cfg.uploads.per_ip, 2, "default per_ip");
+    assert_eq!(cfg.uploads.global, 16, "default global");
+    assert_eq!(cfg.uploads.max_ips, 4_096, "default max_ips");
+    assert_eq!(
+        cfg.uploads.per_ip,
+        crate::api::misskey::response::MAX_CONCURRENT_UPLOADS_PER_IP,
+        "default tracks response constant"
+    );
+    assert_eq!(
+        cfg.uploads.global,
+        crate::api::misskey::response::MAX_CONCURRENT_UPLOADS_GLOBAL,
+        "default tracks response constant"
+    );
+    assert_eq!(
+        cfg.uploads.max_ips,
+        crate::api::misskey::response::MAX_UPLOAD_SLOT_IPS,
+        "default tracks response constant"
+    );
+    assert!(cfg.validate().is_ok(), "defaults validate");
+    // Explicit values round-trip through file + serde value.
+    let custom: Config =
+        serde_json::from_str(r#"{"uploads": {"per_ip": 4, "global": 32, "max_ips": 128}}"#)
+            .expect("parse custom uploads");
+    assert_eq!(custom.uploads.per_ip, 4, "custom per_ip");
+    assert_eq!(custom.uploads.global, 32, "custom global");
+    assert_eq!(custom.uploads.max_ips, 128, "custom max_ips");
+    assert!(custom.validate().is_ok(), "custom values validate");
+    let json = serde_json::to_value(&custom).expect("serialize custom");
+    assert_eq!(json["uploads"]["per_ip"], 4, "round-trip per_ip");
+    assert_eq!(json["uploads"]["global"], 32, "round-trip global");
+    assert_eq!(json["uploads"]["max_ips"], 128, "round-trip max_ips");
+    let back: Config = serde_json::from_value(json).expect("deserialize round-trip");
+    assert_eq!(back.uploads, custom.uploads, "round-trip equality");
+    // Typo safety at both levels.
+    assert!(
+        serde_json::from_str::<Config>(r#"{"uploads": {"perip": 1}}"#).is_err(),
+        "nested typo rejected"
+    );
+    assert!(
+        serde_json::from_str::<Config>(r#"{"upload": {}}"#).is_err(),
+        "section typo rejected"
+    );
+    // Guards: every bound must be positive.
+    for section in [
+        UploadsSection {
+            per_ip: 0,
+            ..UploadsSection::default()
+        },
+        UploadsSection {
+            global: 0,
+            ..UploadsSection::default()
+        },
+        UploadsSection {
+            max_ips: 0,
+            ..UploadsSection::default()
+        },
+    ] {
+        let cfg = Config {
+            uploads: section,
+            ..Config::default()
+        };
+        assert!(cfg.validate().is_err(), "uploads guard {section:?}");
+    }
+}
+
+#[test]
+fn batch_d6_defaults_preserve_batch_policies() {
+    // D6 must not flip the Batch B/H/P policies pinned by earlier audits.
+    let cfg: Config = serde_json::from_str("{}").expect("empty object parses");
+    assert!(!cfg.transcode.enabled, "transcode stays disabled");
+    assert!(
+        !cfg.r#unsafe.allow_local_http_for_testing,
+        "unsafe HTTP stays disabled"
+    );
+    assert!(
+        !cfg.diagnostics.detailed_admin_status,
+        "detailed status stays off"
+    );
+    assert!(
+        cfg.diagnostics.structured_logging,
+        "structured logging stays on"
+    );
+    assert_eq!(
+        cfg.federation.rfc9421_mode,
+        Rfc9421Mode::Permissive,
+        "rfc9421 stays permissive"
+    );
+    assert!(cfg.validate().is_ok(), "defaults validate");
+}

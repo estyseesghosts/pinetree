@@ -22,10 +22,12 @@
 //! keys that would currently refuse a request evicted last, so eviction
 //! can never silently un-throttle a key that is currently being abusive.
 //!
-//! TODO(config): wire these bounds through the JSON `Config` once the
-//! shared config schema is settled (config.rs is owned by another agent).
-//! Until then these hardcoded, documented constants are the bounds; do
-//! not add env-var/CLI-only knobs for them.
+//! Batch D6: the bounds are JSON-configurable via `Config::rate_limit`
+//! (`rate_limit { max_buckets, max_auth_failures, prune_interval_ms }`;
+//! see `crate::config::RateLimitSection`). The constants below remain
+//! the defaults so `RateLimiter::new` preserves current behavior; use
+//! `RateLimiter::with_bounds` / `with_config` to install file values.
+//! There are no env-var/CLI-only knobs for these bounds.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -58,8 +60,10 @@ pub const AUTH_BACKOFF_CAP_MS: u64 = 60_000;
 /// on the order of megabytes. Eviction always prefers stale entries and
 /// evicts active abuse keys last; see the module docs.
 ///
-/// TODO(config): make these JSON-configurable once the shared config
-/// schema is settled (config.rs is owned by another agent).
+/// Batch D6: these constants are the defaults for the JSON-configurable
+/// `rate_limit` section (`crate::config::RateLimitSection`). Prefer
+/// `RateLimitBounds::default()` (which mirrors them) over the raw
+/// constants in new code.
 pub const MAX_RATE_LIMIT_BUCKETS: usize = 32_768;
 pub const MAX_AUTH_FAILURE_BUCKETS: usize = 32_768;
 /// At most one full expiry scan per map per this interval of clock time.
@@ -68,6 +72,43 @@ pub const MAX_AUTH_FAILURE_BUCKETS: usize = 32_768;
 /// expire as the clock advances. Cap-pressure pruning and eviction apply
 /// regardless of time, so the bounds hold even if the clock stalls.
 pub const PRUNE_INTERVAL_MS: i64 = 60_000;
+/// JSON-configurable memory bounds for [`RateLimiter`] (Batch D6).
+///
+/// Mirrors `crate::config::RateLimitSection` field for field without
+/// importing the config crate (keeps the adapter layer decoupled).
+/// `Default` mirrors the documented constants above so existing callers
+/// keep current behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimitBounds {
+    /// Cap on ordinary `(key, bucket)` window entries.
+    pub max_buckets: usize,
+    /// Cap on `(key, bucket)` auth-failure entries.
+    pub max_auth_failures: usize,
+    /// At most one full expiry scan per map per this interval (ms).
+    pub prune_interval_ms: i64,
+}
+
+impl Default for RateLimitBounds {
+    fn default() -> Self {
+        Self {
+            max_buckets: MAX_RATE_LIMIT_BUCKETS,
+            max_auth_failures: MAX_AUTH_FAILURE_BUCKETS,
+            prune_interval_ms: PRUNE_INTERVAL_MS,
+        }
+    }
+}
+
+impl RateLimitBounds {
+    /// Explicit bounds; all three must be `> 0` (checked by
+    /// `Config::validate` on the JSON path).
+    pub fn new(max_buckets: usize, max_auth_failures: usize, prune_interval_ms: i64) -> Self {
+        Self {
+            max_buckets,
+            max_auth_failures,
+            prune_interval_ms,
+        }
+    }
+}
 /// Configured limits for one endpoint bucket.
 #[derive(Debug, Clone, Copy)]
 pub struct BucketLimit {
@@ -103,9 +144,15 @@ pub struct RateLimiter {
     failures: Mutex<HashMap<(String, String), FailureState>>,
     bucket_prune_at: AtomicI64,
     failure_prune_at: AtomicI64,
+    bounds: RateLimitBounds,
 }
 impl RateLimiter {
     pub fn new(clock: Arc<dyn Clock>) -> Self {
+        Self::new_with_bounds(clock, RateLimitBounds::default())
+    }
+
+    /// Constructor with explicit memory bounds (Batch D6 JSON path).
+    pub fn new_with_bounds(clock: Arc<dyn Clock>, bounds: RateLimitBounds) -> Self {
         Self {
             clock,
             limits: HashMap::new(),
@@ -114,7 +161,27 @@ impl RateLimiter {
             failures: Mutex::new(HashMap::new()),
             bucket_prune_at: AtomicI64::new(i64::MIN),
             failure_prune_at: AtomicI64::new(i64::MIN),
+            bounds,
         }
+    }
+
+    /// Builder installing JSON `rate_limit` bounds (Batch D6).
+    /// Preserves all endpoint limits; only the memory caps change.
+    pub fn with_bounds(mut self, bounds: RateLimitBounds) -> Self {
+        self.bounds = bounds;
+        self
+    }
+
+    /// Alias for [`RateLimiter::with_bounds`] (Batch D6 `with_config`
+    /// wiring point for the `Config::rate_limit` section).
+    pub fn with_config(mut self, bounds: RateLimitBounds) -> Self {
+        self.bounds = bounds;
+        self
+    }
+
+    /// Active memory bounds (diagnostic/test hook).
+    pub fn bounds(&self) -> RateLimitBounds {
+        self.bounds
     }
 
     /// Misskey Phase 1 defaults (`docs/endpoint-manifest.md` §7 plus the
@@ -289,10 +356,15 @@ impl RateLimiter {
         let mut states = self.failures.lock().unwrap_or_else(|e| e.into_inner());
         // Bound the map before growing it: prune expired entries, then
         // evict stalest-first with actively blocking keys evicted last.
-        if states.len() >= MAX_AUTH_FAILURE_BUCKETS {
+        if states.len() >= self.bounds.max_auth_failures {
             prune_failure_states(&mut states, &self.auth_limits, now);
-            if states.len() >= MAX_AUTH_FAILURE_BUCKETS {
-                evict_stalest_failures(&mut states, &self.auth_limits, now);
+            if states.len() >= self.bounds.max_auth_failures {
+                evict_stalest_failures(
+                    &mut states,
+                    &self.auth_limits,
+                    now,
+                    self.bounds.max_auth_failures,
+                );
             }
         }
         for (key, bucket_limit) in [(account_key, limit.account), (ip_key, limit.ip)] {
@@ -361,10 +433,10 @@ impl RateLimiter {
         // evict stalest-first with keys at their window cap evicted last.
         // Only new keys can grow the map, so existing keys skip the scan
         // and stay on the fast path.
-        if !states.contains_key(&key) && states.len() >= MAX_RATE_LIMIT_BUCKETS {
+        if !states.contains_key(&key) && states.len() >= self.bounds.max_buckets {
             prune_bucket_states(&mut states, &self.limits, now);
-            if states.len() >= MAX_RATE_LIMIT_BUCKETS {
-                evict_stalest_buckets(&mut states, &self.limits, now);
+            if states.len() >= self.bounds.max_buckets {
+                evict_stalest_buckets(&mut states, &self.limits, now, self.bounds.max_buckets);
             }
         }
         let mut entry = states.get(&key).copied().unwrap_or(BucketState {
@@ -398,10 +470,11 @@ impl RateLimiter {
     }
 
     /// Full expiry scan of the ordinary-bucket map, at most once per
-    /// [`PRUNE_INTERVAL_MS`] of clock time. Lock-free gate: concurrent
+    /// bound interval of clock time. Lock-free gate: concurrent
     /// callers may rarely prune twice, which is harmless and idempotent.
     fn prune_buckets_if_due(&self, now: i64) {
-        if now.saturating_sub(self.bucket_prune_at.load(Ordering::Relaxed)) < PRUNE_INTERVAL_MS {
+        let interval = self.bounds.prune_interval_ms;
+        if now.saturating_sub(self.bucket_prune_at.load(Ordering::Relaxed)) < interval {
             return;
         }
         let mut states = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -410,9 +483,10 @@ impl RateLimiter {
     }
 
     /// Full expiry scan of the auth-failure map, at most once per
-    /// [`PRUNE_INTERVAL_MS`] of clock time. See [`RateLimiter::prune_buckets_if_due`].
+    /// bound interval of clock time. See [`RateLimiter::prune_buckets_if_due`].
     fn prune_failures_if_due(&self, now: i64) {
-        if now.saturating_sub(self.failure_prune_at.load(Ordering::Relaxed)) < PRUNE_INTERVAL_MS {
+        let interval = self.bounds.prune_interval_ms;
+        if now.saturating_sub(self.failure_prune_at.load(Ordering::Relaxed)) < interval {
             return;
         }
         let mut states = self.failures.lock().unwrap_or_else(|e| e.into_inner());
@@ -420,14 +494,16 @@ impl RateLimiter {
         self.failure_prune_at.store(now, Ordering::Relaxed);
     }
 
-    /// Retained ordinary bucket entries, bounded by
-    /// [`MAX_RATE_LIMIT_BUCKETS`]. Diagnostic/test hook.
+    /// Retained ordinary bucket entries, bounded by the configured
+    /// `max_buckets` (default [`MAX_RATE_LIMIT_BUCKETS`]).
+    /// Diagnostic/test hook.
     pub fn bucket_count(&self) -> usize {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
-    /// Retained auth-failure entries, bounded by
-    /// [`MAX_AUTH_FAILURE_BUCKETS`]. Diagnostic/test hook.
+    /// Retained auth-failure entries, bounded by the configured
+    /// `max_auth_failures` (default [`MAX_AUTH_FAILURE_BUCKETS`]).
+    /// Diagnostic/test hook.
     pub fn failure_count(&self) -> usize {
         self.failures
             .lock()
@@ -491,7 +567,7 @@ pub(crate) fn bucket_eviction_rank(
     };
     (at_cap_live, state.window_start_ms)
 }
-/// Evict stalest-first until the map fits under [`MAX_RATE_LIMIT_BUCKETS`].
+/// Evict stalest-first until the map fits under `max_buckets`.
 /// Entries for unknown buckets and idle keys go first (oldest window
 /// first); keys currently at their cap inside a live window are evicted
 /// only if nothing else remains, so eviction under churn discards idle
@@ -502,11 +578,12 @@ pub(crate) fn evict_stalest_buckets(
     states: &mut HashMap<(String, String), BucketState>,
     limits: &HashMap<String, BucketLimit>,
     now: i64,
+    max_buckets: usize,
 ) {
-    if states.len() < MAX_RATE_LIMIT_BUCKETS {
+    if states.len() < max_buckets {
         return;
     }
-    let target = MAX_RATE_LIMIT_BUCKETS * 7 / 8;
+    let target = max_buckets * 7 / 8;
     let mut ranked: Vec<(bool, i64, (String, String))> = states
         .iter()
         .map(|(key, state)| {
@@ -585,7 +662,7 @@ pub(crate) fn prune_failure_states(
 ) {
     states.retain(|key, state| failure_state_is_live(auth_limits, key, state, now));
 }
-/// Evict until the map fits under [`MAX_AUTH_FAILURE_BUCKETS`].
+/// Evict until the map fits under `max_auth_failures`.
 /// Non-blocking entries go first (fewest failures, oldest first);
 /// entries that would currently refuse an attempt are evicted last.
 /// Single-pass down to a below-cap target; see [`evict_stalest_buckets`].
@@ -593,11 +670,12 @@ pub(crate) fn evict_stalest_failures(
     states: &mut HashMap<(String, String), FailureState>,
     auth_limits: &HashMap<String, AuthLimit>,
     now: i64,
+    max_auth_failures: usize,
 ) {
-    if states.len() < MAX_AUTH_FAILURE_BUCKETS {
+    if states.len() < max_auth_failures {
         return;
     }
-    let target = MAX_AUTH_FAILURE_BUCKETS * 7 / 8;
+    let target = max_auth_failures * 7 / 8;
     let mut ranked: Vec<(bool, u64, i64, (String, String))> = states
         .iter()
         .map(|(key, state)| {
