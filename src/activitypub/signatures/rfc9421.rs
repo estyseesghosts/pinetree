@@ -203,13 +203,24 @@ pub fn verify_rfc9421_signature(
         .ok_or("Signature-Input missing created".to_string())?;
     if let Some(now) = now_ms {
         let now_secs = now.div_euclid(1000);
-        if (now_secs - created).abs() > max_clock_skew_secs {
+        // Overflow-safe freshness check: `created`/`expires` are
+        // attacker-controlled i64s, so `checked_sub` + `checked_abs` +
+        // `checked_add` fail closed (Err) instead of panicking on
+        // `created = i64::MIN` or wrapping on `expires = i64::MAX`.
+        let skew_ok = now_secs
+            .checked_sub(created)
+            .and_then(|delta| delta.checked_abs())
+            .is_some_and(|delta| delta <= max_clock_skew_secs);
+        if !skew_ok {
             return Err("Signature-Input created outside allowed clock skew".to_string());
         }
-        if let Some(expires) = parsed.expires
-            && now_secs > expires + max_clock_skew_secs
-        {
-            return Err("RFC 9421 signature expired".to_string());
+        if let Some(expires) = parsed.expires {
+            let not_expired = expires
+                .checked_add(max_clock_skew_secs)
+                .is_some_and(|limit| now_secs <= limit);
+            if !not_expired {
+                return Err("RFC 9421 signature expired".to_string());
+            }
         }
     }
     let authority = headers

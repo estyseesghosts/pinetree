@@ -282,7 +282,16 @@ pub fn verify_http_signature(
     let date_str = header_value(headers, "date")?;
     let date_ms = parse_http_date(&date_str)?;
     if let Some(now) = now_ms {
-        if (now - date_ms).abs() > max_clock_skew_secs * 1000 {
+        // Overflow-safe skew check: `date_ms` derives from the
+        // attacker-controlled `Date` header, so `checked_sub` +
+        // `checked_abs` (+ `checked_mul` on the configured skew) fail
+        // closed (Err) instead of panicking on extreme values.
+        let skew_ok = now
+            .checked_sub(date_ms)
+            .and_then(|delta| delta.checked_abs())
+            .zip(max_clock_skew_secs.checked_mul(1000))
+            .is_some_and(|(delta, skew_ms)| delta <= skew_ms);
+        if !skew_ok {
             return Err("Date header outside allowed clock skew".to_string());
         }
     }
