@@ -3,6 +3,7 @@
 /misskey
 /sharkey
 /target/
+/.cargo/
 MPC68MOKR/
 /data/
 libfdb_c*.so

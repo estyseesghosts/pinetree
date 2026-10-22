@@ -1,6 +1,6 @@
-# Machine-local cargo settings (git-ignored). Keep build artifacts on the
-# native Linux filesystem: under WSL, a repo checked out on /mnt/c pays the
-# 9P tax on every file access, which makes builds and test runs several times
-# slower. Override the path below if your checkout lives elsewhere.
+# Machine-local cargo settings. Shared with birchtree so identical registry
+# crates (same version, features, profile, rustc) are compiled once.
+# Build one of the two trees at a time: Cargo locks this directory.
+# Override with CARGO_TARGET_DIR if this path is wrong on another machine.
 [build]
-target-dir = "/root/pinetree-target"
+target-dir = "C:/Users/julie/.cargo/shared-target"
