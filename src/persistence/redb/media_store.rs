@@ -6,7 +6,9 @@ use crate::application::ports::{
     RemoteCacheRecord, TimelineCursor,
 };
 use crate::domain::media::MediaMeta;
-use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
+use redb::{
+    ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, WriteTransaction,
+};
 
 /// Paging contract (Batch C, `prod-ready.md` §4 C1): the single shared bound
 /// on `MediaStore::list_all_media` page sizes. A requested `limit` counts
@@ -43,6 +45,78 @@ pub(crate) const REMOTE_CACHE_BY_BLOB: TableDefinition<(&str, &str, &str), u8> =
 /// re-records it). Carried in backup like every other live table.
 pub(crate) const CACHE_BLOB_CLASS: TableDefinition<&str, &str> =
     TableDefinition::new("cache_blob_class");
+/// LRU cursor for CHARGED remote-cache rows (Wave 2 M1):
+/// `(last_access_ms, source_url, variant)` → unit marker, oldest first.
+/// Only rows with `size_bytes > 0 && !bytes_absent` are present here, so a
+/// charged page is a bounded prefix walk — never a full-table collect and
+/// sort — no matter how many tombstones precede the live rows. Tombstones
+/// live in [`REMOTE_CACHE_TOMB_LRU`]. Both cursors are maintained inline by
+/// every `REMOTE_CACHE` writer in this file in the SAME write transaction
+/// as the row mutation (crash-atomic: index and row always agree), and are
+/// rebuilt from `REMOTE_CACHE` when a page finds their counts diverged
+/// (open-time migration, restore without these tables, test-only
+/// clear-plus-backfill). A stale entry (row changed status without a
+/// cursor move) is impossible outside those paths; pages skip-and-flag
+/// them defensively and rebuild once before re-reading.
+pub(crate) const REMOTE_CACHE_CHARGED_LRU: TableDefinition<(i64, &str, &str), u8> =
+    TableDefinition::new("remote_cache_charged_lru");
+/// LRU cursor for TOMBSTONE remote-cache rows (Wave 2 M1): same key shape
+/// as [`REMOTE_CACHE_CHARGED_LRU`], only rows with
+/// `bytes_absent || size_bytes == 0`. Lets the retention pass page past
+/// unremovable head rows to an expired tail instead of rescanning from
+/// zero every pass.
+pub(crate) const REMOTE_CACHE_TOMB_LRU: TableDefinition<(i64, &str, &str), u8> =
+    TableDefinition::new("remote_cache_tomb_lru");
+
+/// Charged-row predicate shared by the LRU cursors and the page filters:
+/// `size_bytes > 0 && !bytes_absent`. Everything else is a tombstone.
+fn cache_row_charged(rec: &RemoteCacheRecord) -> bool {
+    rec.size_bytes > 0 && !rec.bytes_absent
+}
+
+/// Move the LRU cursor entries for one `REMOTE_CACHE` row transition in
+/// the ambient write transaction. `old` is the pre-image (removed from
+/// its status cursor), `new` the post-image (added to its status cursor);
+/// either may be `None` for pure deletes/inserts. Both tables are opened
+/// exactly once here — never alongside another open of the same table in
+/// one transaction.
+fn lru_replace_in_txn(
+    write_txn: &WriteTransaction,
+    old: Option<&RemoteCacheRecord>,
+    new: Option<&RemoteCacheRecord>,
+) -> Result<(), PortError> {
+    let mut charged = write_txn
+        .open_table(REMOTE_CACHE_CHARGED_LRU)
+        .map_err(map_redb_err)?;
+    let mut tomb = write_txn
+        .open_table(REMOTE_CACHE_TOMB_LRU)
+        .map_err(map_redb_err)?;
+    if let Some(prev) = old {
+        let key = (
+            prev.last_access_ms,
+            prev.source_url.as_str(),
+            prev.variant.as_str(),
+        );
+        if cache_row_charged(prev) {
+            charged.remove(key).map_err(map_redb_err)?;
+        } else {
+            tomb.remove(key).map_err(map_redb_err)?;
+        }
+    }
+    if let Some(next) = new {
+        let key = (
+            next.last_access_ms,
+            next.source_url.as_str(),
+            next.variant.as_str(),
+        );
+        if cache_row_charged(next) {
+            charged.insert(key, &1u8).map_err(map_redb_err)?;
+        } else {
+            tomb.insert(key, &1u8).map_err(map_redb_err)?;
+        }
+    }
+    Ok(())
+}
 /// Cache accounting singleton (`"stats"` → JSON [`CacheStats`],
 /// `"cap"` → u64 le global byte cap for in-flight reservations).
 pub(crate) const CACHE_ACCOUNTING: TableDefinition<&str, &[u8]> =
@@ -74,6 +148,310 @@ fn blob_key_still_indexed(
         }
     }
     Ok(false)
+}
+/// Read-phase snapshot for `commit_cache_eviction` (Wave 2 L2). Built on a
+/// read transaction by [`RedbStore::cache_eviction_read_view`]; the write
+/// phase re-validates the refcount (CAS) and every mark id (point lookup)
+/// under the write lock before mutating.
+struct CacheEvictionReadView {
+    /// A live durable (`owner_id.is_some()`) media row still references the
+    /// key: eviction must report `SkippedDurableRef` without mutating.
+    has_durable: bool,
+    /// `BLOB_REFCOUNT` at read time; the write phase fails closed when it
+    /// moved (a concurrent insert/delete changed the alias set).
+    refcount: u64,
+    /// Alias-anchored `REMOTE_CACHE` rows still pointing at the key (for
+    /// the read-only `AlreadyAbsent` check).
+    targets: Vec<RemoteCacheRecord>,
+    /// `MEDIA_META` ids with this key that are non-durable and not yet
+    /// marked evicted (the write phase re-validates each by point lookup).
+    mark_media_ids: Vec<String>,
+}
+impl RedbStore {
+    /// Count check for the Wave 2 LRU cursors: `(REMOTE_CACHE rows,
+    /// cursor entries)`. Errors when the cursor tables do not exist yet
+    /// (pre-migration database); the caller rebuilds in that case.
+    fn remote_cache_lru_counts(&self) -> Result<(u64, u64), PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let cache_len = read_txn
+            .open_table(REMOTE_CACHE)
+            .map_err(map_redb_err)?
+            .len()
+            .map_err(map_redb_err)?;
+        let charged_len = read_txn
+            .open_table(REMOTE_CACHE_CHARGED_LRU)
+            .map_err(map_redb_err)?
+            .len()
+            .map_err(map_redb_err)?;
+        let tomb_len = read_txn
+            .open_table(REMOTE_CACHE_TOMB_LRU)
+            .map_err(map_redb_err)?
+            .len()
+            .map_err(map_redb_err)?;
+        Ok((cache_len, charged_len + tomb_len))
+    }
+
+    /// Rebuild both LRU cursors from `REMOTE_CACHE` in one write
+    /// transaction. Unconditional: callers gate on
+    /// [`Self::remote_cache_lru_counts`] (or on a stale entry sighting).
+    fn rebuild_remote_cache_lru(&self) -> Result<(), PortError> {
+        let write_txn = self.begin_write()?;
+        {
+            let rows: Vec<(i64, String, String, bool)> = {
+                let cache = write_txn.open_table(REMOTE_CACHE).map_err(map_redb_err)?;
+                let mut out = Vec::new();
+                for entry in cache.iter().map_err(map_redb_err)? {
+                    let (_, v) = entry.map_err(map_redb_err)?;
+                    let rec: RemoteCacheRecord = decode_json(v.value())?;
+                    out.push((
+                        rec.last_access_ms,
+                        rec.source_url.clone(),
+                        rec.variant.clone(),
+                        cache_row_charged(&rec),
+                    ));
+                }
+                out
+            };
+            {
+                let mut charged = write_txn
+                    .open_table(REMOTE_CACHE_CHARGED_LRU)
+                    .map_err(map_redb_err)?;
+                let stale: Vec<(i64, String, String)> = charged
+                    .iter()
+                    .map_err(map_redb_err)?
+                    .map(|entry| {
+                        entry.map(|(k, _)| {
+                            let (ms, url, variant) = k.value();
+                            (ms, url.to_string(), variant.to_string())
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(map_redb_err)?;
+                for (ms, url, variant) in &stale {
+                    charged
+                        .remove((*ms, url.as_str(), variant.as_str()))
+                        .map_err(map_redb_err)?;
+                }
+            }
+            {
+                let mut tomb = write_txn
+                    .open_table(REMOTE_CACHE_TOMB_LRU)
+                    .map_err(map_redb_err)?;
+                let stale: Vec<(i64, String, String)> = tomb
+                    .iter()
+                    .map_err(map_redb_err)?
+                    .map(|entry| {
+                        entry.map(|(k, _)| {
+                            let (ms, url, variant) = k.value();
+                            (ms, url.to_string(), variant.to_string())
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(map_redb_err)?;
+                for (ms, url, variant) in &stale {
+                    tomb.remove((*ms, url.as_str(), variant.as_str()))
+                        .map_err(map_redb_err)?;
+                }
+            }
+            {
+                let mut charged = write_txn
+                    .open_table(REMOTE_CACHE_CHARGED_LRU)
+                    .map_err(map_redb_err)?;
+                let mut tomb = write_txn
+                    .open_table(REMOTE_CACHE_TOMB_LRU)
+                    .map_err(map_redb_err)?;
+                for (ms, url, variant, is_charged) in &rows {
+                    let key = (*ms, url.as_str(), variant.as_str());
+                    if *is_charged {
+                        charged.insert(key, &1u8).map_err(map_redb_err)?;
+                    } else {
+                        tomb.insert(key, &1u8).map_err(map_redb_err)?;
+                    }
+                }
+            }
+        }
+        self.commit_write(write_txn)
+    }
+
+    /// Repair-on-read for the LRU cursors: rebuild when their entry count
+    /// diverges from the `REMOTE_CACHE` row count (migration, restore, or
+    /// test-only clear-plus-backfill which rewrites rows without cursor
+    /// maintenance). Steady-state writers keep both in the same
+    /// transaction, so this is a no-op read-txn lens check per page.
+    fn heal_remote_cache_lru(&self) -> Result<(), PortError> {
+        let needs_rebuild = match self.remote_cache_lru_counts() {
+            Ok((cache_len, cursor_len)) => cursor_len != cache_len,
+            Err(_) => true,
+        };
+        if !needs_rebuild {
+            return Ok(());
+        }
+        self.rebuild_remote_cache_lru()
+    }
+
+    /// One LRU-cursor page walk: skip `offset` entries in
+    /// `(last_access_ms, source_url, variant)` order, then resolve up to
+    /// `limit` entries through point lookups, keeping only rows whose
+    /// current charged status matches `want_charged`. Returns the rows plus
+    /// whether any cursor entry failed validation (torn status or missing
+    /// row: impossible for same-transaction writers, possible only after a
+    /// cursor-bypassing rewrite — the caller rebuilds once and re-reads).
+    /// Cost is O(offset + limit) cursor steps plus O(limit) point lookups:
+    /// no full-table collect, decode, or sort per page.
+    fn lru_cursor_page(
+        &self,
+        cursor: TableDefinition<(i64, &str, &str), u8>,
+        offset: usize,
+        limit: usize,
+        want_charged: bool,
+    ) -> Result<(Vec<RemoteCacheRecord>, bool), PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let index = read_txn.open_table(cursor).map_err(map_redb_err)?;
+        let remote = read_txn.open_table(REMOTE_CACHE).map_err(map_redb_err)?;
+        let mut out: Vec<RemoteCacheRecord> = Vec::new();
+        let mut skipped = 0usize;
+        let mut stale = false;
+        for entry in index.iter().map_err(map_redb_err)? {
+            let (k, _) = entry.map_err(map_redb_err)?;
+            let (_, url, variant) = k.value();
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            if out.len() >= limit {
+                break;
+            }
+            let (url, variant) = (url.to_string(), variant.to_string());
+            match remote
+                .get((url.as_str(), variant.as_str()))
+                .map_err(map_redb_err)?
+            {
+                Some(g) => {
+                    let rec: RemoteCacheRecord = decode_json(g.value())?;
+                    if cache_row_charged(&rec) == want_charged {
+                        out.push(rec);
+                    } else {
+                        stale = true;
+                    }
+                }
+                None => {
+                    stale = true;
+                }
+            }
+        }
+        Ok((out, stale))
+    }
+
+    /// Cursor-backed page with repair: heal on count divergence, walk,
+    /// and on a stale-entry sighting rebuild once and re-read so a
+    /// cursor-bypassing rewrite can never hide rows from eviction.
+    fn lru_backed_page(
+        &self,
+        cursor: TableDefinition<(i64, &str, &str), u8>,
+        offset: usize,
+        limit: usize,
+        want_charged: bool,
+    ) -> Result<Vec<RemoteCacheRecord>, PortError> {
+        self.heal_remote_cache_lru()?;
+        let (rows, stale) = self.lru_cursor_page(cursor, offset, limit, want_charged)?;
+        if stale {
+            self.rebuild_remote_cache_lru()?;
+            let (rows, _) = self.lru_cursor_page(cursor, offset, limit, want_charged)?;
+            return Ok(rows);
+        }
+        Ok(rows)
+    }
+
+    /// Read-phase snapshot for [`MediaStore::commit_cache_eviction`]
+    /// (Wave 2 L2): existence, durability, refcount, and mark-set reads run
+    /// on a READ transaction; the write transaction opens only when a
+    /// mutation will actually happen. Alias resolution is index-anchored
+    /// (the `REMOTE_CACHE_BY_BLOB` prefix range plus point lookups, or the
+    /// caller-supplied `index_keys` point lookups) — never a `REMOTE_CACHE`
+    /// scan. The durability/mark walk still scans `MEDIA_META`, but on the
+    /// read transaction: non-aliased rows (durable sharers, orphan cache
+    /// media rows) share the key without a cache alias, so only a full read
+    /// keeps the Wave 1 alias-completeness. The write phase re-validates
+    /// every id by point lookup plus a refcount CAS, so a concurrent
+    /// insert/delete between the phases fails closed instead of evicting
+    /// under a new durable reference.
+    fn cache_eviction_read_view(
+        &self,
+        blob_key: &str,
+        index_keys: &[(String, String)],
+    ) -> Result<CacheEvictionReadView, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let refcount = read_txn
+            .open_table(BLOB_REFCOUNT)
+            .map_err(map_redb_err)?
+            .get(blob_key)
+            .map_err(map_redb_err)?
+            .map(|g| g.value())
+            .unwrap_or(0);
+        let remote = read_txn.open_table(REMOTE_CACHE).map_err(map_redb_err)?;
+        let mut targets: Vec<RemoteCacheRecord> = Vec::new();
+        if index_keys.is_empty() {
+            let by_blob = read_txn
+                .open_table(REMOTE_CACHE_BY_BLOB)
+                .map_err(map_redb_err)?;
+            let range = by_blob
+                .range((blob_key, "", "")..=(blob_key, "\u{10ffff}", "\u{10ffff}"))
+                .map_err(map_redb_err)?;
+            for entry in range {
+                let (k, _) = entry.map_err(map_redb_err)?;
+                let (_, url, variant) = k.value();
+                let (url, variant) = (url.to_string(), variant.to_string());
+                match remote
+                    .get((url.as_str(), variant.as_str()))
+                    .map_err(map_redb_err)?
+                {
+                    Some(g) => {
+                        let rec: RemoteCacheRecord = decode_json(g.value())?;
+                        if rec.blob_key == blob_key {
+                            targets.push(rec);
+                        }
+                    }
+                    None => {}
+                }
+            }
+        } else {
+            for (url, variant) in index_keys {
+                match remote
+                    .get((url.as_str(), variant.as_str()))
+                    .map_err(map_redb_err)?
+                {
+                    Some(g) => {
+                        let rec: RemoteCacheRecord = decode_json(g.value())?;
+                        if rec.blob_key == blob_key {
+                            targets.push(rec);
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
+        let media = read_txn.open_table(MEDIA_META).map_err(map_redb_err)?;
+        let mut has_durable = false;
+        let mut mark_media_ids: Vec<String> = Vec::new();
+        for entry in media.iter().map_err(map_redb_err)? {
+            let (k, v) = entry.map_err(map_redb_err)?;
+            let meta: MediaMeta = decode_json(v.value())?;
+            if meta.blob_key != blob_key {
+                continue;
+            }
+            if meta.owner_id.is_some() {
+                has_durable = true;
+            } else if !meta.evicted {
+                mark_media_ids.push(k.value().to_string());
+            }
+        }
+        Ok(CacheEvictionReadView {
+            has_durable,
+            refcount,
+            targets,
+            mark_media_ids,
+        })
+    }
 }
 impl MediaStore for RedbStore {
     fn insert_metadata(&self, input: InsertMediaInput) -> Result<MediaMeta, PortError> {
@@ -321,6 +699,9 @@ impl MediaStore for RedbStore {
                     .map_err(map_redb_err)?;
                 guard.map(|g| decode_json(g.value())).transpose()?
             };
+            // Wave 2 M1: pre-image for the LRU cursor move below (`match
+            // old` consumes the value).
+            let old_lru_image = old.clone();
             // Slice 5: a rewrite of a still-live same-key row accompanies
             // no charge (the fetch sharer path only charges for absent or
             // previously-debited keys), so it must not (re-)record the
@@ -432,6 +813,9 @@ impl MediaStore for RedbStore {
                 // left unrecorded — attributing it to any one alias would
                 // be a guess (see `commit_cache_eviction` fallback).
             }
+            // Wave 2 M1: keep the LRU cursors in step with the row write
+            // (same transaction, so cursor and row never disagree).
+            lru_replace_in_txn(&write_txn, old_lru_image.as_ref(), Some(&stored))?;
         }
         self.commit_write(write_txn)
     }
@@ -452,6 +836,9 @@ impl MediaStore for RedbStore {
             let Some(mut rec) = rec else {
                 return Ok(());
             };
+            // Wave 2 M1: pre-image for the cursor move (the touch may
+            // change `last_access_ms`, i.e. the cursor key itself).
+            let old_lru_image = rec.clone();
             rec.last_access_ms = now_ms;
             rec.access_count = rec.access_count.saturating_add(1);
             // Same-millisecond touches must read as newer than any listed
@@ -462,6 +849,8 @@ impl MediaStore for RedbStore {
             table
                 .insert((source_url, variant), encoded.as_slice())
                 .map_err(map_redb_err)?;
+            // Wave 2 M1: keep the LRU cursors in step (same transaction).
+            lru_replace_in_txn(&write_txn, Some(&old_lru_image), Some(&rec))?;
         }
         self.commit_write(write_txn)
     }
@@ -509,8 +898,12 @@ impl MediaStore for RedbStore {
 
     /// Charged-row window for eviction (slice 2): tombstones are filtered
     /// store-side, so they can never starve the window no matter how many
-    /// precede the live rows. One scan per page; the eviction loop advances
-    /// `offset` past stuck windows and stops on a short page.
+    /// precede the live rows. One cursor walk per page (Wave 2 M1): the
+    /// `(last_access_ms, source_url, variant)` cursor holds exactly the
+    /// charged rows in eviction order, so a page costs O(offset + limit)
+    /// cursor steps plus O(limit) point lookups — never a full-table
+    /// collect, JSON decode, and sort. The eviction loop advances `offset`
+    /// past stuck windows and stops on a short page.
     fn remote_cache_charged_page(
         &self,
         offset: usize,
@@ -519,29 +912,15 @@ impl MediaStore for RedbStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
-        let table = read_txn.open_table(REMOTE_CACHE).map_err(map_redb_err)?;
-        let mut charged: Vec<RemoteCacheRecord> = Vec::new();
-        for entry in table.iter().map_err(map_redb_err)? {
-            let (_, v) = entry.map_err(map_redb_err)?;
-            let rec: RemoteCacheRecord = decode_json(v.value())?;
-            if rec.size_bytes > 0 && !rec.bytes_absent {
-                charged.push(rec);
-            }
-        }
-        charged.sort_by(|a, b| {
-            (a.last_access_ms, &a.source_url, &a.variant).cmp(&(
-                b.last_access_ms,
-                &b.source_url,
-                &b.variant,
-            ))
-        });
-        Ok(charged.into_iter().skip(offset).take(limit).collect())
+        self.lru_backed_page(REMOTE_CACHE_CHARGED_LRU, offset, limit, true)
     }
 
     /// Tombstone window for the retention pass (slice 2, finding 9): only
     /// zero-byte/absent rows, oldest first. The caller filters by class TTL
-    /// and live-media reference before the conditional remove.
+    /// and live-media reference before the conditional remove. Backed by
+    /// the tombstone LRU cursor (Wave 2 M1): one O(offset + limit) walk
+    /// per page, so the retention pass can page past unremovable head
+    /// rows to an expired tail instead of rescanning from zero.
     fn remote_cache_tombstone_page(
         &self,
         offset: usize,
@@ -550,24 +929,7 @@ impl MediaStore for RedbStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
-        let table = read_txn.open_table(REMOTE_CACHE).map_err(map_redb_err)?;
-        let mut tombstones: Vec<RemoteCacheRecord> = Vec::new();
-        for entry in table.iter().map_err(map_redb_err)? {
-            let (_, v) = entry.map_err(map_redb_err)?;
-            let rec: RemoteCacheRecord = decode_json(v.value())?;
-            if rec.bytes_absent || rec.size_bytes == 0 {
-                tombstones.push(rec);
-            }
-        }
-        tombstones.sort_by(|a, b| {
-            (a.last_access_ms, &a.source_url, &a.variant).cmp(&(
-                b.last_access_ms,
-                &b.source_url,
-                &b.variant,
-            ))
-        });
-        Ok(tombstones.into_iter().skip(offset).take(limit).collect())
+        self.lru_backed_page(REMOTE_CACHE_TOMB_LRU, offset, limit, false)
     }
 
     /// Dangling-index window for the reconciler (slice 4, finding E): only
@@ -578,6 +940,15 @@ impl MediaStore for RedbStore {
     /// in the same read transaction. Callers treat every row as a
     /// candidate and re-validate under the lifecycle gate plus the
     /// per-key lock (see `remote_cache_remove_if`).
+    ///
+    /// Wave 2 M1: unlike the charged/tombstone windows this page never
+    /// collected or sorted the table — it streams the key-ordered index
+    /// from zero, so a call already costs O(offset + limit) point
+    /// lookups, not O(N). A cursor API would avoid re-walking the
+    /// skipped prefix across calls, but the port signature is
+    /// offset-based (shared with the parent-owned trait); the reconciler
+    /// loop bounds the total by advancing `offset` and stopping on a
+    /// short page.
     fn remote_cache_dangling_page(
         &self,
         offset: usize,
@@ -626,6 +997,9 @@ impl MediaStore for RedbStore {
             };
             table.remove((source_url, variant)).map_err(map_redb_err)?;
             if let Some(previous) = old {
+                // Wave 2 M1: the cursor entry goes with the row (same
+                // transaction).
+                lru_replace_in_txn(&write_txn, Some(&previous), None)?;
                 if !previous.blob_key.is_empty() {
                     by_blob
                         .remove((previous.blob_key.as_str(), source_url, variant))
@@ -677,6 +1051,9 @@ impl MediaStore for RedbStore {
                 return Ok(false);
             }
             table.remove((source_url, variant)).map_err(map_redb_err)?;
+            // Wave 2 M1: the cursor entry goes with the row (same
+            // transaction), so pages never serve the removed row.
+            lru_replace_in_txn(&write_txn, Some(&current), None)?;
             if !current.blob_key.is_empty() {
                 by_blob
                     .remove((current.blob_key.as_str(), source_url, variant))
@@ -754,32 +1131,97 @@ impl MediaStore for RedbStore {
                 base.saturating_sub(delta.unsigned_abs())
             }
         }
+        // Read phase on a READ transaction (Wave 2 L2): the existence and
+        // durability probes that decide the read-only outcomes
+        // (`AlreadyAbsent`, `SkippedDurableRef`) run here, never under the
+        // write lock. The write transaction below opens only when a
+        // mutation will actually happen.
+        let view = self.cache_eviction_read_view(blob_key, index_keys)?;
+        if view.has_durable {
+            return Ok(CacheEvictionOutcome::SkippedDurableRef);
+        }
+        if size_bytes == 0 {
+            return Ok(CacheEvictionOutcome::AlreadyAbsent);
+        }
+        if !view.targets.is_empty()
+            && view
+                .targets
+                .iter()
+                .all(|r| r.bytes_absent || r.size_bytes == 0)
+        {
+            return Ok(CacheEvictionOutcome::AlreadyAbsent);
+        }
+        // Write phase: point lookups and point updates only. The durable
+        // probe is re-validated cheaply (alias range plus point lookups,
+        // O(aliases)) instead of rescanning `MEDIA_META`; a refcount change
+        // or a new durable alias since the read phase fails closed with
+        // `SkippedDurableRef` and no mutation.
         let write_txn = self.begin_write()?;
         let outcome = {
-            let mut media = write_txn.open_table(MEDIA_META).map_err(map_redb_err)?;
             let mut remote = write_txn.open_table(REMOTE_CACHE).map_err(map_redb_err)?;
-            let mut accounting = write_txn
-                .open_table(CACHE_ACCOUNTING)
+            let by_blob = write_txn
+                .open_table(REMOTE_CACHE_BY_BLOB)
                 .map_err(map_redb_err)?;
-            let mut has_durable = false;
-            for entry in media.iter().map_err(map_redb_err)? {
-                let (_, v) = entry.map_err(map_redb_err)?;
-                let meta: MediaMeta = decode_json(v.value())?;
-                if meta.blob_key == blob_key && meta.owner_id.is_some() {
-                    has_durable = true;
-                    break;
+            let mut media = write_txn.open_table(MEDIA_META).map_err(map_redb_err)?;
+            let refcounts = write_txn.open_table(BLOB_REFCOUNT).map_err(map_redb_err)?;
+            let refcount_now = refcounts
+                .get(blob_key)
+                .map_err(map_redb_err)?
+                .map(|g| g.value())
+                .unwrap_or(0);
+            if refcount_now != view.refcount {
+                return Ok(CacheEvictionOutcome::SkippedDurableRef);
+            }
+            // Alias pairs for this key (index-anchored, O(aliases)).
+            let alias_pairs: Vec<(String, String)> = {
+                let range = by_blob
+                    .range((blob_key, "", "")..=(blob_key, "\u{10ffff}", "\u{10ffff}"))
+                    .map_err(map_redb_err)?;
+                let mut out = Vec::new();
+                for entry in range {
+                    let (k, _) = entry.map_err(map_redb_err)?;
+                    let (_, url, variant) = k.value();
+                    out.push((url.to_string(), variant.to_string()));
+                }
+                out
+            };
+            let mut durable_now = false;
+            for (url, variant) in &alias_pairs {
+                let Some(g) = remote
+                    .get((url.as_str(), variant.as_str()))
+                    .map_err(map_redb_err)?
+                else {
+                    continue;
+                };
+                let rec: RemoteCacheRecord = decode_json(g.value())?;
+                if rec.blob_key != blob_key {
+                    continue;
+                }
+                if let Some(mg) = media.get(rec.media_id.as_str()).map_err(map_redb_err)? {
+                    let meta: MediaMeta = decode_json(mg.value())?;
+                    if meta.blob_key == blob_key && meta.owner_id.is_some() {
+                        durable_now = true;
+                        break;
+                    }
                 }
             }
-            if has_durable {
+            if durable_now {
                 return Ok(CacheEvictionOutcome::SkippedDurableRef);
             }
             let mut targets: Vec<RemoteCacheRecord> = Vec::new();
             if index_keys.is_empty() {
-                for entry in remote.iter().map_err(map_redb_err)? {
-                    let (_, v) = entry.map_err(map_redb_err)?;
-                    let rec: RemoteCacheRecord = decode_json(v.value())?;
-                    if rec.blob_key == blob_key {
-                        targets.push(rec);
+                // Same alias-anchored load as the read phase (equivalent
+                // to the old full `REMOTE_CACHE` scan for this key, but
+                // O(aliases)).
+                for (url, variant) in &alias_pairs {
+                    if let Some(g) = remote
+                        .get((url.as_str(), variant.as_str()))
+                        .map_err(map_redb_err)?
+                    {
+                        let rec: RemoteCacheRecord = decode_json(g.value())?;
+                        if rec.blob_key == blob_key {
+                            targets.push(rec);
+                        }
                     }
                 }
             } else {
@@ -804,6 +1246,12 @@ impl MediaStore for RedbStore {
             if !targets.is_empty() && targets.iter().all(|r| r.bytes_absent || r.size_bytes == 0) {
                 return Ok(CacheEvictionOutcome::AlreadyAbsent);
             }
+            let mut charged_lru = write_txn
+                .open_table(REMOTE_CACHE_CHARGED_LRU)
+                .map_err(map_redb_err)?;
+            let mut tomb_lru = write_txn
+                .open_table(REMOTE_CACHE_TOMB_LRU)
+                .map_err(map_redb_err)?;
             for rec in &targets {
                 let mut updated = rec.clone();
                 updated.size_bytes = 0;
@@ -819,16 +1267,32 @@ impl MediaStore for RedbStore {
                         encoded.as_slice(),
                     )
                     .map_err(map_redb_err)?;
+                // Wave 2 M1: the row changed cursors (charged to
+                // tombstone); the `last_access_ms` key itself is
+                // untouched, matching the old "no fake freshness" rule.
+                charged_lru
+                    .remove((
+                        rec.last_access_ms,
+                        rec.source_url.as_str(),
+                        rec.variant.as_str(),
+                    ))
+                    .map_err(map_redb_err)?;
+                tomb_lru
+                    .insert(
+                        (
+                            updated.last_access_ms,
+                            updated.source_url.as_str(),
+                            updated.variant.as_str(),
+                        ),
+                        &1u8,
+                    )
+                    .map_err(map_redb_err)?;
             }
-            let mut evict_ids: Vec<String> = Vec::new();
-            for entry in media.iter().map_err(map_redb_err)? {
-                let (k, v) = entry.map_err(map_redb_err)?;
-                let meta: MediaMeta = decode_json(v.value())?;
-                if meta.blob_key == blob_key && meta.owner_id.is_none() && !meta.evicted {
-                    evict_ids.push(k.value().to_string());
-                }
-            }
-            for id in &evict_ids {
+            // Mark the cache media rows evicted by point lookup over the
+            // read-phase alias set (plus the read-scan fallback ids for
+            // non-aliased rows): no full `MEDIA_META` scan under the
+            // write lock. Each row is re-validated before the mark.
+            for id in &view.mark_media_ids {
                 let meta_opt: Option<MediaMeta> =
                     match media.get(id.as_str()).map_err(map_redb_err)? {
                         Some(g) => Some(decode_json(g.value())?),
@@ -837,12 +1301,18 @@ impl MediaStore for RedbStore {
                 let Some(mut meta) = meta_opt else {
                     continue;
                 };
+                if meta.blob_key != blob_key || meta.owner_id.is_some() || meta.evicted {
+                    continue;
+                }
                 meta.evicted = true;
                 let encoded = encode_json(&meta)?;
                 media
                     .insert(id.as_str(), encoded.as_slice())
                     .map_err(map_redb_err)?;
             }
+            let mut accounting = write_txn
+                .open_table(CACHE_ACCOUNTING)
+                .map_err(map_redb_err)?;
             let mut stats: CacheStats = match accounting.get("stats").map_err(map_redb_err)? {
                 Some(g) => decode_json(g.value())?,
                 None => CacheStats::default(),

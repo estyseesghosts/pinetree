@@ -17,9 +17,17 @@ const MAX_EVICTION_ROUNDS: usize = 64;
 const CHARGED_PAGE_SIZE: usize = 32;
 
 /// Tombstone rows examined per [`ensure_cache_budget`] call by the
-/// retention pass. One bounded page: steady-state cleanup amortized across
-/// pressure events, never a full-history walk.
+/// retention pass. A bounded multi-page walk: unremovable head rows are
+/// skip-counted so the same pass pages forward to an expired tail instead
+/// of rescanning the head window, and steady-state cleanup stays amortized
+/// across pressure events — never a full-history walk.
 const TOMBSTONE_RETENTION_SCAN: usize = 64;
+
+/// Bound on retention pages per [`ensure_cache_budget`] call: with
+/// [`TOMBSTONE_RETENTION_SCAN`] rows per page this caps one pass at 512
+/// visited rows regardless of how much unremovable head history precedes
+/// an expired tail.
+const MAX_RETENTION_PAGES: usize = 8;
 
 /// Listing-time fingerprint of one physical blob key: the COMPLETE alias
 /// set resolved through the blob-key index at listing time — never just
@@ -231,24 +239,50 @@ fn snapshot_key_candidate(
 /// window is already absent by construction. The conditional remove is the
 /// whole race protocol: a concurrent refetch installs a new `media_id`,
 /// so the CAS fails and the fresh row survives.
+///
+/// The pass skip-counts unremovable head rows (unexpired TTL, live media
+/// reference, lost CAS race) and pages forward in the SAME pass — and
+/// across passes, since removals persist — so an expired tail is visited
+/// instead of rescanning the same head window forever. The pass is bounded
+/// by [`MAX_RETENTION_PAGES`]: removed rows vanish from the cursor, so
+/// only skipped rows advance the offset and the next page re-reads from
+/// there.
 fn retain_expired_tombstones(services: &AppServices, now_ms: i64) -> Result<(), PortError> {
-    let page = services
-        .media
-        .remote_cache_tombstone_page(0, TOMBSTONE_RETENTION_SCAN)?;
-    for rec in &page {
-        let ttl_ms = ttl_days_for(services, rec.class) as i64 * 86_400_000;
-        if now_ms.saturating_sub(rec.last_access_ms) < ttl_ms {
-            continue;
+    let mut offset: usize = 0;
+    for _ in 0..MAX_RETENTION_PAGES {
+        let page = services
+            .media
+            .remote_cache_tombstone_page(offset, TOMBSTONE_RETENTION_SCAN)?;
+        if page.is_empty() {
+            break;
         }
-        if services.media.get(&rec.media_id)?.is_some() {
-            continue;
+        let mut skipped = 0usize;
+        for rec in &page {
+            let ttl_ms = ttl_days_for(services, rec.class) as i64 * 86_400_000;
+            if now_ms.saturating_sub(rec.last_access_ms) < ttl_ms {
+                skipped += 1;
+                continue;
+            }
+            if services.media.get(&rec.media_id)?.is_some() {
+                skipped += 1;
+                continue;
+            }
+            if !services.media.remote_cache_remove_if(
+                &rec.source_url,
+                &rec.variant,
+                &rec.media_id,
+                &rec.blob_key,
+            )? {
+                // Lost the CAS race (a concurrent refetch installed a new
+                // media id): the fresh row survives; treat the row as an
+                // unremovable head and move past it.
+                skipped += 1;
+            }
         }
-        let _removed = services.media.remote_cache_remove_if(
-            &rec.source_url,
-            &rec.variant,
-            &rec.media_id,
-            &rec.blob_key,
-        )?;
+        offset += skipped;
+        if page.len() < TOMBSTONE_RETENTION_SCAN {
+            break;
+        }
     }
     Ok(())
 }
