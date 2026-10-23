@@ -304,8 +304,31 @@ pub fn render_miauth_page(
         Some(msg) => format!("<p class=\"error\">{}</p>", escape_html(msg)),
         None => String::new(),
     };
+    // Hidden round-trip fields: the approval POST carries its body only
+    // (query params on the GET are not forwarded), so name/icon/callback/
+    // permission must ride the form or `miauth_submit` never sees the
+    // callback and can never 302 back to the app. Emit only params that
+    // were actually present so a re-approve never clobbers stored values
+    // with empty strings (`contains_key` gates the update path).
+    let hidden = [
+        ("name", name),
+        ("icon", icon),
+        ("callback", callback),
+        ("permission", permission),
+    ]
+    .iter()
+    .filter_map(|(key, value)| {
+        value.map(|raw| {
+            format!(
+                "<input type=\"hidden\" name=\"{key}\" value=\"{}\" />",
+                escape_html(raw)
+            )
+        })
+    })
+    .collect::<Vec<_>>()
+    .join("\n");
     format!(
-        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\" />\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n<title>MiAuth — {app_name}</title>\n<style>\nbody {{ font-family: sans-serif; background: #f4f4f6; margin: 0; display: grid; place-content: center; min-height: 100vh; }}\n.card {{ background: #fff; border-radius: 12px; padding: 32px; max-width: 480px; width: calc(100vw - 64px); box-shadow: 0 8px 16px rgba(0,0,0,.1); }}\n.icon {{ width: 64px; height: 64px; border-radius: 12px; }}\n.error {{ color: #b00020; }}\n.callback code {{ font-size: 90%; word-break: break-all; }}\n.actions {{ display: flex; gap: 12px; margin-top: 16px; }}\nbutton {{ padding: 10px 20px; border-radius: 8px; border: none; cursor: pointer; }}\nbutton.approve {{ background: #86b300; color: #fff; }}\nbutton.deny {{ background: #eee; }}\n</style>\n</head>\n<body>\n<div class=\"card\">\n{icon_img}\n<h1>{app_name} wants to access your account</h1>\n{error_banner}\n<p>This app requests the following permissions:</p>\n<ul>\n{permission_list}\n</ul>\n{callback_row}\n<form method=\"post\" action=\"/miauth/{session}\">\n<div class=\"actions\">\n<button class=\"approve\" type=\"submit\" name=\"decision\" value=\"approve\">Approve</button>\n<button class=\"deny\" type=\"submit\" name=\"decision\" value=\"deny\">Deny</button>\n</div>\n</form>\n</div>\n</body>\n</html>"
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\" />\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n<title>MiAuth — {app_name}</title>\n<style>\nbody {{ font-family: sans-serif; background: #f4f4f6; margin: 0; display: grid; place-content: center; min-height: 100vh; }}\n.card {{ background: #fff; border-radius: 12px; padding: 32px; max-width: 480px; width: calc(100vw - 64px); box-shadow: 0 8px 16px rgba(0,0,0,.1); }}\n.icon {{ width: 64px; height: 64px; border-radius: 12px; }}\n.error {{ color: #b00020; }}\n.callback code {{ font-size: 90%; word-break: break-all; }}\n.actions {{ display: flex; gap: 12px; margin-top: 16px; }}\nbutton {{ padding: 10px 20px; border-radius: 8px; border: none; cursor: pointer; }}\nbutton.approve {{ background: #86b300; color: #fff; }}\nbutton.deny {{ background: #eee; }}\n.login label {{ display: block; margin: 8px 0; font-size: 14px; }}\n.login input {{ display: block; width: 100%; box-sizing: border-box; padding: 8px; margin-top: 4px; border: 1px solid #ccc; border-radius: 8px; }}</style>\n</head>\n<body>\n<div class=\"card\">\n{icon_img}\n<h1>{app_name} wants to access your account</h1>\n{error_banner}\n<p>This app requests the following permissions:</p>\n<ul>\n{permission_list}\n</ul>\n{callback_row}\n<form method=\"post\" action=\"/miauth/{session}\">\n<div class=\"login\">\n<label>Username<input type=\"text\" name=\"username\" autocomplete=\"username\" required /></label>\n<label>Password<input type=\"password\" name=\"password\" autocomplete=\"current-password\" required /></label>\n</div>\n{hidden}\n<div class=\"actions\">\n<button class=\"approve\" type=\"submit\" name=\"decision\" value=\"approve\">Approve</button>\n<button class=\"deny\" type=\"submit\" name=\"decision\" value=\"deny\">Deny</button>\n</div>\n</form>\n</div>\n</body>\n</html>"
     )
 }
 
@@ -468,5 +491,56 @@ mod tests {
         // Untrusted app names are escaped.
         let evil = render_miauth_page("s", Some("<script>"), None, None, None, None);
         assert!(!evil.contains("<script>"));
+    }
+
+    #[test]
+    fn miauth_page_has_login_inputs() {
+        // The approval POST requires username+password, so the page must
+        // offer them — otherwise every Approve is a dead-end error.
+        let html = render_miauth_page("s", Some("App"), None, None, None, None);
+        assert!(html.contains("name=\"username\""), "missing username input");
+        assert!(html.contains("name=\"password\""), "missing password input");
+    }
+
+    #[test]
+    fn miauth_page_round_trips_params_as_hidden_inputs() {
+        // GET query params never reach the POST body, so the params the
+        // redirect decision needs must ride the form as hidden inputs.
+        let html = render_miauth_page(
+            "sess9",
+            Some("App"),
+            Some("https://cdn.example/icon.png"),
+            Some("https://app.example/cb"),
+            Some("read:account"),
+            None,
+        );
+        for (key, value) in [
+            ("name", "App"),
+            ("icon", "https://cdn.example/icon.png"),
+            ("callback", "https://app.example/cb"),
+            ("permission", "read:account"),
+        ] {
+            assert!(
+                html.contains(&format!(
+                    "<input type=\"hidden\" name=\"{key}\" value=\"{value}\" />"
+                )),
+                "missing hidden input for {key}"
+            );
+        }
+        // Absent params stay absent: a re-approve must not clobber stored
+        // values with empty strings (`contains_key` gates the update path).
+        let bare = render_miauth_page("s", None, None, None, None, None);
+        assert!(!bare.contains("type=\"hidden\""), "unexpected hidden input");
+        // Hidden values are HTML-escaped.
+        let evil = render_miauth_page(
+            "s",
+            None,
+            None,
+            Some("\"><script>alert(1)</script>"),
+            None,
+            None,
+        );
+        assert!(!evil.contains("<script>"));
+        assert!(evil.contains("name=\"callback\""));
     }
 }

@@ -242,9 +242,18 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/files/{id}", get(serve_file))
         .route("/files/{id}/{name}", get(serve_file_named))
         .route("/identicon/{id}", get(identicon))
-        .route("/miauth/{session}", get(miauth_page).post(miauth_submit))
-        .route("/miauth/{session}/check", post(miauth_check))
-        .route("/api/miauth/{session}/check", post(miauth_check))
+        .route(
+            "/miauth/{session}",
+            get(miauth_page).post(miauth_submit).options(preflight),
+        )
+        .route(
+            "/miauth/{session}/check",
+            post(miauth_check).options(preflight),
+        )
+        .route(
+            "/api/miauth/{session}/check",
+            post(miauth_check).options(preflight),
+        )
         .route("/signup", post(signup).options(preflight))
         .route("/api/signup", post(signup).options(preflight))
         .route("/signin", post(signin).options(preflight))
@@ -256,7 +265,10 @@ pub fn build_router(state: ApiState) -> Router {
         // so direct callers work the same with or without the prefix).
         .route("/signin-flow", post(signin_flow).options(preflight))
         .route("/api/signin-flow", post(signin_flow).options(preflight))
-        .route("/api/drive/files/create", post(drive_files_create))
+        .route(
+            "/api/drive/files/create",
+            post(drive_files_create).options(preflight),
+        )
         // Batch Q Phase 1 (item 9): the route `meta.mediaProxy`
         // (`{uri}/proxy`) advertises. Upstream shape is `/proxy/:url*`
         // with a `?url=` override, so both forms route here.
