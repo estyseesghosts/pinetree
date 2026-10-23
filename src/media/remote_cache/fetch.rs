@@ -8,6 +8,8 @@ use crate::federation::delivery::{SafeHttpClient, SafeHttpConfig};
 use crate::media::fetch_stream;
 use crate::media::ingest;
 use crate::media::storage;
+use std::sync::{Arc, OnceLock};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Variant key for the original bytes (what the `GET /files/:id` handler
 /// asks for and what the fetch job caches).
@@ -16,6 +18,65 @@ pub const DEFAULT_VARIANT: &str = "original";
 /// Variant key for avatar/emoji proxies (callers pass this with
 /// `force_class = Some(MediaClass::Avatar)`).
 pub const AVATAR_VARIANT: &str = "avatar";
+
+/// Wave 7 canonical bound for origin fetches: cold `GET /files/:id`
+/// refetches, `GET /proxy` origin fetches, and background
+/// `fetch_and_index_remote_media` calls (inbox job) share one process-wide
+/// non-blocking semaphore of 8. Hits return before acquiring, so index hits
+/// never consume cold slots. Exhaustion fails closed retryable (never queues):
+/// HTTP maps the busy marker to 429 `RATE_LIMIT_EXCEEDED` with a short
+/// `Retry-After`, the job treats it as transient and retries (never skips).
+///
+/// Slot pinning (audit §2.6): a parked cold fetch holds its slot plus a full
+/// `max_file_size` in-flight reservation for the whole origin timeout
+/// (plain HTTP `total_timeout`, 20 s). Eight stalled origins pin
+/// `8 * max_file_size` phantom plus eight blocking threads, so sustained
+/// cold-miss rate collapses until origins drain — intended fail-closed, kept
+/// observable via the `eprintln!` below rather than removed.
+pub const MAX_CONCURRENT_MEDIA_FETCHES: usize = 8;
+/// Marker inside `PortError::StorageUnavailable` for slot exhaustion.
+/// `StorageUnavailable` is deliberate: the background job retries it (a
+/// `Validation` would be swallowed as a per-attachment skip and lose the
+/// row), while the HTTP layer intercepts this marker before the generic
+/// 500 mapping and answers 429 instead.
+pub const FETCH_SLOT_BUSY_MESSAGE: &str = "FETCH_SLOT_BUSY";
+
+fn media_fetch_slots() -> Arc<Semaphore> {
+    static SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    SLOTS
+        .get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_MEDIA_FETCHES)))
+        .clone()
+}
+
+/// Non-blocking take of the shared media-fetch slot. `Ok` holds the permit
+/// for the whole origin fetch + commit; `Err` is fail-closed busy.
+pub fn try_acquire_media_fetch_slot() -> Result<OwnedSemaphorePermit, PortError> {
+    match media_fetch_slots().try_acquire_owned() {
+        Ok(permit) => Ok(permit),
+        Err(_) => {
+            eprintln!(
+                "media fetch slots exhausted (all {MAX_CONCURRENT_MEDIA_FETCHES} held); failing closed (429/defer)"
+            );
+            Err(PortError::StorageUnavailable(
+                FETCH_SLOT_BUSY_MESSAGE.to_string(),
+            ))
+        }
+    }
+}
+
+/// True when `err` is slot exhaustion (callers map to 429/retry, never 500).
+pub fn is_media_fetch_slot_busy(err: &PortError) -> bool {
+    matches!(
+        err,
+        PortError::StorageUnavailable(msg) if msg.contains(FETCH_SLOT_BUSY_MESSAGE)
+    )
+}
+
+/// Available cold-fetch permits, for diagnostics/tests.
+#[allow(dead_code)]
+pub fn media_fetch_slots_available() -> usize {
+    media_fetch_slots().available_permits()
+}
 
 /// Slice 1: best-effort staged-file cleanup. The staged temp file is
 /// removed on drop (post-`import_file` the remove is a harmless miss, so a
@@ -154,6 +215,12 @@ pub(crate) fn fetch_and_index_remote_media(
             }
         }
     }
+    // Wave 7 bound: the miss path (validate + reservation + network +
+    // commit) holds one shared cold-fetch slot. Hits above returned before
+    // acquiring, so they never consume slots. Busy fails closed before any
+    // reservation exists, so nothing leaks; HTTP maps it to 429, the
+    // background job retries it.
+    let _fetch_slot = try_acquire_media_fetch_slot()?;
     // Miss path: validate before holding any reservation (cheap skip).
     validate_remote_media_url(source_url, client)?;
 
@@ -828,5 +895,36 @@ mod tests {
         let meta = fetch_and_cache_remote_media(&services, &local_client, &svg_att).unwrap();
         assert_eq!(meta.mime, "application/octet-stream");
         assert_ne!(meta.mime, "image/svg+xml");
+    }
+}
+
+#[cfg(test)]
+mod wave7_slot_tests {
+    use super::*;
+
+    #[test]
+    fn wave7_slot_acquire_succeeds_when_free() {
+        // Sanity: a free pool hands out a permit that releases on drop.
+        let _permit = try_acquire_media_fetch_slot().expect("free pool must hand out a slot");
+        assert!(media_fetch_slots_available() < MAX_CONCURRENT_MEDIA_FETCHES);
+    }
+
+    #[test]
+    fn wave7_busy_marker_is_retryable_not_validation() {
+        // Wave 7 contract: slot exhaustion surfaces as `StorageUnavailable`
+        // carrying the busy marker — never `Validation` (which the
+        // background job would swallow as a per-attachment skip, losing the
+        // row). The job propagates it and retries; HTTP maps it to 429.
+        let busy = PortError::StorageUnavailable(FETCH_SLOT_BUSY_MESSAGE.to_string());
+        assert!(is_media_fetch_slot_busy(&busy));
+        assert!(!is_media_fetch_slot_busy(&PortError::Validation(
+            "CACHE_CAPACITY_EXCEEDED".to_string()
+        )));
+        assert!(!is_media_fetch_slot_busy(&PortError::StorageUnavailable(
+            "stat blob file: io error".to_string()
+        )));
+        assert!(!is_media_fetch_slot_busy(&PortError::NotFound(
+            "NO_SUCH_FILE".to_string()
+        )));
     }
 }

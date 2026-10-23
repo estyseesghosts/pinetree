@@ -29,8 +29,10 @@ mod support;
 
 pub use evict::ensure_cache_budget;
 pub use fetch::{
-    AVATAR_VARIANT, DEFAULT_VARIANT, fetch_and_cache_remote_media, fetch_on_first_request,
-    fetch_on_first_request_as, validate_remote_media_url,
+    AVATAR_VARIANT, DEFAULT_VARIANT, FETCH_SLOT_BUSY_MESSAGE, MAX_CONCURRENT_MEDIA_FETCHES,
+    fetch_and_cache_remote_media, fetch_on_first_request, fetch_on_first_request_as,
+    is_media_fetch_slot_busy, media_fetch_slots_available, try_acquire_media_fetch_slot,
+    validate_remote_media_url,
 };
 pub use store::{
     MAX_REMOTE_ATTACHMENTS_PER_NOTE, MAX_REMOTE_MEDIA_TOTAL_BYTES_PER_NOTE,
