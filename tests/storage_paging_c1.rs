@@ -238,6 +238,7 @@ fn insert_cached(h: &Harness, seq: usize, size: u64, with_bytes: bool) -> MediaM
             last_access_ms: BASE_MS,
             access_count: 1,
             bytes_absent: false,
+            generation: 0,
         })
         .unwrap();
     h.store
@@ -959,13 +960,14 @@ fn maintenance_triggers_enqueue_drainable_jobs() {
     reconciler::enqueue_storage_reconcile(h.services.jobs.as_ref(), BASE_MS).unwrap();
     reconciler::enqueue_storage_backfill(h.services.jobs.as_ref(), BASE_MS).unwrap();
     assert_eq!(h.store.pending_count().unwrap(), 2);
-    // Keys embed the timestamp (no silent dedup of repeat boots); every
-    // enqueued job is idempotent, so stacking is safe. (`pending_count`
+    // Keys embed the timestamp and enqueue is idempotent on the
+    // idempotency key (Wave 6): a repeat boot with the same timestamp is a
+    // no-op, so stacking stays safe without duplicate rows. (`pending_count`
     // counts due jobs under the frozen test clock, so the repeat uses the
     // same timestamp.)
     reconciler::enqueue_storage_reconcile(h.services.jobs.as_ref(), BASE_MS).unwrap();
-    assert_eq!(h.store.pending_count().unwrap(), 3);
-    assert_eq!(drain(&h.worker, 8), 3);
+    assert_eq!(h.store.pending_count().unwrap(), 2);
+    assert_eq!(drain(&h.worker, 8), 2);
     assert_eq!(h.store.pending_count().unwrap(), 0);
     assert_eq!(h.store.durable_bytes("owner").unwrap(), 20);
 }

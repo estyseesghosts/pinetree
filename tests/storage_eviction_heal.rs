@@ -126,6 +126,9 @@ fn evict_harness() -> (EvictHarness, String) {
                 is_bot: false,
                 is_cat: false,
                 is_locked: false,
+                also_known_as: None,
+                moved_to_uri: None,
+                moved_at_ms: None,
                 preserved_usernames: Vec::new(),
             },
             None,
@@ -259,6 +262,7 @@ fn eviction_bytes_only_metadata_and_source_url_survive_refetch_heals() {
         last_access_ms: BASE_MS,
         access_count: 0,
         bytes_absent: false,
+        generation: 0,
     };
     h.store.remote_cache_insert(&rec).expect("index insert");
     let found = h

@@ -1130,14 +1130,16 @@ async fn batch_q_proxy_route() {
     assert_eq!(body, PNG_1PX);
     assert_eq!(headers["content-type"], "image/png");
     assert_eq!(headers["cache-control"], "max-age=31536000, immutable");
-    // Non-media is refused, never proxied as active content.
+    // Non-media is refused with the collapsed 404 (Wave 7: wrong-type and
+    // SSRF-blocked/dead origins are one indistinguishable status), never
+    // proxied as active content.
     let (status, _, _) = proxy(
         &state,
         params(&format!("http://{addr}/note.txt")),
         Some("test-agent"),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 /// Batch Q Phase 1, item 3a: `users/show` 404s suspended users for

@@ -787,61 +787,65 @@ fn deliver_payload(url: &str) -> webhooks::WebhookDeliverPayload {
     }
 }
 
+/// A port that is closed by construction: bound then dropped, so nothing
+/// listens. Delivery must be SSRF-blocked before any dial.
+fn closed_loopback_url() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    format!("http://127.0.0.1:{port}/hook")
+}
+
 #[test]
 fn deliver_success_posts_signed_body() {
-    let (url, captured, handle) = stub_server(200, 1);
+    // Wave 3 SSRF hardening: the webhook path forces
+    // `allow_private_ips = false`, so loopback delivery — even with a
+    // permissive caller client — is a permanent SSRF failure, never a dial.
+    // (Signed-body wire coverage lives in the signature round-trip below
+    // and `deliver_ssrf_blocked_is_permanent`; no loopback stub can receive
+    // on this path by design.)
+    let url = closed_loopback_url();
     let tracker = DestinationTracker::new();
     let payload = deliver_payload(&url);
     let outcome =
         webhooks::execute_webhook_deliver(&loopback_client(), &tracker, 1000, 5000, &payload);
-    assert_eq!(outcome, DeliveryOutcome::Delivered);
-    handle.join().unwrap();
-    let reqs = captured.lock().unwrap();
-    assert_eq!(reqs.len(), 1);
-    assert_eq!(reqs[0].method, "POST");
-    assert_eq!(reqs[0].path, "/hook");
-    let sig = reqs[0]
-        .headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("X-Pinetree-Hook-Signature"))
-        .expect("signature header")
-        .1
-        .clone();
+    match &outcome {
+        DeliveryOutcome::PermanentFailure(reason) => {
+            assert!(reason.contains("SSRF"), "{outcome:?}");
+        }
+        _ => panic!("loopback must be SSRF-blocked, got {outcome:?}"),
+    }
     let expected_body = serde_json::to_vec(&payload.body).unwrap();
-    assert_eq!(reqs[0].body, expected_body);
-    assert_eq!(sig, webhook_signature_hex("s3cret", &expected_body));
+    let sig = webhook_signature_hex("s3cret", &expected_body);
     assert!(verify_webhook_signature("s3cret", &expected_body, &sig));
     assert!(
         tracker.cooldown_until(&url, 5000).is_none(),
-        "success clears cooldown"
+        "blocked sets no cooldown"
     );
 }
 
 #[test]
 fn deliver_transient_then_cooldown_defers() {
-    let (url, _captured, handle) = stub_server(500, 1);
+    // Wave 3 SSRF hardening: loopback can no longer produce the transient
+    // path (no dial happens), so a blocked URL stays a permanent failure
+    // with no cooldown deferral. Cooldown/defer discipline for reachable
+    // destinations is pinned by the tracker unit tests.
+    let url = closed_loopback_url();
     let tracker = DestinationTracker::new();
     let payload = deliver_payload(&url);
     let outcome =
         webhooks::execute_webhook_deliver(&loopback_client(), &tracker, 1000, 5000, &payload);
     assert!(
-        matches!(outcome, DeliveryOutcome::TransientFailure { .. }),
+        matches!(outcome, DeliveryOutcome::PermanentFailure(_)),
         "{outcome:?}"
     );
-    handle.join().unwrap();
-    // Same instant: destination in cooldown — no second send, no attempt burned.
-    let deferred =
+    // Same instant: still permanent, not deferred — blocked sets no cooldown.
+    let second =
         webhooks::execute_webhook_deliver(&loopback_client(), &tracker, 1000, 5000, &payload);
-    match deferred {
-        DeliveryOutcome::Deferred { until_ms } => {
-            assert_eq!(
-                until_ms,
-                5000 + 1000,
-                "first-failure backoff is one base unit"
-            );
-        }
-        other => panic!("expected Deferred, got {other:?}"),
-    }
+    assert!(
+        matches!(second, DeliveryOutcome::PermanentFailure(_)),
+        "{second:?}"
+    );
 }
 
 #[test]

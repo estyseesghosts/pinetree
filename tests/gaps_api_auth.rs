@@ -179,26 +179,53 @@ fn totp_key_done_passwordless_unregister_rotate() {
     let token = totp_token(&enrol.secret, now_secs).unwrap();
     services.confirm_2fa_key(&bob, "s3cret!", &token).unwrap();
 
-    // passwordless toggle persists.
-    services.set_2fa_passwordless(&bob, true).unwrap();
+    // passwordless can no longer be enabled (adversarial-2 slice 6: no
+    // sign-in path honors it, so the setter refuses `true` and the packer
+    // always emits `false`). Enabling is INVALID_PARAM; `false` stays a
+    // no-op clear.
+    assert_eq!(
+        code_of(services.set_2fa_passwordless(&bob, true).unwrap_err()),
+        "INVALID_PARAM"
+    );
+    services.set_2fa_passwordless(&bob, false).unwrap();
 
-    // rotate swaps the secret; the old token no longer verifies, and the
-    // rotated row is pending until re-confirmed via done.
+    // rotate stages a pending secret under a separate key (upstream
+    // temp-secret parity): the verified secret keeps working until the
+    // new key is confirmed, so rotation never locks login.
     let enrol2 = services.rotate_2fa_key(&bob, "s3cret!").unwrap();
     assert_ne!(enrol.secret, enrol2.secret);
+    // The old secret still verifies under a fresh challenge.
+    services
+        .authenticate_2fa(&bob, &issue_challenge(&services, &bob), &token)
+        .unwrap();
+    // The pending secret does not verify before confirmation.
+    let token2 = totp_token(&enrol2.secret, now_secs).unwrap();
+    assert_eq!(
+        code_of(
+            services
+                .authenticate_2fa(&bob, &issue_challenge(&services, &bob), &token2)
+                .unwrap_err()
+        ),
+        "INVALID_TOKEN"
+    );
+    services.done_2fa(&bob, &token2).unwrap();
+    // After confirmation the new secret verifies and the old one stops.
+    // The confirmation consumed this step's code (replay protection), so
+    // advance past the TOTP step before re-authenticating.
+    clock.advance_ms(60_000);
+    let now_secs = clock.now_ms().div_euclid(1000) as u64;
+    let token2 = totp_token(&enrol2.secret, now_secs).unwrap();
+    services
+        .authenticate_2fa(&bob, &issue_challenge(&services, &bob), &token2)
+        .unwrap();
     assert_eq!(
         code_of(
             services
                 .authenticate_2fa(&bob, &issue_challenge(&services, &bob), &token)
                 .unwrap_err()
         ),
-        "NO_SUCH_2FA"
+        "INVALID_TOKEN"
     );
-    let token2 = totp_token(&enrol2.secret, now_secs).unwrap();
-    services.done_2fa(&bob, &token2).unwrap();
-    services
-        .authenticate_2fa(&bob, &issue_challenge(&services, &bob), &token2)
-        .unwrap();
 
     // unregister drops the row; further use is NO_SUCH_2FA.
     services.unregister_2fa(&bob, "s3cret!").unwrap();
