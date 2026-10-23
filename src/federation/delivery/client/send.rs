@@ -96,6 +96,30 @@ pub(crate) fn with_extra_ca(mut args: Vec<String>, ca: Option<&std::path::Path>)
     args
 }
 
+/// Reject header names/values containing CR or LF before any socket or
+/// subprocess I/O. On the plain-HTTP path a poisoned value would split the
+/// request head (`"{k}: {v}\r\n"`) into smuggled headers; on the curl path it
+/// would ride a `-H` arg. A `debug_assert` is not enough (it compiles out in
+/// release): this returns a permanent error so the caller quarantines instead
+/// of retrying or, worse, sending.
+fn reject_crlf_headers(extra_headers: &[(&str, &str)]) -> Result<(), SendError> {
+    for (name, value) in extra_headers {
+        if name.contains('\r') || name.contains('\n') {
+            return Err(SendError::new(
+                SendErrorKind::InvalidUrl,
+                format!("invalid header name {name:?}: CR/LF rejected"),
+            ));
+        }
+        if value.contains('\r') || value.contains('\n') {
+            return Err(SendError::new(
+                SendErrorKind::InvalidUrl,
+                format!("invalid value for header {name:?}: CR/LF rejected"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl SafeHttpClient {
     pub fn new(config: SafeHttpConfig) -> Self {
         Self { config }
@@ -111,6 +135,7 @@ impl SafeHttpClient {
         body: Option<&[u8]>,
         max_response_bytes: usize,
     ) -> Result<SafeHttpResponse, SendError> {
+        reject_crlf_headers(extra_headers)?;
         self.send_with_resolver(
             method,
             url,
@@ -135,6 +160,7 @@ impl SafeHttpClient {
         max_response_bytes: usize,
         resolver: &BoundedDnsResolver,
     ) -> Result<SafeHttpResponse, SendError> {
+        reject_crlf_headers(extra_headers)?;
         let mut current_url = url.to_string();
         let mut hops = 0usize;
 

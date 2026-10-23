@@ -27,7 +27,7 @@ use crate::domain::webhook::{
     webhook_idempotency_key, webhook_signature_hex,
 };
 use crate::federation::delivery::MAX_AP_JSON_BYTES;
-use crate::federation::delivery::SafeHttpClient;
+use crate::federation::delivery::{SafeHttpClient, SafeHttpConfig};
 use crate::federation::retry::{DeliveryOutcome, DestinationTracker, classify_inbox_status};
 use crate::services::email::EmailSendPayload;
 
@@ -483,8 +483,12 @@ pub fn enqueue_planned(
 /// Execute one `WebhookDeliver` job: cooldown-aware signed POST reusing
 /// the federation outbox's classification/backoff discipline
 /// (`classify_inbox_status` + `DestinationTracker`). SSRF is enforced by
-/// `SafeHttpClient`; a blocked URL is a permanent failure (quarantine,
-/// never retry).
+/// `SafeHttpClient` with `allow_private_ips` forced to `false`: webhook
+/// delivery never inherits the federation testing exemption (env
+/// `PINETREE_ALLOW_PRIVATE_IPS` or a permissive caller config), so a stored
+/// loopback or link-local URL quarantines as a permanent failure instead of
+/// dialing a private address. A blocked URL is a permanent failure
+/// (quarantine, never retry).
 pub fn execute_webhook_deliver(
     client: &SafeHttpClient,
     tracker: &DestinationTracker,
@@ -495,6 +499,14 @@ pub fn execute_webhook_deliver(
     if let Some(until) = tracker.cooldown_until(&payload.url, now_ms) {
         return DeliveryOutcome::Deferred { until_ms: until };
     }
+    // Wave 3 SSRF hardening (the `dispatch.rs` `WebhookDeliver` arm routes
+    // here): the shape gate (`validate_hook_url`) accepts loopback, so the
+    // delivery path is the enforcement point. Clone the caller's timeouts
+    // but never its SSRF exemption.
+    let strict = SafeHttpClient::new(SafeHttpConfig {
+        allow_private_ips: false,
+        ..client.config.clone()
+    });
     let body = serde_json::to_vec(&payload.body).unwrap_or_default();
     let signature = webhook_signature_hex(&payload.secret, &body);
     let headers = [
@@ -502,7 +514,7 @@ pub fn execute_webhook_deliver(
         ("X-Pinetree-Hook-Id", payload.webhook_id.as_str()),
         ("X-Pinetree-Hook-Signature", signature.as_str()),
     ];
-    match client.send(
+    match strict.send(
         "POST",
         &payload.url,
         &headers,

@@ -116,7 +116,17 @@ impl EmailMessage {
             ));
         }
         for addr in &self.to {
-            crate::domain::webhook::validate_email_shape(addr)
+            // Canonicalize to the exact bytes that reach `RCPT TO:<…>` /
+            // `To:` (both write `trim()`), then re-validate the canonical
+            // form. The raw input must already be canonical so surrounding
+            // whitespace cannot smuggle controls past the shape gate.
+            let canonical = addr.trim();
+            if canonical != addr {
+                return Err(EmailError::InvalidMessage(format!(
+                    "bad recipient {addr:?}: surrounding whitespace"
+                )));
+            }
+            crate::domain::webhook::validate_email_shape(canonical)
                 .map_err(|e| EmailError::InvalidMessage(format!("bad recipient {addr:?}: {e}")))?;
         }
         if self.subject.trim().is_empty() || self.subject.chars().count() > 200 {
@@ -216,6 +226,12 @@ impl EmailSender for SmtpEmailSender {
             return Err(EmailError::NotConfigured);
         }
         msg.validate()?;
+        // `SmtpConfig::validate` is not on this path (dormant-transport
+        // check above only); re-validate the canonical sender now so a
+        // half-checked config can never inject via `MAIL FROM:<…>` / `From:`.
+        let from = self.config.smtp_from.trim();
+        crate::domain::webhook::validate_email_shape(from)
+            .map_err(|e| EmailError::InvalidMessage(format!("bad sender: {e}")))?;
         let stream = self.connect()?;
         let mut reader = BufReader::new(
             stream
@@ -255,12 +271,16 @@ impl EmailSender for SmtpEmailSender {
                     other => other,
                 })?;
         }
-        session.command(
-            &format!("MAIL FROM:<{}>", self.config.smtp_from.trim()),
-            250,
-            "MAIL FROM",
-        )?;
+        session.command(&format!("MAIL FROM:<{from}>"), 250, "MAIL FROM")?;
         for rcpt in &msg.to {
+            // Defense-in-depth: re-check the canonical recipient immediately
+            // before it reaches the socket (`validate()` above already gates
+            // this; a future caller that skips validation still fails closed
+            // here instead of injecting). Invalid data is terminal
+            // (`InvalidMessage`, quarantine) rather than a transport retry.
+            let rcpt = rcpt.trim();
+            crate::domain::webhook::validate_email_shape(rcpt)
+                .map_err(|e| EmailError::InvalidMessage(format!("bad recipient {rcpt:?}: {e}")))?;
             // `command` already accepts 250 and 251 for RCPT TO.
             session.command(&format!("RCPT TO:<{rcpt}>"), 250, "RCPT TO")?;
         }
@@ -366,7 +386,11 @@ impl SmtpEmailSender {
     fn render(&self, msg: &EmailMessage) -> Vec<u8> {
         let mut out = String::new();
         out.push_str(&format!("From: {}\r\n", self.config.smtp_from.trim()));
-        out.push_str(&format!("To: {}\r\n", msg.to.join(", ")));
+        // Canonical recipients only: validated addresses carry no CR, LF,
+        // `<`, `>`, `,`, whitespace, or controls, so joining with `", "`
+        // cannot smuggle extra headers.
+        let recipients: Vec<&str> = msg.to.iter().map(|addr| addr.trim()).collect();
+        out.push_str(&format!("To: {}\r\n", recipients.join(", ")));
         out.push_str(&format!("Subject: {}\r\n", encode_subject(&msg.subject)));
         out.push_str("MIME-Version: 1.0\r\n");
         out.push_str("Content-Type: text/plain; charset=utf-8\r\n");

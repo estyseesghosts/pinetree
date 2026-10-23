@@ -147,11 +147,30 @@ pub fn validate_trigger(trigger: &str, allowed: &[&str]) -> Result<(), DomainErr
 
 /// Basic email shape check (same rule as the `i/update-email` endpoint
 /// helper: one `@`, non-empty local/domain, dot in domain, 3..=254).
+///
+/// SMTP-injection gate: rejects CR, LF, `<`, `>`, `,`, any whitespace, and
+/// any other control character, so a validated address can never smuggle
+/// extra headers (`Bcc:`) or envelope commands (`DATA`) into `RCPT TO:<…>`
+/// or `To:` lines. Length and single-`@` rules are unchanged.
 pub fn validate_email_shape(addr: &str) -> Result<(), DomainError> {
     if addr.len() < 3 || addr.len() > 254 {
         return Err(DomainError::Validation(
             "email must be 3..=254 chars".to_string(),
         ));
+    }
+    for c in addr.chars() {
+        if c == '\r'
+            || c == '\n'
+            || c == '<'
+            || c == '>'
+            || c == ','
+            || c.is_whitespace()
+            || c.is_control()
+        {
+            return Err(DomainError::Validation(
+                "malformed email address".to_string(),
+            ));
+        }
     }
     let mut parts = addr.split('@');
     match (parts.next(), parts.next(), parts.next()) {
@@ -246,6 +265,19 @@ mod tests {
         assert!(validate_trigger("mention", USER_WEBHOOK_TRIGGERS).is_ok());
         assert!(validate_email_shape("mod@example.com").is_ok());
         assert!(validate_email_shape("nope").is_err());
+        // SMTP-injection shapes: must fail without weakening the
+        // length / single-`@` rules above.
+        assert!(validate_email_shape("a@b\r\nBcc: x@y").is_err());
+        assert!(validate_email_shape("a@b\r\nDATA\r\n").is_err());
+        assert!(validate_email_shape("a@b\rc@example.com").is_err());
+        assert!(validate_email_shape("a@b\nc@example.com").is_err());
+        assert!(validate_email_shape("a<b@example.com").is_err());
+        assert!(validate_email_shape("a>b@example.com").is_err());
+        assert!(validate_email_shape("a,b@example.com").is_err());
+        assert!(validate_email_shape("a @b.example.com").is_err());
+        assert!(validate_email_shape(" a@b.example.com").is_err());
+        assert!(validate_email_shape("a@b.example.com ").is_err());
+        assert!(validate_email_shape("a@b\x7f.example.com").is_err());
     }
 
     #[test]
