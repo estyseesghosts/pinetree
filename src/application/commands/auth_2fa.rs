@@ -41,6 +41,15 @@ pub(crate) const TOTP_CHALLENGE_TTL_MS: i64 = 5 * 60 * 1000;
 /// here, so the check-and-write stays one durable transaction.
 const KEY_TOTP_CHALLENGE: &str = "totp_challenge";
 
+/// Registry key under scope [`SCOPE_2FA`] for the pending (unconfirmed)
+/// TOTP secret minted by `register` / `update-key`. Upstream Misskey keeps
+/// this in a separate `twoFactorTempSecret` column so rotation never
+/// clobbers the live secret; pinetree mirrors that with a separate
+/// registry row holding an unverified [`TotpState`]. Only `done` /
+/// `key-done` promote it to [`KEY_TOTP`], so the verified secret keeps
+/// working until the new key is confirmed.
+const KEY_TOTP_PENDING: &str = "totp_pending";
+
 /// Outstanding second-factor challenge: issued only after a password
 /// success, bound to one account, single-use, expiring. Stored as a
 /// registry row under the owning account so the binding is structural.
@@ -78,6 +87,44 @@ impl AppServices {
         }
     }
 
+    /// The pending (unconfirmed) secret under [`KEY_TOTP_PENDING`], if any.
+    fn pending_totp_row(&self, account_id: &str) -> Result<Option<TotpState>, PortError> {
+        let item = self.registry.registry_get(
+            account_id,
+            None,
+            &vec![SCOPE_2FA.to_string()],
+            KEY_TOTP_PENDING,
+        )?;
+        match item {
+            None => Ok(None),
+            Some(item) => serde_json::from_value(item.value)
+                .map(Some)
+                .map_err(|e| PortError::Validation(format!("INVALID_PARAM corrupt 2fa row: {e}"))),
+        }
+    }
+
+    fn store_pending_totp_row(&self, account_id: &str, state: &TotpState) -> Result<(), PortError> {
+        self.registry.registry_set(RegistryItem {
+            id: self.ids.generate(),
+            user_id: account_id.to_string(),
+            domain: None,
+            scope: vec![SCOPE_2FA.to_string()],
+            key: KEY_TOTP_PENDING.to_string(),
+            value: serde_json::to_value(state)
+                .map_err(|e| PortError::Validation(format!("INVALID_PARAM 2fa encode: {e}")))?,
+            updated_at_ms: self.now_ms(),
+        })
+    }
+
+    fn remove_pending_totp_row(&self, account_id: &str) -> Result<(), PortError> {
+        self.registry.registry_remove(
+            account_id,
+            None,
+            &vec![SCOPE_2FA.to_string()],
+            KEY_TOTP_PENDING,
+        )
+    }
+
     fn store_totp_row(&self, account_id: &str, state: &TotpState) -> Result<(), PortError> {
         self.registry.registry_set(RegistryItem {
             id: self.ids.generate(),
@@ -99,16 +146,19 @@ impl AppServices {
     fn check_password(&self, account_id: &str, password: &str) -> Result<(), PortError> {
         let stored = self.auth.get_password_hash(account_id)?;
         let stored = stored.as_deref().unwrap_or("");
-        if !crate::api::misskey::auth::verify_password(password, stored) {
+        if !crate::domain::password::verify_password(password, stored) {
             return Err(PortError::Validation("INCORRECT_PASSWORD".to_string()));
         }
         Ok(())
     }
 
+    /// Mint a pending secret under [`KEY_TOTP_PENDING`] (upstream
+    /// `register.ts` `twoFactorTempSecret` parity): the live verified row,
+    /// if any, is untouched until the new key is confirmed.
     fn enrol_totp(&self, account_id: &str, label: String) -> Result<TotpEnrolment, PortError> {
         let secret_bytes: [u8; 20] = rand::random();
         let secret = base32_encode(&secret_bytes);
-        self.store_totp_row(
+        self.store_pending_totp_row(
             account_id,
             &TotpState {
                 secret_b32: secret.clone(),
@@ -126,6 +176,49 @@ impl AppServices {
             secret,
             label,
         })
+    }
+
+    /// Promote the pending secret to the verified row after a token check
+    /// (upstream `done.ts` temp-secret promotion parity). The previous
+    /// verified secret, if any, keeps working until this promotion commits,
+    /// and its stored `passwordless` bit is preserved. Legacy rows written
+    /// before the pending-key separation (an unverified secret under
+    /// [`KEY_TOTP`]) confirm in place; re-confirming an already-verified
+    /// row with a live token stays a no-op success.
+    fn promote_pending_totp(&self, account_id: &str, token: &str) -> Result<(), PortError> {
+        validate_totp_token_format(token)?;
+        let now = self.now_ms();
+        if let Some(pending) = self.pending_totp_row(account_id)? {
+            if !verify_totp(&pending.secret_b32, now, token) {
+                return Err(PortError::Validation("INVALID_TOKEN".to_string()));
+            }
+            let preserved = self
+                .totp_row(account_id)?
+                .filter(|state| state.verified)
+                .map(|state| state.passwordless)
+                .unwrap_or(false);
+            self.store_totp_row(
+                account_id,
+                &TotpState {
+                    secret_b32: pending.secret_b32,
+                    verified: true,
+                    passwordless: preserved,
+                },
+            )?;
+            self.remove_pending_totp_row(account_id)?;
+            return Ok(());
+        }
+        let mut state = self
+            .totp_row(account_id)?
+            .ok_or_else(|| PortError::NotFound("NO_SUCH_2FA".to_string()))?;
+        if !verify_totp(&state.secret_b32, now, token) {
+            return Err(PortError::Validation("INVALID_TOKEN".to_string()));
+        }
+        if !state.verified {
+            state.verified = true;
+            self.store_totp_row(account_id, &state)?;
+        }
+        Ok(())
     }
 
     fn username_label(&self, account_id: &str) -> Result<String, PortError> {
@@ -154,7 +247,7 @@ impl AppServices {
     }
 
     /// `i/2fa/key-done` (upstream `key-done.ts`): password + token verify,
-    /// marks the pending secret verified.
+    /// promotes the pending secret to verified.
     pub fn confirm_2fa_key(
         &self,
         account_id: &str,
@@ -162,51 +255,60 @@ impl AppServices {
         token: &str,
     ) -> Result<(), PortError> {
         self.check_password(account_id, password)?;
-        validate_totp_token_format(token)?;
-        let mut state = self
-            .totp_row(account_id)?
-            .ok_or_else(|| PortError::NotFound("NO_SUCH_2FA".to_string()))?;
-        if !verify_totp(&state.secret_b32, self.now_ms(), token) {
-            return Err(PortError::Validation("INVALID_TOKEN".to_string()));
-        }
-        state.verified = true;
-        self.store_totp_row(account_id, &state)
+        self.promote_pending_totp(account_id, token)
     }
 
     /// `i/2fa/done` (upstream `done.ts`): token-only confirm of a pending
     /// secret (the `register` response flow).
     pub fn done_2fa(&self, account_id: &str, token: &str) -> Result<(), PortError> {
-        validate_totp_token_format(token)?;
-        let mut state = self
-            .totp_row(account_id)?
-            .ok_or_else(|| PortError::NotFound("NO_SUCH_2FA".to_string()))?;
-        if !verify_totp(&state.secret_b32, self.now_ms(), token) {
-            return Err(PortError::Validation("INVALID_TOKEN".to_string()));
-        }
-        state.verified = true;
-        self.store_totp_row(account_id, &state)
+        self.promote_pending_totp(account_id, token)
     }
 
-    /// `i/2fa/password-less` (upstream `password-less.ts`): toggle login
-    /// without password for a verified secret.
+    /// `i/2fa/password-less` (upstream `password-less.ts`): refused when
+    /// enabling. DIVERGENCE (adversarial-2 finding 7): pinetree implements
+    /// no passwordless sign-in — every sign-in path still requires the
+    /// password before the TOTP challenge — so the flag must never be
+    /// advertised (`MeDetailed::usePasswordLessLogin` packs `false`
+    /// always) nor persisted anew. `value: true` answers `INVALID_PARAM`;
+    /// `value: false` clears a legacy stored `true` and is a no-op
+    /// success when no verified secret exists (already effectively
+    /// disabled). Stored legacy `true` rows keep signing in with
+    /// password + TOTP; the bit is data, not a capability.
     pub fn set_2fa_passwordless(&self, account_id: &str, value: bool) -> Result<(), PortError> {
-        let mut state = self.verified_totp(account_id)?;
-        state.passwordless = value;
+        if value {
+            return Err(PortError::Validation(
+                "INVALID_PARAM passwordless login is not supported: sign-in always requires the password before the TOTP challenge"
+                    .to_string(),
+            ));
+        }
+        let Some(mut state) = self.totp_row(account_id)? else {
+            // No secret at all: already effectively disabled.
+            return Ok(());
+        };
+        if !state.verified {
+            // No verified secret: nothing enabled to clear.
+            return Ok(());
+        }
+        state.passwordless = false;
         self.store_totp_row(account_id, &state)
     }
 
     /// `i/2fa/unregister` (upstream `unregister.ts`): password check, drop
-    /// the whole row.
+    /// both the verified row and any pending rotation.
     pub fn unregister_2fa(&self, account_id: &str, password: &str) -> Result<(), PortError> {
         self.check_password(account_id, password)?;
-        if self.totp_row(account_id)?.is_none() {
+        if self.totp_row(account_id)?.is_none() && self.pending_totp_row(account_id)?.is_none() {
             return Err(PortError::NotFound("NO_SUCH_2FA".to_string()));
         }
-        self.remove_totp_row(account_id)
+        self.remove_totp_row(account_id)?;
+        self.remove_pending_totp_row(account_id)
     }
 
-    /// `i/2fa/update-key` (upstream `update-key.ts`): password check, rotate
-    /// to a fresh pending secret (must be re-confirmed via `done`).
+    /// `i/2fa/update-key`: password check, then mint a fresh pending
+    /// secret under [`KEY_TOTP_PENDING`] (must be re-confirmed via `done`
+    /// or `key-done`). The verified secret is NOT clobbered: it keeps
+    /// working until the new key is confirmed (upstream temp-secret
+    /// parity — rotation must not lock login).
     pub fn rotate_2fa_key(
         &self,
         account_id: &str,
@@ -225,8 +327,12 @@ impl AppServices {
     /// like the password path.
     ///
     /// Account gates mirror `authenticate()`: suspended refuses loudly
-    /// (403); deleted/missing accounts answer like a TOTP-less account
-    /// (400 `NO_SUCH_2FA`), so the endpoint is not a username oracle.
+    /// (403); missing accounts answer like a TOTP-less account
+    /// (404 `NO_SUCH_2FA`), so the endpoint is not a username oracle.
+    /// Deleted accounts also answer `NO_SUCH_2FA` — even though storage
+    /// marks a deleted account suspended too — so replaying a pre-deletion
+    /// challenge is indistinguishable from a TOTP-less account within the
+    /// 5-minute challenge TTL (Wave 8 oracle closure).
     /// Challenge validation, the cross-challenge replay guard, the
     /// last-step record, and challenge removal commit in one
     /// `RegistryStore::consume_totp_login` transaction, so two
@@ -247,14 +353,17 @@ impl AppServices {
                     "NO_SUCH_2FA no second factor is enabled".to_string(),
                 ));
             }
-            Some(account) if account.is_suspended => {
-                return Err(PortError::Validation(
-                    "USER_SUSPENDED account is suspended".to_string(),
-                ));
-            }
+            // Deleted first: storage marks deleted accounts suspended too,
+            // but a deleted account must read exactly like a TOTP-less one
+            // (see the gate docs above), never like a suspended one.
             Some(account) if account.is_deleted => {
                 return Err(PortError::NotFound(
                     "NO_SUCH_2FA no second factor is enabled".to_string(),
+                ));
+            }
+            Some(account) if account.is_suspended => {
+                return Err(PortError::Validation(
+                    "USER_SUSPENDED account is suspended".to_string(),
                 ));
             }
             Some(_) => {}
@@ -277,9 +386,12 @@ impl AppServices {
     }
 
     /// Packed `MeDetailed` security flags: `(twoFactorEnabled,
-    /// usePasswordLessLogin)` from the persisted row. `securityKeys`
+    /// storedPasswordless)` from the persisted row. `securityKeys`
     /// stays `false` at the packer: pinetree stores no WebAuthn
-    /// credentials, so there is nothing to reflect.
+    /// credentials, so there is nothing to reflect. DIVERGENCE
+    /// (adversarial-2 finding 7): the second value is the legacy stored
+    /// bit only — the packer always emits `usePasswordLessLogin: false`
+    /// because no sign-in path honors passwordless login.
     pub(crate) fn totp_flags(&self, account_id: &str) -> Result<(bool, bool), PortError> {
         match self.totp_row(account_id)? {
             Some(state) if state.verified => Ok((true, state.passwordless)),
@@ -337,9 +449,14 @@ impl AppServices {
             ));
         }
         if self.now_ms() > stored.expires_at_ms {
-            let _ = self
-                .registry
-                .registry_remove(account_id, None, &scope, KEY_TOTP_CHALLENGE);
+            // Prune the expired row on read. A prune failure must not mask
+            // the expiry: log it and still report the challenge expired.
+            if let Err(err) =
+                self.registry
+                    .registry_remove(account_id, None, &scope, KEY_TOTP_CHALLENGE)
+            {
+                eprintln!("2fa: failed to prune expired challenge for {account_id}: {err:?}");
+            }
             return Err(PortError::Validation(
                 "INVALID_TOKEN challenge expired".to_string(),
             ));
@@ -361,14 +478,16 @@ impl AppServices {
     }
 
     /// `admin/unset-mfa` (covers the `mfa` scope item): admin clears a
-    /// user's TOTP row without their password. Missing row is a no-op
-    /// success (upstream `unset-mfa` parity posture).
+    /// user's TOTP rows (verified and any pending rotation) without their
+    /// password. Missing rows are a no-op success (upstream `unset-mfa`
+    /// parity posture).
     pub fn admin_unset_2fa(&self, account_id: &str) -> Result<(), PortError> {
         self.accounts.get_owner(account_id)?;
         self.accounts
             .find_by_id(account_id)?
             .ok_or_else(|| PortError::NotFound("NO_SUCH_USER".to_string()))?;
-        self.remove_totp_row(account_id)
+        self.remove_totp_row(account_id)?;
+        self.remove_pending_totp_row(account_id)
     }
 
     fn verified_totp(&self, account_id: &str) -> Result<TotpState, PortError> {

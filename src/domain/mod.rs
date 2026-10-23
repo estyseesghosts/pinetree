@@ -18,6 +18,7 @@ pub mod muting;
 pub mod note;
 pub mod notification;
 pub mod page;
+pub mod password;
 pub mod pinning;
 pub mod policy;
 pub mod poll;

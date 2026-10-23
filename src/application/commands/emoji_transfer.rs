@@ -153,7 +153,7 @@ fn export_custom_emojis(
         // `EmojiDetailed` pack (upstream `emoji` row parity); the packer
         // falls back to the canonical `/emojis/:name` URL when the drive
         // row is gone, so unreachable rows still serialize.
-        let packed = crate::api::misskey::packers::pack_emoji_detailed(emoji, services);
+        let packed = super::emoji::emoji_detailed_value(emoji, services);
         meta_rows.push(serde_json::json!({
             "fileName": file_name,
             "downloaded": downloaded,

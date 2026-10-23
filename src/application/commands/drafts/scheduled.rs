@@ -4,7 +4,7 @@ use crate::application::ports::{
     CreateDraftInput, CreateNoteInput, JobKind, NewJob, PortError, ScheduledDraftPayload,
 };
 use crate::domain::draft::NoteDraft;
-use crate::domain::notification::NotificationKind;
+use crate::domain::notification::{Notification, NotificationKind};
 use crate::domain::poll::PollInput;
 
 /// Outcome of one `PostScheduledDraft` job (worker settlement + tests).
@@ -21,19 +21,25 @@ pub enum PostScheduledOutcome {
 }
 
 impl AppServices {
+    /// Post one due scheduled draft. Returns the settlement plus, when a
+    /// notification row was inserted, the stored row itself (the pack
+    /// input): the caller — the `PostScheduledDraft` worker, an adapter —
+    /// packs the `main`-channel body worker-side (mirroring
+    /// `push_notify_mains`), so the application layer never touches wire
+    /// shapes.
     pub fn post_scheduled_draft(
         &self,
         draft_id: &str,
         scheduled_at_ms: i64,
-    ) -> Result<PostScheduledOutcome, PortError> {
+    ) -> Result<(PostScheduledOutcome, Option<Notification>), PortError> {
         let Some(draft) = self.notes.get_draft(draft_id)? else {
-            return Ok(PostScheduledOutcome::Skipped);
+            return Ok((PostScheduledOutcome::Skipped, None));
         };
         if !draft.is_actually_scheduled || draft.scheduled_at_ms != Some(scheduled_at_ms) {
-            return Ok(PostScheduledOutcome::Skipped);
+            return Ok((PostScheduledOutcome::Skipped, None));
         }
         if scheduled_at_ms > self.now_ms() {
-            return Ok(PostScheduledOutcome::Skipped);
+            return Ok((PostScheduledOutcome::Skipped, None));
         }
         let input = CreateNoteInput {
             author_id: draft.user_id.clone(),
@@ -68,24 +74,24 @@ impl AppServices {
                 // Post succeeded: drop the draft (its arming already fired)
                 // and notify.
                 self.notes.delete_draft(&draft.id, Vec::new())?;
-                self.emit_scheduled_notification(
+                let stored = self.insert_scheduled_notification(
                     &draft.user_id,
                     NotificationKind::ScheduledNotePosted,
                     Some(note.id),
                     None,
                 )?;
-                Ok(PostScheduledOutcome::Posted)
+                Ok((PostScheduledOutcome::Posted, Some(stored)))
             }
             Err(_) => {
                 // Post failed: the draft is kept (upstream parity) and the
                 // failure is notified with the draft attached.
-                self.emit_scheduled_notification(
+                let stored = self.insert_scheduled_notification(
                     &draft.user_id,
                     NotificationKind::ScheduledNotePostFailed,
                     None,
                     Some(draft.id),
                 )?;
-                Ok(PostScheduledOutcome::Failed)
+                Ok((PostScheduledOutcome::Failed, Some(stored)))
             }
         }
     }
@@ -165,38 +171,30 @@ impl AppServices {
     }
 
     /// Insert a scheduling notification directly (the worker is already
-    /// inside a job: no extra queue hop) and fan the `main`-channel
-    /// `notification` hint out through the streaming sink.
-    fn emit_scheduled_notification(
+    /// inside a job: no extra queue hop) and return the stored row. The
+    /// caller packs the `main`-channel body worker-side, so this stays
+    /// clear of wire shapes.
+    fn insert_scheduled_notification(
         &self,
         user_id: &str,
         kind: NotificationKind,
         note_id: Option<String>,
         draft_id: Option<String>,
-    ) -> Result<(), PortError> {
-        let stored =
-            self.notifications
-                .insert_notification(crate::domain::notification::Notification {
-                    id: self.ids.generate(),
-                    notifiee_id: user_id.to_string(),
-                    notifier_id: user_id.to_string(),
-                    kind,
-                    note_id,
-                    reaction: None,
-                    draft_id,
-                    file_id: None,
-                    exported_entity: None,
-                    clip_id: None,
-                    page_id: None,
-                    is_read: false,
-                })?;
-        let packed = crate::api::misskey::packers::pack_notification(&stored, self);
-        self.streaming
-            .push_main(crate::application::events::MainMessage {
-                user_id: user_id.to_string(),
-                kind: crate::application::events::MainEventKind::Notification,
-                body: packed,
-            })
+    ) -> Result<Notification, PortError> {
+        self.notifications.insert_notification(Notification {
+            id: self.ids.generate(),
+            notifiee_id: user_id.to_string(),
+            notifier_id: user_id.to_string(),
+            kind,
+            note_id,
+            reaction: None,
+            draft_id,
+            file_id: None,
+            exported_entity: None,
+            clip_id: None,
+            page_id: None,
+            is_read: false,
+        })
     }
     pub fn create_scheduled_note(
         &self,

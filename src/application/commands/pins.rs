@@ -505,7 +505,7 @@ mod tests {
     }
 
     #[test]
-    fn pin_packs_into_user_and_federates_for_public() {
+    fn pin_surfaces_through_pinned_ids_and_federates_for_public() {
         use crate::application::ports::JobKind;
         let (services, _) = pin_services("pack");
         let alice = services.create_account("alice", None).unwrap();
@@ -527,15 +527,12 @@ mod tests {
         }
         assert_eq!(featured_jobs, 1);
 
-        // The packer surfaces the pinning.
-        let packed = crate::api::misskey::packers::pack_user_detailed_not_me(
-            &services.accounts.find_by_id(&alice.id).unwrap().unwrap(),
-            Some(&alice.id),
-            &services,
-        )
-        .unwrap();
-        assert_eq!(packed["pinnedNoteIds"][0], serde_json::json!(note.id));
-        assert_eq!(packed["pinnedNotes"][0]["id"], serde_json::json!(note.id));
+        // The application pack input the user packer consumes:
+        // pinned ids read back oldest-first.
+        assert_eq!(
+            services.pinned_note_ids(&alice.id).unwrap(),
+            vec![note.id.clone()]
+        );
     }
 
     #[test]

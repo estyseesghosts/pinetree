@@ -1,10 +1,9 @@
-use std::collections::HashSet;
-
 use super::super::AppServices;
+use crate::application::commands::helpers::NoteSideEffectMode;
 
 use crate::application::events::StreamingEvent;
 use crate::application::ports::{CreateNoteInput, EditNoteInput, NewJob, PortError};
-use crate::domain::note::{Note, extract_mentions};
+use crate::domain::note::Note;
 use crate::domain::notification::NotificationKind;
 use crate::domain::poll::PollInput;
 use crate::domain::reaction::{Reaction, coerce_reaction};
@@ -24,77 +23,20 @@ impl AppServices {
         if self.inbound_host_blocked(&input.author_id) {
             return Ok(None);
         }
-        let mut jobs = Vec::new();
-        // One `Notify` per user (mirrors the local `create_note` dedup):
-        // a remote note that is both a reply and a mention must not emit
-        // two `notification` frames.
-        let mut already_notified: HashSet<String> = HashSet::new();
-        if let Some(reply_id) = input.reply_to.as_deref() {
-            if let Ok(Some(target)) = self.notes.get_note(reply_id) {
-                if target.author_id != input.author_id {
-                    already_notified.insert(target.author_id.clone());
-                    if let Ok(job) = self.notify_job(
-                        &target.author_id,
-                        &input.author_id,
-                        NotificationKind::Reply,
-                        Some("__PENDING_NOTE_ID__".to_string()),
-                        None,
-                        "inbound-reply",
-                    ) {
-                        jobs.push(job);
-                    }
-                }
-            }
-        }
-        if let Some(renote_id) = input.renote_of.as_deref() {
-            if let Ok(Some(target)) = self.notes.get_note(renote_id) {
-                if target.author_id != input.author_id
-                    && !already_notified.contains(&target.author_id)
-                {
-                    already_notified.insert(target.author_id.clone());
-                    if let Ok(job) = self.notify_job(
-                        &target.author_id,
-                        &input.author_id,
-                        NotificationKind::Renote,
-                        Some("__PENDING_NOTE_ID__".to_string()),
-                        None,
-                        "inbound-renote",
-                    ) {
-                        jobs.push(job);
-                    }
-                }
-            }
-        }
-        if !input.no_extract_mentions {
-            let mut text = input.text.clone().unwrap_or_default();
-            if let Some(cw) = input.cw.as_ref() {
-                text.push('\n');
-                text.push_str(cw);
-            }
-            let mut seen: HashSet<String> = HashSet::new();
-            for username in extract_mentions(&text) {
-                let lower = username.to_lowercase();
-                if !seen.insert(lower.clone()) {
-                    continue;
-                }
-                if let Ok(Some(mentioned)) = self.accounts.find_by_handle(&lower) {
-                    if mentioned.id != input.author_id && !already_notified.contains(&mentioned.id)
-                    {
-                        already_notified.insert(mentioned.id.clone());
-                        if let Ok(job) = self.notify_job(
-                            &mentioned.id,
-                            &input.author_id,
-                            NotificationKind::Mention,
-                            Some("__PENDING_NOTE_ID__".to_string()),
-                            None,
-                            "inbound-mention",
-                        ) {
-                            jobs.push(job);
-                        }
-                    }
-                }
-            }
-        }
+        // Reply, renote, and mention `Notify` jobs through the shared
+        // application operation (same triple the local `create_note`
+        // builds; best-effort here so one bad reference never fails the
+        // inbox delivery).
+        let effects = self.note_interaction_jobs(
+            &input.author_id,
+            input.reply_to.as_deref(),
+            input.renote_of.as_deref(),
+            input.text.as_deref(),
+            input.cw.as_deref(),
+            input.no_extract_mentions,
+            NoteSideEffectMode::Inbound,
+        )?;
+        let mut jobs = effects.jobs;
         jobs.push(self.streaming_job(
             &StreamingEvent::NoteCreated {
                 note_id: "__PENDING_NOTE_ID__".to_string(),

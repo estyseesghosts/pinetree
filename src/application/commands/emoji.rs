@@ -648,3 +648,120 @@ impl AppServices {
         self.emojis.list_remote_emojis(query, host, cursor)
     }
 }
+
+// --- Export wire values (moved down from the Misskey adapter) --------------
+//
+// `export_custom_emojis` (the transfer worker path) embeds the `EmojiDetailed`
+// upstream row shape in `meta.json`. The JSON construction lives here — in
+// the application layer, over domain types — so the export job does not
+// import the HTTP adapter; the Misskey `pack_emoji_detailed` packer delegates to
+// [`emoji_detailed_value`] and keeps the HTTP shape canonical in one place.
+
+/// Served URL for one local emoji: the drive file's URL, falling back to
+/// the canonical `/emojis/:name` path when the file row is gone (upstream
+/// renders `publicUrl || originalUrl`; pinetree has one served URL).
+pub fn emoji_served_url(emoji: &CustomEmoji, services: &AppServices) -> serde_json::Value {
+    if let Some(media_id) = emoji.media_id.as_deref() {
+        if let Ok(Some(meta)) = services.media.get(media_id) {
+            return serde_json::Value::String(meta.url.clone());
+        }
+    }
+    serde_json::Value::String(format!(
+        "{}/emojis/{}",
+        services.public_url.trim_end_matches('/'),
+        emoji.shortcode
+    ))
+}
+
+/// Custom emoji packs (Batch N WS1; Misskey `EmojiEntityService` parity).
+/// `EmojiSimple {aliases, name, category, url, localOnly?, isSensitive?,
+/// roleIds…?}` omits falsy `localOnly`/`isSensitive` and empty `roleIds`
+/// (upstream `omit` parity); `url` prefers the served drive URL.
+pub fn emoji_simple_value(emoji: &CustomEmoji, services: &AppServices) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "name".to_string(),
+        serde_json::Value::String(emoji.shortcode.clone()),
+    );
+    if let Some(category) = emoji.category.as_deref() {
+        obj.insert(
+            "category".to_string(),
+            serde_json::Value::String(category.to_string()),
+        );
+    }
+    obj.insert(
+        "aliases".to_string(),
+        serde_json::Value::Array(
+            emoji
+                .aliases
+                .iter()
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect(),
+        ),
+    );
+    obj.insert("url".to_string(), emoji_served_url(emoji, services));
+    if emoji.local_only {
+        obj.insert("localOnly".to_string(), serde_json::Value::Bool(true));
+    }
+    if emoji.is_sensitive {
+        obj.insert("isSensitive".to_string(), serde_json::Value::Bool(true));
+    }
+    if !emoji.role_ids.is_empty() {
+        obj.insert(
+            "roleIdsThatCanBeUsedThisEmojiAsReaction".to_string(),
+            serde_json::Value::Array(
+                emoji
+                    .role_ids
+                    .iter()
+                    .cloned()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    serde_json::Value::Object(obj)
+}
+
+/// `EmojiDetailed` (upstream `emoji` row parity): `pack_emoji_simple` plus
+/// `id/host/license` (+ stored media flags verbatim).
+pub fn emoji_detailed_value(emoji: &CustomEmoji, services: &AppServices) -> serde_json::Value {
+    let mut obj = match emoji_simple_value(emoji, services) {
+        serde_json::Value::Object(map) => map,
+        other => return other,
+    };
+    obj.insert(
+        "id".to_string(),
+        serde_json::Value::String(emoji.id.clone()),
+    );
+    obj.insert("host".to_string(), serde_json::Value::Null);
+    obj.insert(
+        "license".to_string(),
+        emoji
+            .license
+            .clone()
+            .map(serde_json::Value::String)
+            .unwrap_or(serde_json::Value::Null),
+    );
+    // Stored (never enforced — pinetree has no custom-role subsystem).
+    obj.insert(
+        "localOnly".to_string(),
+        serde_json::Value::Bool(emoji.local_only),
+    );
+    obj.insert(
+        "isSensitive".to_string(),
+        serde_json::Value::Bool(emoji.is_sensitive),
+    );
+    obj.insert(
+        "roleIdsThatCanBeUsedThisEmojiAsReaction".to_string(),
+        serde_json::Value::Array(
+            emoji
+                .role_ids
+                .iter()
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect(),
+        ),
+    );
+    serde_json::Value::Object(obj)
+}

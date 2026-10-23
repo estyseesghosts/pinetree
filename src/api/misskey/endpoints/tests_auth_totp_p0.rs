@@ -20,6 +20,8 @@ use super::super::auth_http::miauth_submit;
 use super::super::tests_common::{call, signup_user, test_peer, test_state};
 use crate::api::misskey::response::RateLimiter;
 use crate::application::commands::auth_2fa::totp_token;
+use crate::application::ports::RegistryItem;
+use crate::domain::admin::{KEY_TOTP, SCOPE_2FA, TotpState};
 use crate::domain::id::ManualClock;
 
 fn now_secs(state: &super::super::ApiState) -> u64 {
@@ -446,9 +448,10 @@ async fn suspended_and_deleted_blocked() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
-    // Deleted accounts fail closed at both factors. (Storage marks a
-    // deleted account suspended too, so — like `authenticate()` — the
-    // suspended gate answers first with 403.)
+    // Deleted accounts read exactly like TOTP-less accounts (Wave 8
+    // oracle closure): replaying a pre-deletion challenge answers 400
+    // `NO_SUCH_2FA`, never 403 — even though storage also marks the
+    // deleted row suspended, the deleted gate answers first.
     let (bob_id, bob_token) = signup_user(&state, "bob").await;
     let bob_secret = enable_totp(&state, &bob_token, &clock).await;
     let (status, value) = call(
@@ -472,8 +475,8 @@ async fn suspended_and_deleted_blocked() {
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{value}");
-    assert_eq!(value["error"]["code"], "USER_SUSPENDED", "{value}");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+    assert_eq!(value["error"]["code"], "NO_SUCH_2FA", "{value}");
 
     // Past the progressive delay the failed attempt above armed on the
     // shared test IP.
@@ -489,13 +492,17 @@ async fn suspended_and_deleted_blocked() {
     assert_ne!(status, StatusCode::OK, "{value}");
 }
 
-/// Passwordless mode never downgrades a TOTP account to password-only.
+/// Passwordless login can never be enabled: the setter refuses `true`,
+/// the packer reports `false`, and a TOTP account still needs
+/// password + TOTP (adversarial-2 finding 7: pinetree implements no
+/// passwordless sign-in, so the capability is never advertised).
 #[tokio::test]
 async fn passwordless_does_not_downgrade() {
     let (state, clock) = test_state();
     let (_, token) = signup_user(&state, "alice").await;
     let secret = enable_totp(&state, &token, &clock).await;
 
+    // Enabling is refused and persists nothing.
     let (status, value) = call(
         &state,
         "i/2fa/password-less",
@@ -503,11 +510,22 @@ async fn passwordless_does_not_downgrade() {
         Some(&token),
     )
     .await;
-    assert_eq!(status, StatusCode::NO_CONTENT, "{value}");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+    assert_eq!(value["error"]["code"], "INVALID_PARAM", "{value}");
 
     let packed = me(&state, &token).await;
     assert_eq!(packed["twoFactorEnabled"], true);
-    assert_eq!(packed["usePasswordLessLogin"], true);
+    assert_eq!(packed["usePasswordLessLogin"], false);
+
+    // Disabling again is a no-op success (already clear).
+    let (status, value) = call(
+        &state,
+        "i/2fa/password-less",
+        serde_json::json!({ "value": false }),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{value}");
 
     // Password-only is still rejected.
     let (status, value) = call(
@@ -542,6 +560,81 @@ async fn passwordless_does_not_downgrade() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{value}");
+}
+
+/// A legacy stored `passwordless: true` row (written before the setter
+/// refused it) still packs `false` and still requires password + TOTP.
+#[tokio::test]
+async fn legacy_passwordless_true_still_requires_password() {
+    let (state, clock) = test_state();
+    let (alice_id, token) = signup_user(&state, "alice").await;
+    let secret = enable_totp(&state, &token, &clock).await;
+
+    // Simulate a pre-fix row by flipping the stored bit directly: the
+    // setter no longer permits this, so only legacy data can hold it.
+    let scope = vec![SCOPE_2FA.to_string()];
+    let item = state
+        .services
+        .registry
+        .registry_get(&alice_id, None, &scope, KEY_TOTP)
+        .expect("read totp row")
+        .expect("totp row present");
+    let mut stored: TotpState = serde_json::from_value(item.value).expect("decode totp row");
+    assert!(stored.verified, "test setup must leave a verified secret");
+    stored.passwordless = true;
+    state
+        .services
+        .registry
+        .registry_set(RegistryItem {
+            id: state.services.ids.generate(),
+            user_id: alice_id.clone(),
+            domain: None,
+            scope,
+            key: KEY_TOTP.to_string(),
+            value: serde_json::to_value(&stored).expect("encode totp row"),
+            updated_at_ms: state.services.clock.now_ms(),
+        })
+        .expect("write legacy passwordless row");
+
+    // Still advertised as `false` despite the stored `true`.
+    let packed = me(&state, &token).await;
+    assert_eq!(packed["twoFactorEnabled"], true);
+    assert_eq!(packed["usePasswordLessLogin"], false);
+
+    // Password-only sign-in is still rejected for the legacy row.
+    let (status, value) = call(
+        &state,
+        "signin",
+        serde_json::json!({ "username": "alice", "password": "s3cret-pw" }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+    assert!(value.get("token").is_none(), "{value}");
+    assert!(value.get("i").is_none(), "{value}");
+
+    // Password + TOTP still completes for the legacy row.
+    let (status, value) = call(
+        &state,
+        "signin-flow",
+        serde_json::json!({ "username": "alice", "password": "s3cret-pw" }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["finished"], false);
+    assert_eq!(value["next"], "2fa");
+    let challenge = value["challenge"].as_str().expect("challenge").to_string();
+    let code = totp_token(&secret, now_secs(&state)).expect("code");
+    let (status, value) = call(
+        &state,
+        "i/2fa/authenticate",
+        serde_json::json!({ "userId": alice_id, "challenge": challenge, "token": code }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert!(value["token"].as_str().is_some(), "{value}");
 }
 
 /// MiAuth password approval mints nothing for a TOTP-enabled account.

@@ -581,47 +581,41 @@ mod tests {
     }
 
     #[test]
-    fn poll_pack_shape_has_isvoted_per_requester() {
+    fn poll_vote_state_visible_per_requester() {
+        // Application-level pin of the pack inputs (`pack_note` consumes
+        // these rows to render `poll.choices[].votes/isVoted` per
+        // requester): tallies on the poll row, per-user vote rows.
         let (services, _) = poll_services("pack");
         let alice = services.create_account("alice", None).unwrap();
         let bob = services.create_account("bob", None).unwrap();
         let note = poll_note(&services, &alice.id, &["a", "b"], false, None);
         services.vote_on_poll(&bob.id, &note.id, 1).unwrap();
-        let stored = services.notes.get_note(&note.id).unwrap().unwrap();
 
-        let packed =
-            crate::api::misskey::packers::pack_note(&stored, Some(&bob.id), &services, 0).unwrap();
-        assert_eq!(packed["hasPoll"], serde_json::json!(true));
-        assert_eq!(packed["poll"]["multiple"], serde_json::json!(false));
-        assert_eq!(packed["poll"]["choices"][0]["text"], serde_json::json!("a"));
-        assert_eq!(packed["poll"]["choices"][0]["votes"], serde_json::json!(0));
-        assert_eq!(
-            packed["poll"]["choices"][0]["isVoted"],
-            serde_json::json!(false)
-        );
-        assert_eq!(packed["poll"]["choices"][1]["votes"], serde_json::json!(1));
-        assert_eq!(
-            packed["poll"]["choices"][1]["isVoted"],
-            serde_json::json!(true)
-        );
+        let poll = services.polls.get_poll(&note.id).unwrap().unwrap();
+        assert!(!poll.multiple);
+        assert_eq!(poll.choices, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(poll.votes, vec![0, 1]);
 
-        // A stranger sees tallies but no votes of their own.
+        // Bob's vote row marks his own choice; a stranger has none.
+        let bob_votes = services
+            .polls
+            .votes_by_user_for_note(&bob.id, &note.id)
+            .unwrap();
+        assert_eq!(bob_votes.len(), 1);
+        assert_eq!(bob_votes[0].choice, 1);
         let carol = services.create_account("carol", None).unwrap();
-        let packed =
-            crate::api::misskey::packers::pack_note(&stored, Some(&carol.id), &services, 0)
-                .unwrap();
-        assert_eq!(
-            packed["poll"]["choices"][1]["isVoted"],
-            serde_json::json!(false)
+        assert!(
+            services
+                .polls
+                .votes_by_user_for_note(&carol.id, &note.id)
+                .unwrap()
+                .is_empty()
         );
 
-        // Plain notes pack `hasPoll: false` + `poll: null`.
+        // Plain notes carry no poll row at all.
         let plain = crate::application::ports::CreateNoteInput::simple_public(&alice.id, "plain");
         let plain = services.create_note(plain).unwrap();
-        let packed =
-            crate::api::misskey::packers::pack_note(&plain, Some(&bob.id), &services, 0).unwrap();
-        assert_eq!(packed["hasPoll"], serde_json::json!(false));
-        assert!(packed["poll"].is_null());
+        assert!(services.polls.get_poll(&plain.id).unwrap().is_none());
     }
 
     #[test]

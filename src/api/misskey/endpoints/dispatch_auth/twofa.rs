@@ -198,6 +198,11 @@ pub(crate) fn i_2fa_done(
 }
 
 /// `POST /api/i/2fa/password-less` (split from `api_dispatch_blocking`).
+///
+/// DIVERGENCE (adversarial-2 finding 7): enabling is refused — pinetree
+/// implements no passwordless sign-in, so `value: true` answers 400
+/// `INVALID_PARAM` and persists nothing. `value: false` clears a legacy
+/// stored bit (no-op when already clear).
 pub(crate) fn i_2fa_password_less(
     state: &ApiState,
     obj: &serde_json::Map<String, serde_json::Value>,

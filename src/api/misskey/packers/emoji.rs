@@ -44,56 +44,13 @@ pub fn pack_emoji_simple(
     emoji: &crate::domain::emoji::CustomEmoji,
     services: &AppServices,
 ) -> Value {
-    let mut obj = Map::new();
-    obj.insert("name".to_string(), Value::String(emoji.shortcode.clone()));
-    if let Some(category) = emoji.category.as_deref() {
-        obj.insert("category".to_string(), Value::String(category.to_string()));
-    }
-    obj.insert(
-        "aliases".to_string(),
-        Value::Array(emoji.aliases.iter().cloned().map(Value::String).collect()),
-    );
-    obj.insert("url".to_string(), emoji_url(emoji, services));
-    if emoji.local_only {
-        obj.insert("localOnly".to_string(), Value::Bool(true));
-    }
-    if emoji.is_sensitive {
-        obj.insert("isSensitive".to_string(), Value::Bool(true));
-    }
-    if !emoji.role_ids.is_empty() {
-        obj.insert(
-            "roleIdsThatCanBeUsedThisEmojiAsReaction".to_string(),
-            Value::Array(emoji.role_ids.iter().cloned().map(Value::String).collect()),
-        );
-    }
-    Value::Object(obj)
+    crate::application::commands::emoji::emoji_simple_value(emoji, services)
 }
 pub fn pack_emoji_detailed(
     emoji: &crate::domain::emoji::CustomEmoji,
     services: &AppServices,
 ) -> Value {
-    let mut obj = match pack_emoji_simple(emoji, services) {
-        Value::Object(map) => map,
-        other => return other,
-    };
-    obj.insert("id".to_string(), Value::String(emoji.id.clone()));
-    obj.insert("host".to_string(), Value::Null);
-    obj.insert(
-        "license".to_string(),
-        emoji
-            .license
-            .clone()
-            .map(Value::String)
-            .unwrap_or(Value::Null),
-    );
-    // Stored (never enforced — pinetree has no custom-role subsystem).
-    obj.insert("localOnly".to_string(), Value::Bool(emoji.local_only));
-    obj.insert("isSensitive".to_string(), Value::Bool(emoji.is_sensitive));
-    obj.insert(
-        "roleIdsThatCanBeUsedThisEmojiAsReaction".to_string(),
-        Value::Array(emoji.role_ids.iter().cloned().map(Value::String).collect()),
-    );
-    Value::Object(obj)
+    crate::application::commands::emoji::emoji_detailed_value(emoji, services)
 }
 /// Remote custom-emoji pack (emoji completion; `admin/emoji/list-remote` +
 /// upstream `EmojiDetailed` parity): mirrors `pack_emoji_detailed`
@@ -141,16 +98,7 @@ pub(crate) fn emoji_url(
     emoji: &crate::domain::emoji::CustomEmoji,
     services: &AppServices,
 ) -> Value {
-    if let Some(media_id) = emoji.media_id.as_deref() {
-        if let Ok(Some(meta)) = services.media.get(media_id) {
-            return Value::String(meta.url.clone());
-        }
-    }
-    Value::String(format!(
-        "{}/emojis/{}",
-        services.public_url.trim_end_matches('/'),
-        emoji.shortcode
-    ))
+    crate::application::commands::emoji::emoji_served_url(emoji, services)
 }
 /// Registry maps for note packs (Batch N WS1 + WP8b): bare shortcode → URL
 /// for local emoji, plus `name@host` → URL for remote emoji when the viewer

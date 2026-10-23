@@ -143,8 +143,22 @@ impl From<ApiError> for SigninFlowError {
 /// Captcha verification is skipped the same way upstream skips it when no
 /// captcha provider is configured.
 ///
+/// Wave 8 decision (adversarial-3 §Wave 8): this endpoint keeps the
+/// upstream disclosure posture — unknown usernames answer 404 and
+/// suspended accounts answer 403 BEFORE the password is checked
+/// (`SigninApiService.signin` order, verified against the reference
+/// checkout). The legacy `signin` arm (`do_signin`) deliberately keeps
+/// the opposite, hardened posture (password first, existence-hiding).
+/// The two postures differ on purpose — parity here, hardening there —
+/// and both are pinned by `tests/wave8_api_auth.rs`. Do not "unify" them
+/// without a written decision.
+///
 /// DIVERGENCES from upstream: no `passkey` `next` hint (nothing to enroll
-/// it with; `securityKeys` packs `false`); throttling reuses the
+/// it with; `securityKeys` packs `false`); no passwordless sign-in either
+/// (adversarial-2 finding 7: `usePasswordLessLogin` packs `false` always
+/// and `i/2fa/password-less` refuses to enable it, so the password step
+/// below stays mandatory even for legacy stored `passwordless: true`
+/// rows); throttling reuses the
 /// `auth/signin` failure-counted bucket (10/account + 30/IP per minute)
 /// instead of upstream's IP-only 10/hour + 1s min-interval, answering the
 /// verbatim upstream `TOO_MANY_AUTHENTICATION_FAILURES` id on 429;
@@ -197,11 +211,16 @@ pub(crate) async fn do_signin_flow(
     // (upstream `SigninApiService.ts` order; no history row, like
     // upstream's direct `error()` return). Deleted accounts read as
     // unknown (404): the handle is gone, so there is nothing to reveal.
-    if account.is_suspended {
-        return Err(SigninFlowError::Api(ApiError::signin_suspended()));
-    }
+    // Deleted is checked first: storage marks deleted rows suspended too.
+    // Deleted handles read as unknown (404): the handle is gone, so there
+    // is nothing to reveal. Checked before `is_suspended` because storage
+    // marks deleted rows suspended too (Wave 8 fix: deleted + wrong
+    // password used to answer 403).
     if account.is_deleted {
         return Err(SigninFlowError::Api(ApiError::signin_no_such_user()));
+    }
+    if account.is_suspended {
+        return Err(SigninFlowError::Api(ApiError::signin_suspended()));
     }
     let password = match obj.get("password") {
         None | Some(Value::Null) => None,

@@ -120,9 +120,7 @@ pub(crate) fn i_apps(
     state.rate_limiter.check(&rate_key, "i/apps")?;
     let sort = match obj.get("sort").and_then(Value::as_str) {
         None => "default",
-        Some("+createdAt") | Some("-createdAt") | Some("+lastUsedAt") | Some("-lastUsedAt") => {
-            obj.get("sort").and_then(Value::as_str).unwrap()
-        }
+        Some(known @ ("+createdAt" | "-createdAt" | "+lastUsedAt" | "-lastUsedAt")) => known,
         Some(_) => {
             return Err(ApiError::invalid_param(
                 "sort",

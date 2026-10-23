@@ -1,12 +1,10 @@
-use std::collections::HashSet;
-
 use crate::application::commands::AppServices;
+use crate::application::commands::helpers::NoteSideEffectMode;
 
 use crate::application::events::StreamingEvent;
 use crate::application::ports::{CreateNoteInput, EditNoteInput, PortError};
-use crate::domain::note::{Note, extract_mentions};
+use crate::domain::note::Note;
 use crate::domain::notification::NotificationKind;
-use crate::domain::policy::{ViewerContext, is_visible};
 
 /// Local custom-emoji reaction shape (`:name:` or `:name@.:`, Misskey
 /// `isCustomEmojiRegexp` parity): returns the lowercased shortcode the
@@ -51,99 +49,20 @@ impl AppServices {
             ));
         }
 
-        // Resolve reply/renote targets so we know who to notify.
-        let reply_target = match input.reply_to.as_deref() {
-            None => None,
-            Some(id) => match self.notes.get_note(id)? {
-                // Missing and invisible targets are indistinguishable so a
-                // reply cannot probe for the existence of hidden notes (D8).
-                None => return Err(PortError::NotFound("NO_SUCH_NOTE".to_string())),
-                Some(note) => {
-                    let follows_author = note.author_id == input.author_id
-                        || self
-                            .follows
-                            .is_following(&input.author_id, &note.author_id)?;
-                    let viewer = ViewerContext::local_user(&input.author_id, follows_author);
-                    if note.is_deleted || !is_visible(&note, &viewer) {
-                        return Err(PortError::NotFound("NO_SUCH_NOTE".to_string()));
-                    }
-                    Some(note)
-                }
-            },
-        };
-        let renote_target = match input.renote_of.as_deref() {
-            None => None,
-            Some(id) => match self.notes.get_note(id)? {
-                None => {
-                    return Err(PortError::NotFound("NO_SUCH_RENOTE_TARGET".to_string()));
-                }
-                Some(note) if note.is_deleted => {
-                    return Err(PortError::NotFound("NO_SUCH_RENOTE_TARGET".to_string()));
-                }
-                Some(note) => Some(note),
-            },
-        };
-
-        let mut jobs = Vec::new();
-        let mut already_notified: HashSet<String> = HashSet::new();
-
-        if let Some(target) = reply_target.as_ref() {
-            if target.author_id != input.author_id {
-                already_notified.insert(target.author_id.clone());
-                jobs.push(self.notify_job(
-                    &target.author_id,
-                    &input.author_id,
-                    NotificationKind::Reply,
-                    Some("__PENDING_NOTE_ID__".to_string()),
-                    None,
-                    "reply",
-                )?);
-            }
-        }
-        if let Some(target) = renote_target.as_ref() {
-            if target.author_id != input.author_id && !already_notified.contains(&target.author_id)
-            {
-                already_notified.insert(target.author_id.clone());
-                jobs.push(self.notify_job(
-                    &target.author_id,
-                    &input.author_id,
-                    NotificationKind::Renote,
-                    Some("__PENDING_NOTE_ID__".to_string()),
-                    None,
-                    "renote",
-                )?);
-            }
-        }
-
-        // `@username` mentions (local only) become Mention notifications.
-        if !input.no_extract_mentions {
-            let mut text = input.text.clone().unwrap_or_default();
-            if let Some(cw) = input.cw.as_ref() {
-                text.push('\n');
-                text.push_str(cw);
-            }
-            let mut seen: HashSet<String> = HashSet::new();
-            for username in extract_mentions(&text) {
-                let lower = username.to_lowercase();
-                if !seen.insert(lower.clone()) {
-                    continue;
-                }
-                if let Some(mentioned) = self.accounts.find_by_handle(&lower)? {
-                    if mentioned.id != input.author_id && !already_notified.contains(&mentioned.id)
-                    {
-                        already_notified.insert(mentioned.id.clone());
-                        jobs.push(self.notify_job(
-                            &mentioned.id,
-                            &input.author_id,
-                            NotificationKind::Mention,
-                            Some("__PENDING_NOTE_ID__".to_string()),
-                            None,
-                            "mention",
-                        )?);
-                    }
-                }
-            }
-        }
+        // Resolve reply/renote targets and build the reply, renote, and
+        // mention `Notify` jobs through the shared application operation
+        // (same triple the inbound federation path builds).
+        let effects = self.note_interaction_jobs(
+            &input.author_id,
+            input.reply_to.as_deref(),
+            input.renote_of.as_deref(),
+            input.text.as_deref(),
+            input.cw.as_deref(),
+            input.no_extract_mentions,
+            NoteSideEffectMode::Local,
+        )?;
+        let renote_target = effects.renote_target;
+        let mut jobs = effects.jobs;
 
         jobs.push(self.streaming_job(
             &StreamingEvent::NoteCreated {

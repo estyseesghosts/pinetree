@@ -267,10 +267,13 @@ pub(crate) fn users_lists_show(
     let for_public = opt_bool(&obj, "forPublic", false)?;
     let list = match state.services.lists.get_user_list(&list_id) {
         Ok(Some(list)) => {
-            let allowed = if !for_public && caller.is_some() {
-                list.owner_id == caller.as_ref().unwrap().account.id
-            } else {
-                list.is_public
+            // Upstream lookup parity (`show.ts` / `get-memberships.ts`):
+            // owner view (`{id, userId}`) when `forPublic` is off and a
+            // caller is present, public-only view (`{id, isPublic}`)
+            // otherwise — anonymous callers see public lists either way.
+            let allowed = match (for_public, caller.as_ref()) {
+                (false, Some(present)) => list.owner_id == present.account.id,
+                _ => list.is_public,
             };
             if !allowed {
                 return Err(ApiError::user_list_no_such_list("users/lists/show"));
@@ -384,10 +387,13 @@ pub(crate) fn users_lists_get_memberships(
     let cursor = parse_list_cursor(&obj)?;
     let list = match state.services.lists.get_user_list(&list_id) {
         Ok(Some(list)) => {
-            let allowed = if !for_public && caller.is_some() {
-                list.owner_id == caller.as_ref().unwrap().account.id
-            } else {
-                list.is_public
+            // Upstream lookup parity (`show.ts` / `get-memberships.ts`):
+            // owner view (`{id, userId}`) when `forPublic` is off and a
+            // caller is present, public-only view (`{id, isPublic}`)
+            // otherwise — anonymous callers see public lists either way.
+            let allowed = match (for_public, caller.as_ref()) {
+                (false, Some(present)) => list.owner_id == present.account.id,
+                _ => list.is_public,
             };
             if !allowed {
                 return Err(ApiError::user_list_no_such_list(

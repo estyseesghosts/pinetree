@@ -219,7 +219,10 @@ pub(crate) fn request_reset_password(
         .as_ref()
         .is_some_and(|acc| acc.email.as_deref() == Some(email.as_str()) && acc.email_verified);
     if mailable {
-        let acc = candidate.expect("filtered Some");
+        let Some(acc) = candidate else {
+            // Unreachable: `mailable` just confirmed `candidate` is `Some`.
+            return Err(ApiError::email_not_configured());
+        };
         let token = random_code(64);
         state
             .services

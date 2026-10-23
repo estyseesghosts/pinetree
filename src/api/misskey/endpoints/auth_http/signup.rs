@@ -250,16 +250,23 @@ pub(crate) async fn do_signin(
     // verifies so sign-in keeps pinetree's existence-hiding ordering (an
     // unknown and a suspended username answer alike to a caller without
     // the password) — DIVERGENCE from upstream, which reveals the account
-    // state before the password check. Upstream's per-endpoint error id
+    // state before the password check, and from the `signin-flow` arm,
+    // which keeps the upstream oracle for parity (Wave 8 decision: the two
+    // postures are intentional, pinned by `tests/wave8_api_auth.rs`).
+    // Upstream's per-endpoint error id
     // (`e03a5f46-…`) is not copied: one UUID per code keeps pinetree's
     // `USER_SUSPENDED` id (§16 convention).
-    if account.is_suspended {
-        return Err(ApiError::user_suspended());
-    }
+    // Deleted handles read as unknown (401), like the wrong-password path:
+    // checked before `is_suspended` because storage marks deleted rows
+    // suspended too (Wave 8 fix: deleted + correct password used to
+    // answer 403, leaking existence).
     if account.is_deleted {
         // Existence-hiding order, like the wrong-password path above: a
         // deleted handle answers exactly like an unknown one.
         return Err(ApiError::authentication_failed());
+    }
+    if account.is_suspended {
+        return Err(ApiError::user_suspended());
     }
     // Phase 2 (P0): a verified TOTP secret ends the password-only path.
     // The legacy endpoint has no challenge step in its contract, so it
@@ -267,6 +274,9 @@ pub(crate) async fn do_signin(
     // session for a TOTP-enabled account. `usePasswordLessLogin` does not
     // change this: without WebAuthn credentials there is no safe
     // passwordless path, so the second factor stays mandatory.
+    // DIVERGENCE (adversarial-2 finding 7): the flag is never advertised
+    // (`MeDetailed` packs `false` always), the setter refuses to enable
+    // it, and legacy stored `true` rows still take this same path.
     if state
         .services
         .totp_flags(&account.id)
