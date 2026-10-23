@@ -285,9 +285,13 @@ pub trait JobQueue: Send + Sync {
         followups: Vec<NewJob>,
     ) -> Result<(), PortError>;
     /// Insert `jobs` in ONE write transaction (all or nothing), at most
-    /// [`MAX_JOBS_PER_TXN`] per call. No de-duplication on idempotency key:
-    /// a re-run of the producing job can enqueue duplicates, so every
-    /// receiver of a re-enqueued federation delivery must dedupe by activity id.
+    /// [`MAX_JOBS_PER_TXN`] per call. Idempotent on idempotency key: jobs
+    /// whose key already has a live (non-quarantined) row are skipped, so a
+    /// re-run of the producing job (crash + lease-expiry reclaim) converges
+    /// instead of duplicating; within-batch repeats keep the first.
+    /// Quarantined rows do not suppress a same-key re-enqueue (a failed row
+    /// is never reclaimed, so suppressing would lose the retry). Receivers
+    /// of re-enqueued federation deliveries still dedupe by activity id.
     fn enqueue_jobs(&self, jobs: Vec<NewJob>) -> Result<(), PortError>;
     /// Release the lease on a claimed `job_id` and reschedule it at
     /// `not_before_ms` WITHOUT counting an attempt (used when a destination is

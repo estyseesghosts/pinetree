@@ -13,7 +13,12 @@ pub(crate) enum Disposition {
     /// rescheduled earlier than that.
     Retry { retry_after_ms: Option<i64> },
     /// Fan-out finished: complete the job and enqueue these per-inbox
-    /// follow-ups. The last batch commits atomically with the completion.
+    /// follow-ups. The batches commit in separate transactions ahead of the
+    /// completion; every batch enqueue is idempotent on `idempotency_key`,
+    /// so a crash after batch K of N followed by a lease-expiry reclaim
+    /// replays the same keys and converges on one row per key instead of
+    /// duplicating per-inbox POSTs. The last batch commits atomically with
+    /// the completion.
     Fanout(Vec<NewJob>),
     /// Destination in cooldown: reschedule at this time WITHOUT counting an
     /// attempt.
@@ -86,6 +91,10 @@ impl JobWorker {
                 }
             }
             Disposition::Fanout(followups) => {
+                // Each batch enqueue is idempotent on `idempotency_key`: a
+                // crash between batches leaves the parent claimable, and the
+                // reclaim replays the same batches without inserting a second
+                // row per key. The final batch commits with the completion.
                 let (batches, last) = split_followup_batches(followups);
                 for batch in batches {
                     self.jobs.enqueue_jobs(batch)?;

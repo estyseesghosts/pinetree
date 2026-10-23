@@ -1,11 +1,12 @@
 use super::codec::{decode_json, encode_json, map_redb_err};
-use super::store::RedbStore;
+use super::store::{COUNTER_JOBS_PENDING, RedbStore};
 use crate::application::ports::{
     Job, JobQueue, MAX_JOB_ATTEMPTS, MAX_JOBS_PER_TXN, NewJob, PortError,
 };
 use redb::{
     ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, WriteTransaction,
 };
+use std::collections::HashSet;
 
 pub(crate) const JOBS: TableDefinition<&str, &[u8]> = TableDefinition::new("jobs");
 pub(crate) const JOBS_DUE_INDEX: TableDefinition<(i64, &str), u8> =
@@ -13,8 +14,14 @@ pub(crate) const JOBS_DUE_INDEX: TableDefinition<(i64, &str), u8> =
 impl RedbStore {
     /// Mark `job_id` done inside an open write transaction (no-op when the
     /// job is missing). Table guards are scoped to this call so the caller
-    /// can open the same tables again later in the transaction.
-    fn complete_in_txn(&self, write_txn: &WriteTransaction, job_id: &str) -> Result<(), PortError> {
+    /// can open the same tables again later in the transaction. Returns
+    /// `true` when a claimable (non-quarantined) row was removed, so the
+    /// caller can debit the maintained pending counter exactly once.
+    fn complete_in_txn(
+        &self,
+        write_txn: &WriteTransaction,
+        job_id: &str,
+    ) -> Result<bool, PortError> {
         let mut jobs_table = write_txn.open_table(JOBS).map_err(map_redb_err)?;
         let mut due_table = write_txn.open_table(JOBS_DUE_INDEX).map_err(map_redb_err)?;
         let job_opt: Option<Job> = match jobs_table.get(job_id).map_err(map_redb_err)? {
@@ -22,20 +29,73 @@ impl RedbStore {
             None => None,
         };
         if let Some(job) = job_opt {
+            let counted = !job.failed;
             jobs_table.remove(job_id).map_err(map_redb_err)?;
             let _ = due_table.remove((job.not_before, job_id));
             if let Some(exp) = job.lease_expires {
                 let _ = due_table.remove((exp, job_id));
             }
+            Ok(counted)
+        } else {
+            Ok(false)
         }
-        Ok(())
+    }
+
+    /// Drop every job whose `idempotency_key` already has a live
+    /// (non-quarantined) row in `write_txn`, plus within-batch repeats (keep
+    /// the first). Table guards are scoped to this call so the caller can
+    /// open the same tables again later in the transaction.
+    ///
+    /// Wave 6 crash atomicity: the worker settles a fan-out parent with one
+    /// `enqueue_jobs` per batch plus a final `complete_with_followups`, each
+    /// in its own transaction. A crash after batch K of N followed by a
+    /// lease-expiry reclaim re-runs the same batches; without dedupe the
+    /// replayed batch inserts a second row per key and the inbox is POSTed
+    /// twice. Quarantined rows do NOT suppress a re-enqueue: a failed row is
+    /// never claimed again, so a same-key retry after quarantine is new work,
+    /// not a duplicate.
+    fn filter_new_jobs_in_txn(
+        &self,
+        write_txn: &WriteTransaction,
+        jobs: Vec<NewJob>,
+    ) -> Result<Vec<NewJob>, PortError> {
+        if jobs.is_empty() {
+            return Ok(jobs);
+        }
+        let wanted: HashSet<&str> = jobs
+            .iter()
+            .map(|job| job.idempotency_key.as_str())
+            .collect();
+        let existing: HashSet<String> = {
+            let jobs_table = write_txn.open_table(JOBS).map_err(map_redb_err)?;
+            let mut found = HashSet::new();
+            for entry in jobs_table.iter().map_err(map_redb_err)? {
+                let (_, value) = entry.map_err(map_redb_err)?;
+                let job: Job = decode_json(value.value())?;
+                if !job.failed && wanted.contains(job.idempotency_key.as_str()) {
+                    found.insert(job.idempotency_key);
+                }
+            }
+            found
+        };
+        let mut seen = HashSet::with_capacity(jobs.len());
+        let mut unique = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            if existing.contains(job.idempotency_key.as_str()) {
+                continue;
+            }
+            if seen.insert(job.idempotency_key.clone()) {
+                unique.push(job);
+            }
+        }
+        Ok(unique)
     }
 }
 impl JobQueue for RedbStore {
     fn claim_next(&self, lease_duration_ms: i64) -> Result<Option<Job>, PortError> {
         let now = self.clock.now_ms();
         let write_txn = self.begin_write()?;
-        let claimed = {
+        let (claimed, quarantined_now) = {
             let mut jobs_table = write_txn.open_table(JOBS).map_err(map_redb_err)?;
             let mut due_table = write_txn.open_table(JOBS_DUE_INDEX).map_err(map_redb_err)?;
 
@@ -95,7 +155,7 @@ impl JobQueue for RedbStore {
                     false
                 };
                 if quarantined {
-                    None
+                    (None, true)
                 } else {
                     job.lease_expires = Some(new_lease);
                     let encoded = encode_json(&job)?;
@@ -105,19 +165,27 @@ impl JobQueue for RedbStore {
                     due_table
                         .insert((new_lease, job.id.as_str()), &1u8)
                         .map_err(map_redb_err)?;
-                    Some(job)
+                    (Some(job), false)
                 }
             } else {
-                None
+                (None, false)
             }
         };
+        // A freshly quarantined row leaves the pending set in the same
+        // transaction that marked it terminal.
+        if quarantined_now {
+            self.counter_add_in_txn(&write_txn, COUNTER_JOBS_PENDING, -1)?;
+        }
         self.commit_write(write_txn)?;
         Ok(claimed)
     }
 
     fn complete(&self, job_id: &str) -> Result<(), PortError> {
         let write_txn = self.begin_write()?;
-        self.complete_in_txn(&write_txn, job_id)?;
+        let removed = self.complete_in_txn(&write_txn, job_id)?;
+        if removed {
+            self.counter_add_in_txn(&write_txn, COUNTER_JOBS_PENDING, -1)?;
+        }
         self.commit_write(write_txn)
     }
 
@@ -139,9 +207,18 @@ impl JobQueue for RedbStore {
         }
         let write_txn = self.begin_write()?;
         // `complete_in_txn` opens and drops its own table guards before the
-        // followups open theirs (redb rejects opening a table twice).
-        self.complete_in_txn(&write_txn, job_id)?;
+        // followups open theirs (redb rejects opening a table twice). The
+        // filter runs between the two for the same reason: a crash-restarted
+        // fan-out replays batches whose keys are already stored, and only the
+        // not-yet-stored tail may be inserted.
+        let removed = self.complete_in_txn(&write_txn, job_id)?;
+        let followups = self.filter_new_jobs_in_txn(&write_txn, followups)?;
         self.enqueue_jobs_in_txn(&write_txn, followups, None)?;
+        // `enqueue_jobs_in_txn` already credited every inserted followup, so
+        // only the settled parent can still move the counter here.
+        if removed {
+            self.counter_add_in_txn(&write_txn, COUNTER_JOBS_PENDING, -1)?;
+        }
         self.commit_write(write_txn)
     }
 
@@ -156,6 +233,10 @@ impl JobQueue for RedbStore {
             job.validate()?;
         }
         let write_txn = self.begin_write()?;
+        // Idempotent on `idempotency_key`: a crash-restarted producer
+        // replays the same batch, and only keys with no live row are
+        // inserted, so one key can never yield two deliveries.
+        let jobs = self.filter_new_jobs_in_txn(&write_txn, jobs)?;
         self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
         self.commit_write(write_txn)
     }
@@ -195,7 +276,7 @@ impl JobQueue for RedbStore {
 
     fn fail(&self, job_id: &str, retry_at_ms: i64) -> Result<(), PortError> {
         let write_txn = self.begin_write()?;
-        {
+        let quarantined_now = {
             let mut jobs_table = write_txn.open_table(JOBS).map_err(map_redb_err)?;
             let mut due_table = write_txn.open_table(JOBS_DUE_INDEX).map_err(map_redb_err)?;
             let mut job: Job = match jobs_table.get(job_id).map_err(map_redb_err)? {
@@ -223,6 +304,7 @@ impl JobQueue for RedbStore {
                 jobs_table
                     .insert(job_id, encoded.as_slice())
                     .map_err(map_redb_err)?;
+                true
             } else {
                 job.not_before = retry_at_ms;
                 let encoded = encode_json(&job)?;
@@ -232,14 +314,18 @@ impl JobQueue for RedbStore {
                 due_table
                     .insert((retry_at_ms, job_id), &1u8)
                     .map_err(map_redb_err)?;
+                false
             }
+        };
+        if quarantined_now {
+            self.counter_add_in_txn(&write_txn, COUNTER_JOBS_PENDING, -1)?;
         }
         self.commit_write(write_txn)
     }
 
     fn fail_permanent(&self, job_id: &str, reason: &str) -> Result<(), PortError> {
         let write_txn = self.begin_write()?;
-        {
+        let removed_pending = {
             let mut jobs_table = write_txn.open_table(JOBS).map_err(map_redb_err)?;
             let mut due_table = write_txn.open_table(JOBS_DUE_INDEX).map_err(map_redb_err)?;
             let mut job: Job = match jobs_table.get(job_id).map_err(map_redb_err)? {
@@ -262,6 +348,10 @@ impl JobQueue for RedbStore {
             jobs_table
                 .insert(job_id, encoded.as_slice())
                 .map_err(map_redb_err)?;
+            true
+        };
+        if removed_pending {
+            self.counter_add_in_txn(&write_txn, COUNTER_JOBS_PENDING, -1)?;
         }
         self.commit_write(write_txn)
     }
@@ -276,20 +366,13 @@ impl JobQueue for RedbStore {
     }
 
     fn pending_count(&self) -> Result<usize, PortError> {
-        // Counts actionable (non-terminal) jobs only: quarantined rows stay
-        // in the table for inspection via `get_job` but are not pending work,
-        // so drains that loop on `pending_count() == 0` still terminate.
-        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
-        let table = read_txn.open_table(JOBS).map_err(map_redb_err)?;
-        let mut count = 0usize;
-        for entry in table.iter().map_err(map_redb_err)? {
-            let (_, val) = entry.map_err(map_redb_err)?;
-            let job: Job = decode_json(val.value())?;
-            if !job.failed {
-                count += 1;
-            }
-        }
-        Ok(count)
+        // Wave 4 liveness: O(1) maintained counter (bumped on enqueue,
+        // settle, and quarantine in the same transactions; seeded once at
+        // open). Counts actionable (non-terminal) jobs only: quarantined
+        // rows stay in the table for inspection via `get_job` but are not
+        // pending work, so drains that loop on `pending_count() == 0` still
+        // terminate. The old code decoded every job row per call.
+        Ok(self.counter_get(COUNTER_JOBS_PENDING)? as usize)
     }
 
     fn remove_scheduled_draft_jobs(&self, draft_id: &str) -> Result<usize, PortError> {
@@ -336,6 +419,11 @@ impl JobQueue for RedbStore {
             }
         }
         let removed = targets.len();
+        // Every removed row was claimable (non-terminal), so it leaves the
+        // maintained pending set.
+        if removed > 0 {
+            self.counter_add_in_txn(&write_txn, COUNTER_JOBS_PENDING, -(removed as i64))?;
+        }
         self.commit_write(write_txn)?;
         Ok(removed)
     }
