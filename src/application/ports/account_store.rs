@@ -22,6 +22,16 @@ pub struct CreateAccountInput {
     pub is_cat: bool,
     pub is_locked: bool,
     pub preserved_usernames: Vec<String>,
+    /// Wave 6 atomicity: remote-actor handshake seeded in the creating
+    /// commit (`alsoKnownAs`; `None` = absent). Keeping it on the input
+    /// (instead of a follow-up `update_account`) makes the crash between
+    /// the old two transactions impossible.
+    pub also_known_as: Option<Vec<String>>,
+    /// Wave 6 atomicity: remote-actor `movedTo` seeded in the creating
+    /// commit (`Some(uri)` marks moved; `None` = not moved).
+    pub moved_to_uri: Option<String>,
+    /// Wave 6 atomicity: unix millis of the move, set with `moved_to_uri`.
+    pub moved_at_ms: Option<i64>,
 }
 
 impl CreateAccountInput {
@@ -40,6 +50,9 @@ impl CreateAccountInput {
             is_cat: false,
             is_locked: false,
             preserved_usernames: Vec::new(),
+            also_known_as: None,
+            moved_to_uri: None,
+            moved_at_ms: None,
         }
     }
 }
@@ -176,6 +189,16 @@ pub trait AccountStore: Send + Sync {
     fn count_accounts(&self) -> Result<u64, PortError> {
         Err(PortError::StorageUnavailable(
             "AccountStore::count_accounts not implemented".to_string(),
+        ))
+    }
+    /// Stored local account rows that are neither deleted nor suspended
+    /// (NodeInfo `usage.users.total`; same predicate as `search_accounts`
+    /// plus `is_local`). Backends serve it from a maintained counter —
+    /// never a table scan. The default reports unavailability so test
+    /// doubles keep compiling.
+    fn count_local_accounts(&self) -> Result<u64, PortError> {
+        Err(PortError::StorageUnavailable(
+            "AccountStore::count_local_accounts not implemented".to_string(),
         ))
     }
 

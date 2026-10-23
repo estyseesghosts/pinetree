@@ -27,6 +27,7 @@ use crate::activitypub::signatures::{
 };
 use crate::application::commands::AppServices;
 use crate::application::ports::PortError;
+use crate::federation::KeyFetchNegativeCache;
 use crate::federation::delivery::{MAX_AP_JSON_BYTES, resolve_remote_public_key};
 
 pub(crate) mod announce;
@@ -271,7 +272,16 @@ fn resolve_and_verify(
         Ok((owner, pem)) => match verify(&pem) {
             Ok(()) => VerifyOutcome::Verified(owner),
             Err(_) => {
-                // Stale cached key (e.g. rotated): refresh once and re-verify.
+                // Stale cached key (e.g. rotated): refresh once and re-verify —
+                // unless the key fetch just failed (negative cache), in which
+                // case the initial miss already paid for the fetch and a
+                // forced retry would be pure amplification.
+                if !KeyFetchNegativeCache::should_fetch(key_id, services.clock.now_ms()) {
+                    crate::fed_debug!(
+                        "in  signature-retry-skipped keyId={key_id:?} (negative cache)"
+                    );
+                    return VerifyOutcome::Failed(format!("key unresolvable: {key_id}"));
+                }
                 crate::fed_debug!(
                     "in  signature-retry keyId={key_id:?} (cached key failed; refreshing)"
                 );

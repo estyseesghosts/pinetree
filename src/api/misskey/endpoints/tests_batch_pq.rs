@@ -1323,6 +1323,9 @@ async fn batch_q_notes_show_content_restricted() {
                 is_cat: false,
                 is_locked: false,
                 preserved_usernames: Vec::new(),
+                also_known_as: None,
+                moved_to_uri: None,
+                moved_at_ms: None,
             },
             None,
         )

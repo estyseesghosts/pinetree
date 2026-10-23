@@ -29,6 +29,7 @@ use crate::activitypub::signatures::actor_uri_from_key_id;
 use crate::application::commands::AppServices;
 use crate::application::ports::{CreateAccountInput, PortError, UpdateAccountPatch};
 use crate::domain::account::Account;
+use crate::federation::{KeyFetchNegativeCache, KeyFetchSingleflight};
 
 use super::client::SafeHttpClient;
 use super::errors::MAX_AP_JSON_BYTES;
@@ -139,6 +140,14 @@ pub fn upsert_remote_actor_from_doc(
         })
         .filter(|s| !s.is_empty());
 
+    // Wave 6 atomicity: the move handshake rides the creating commit.
+    // A single clock read stamps the move; `None` when the document
+    // carries no `movedTo`.
+    let handshake_moved_at_ms = parsed
+        .moved_to_uri
+        .as_ref()
+        .map(|_| services.clock.now_ms());
+
     let account = if let Some(existing) = services.accounts.find_by_uri(&parsed.uri)?.or(services
         .accounts
         .find_by_username_and_host(&parsed.username, Some(&parsed.host))?)
@@ -146,7 +155,8 @@ pub fn upsert_remote_actor_from_doc(
         // Batch P: refresh the move-handshake columns from the document
         // (`updatePerson` parity). `alsoKnownAs` overwrites only when the
         // document carries the field; `movedTo` is set-only (patch has no
-        // clear — an account never un-moves).
+        // clear — an account never un-moves). Single `update_account`
+        // transaction: profile and handshake commit together.
         let mut patch = UpdateAccountPatch {
             display_name: Some(parsed.display_name.clone()),
             description: Some(description),
@@ -165,12 +175,16 @@ pub fn upsert_remote_actor_from_doc(
         }
         if let Some(moved) = parsed.moved_to_uri.clone() {
             patch.moved_to_uri = Some(moved);
-            patch.moved_at_ms = Some(services.clock.now_ms());
+            patch.moved_at_ms = handshake_moved_at_ms;
         }
         services
             .accounts
             .update_account(&existing.id, patch, Vec::new())?
     } else {
+        // Wave 6 atomicity: seed the handshake columns in the creating
+        // commit. The old create-then-update window (crash leaves a row
+        // without `also_known_as`/`moved_to_uri`) is gone: one transaction
+        // carries profile and move columns together.
         services.accounts.create_account(
             CreateAccountInput {
                 handle: parsed.username.clone(),
@@ -186,30 +200,13 @@ pub fn upsert_remote_actor_from_doc(
                 is_cat: parsed.is_cat,
                 is_locked: parsed.manually_approves_followers,
                 preserved_usernames: Vec::new(),
+                also_known_as: parsed.also_known_as.clone(),
+                moved_to_uri: parsed.moved_to_uri.clone(),
+                moved_at_ms: handshake_moved_at_ms,
             },
             None,
         )?
     };
-    // Batch P: seed the move-handshake columns on first sight (same fields
-    // as the refresh path above; one extra txn only when present). Rebind:
-    // callers read the handshake columns off the returned row, and the
-    // pre-seed struct does not have them.
-    let mut account = account;
-    if parsed.also_known_as.is_some() || parsed.moved_to_uri.is_some() {
-        let mut patch = UpdateAccountPatch {
-            ..Default::default()
-        };
-        if parsed.also_known_as.is_some() {
-            patch.also_known_as = Some(parsed.also_known_as.clone());
-        }
-        if let Some(moved) = parsed.moved_to_uri.clone() {
-            patch.moved_to_uri = Some(moved);
-            patch.moved_at_ms = Some(services.clock.now_ms());
-        }
-        account = services
-            .accounts
-            .update_account(&account.id, patch, Vec::new())?;
-    }
 
     // Slice 3 (H5): run domain validation on the upsert path (both the
     // freshly created and the previously stored account) before caching any
@@ -244,6 +241,12 @@ pub fn upsert_remote_actor_from_doc(
 /// on miss (or when `force_refresh` is true). The returned URI is the key's
 /// owner: callers must compare the activity actor against it, never against
 /// a string derived from the keyId.
+///
+/// Wave 5 amplification guard: a recent fetch failure for this key id
+/// fails fast from the bounded [`KeyFetchNegativeCache`] (same backoff
+/// shape as stamps: 60s × failures, capped at one hour) instead of paying
+/// for another signed fetch, and concurrent refreshes for one key id share
+/// a single in-flight fetch via [`KeyFetchSingleflight`].
 pub fn resolve_remote_public_key(
     services: &AppServices,
     client: &SafeHttpClient,
@@ -255,6 +258,48 @@ pub fn resolve_remote_public_key(
             return Ok((cached.actor_uri, cached.public_key_pem));
         }
     }
+    if !KeyFetchNegativeCache::should_fetch(key_id, services.clock.now_ms()) {
+        return Err(PortError::Validation(format!(
+            "key fetch backing off after recent failure: {key_id}"
+        )));
+    }
+    let (flight, is_leader) = KeyFetchSingleflight::join(key_id);
+    if !is_leader {
+        return KeyFetchSingleflight::wait(&flight);
+    }
+    // Leader: re-check the gate — a just-completed flight may have recorded
+    // a failure after our first check, in which case fetching again would
+    // be pure amplification.
+    if !KeyFetchNegativeCache::should_fetch(key_id, services.clock.now_ms()) {
+        let outcome = Err(PortError::Validation(format!(
+            "key fetch backing off after recent failure: {key_id}"
+        )));
+        KeyFetchSingleflight::finish(key_id, &flight, outcome.clone());
+        return outcome;
+    }
+    // Panic containment: a panicking fetch must still wake the followers
+    // with an error instead of stranding them on the condvar.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fetch_remote_key_once(services, client, key_id)
+    }))
+    .unwrap_or_else(|_| {
+        Err(PortError::StorageUnavailable(
+            "key refresh panicked".to_string(),
+        ))
+    });
+    KeyFetchNegativeCache::record(key_id, services.clock.now_ms(), outcome.is_ok());
+    KeyFetchSingleflight::finish(key_id, &flight, outcome.clone());
+    outcome
+}
+
+/// The single network fetch behind [`resolve_remote_public_key`]: download
+/// the actor document the key id names and require it to advertise the
+/// requested key id.
+fn fetch_remote_key_once(
+    services: &AppServices,
+    client: &SafeHttpClient,
+    key_id: &str,
+) -> Result<(String, String), PortError> {
     let actor_uri = actor_uri_from_key_id(key_id);
     let (_account, parsed) = fetch_and_upsert_remote_actor(services, client, &actor_uri)?;
     // Slice 2 (C1): the fetched document must actually advertise the

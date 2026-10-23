@@ -1,5 +1,5 @@
 use super::codec::{decode_json, encode_json, map_redb_err};
-use super::store::{ACCOUNTS, HANDLE_INDEX, RedbStore};
+use super::store::{ACCOUNTS, COUNTER_ACCOUNTS_LOCAL, HANDLE_INDEX, RedbStore};
 use crate::application::ports::{
     AccountStore, CreateAccountInput, NewJob, PortError, UpdateAccountPatch,
 };
@@ -283,7 +283,8 @@ impl RedbStore {
             // §0B: fresh accounts start at the upstream column defaults.
             hide_online_status: false,
             avatar_decorations: Vec::new(),
-            also_known_as: None,
+            // Wave 6 atomicity: see `moved_to_uri` below.
+            also_known_as: input.also_known_as,
             require_signin_to_view_contents: false,
             make_notes_followers_only_before: None,
             make_notes_hidden_before: None,
@@ -321,8 +322,11 @@ impl RedbStore {
             email: None,
             email_verified: false,
             email_verify_code: None,
-            moved_to_uri: None,
-            moved_at_ms: None,
+            // Wave 6 atomicity: handshake columns seed in the creating
+            // commit (single txn with the row + indexes); the old
+            // create-then-update window is gone.
+            moved_to_uri: input.moved_to_uri,
+            moved_at_ms: input.moved_at_ms,
             moderator_note: None,
         };
         account.validate()?;
@@ -402,6 +406,12 @@ impl RedbStore {
             owners_table
                 .insert(account.id.as_str(), self.local_node_id.as_str())
                 .map_err(map_redb_err)?;
+            // Wave 4 scans: a fresh local account joins the maintained
+            // local-user counter (NodeInfo `users.total` predicate: local,
+            // live, unsuspended — all true at creation).
+            if is_local {
+                self.counter_add_in_txn(&write_txn, COUNTER_ACCOUNTS_LOCAL, 1)?;
+            }
         }
         if let Some(entry) = log {
             self.append_log_in_txn(write_txn, entry)?;
@@ -672,6 +682,13 @@ impl AccountStore for RedbStore {
         let read_txn = self.db.begin_read().map_err(map_redb_err)?;
         let table = read_txn.open_table(ACCOUNTS).map_err(map_redb_err)?;
         Ok(table.len().map_err(map_redb_err)?)
+    }
+
+    fn count_local_accounts(&self) -> Result<u64, PortError> {
+        // Wave 4 liveness: O(1) maintained counter (bumped on create,
+        // suspend/unsuspend, and delete in the same transactions; seeded
+        // once at open). The old NodeInfo path decoded the whole table.
+        self.counter_get(COUNTER_ACCOUNTS_LOCAL)
     }
 
     fn all_accounts(

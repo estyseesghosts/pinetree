@@ -10,8 +10,9 @@ pub mod outbox;
 pub mod retry;
 
 use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
+use crate::application::ports::PortError;
 use crate::domain::fed_policy::{
     ACTIVITY_INDEX_CAP, REPLY_COALESCE_TTL_MS, reply_resolve_key, stamp_retry_due,
 };
@@ -221,6 +222,173 @@ impl StampNegativeCache {
     }
 }
 
+/// Negative cache for failed remote actor/key fetches (Wave 5 inbox
+/// amplification fix).
+///
+/// A key id whose fetch recently failed maps to
+/// `(last_attempt_ms, consecutive_failures)`; resolvers consult
+/// [`should_fetch`](KeyFetchNegativeCache::should_fetch) before hitting the
+/// network and record the outcome after. Success removes the entry. Backoff
+/// follows [`stamp_retry_due`]: 60s × failures, capped at one hour.
+/// Process-local and best-effort like the sibling caches above: bounded by
+/// [`ACTIVITY_INDEX_CAP`] with arbitrary-single eviction, and a restart
+/// simply drops the map (worst case is one extra fetch per key id).
+pub struct KeyFetchNegativeCache {
+    inner: Mutex<HashMap<String, (i64, u32)>>,
+}
+
+impl KeyFetchNegativeCache {
+    fn global() -> &'static KeyFetchNegativeCache {
+        static NEG: LazyLock<KeyFetchNegativeCache> = LazyLock::new(|| KeyFetchNegativeCache {
+            inner: Mutex::new(HashMap::new()),
+        });
+        &NEG
+    }
+
+    /// True when a key fetch may proceed now (no recent failure, or the
+    /// backoff window for the recorded failures has elapsed).
+    pub fn should_fetch(key_id: &str, now_ms: i64) -> bool {
+        let key = key_id.trim().to_string();
+        let inner = Self::global()
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match inner.get(&key).copied() {
+            None => true,
+            Some((last, failures)) => stamp_retry_due(failures, Some(last), now_ms),
+        }
+    }
+
+    /// Record a fetch outcome: `true` clears the negative entry, `false`
+    /// inserts/advances it.
+    pub fn record(key_id: &str, now_ms: i64, success: bool) {
+        let key = key_id.trim().to_string();
+        if key.is_empty() {
+            return;
+        }
+        let mut inner = Self::global()
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if success {
+            inner.remove(&key);
+        } else {
+            let failures = inner
+                .get(&key)
+                .map(|(_, f)| f.saturating_add(1))
+                .unwrap_or(1);
+            if inner.len() >= ACTIVITY_INDEX_CAP && !inner.contains_key(&key) {
+                if let Some(first) = inner.keys().next().cloned() {
+                    inner.remove(&first);
+                }
+            }
+            inner.insert(key, (now_ms, failures));
+        }
+    }
+
+    #[cfg(test)]
+    fn clear_for_tests() {
+        Self::global()
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+}
+
+/// One in-flight remote-key refresh shared by concurrent waiters.
+pub(crate) struct KeyFlight {
+    state: Mutex<KeyFlightState>,
+    ready: Condvar,
+}
+
+struct KeyFlightState {
+    done: bool,
+    result: Option<Result<(String, String), PortError>>,
+}
+
+/// Singleflight for in-flight remote-key refreshes (Wave 5 inbox
+/// amplification fix).
+///
+/// Concurrent `resolve_remote_public_key` refreshes for one key id share a
+/// single signed fetch: the first caller becomes the leader and performs
+/// the network fetch, while later callers wait for the leader's outcome
+/// instead of duplicating it. Entries live only for the duration of the
+/// fetch (success lands in the positive auth cache, failure in the
+/// [`KeyFetchNegativeCache`], never here), so the map stays proportional
+/// to genuinely concurrent refreshes.
+pub(crate) struct KeyFetchSingleflight {
+    _private: (),
+}
+
+impl KeyFetchSingleflight {
+    fn flights() -> &'static Mutex<HashMap<String, Arc<KeyFlight>>> {
+        static FLIGHTS: LazyLock<Mutex<HashMap<String, Arc<KeyFlight>>>> =
+            LazyLock::new(|| Mutex::new(HashMap::new()));
+        &FLIGHTS
+    }
+
+    /// Join the in-flight refresh for `key_id`. Returns the flight plus
+    /// `true` when the caller is the leader (and must fetch, then
+    /// [`finish`](KeyFetchSingleflight::finish)); `false` means a leader
+    /// is already fetching and the caller must
+    /// [`wait`](KeyFetchSingleflight::wait) instead.
+    pub(crate) fn join(key_id: &str) -> (Arc<KeyFlight>, bool) {
+        let key = key_id.trim().to_string();
+        let mut flights = Self::flights().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = flights.get(&key) {
+            (Arc::clone(existing), false)
+        } else {
+            let flight = Arc::new(KeyFlight {
+                state: Mutex::new(KeyFlightState {
+                    done: false,
+                    result: None,
+                }),
+                ready: Condvar::new(),
+            });
+            flights.insert(key, Arc::clone(&flight));
+            (flight, true)
+        }
+    }
+
+    /// Publish the leader's outcome and wake every waiter. Called exactly
+    /// once by the leader (even for errors): the entry is removed so later
+    /// callers start a fresh flight (gated by the positive auth cache on
+    /// success, by the negative cache on failure). Waiters already hold
+    /// their own `Arc`, so removal never strands them; a joiner that
+    /// arrives between the wake and the removal simply shares the finished
+    /// outcome instead of fetching again.
+    pub(crate) fn finish(
+        key_id: &str,
+        flight: &KeyFlight,
+        outcome: Result<(String, String), PortError>,
+    ) {
+        {
+            let mut state = flight.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.result = Some(outcome);
+            state.done = true;
+        }
+        flight.ready.notify_all();
+        Self::flights()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key_id.trim());
+    }
+
+    /// Block until the leader publishes its outcome, then return a clone
+    /// of it.
+    pub(crate) fn wait(flight: &KeyFlight) -> Result<(String, String), PortError> {
+        let mut state = flight.state.lock().unwrap_or_else(|e| e.into_inner());
+        while !state.done {
+            state = flight.ready.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+        state
+            .result
+            .clone()
+            .expect("key flight finished without an outcome")
+    }
+}
+
 /// Test-only: drop every federation-layer ephemeral cache entry. Each
 /// gaps test calls this first so the process-global maps cannot leak
 /// across tests sharing one binary.
@@ -229,6 +397,7 @@ pub fn clear_ephemeral_caches_for_tests() {
     ActivityIdIndex::clear_for_tests();
     ReplyCoalescer::clear_for_tests();
     StampNegativeCache::clear_for_tests();
+    KeyFetchNegativeCache::clear_for_tests();
 }
 
 #[cfg(test)]
@@ -300,5 +469,67 @@ mod tests {
         StampNegativeCache::record(stamp, now + 60_000, true);
         assert!(StampNegativeCache::should_fetch(stamp, now + 60_001));
         StampNegativeCache::clear_for_tests();
+    }
+
+    #[test]
+    fn key_fetch_negative_cache_backoff() {
+        KeyFetchNegativeCache::clear_for_tests();
+        let now = 1_760_400_000_000;
+        let key = "https://remote.example/users/alice#main-key";
+        assert!(KeyFetchNegativeCache::should_fetch(key, now));
+        KeyFetchNegativeCache::record(key, now, false);
+        assert!(!KeyFetchNegativeCache::should_fetch(key, now + 59_999));
+        assert!(KeyFetchNegativeCache::should_fetch(key, now + 60_000));
+        // A second consecutive failure backs off twice as long.
+        KeyFetchNegativeCache::record(key, now + 60_000, false);
+        assert!(!KeyFetchNegativeCache::should_fetch(
+            key,
+            now + 60_000 + 119_999
+        ));
+        assert!(KeyFetchNegativeCache::should_fetch(
+            key,
+            now + 60_000 + 120_000
+        ));
+        // Success clears the entry entirely.
+        KeyFetchNegativeCache::record(key, now + 60_000 + 120_000, true);
+        assert!(KeyFetchNegativeCache::should_fetch(
+            key,
+            now + 60_000 + 120_001
+        ));
+        // Empty key ids never record.
+        KeyFetchNegativeCache::record("   ", now, false);
+        assert!(KeyFetchNegativeCache::should_fetch(
+            "https://remote.example/users/bob#main-key",
+            now
+        ));
+        KeyFetchNegativeCache::clear_for_tests();
+    }
+
+    #[test]
+    fn key_fetch_singleflight_shares_one_outcome() {
+        use std::sync::mpsc::channel;
+
+        let key = "https://remote.example/users/singleflight#main-key";
+        let (leader_flight, is_leader) = KeyFetchSingleflight::join(key);
+        assert!(is_leader, "first joiner must be the leader");
+        // A second joiner while the flight is open must wait, not lead.
+        let (joined_tx, joined_rx) = channel::<()>();
+        let waiter = std::thread::spawn(move || {
+            let (flight, is_leader) = KeyFetchSingleflight::join(key);
+            assert!(!is_leader, "concurrent joiner must follow, not lead");
+            joined_tx.send(()).expect("signal join");
+            KeyFetchSingleflight::wait(&flight)
+        });
+        joined_rx.recv().expect("waiter joins before finish");
+        let outcome: Result<(String, String), PortError> = Ok((
+            "https://remote.example/users/singleflight".to_string(),
+            "pem".to_string(),
+        ));
+        KeyFetchSingleflight::finish(key, &leader_flight, outcome.clone());
+        assert_eq!(waiter.join().expect("waiter finishes"), outcome);
+        // The finished flight is removed: the next join leads a fresh one.
+        let (fresh, is_leader) = KeyFetchSingleflight::join(key);
+        assert!(is_leader, "finished flight must not linger");
+        KeyFetchSingleflight::finish(key, &fresh, Err(PortError::Validation("gone".to_string())));
     }
 }

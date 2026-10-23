@@ -976,6 +976,9 @@ async fn batch_o_invalidate_search_alias_and_ap_get() {
                     is_cat: false,
                     is_locked: false,
                     preserved_usernames: Vec::new(),
+                    also_known_as: None,
+                    moved_to_uri: None,
+                    moved_at_ms: None,
                 },
                 None,
             )

@@ -260,6 +260,9 @@ async fn slice10_api_latency_independent_of_slow_peer() {
                 is_cat: false,
                 is_locked: false,
                 preserved_usernames: Vec::new(),
+                also_known_as: None,
+                moved_to_uri: None,
+                moved_at_ms: None,
             },
             None,
         )
