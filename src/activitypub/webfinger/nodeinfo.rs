@@ -2,7 +2,8 @@
 //! `/nodeinfo/2.0`, `/nodeinfo/2.1`) matching Misskey
 //! `NodeinfoServerService.ts`.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::{
     extract::State,
@@ -13,13 +14,23 @@ use serde_json::{Value, json};
 
 use crate::activitypub::PACKER_VERSION;
 use crate::application::commands::AppServices;
-use crate::application::ports::TimelineCursor;
 
 use super::responses::{
     CONTENT_TYPE_NODEINFO_2_0, CONTENT_TYPE_NODEINFO_2_1, base_url, json_response,
 };
 
 const CACHE_NODEINFO: &str = "public, max-age=300";
+
+/// Server-side memo for the rendered NodeInfo usage document (Wave 4
+/// liveness): the endpoint is unauthenticated, so every scrape would
+/// otherwise pay a render per request. Entries expire after
+/// [`NODEINFO_CACHE_TTL_MS`]; versions render independently.
+const NODEINFO_CACHE_TTL_MS: i64 = 60_000;
+
+fn nodeinfo_cache() -> &'static Mutex<HashMap<(String, String), (Value, i64)>> {
+    static CACHE: OnceLock<Mutex<HashMap<(String, String), (Value, i64)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 /// `/.well-known/nodeinfo` link document.
 pub fn render_well_known_nodeinfo(public_url: &str) -> Value {
@@ -39,21 +50,15 @@ pub fn render_well_known_nodeinfo(public_url: &str) -> Value {
 }
 
 /// NodeInfo 2.0 / 2.1 document matching Misskey `NodeinfoServerService.ts`.
+///
+/// Wave 4 liveness: both usage numbers come from maintained O(1) counters
+/// (`count_local_accounts`, `count_local_notes`) — the old code decoded up
+/// to 10_000 account rows plus 10_000 note rows on every unauthenticated
+/// scrape. Errors read as 0 (same lenient posture as the old
+/// `unwrap_or_default` scans).
 pub fn render_nodeinfo(services: &AppServices, version: &str) -> Value {
-    let local_users = services
-        .accounts
-        .search_accounts("", 0, 10_000)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|account| account.is_local())
-        .count();
-    let local_posts = services
-        .notes
-        .list_all_notes(&TimelineCursor::with_limit(10_000))
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|note| note.user_host.is_none())
-        .count();
+    let local_users = services.accounts.count_local_accounts().unwrap_or(0);
+    let local_posts = services.notes.count_local_notes().unwrap_or(0);
 
     let software = if version == "2.1" {
         json!({
@@ -131,7 +136,7 @@ pub async fn nodeinfo_2_0(State(services): State<Arc<AppServices>>) -> Response 
     let mut response = json_response(
         StatusCode::OK,
         CONTENT_TYPE_NODEINFO_2_0,
-        &render_nodeinfo(&services, "2.0"),
+        &cached_nodeinfo(&services, "2.0"),
     );
     response.headers_mut().insert(
         header::CACHE_CONTROL,
@@ -145,13 +150,41 @@ pub async fn nodeinfo_2_1(State(services): State<Arc<AppServices>>) -> Response 
     let mut response = json_response(
         StatusCode::OK,
         CONTENT_TYPE_NODEINFO_2_1,
-        &render_nodeinfo(&services, "2.1"),
+        &cached_nodeinfo(&services, "2.1"),
     );
     response.headers_mut().insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static(CACHE_NODEINFO),
     );
     response
+}
+
+/// Briefly-cached [`render_nodeinfo`] (Wave 4 liveness): the endpoint is
+/// unauthenticated, so scrapes share one render per
+/// [`NODEINFO_CACHE_TTL_MS`] window instead of rendering per request. The
+/// cache is keyed by `(public_url, version)` and holds at most a handful of
+/// entries; a poisoned or contended lock degrades to a fresh render.
+pub fn cached_nodeinfo(services: &AppServices, version: &str) -> Value {
+    let key = (services.public_url.clone(), version.to_string());
+    let now = services.clock.now_ms();
+    if let Ok(cache) = nodeinfo_cache().lock() {
+        if let Some((doc, expires)) = cache.get(&key) {
+            if *expires > now {
+                return doc.clone();
+            }
+        }
+    }
+    let doc = render_nodeinfo(services, version);
+    if let Ok(mut cache) = nodeinfo_cache().lock() {
+        cache.insert(key, (doc.clone(), now.saturating_add(NODEINFO_CACHE_TTL_MS)));
+        while cache.len() > 8 {
+            let Some(first) = cache.keys().next().cloned() else {
+                break;
+            };
+            cache.remove(&first);
+        }
+    }
+    doc
 }
 
 #[cfg(test)]

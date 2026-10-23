@@ -1,7 +1,9 @@
 use super::codec::{decode_json, encode_json, map_redb_err};
 use super::follow_store::{FOLLOW_REQ_FORWARD, FOLLOW_REQ_REVERSE};
 use super::note_store::matches_cursor;
-use super::store::{ACCOUNTS, ACTIVITY_DEDUP, FOLLOWS_FORWARD, FOLLOWS_REVERSE, RedbStore};
+use super::store::{
+    ACCOUNTS, ACTIVITY_DEDUP, COUNTER_ACCOUNTS_LOCAL, FOLLOWS_FORWARD, FOLLOWS_REVERSE, RedbStore,
+};
 use crate::application::ports::{
     AbuseReportFilter, AbuseReportRecipientStore, AbuseReportStore, ModerationLogFilter,
     ModerationLogStore, NewJob, PortError, TimelineCursor, UpdateAccountPatch, UserMemoStore,
@@ -140,9 +142,33 @@ impl ModerationLogStore for RedbStore {
         if suspended {
             self.delete_follow_requests_involving_in_txn(&write_txn, account_id)?;
         }
+        // Wave 4 scans: suspend/unsuspend flips the NodeInfo `users.total`
+        // predicate (local, live, unsuspended). The delta commits in the
+        // same transaction; no-change transitions bump nothing.
+        let before: Option<Account> = {
+            let accounts_table = write_txn.open_table(ACCOUNTS).map_err(map_redb_err)?;
+            match accounts_table.get(account_id).map_err(map_redb_err)? {
+                Some(g) => Some(decode_json(g.value())?),
+                None => None,
+            }
+        };
         let updated = self.set_account_flags_in_txn(&write_txn, account_id, |account| {
             account.is_suspended = suspended;
         })?;
+        if let Some(prev) = before {
+            let counted_before = prev.host.is_none() && !prev.is_deleted && !prev.is_suspended;
+            let counted_after =
+                updated.host.is_none() && !updated.is_deleted && !updated.is_suspended;
+            match (counted_before, counted_after) {
+                (true, false) => {
+                    self.counter_add_in_txn(&write_txn, COUNTER_ACCOUNTS_LOCAL, -1)?;
+                }
+                (false, true) => {
+                    self.counter_add_in_txn(&write_txn, COUNTER_ACCOUNTS_LOCAL, 1)?;
+                }
+                _ => {}
+            }
+        }
         self.append_log_in_txn(&write_txn, &log)?;
         self.enqueue_jobs_in_txn(&write_txn, jobs, None)?;
         self.commit_write(write_txn)?;
@@ -193,10 +219,27 @@ impl ModerationLogStore for RedbStore {
             l.validate()?;
         }
         let write_txn = self.begin_write()?;
+        // Wave 4 scans: deletion drops the row from the NodeInfo
+        // `users.total` predicate when it was counted (local, live,
+        // unsuspended). Read before flagging; the delete itself is
+        // idempotent so only a counted row debits.
+        let counted_before: bool = {
+            let accounts_table = write_txn.open_table(ACCOUNTS).map_err(map_redb_err)?;
+            match accounts_table.get(account_id).map_err(map_redb_err)? {
+                Some(g) => {
+                    let prev: Account = decode_json(g.value())?;
+                    prev.host.is_none() && !prev.is_deleted && !prev.is_suspended
+                }
+                None => false,
+            }
+        };
         self.set_account_flags_in_txn(&write_txn, account_id, |account| {
             account.is_deleted = true;
             account.is_suspended = true;
         })?;
+        if counted_before {
+            self.counter_add_in_txn(&write_txn, COUNTER_ACCOUNTS_LOCAL, -1)?;
+        }
         self.delete_follow_requests_involving_in_txn(&write_txn, account_id)?;
         // Remove follow edges in both directions (account as follower or followee).
         let mut keys: Vec<(String, String)> = Vec::new();

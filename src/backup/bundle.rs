@@ -44,9 +44,13 @@ pub const TABLES_PREFIX: &str = "tables/";
 pub const TABLE_SUFFIX: &str = ".tbl";
 pub const MEDIA_DURABLE_PREFIX: &str = "media/durable/";
 pub const MEDIA_CACHE_PREFIX: &str = "media/cache/";
-/// Per-row byte cap (key+value). Rows are small metadata/JSON; anything
-/// larger is a corrupt bundle, never a real row.
-pub const MAX_TABLE_ROW_BYTES: u64 = 64 * 1024 * 1024;
+/// Per-row byte cap (key+value). Rows are small metadata/JSON (well under a
+/// megabyte in production); anything larger is a corrupt bundle, never a
+/// real row. Restores never allocate an untrusted declared length: framed
+/// values at or under this cap stream in bounded chunks, and oversized
+/// declarations drain to a temp file and fail closed (see
+/// `restore::read_framed_value`), so a crafted header cannot OOM the host.
+pub const MAX_TABLE_ROW_BYTES: u64 = 2 * 1024 * 1024;
 /// Per-table file cap.
 pub const MAX_TABLE_FILE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// Whole-bundle cap (also bounds restore reads).

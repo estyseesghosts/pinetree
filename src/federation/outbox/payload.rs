@@ -24,7 +24,26 @@ pub const FOLLOWER_PAGE_SIZE: usize = 1_000;
 
 /// Fan-outs with more destination inboxes than this are not delivered inline:
 /// each inbox becomes its own `Federate` job.
-pub const FANOUT_INLINE_MAX: usize = 100;
+///
+/// Kept small (Wave 4 liveness): one worker loop must never hold the only
+/// worker for dozens of sequential blocking POSTs and starve `Notify`,
+/// `RemoteMediaFetch`, or `PollExpiry`. Above this threshold the activity
+/// job always splits; at or below it the worker delivers inline with
+/// [`FANOUT_INLINE_CONCURRENCY`] parallelism under a
+/// [`FANOUT_JOB_DEADLINE_MS`] wall-clock deadline.
+pub const FANOUT_INLINE_MAX: usize = 16;
+
+/// Maximum concurrent inline POSTs inside one fan-out job. The inline path
+/// runs in bounded waves (never more than this many sends in flight) so a
+/// small fan-out finishes faster without opening an unbounded burst of
+/// connections when many inboxes share slow hosts.
+pub const FANOUT_INLINE_CONCURRENCY: usize = 4;
+
+/// Wall-clock budget in milliseconds for one fan-out job's inline phase,
+/// measured from `fan_out` entry. Inboxes still unattempted when the budget
+/// is exhausted are not dropped: they become one-inbox follow-up jobs and
+/// the activity job returns `Split`, so the worker moves on to other kinds.
+pub const FANOUT_JOB_DEADLINE_MS: i64 = 30_000;
 
 /// Compact, structured payload stored inside a `JobKind::FederateDeliver` job
 /// (always well under the 64 KiB job payload cap).
@@ -266,6 +285,12 @@ pub enum FederateDeliverPayload {
         /// `Undo(Delete(Person))` (unsuspend).
         undo: bool,
         inbox_override: Option<String>,
+        /// Wave 4 scans: account-id cursor into the shared-inbox walk
+        /// (`None` = first page). A sweep run fans out one page and, while
+        /// pages remain, returns a same-payload continuation carrying the
+        /// next cursor, so no run materializes the whole inbox set.
+        #[serde(default)]
+        after: Option<String>,
     },
     /// Deliver a `Flag` activity to a remote instance (Batch M WP4).
     Flag {

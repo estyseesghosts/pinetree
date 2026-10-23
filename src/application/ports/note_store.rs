@@ -192,13 +192,33 @@ pub struct TimelineCursor {
 }
 
 impl TimelineCursor {
+    /// Hard per-request row cap for cursor-paged note listings (Wave 4
+    /// liveness): no single request may decode more than this many rows.
+    /// Callers needing deeper scans page with `until_id` cursors instead of
+    /// raising `limit`. Both the constructor and the storage backends clamp
+    /// to this bound, so a literal `TimelineCursor { limit: 10_000, .. }`
+    /// degrades to a bounded page rather than a full-table decode.
+    pub const MAX_LIST_LIMIT: usize = 1_000;
+
+    /// Candidate-scan ceiling for `list_all_notes`-style whole-table reads.
+    /// `0` still means "backend default".
     pub fn with_limit(limit: usize) -> Self {
         Self {
             since_id: None,
             until_id: None,
             since_date: None,
             until_date: None,
-            limit,
+            limit: Self::clamp_limit(limit),
+        }
+    }
+
+    /// Clamp a requested `limit` into `(0, MAX_LIST_LIMIT]` (`0` passes
+    /// through so backends keep their default).
+    pub fn clamp_limit(limit: usize) -> usize {
+        if limit == 0 {
+            0
+        } else {
+            limit.min(Self::MAX_LIST_LIMIT)
         }
     }
 }
@@ -316,7 +336,55 @@ pub trait NoteStore: Send + Sync {
             "NoteStore::set_pending_reply_parent not implemented".to_string(),
         ))
     }
+    /// Newest-first note listing, excluding deleted notes. `cursor.limit`
+    /// is clamped to [`TimelineCursor::MAX_LIST_LIMIT`] by every backend
+    /// (Wave 4 liveness: no single request decodes the whole table);
+    /// deeper scans page with `until_id`. Callers that must enumerate more
+    /// (sweeps) loop pages or use a dedicated index (`notes_by_reply`,
+    /// `notes_by_renote`).
     fn list_all_notes(&self, cursor: &TimelineCursor) -> Result<Vec<Note>, PortError>;
+    /// Renotes of one note (`renote_id == renote_id`), newest-first,
+    /// excluding deleted notes. `cursor.limit` is a candidate scan limit
+    /// like [`NoteStore::notes_by_reply`]; backends serve it from the
+    /// `(renote_target, child)` index — never a whole-table scan. The
+    /// default serves test doubles by filtering one bounded
+    /// `list_all_notes` page (id bounds only; production backends apply
+    /// the full cursor).
+    fn notes_by_renote(
+        &self,
+        renote_id: &str,
+        cursor: &TimelineCursor,
+    ) -> Result<Vec<Note>, PortError> {
+        if renote_id.is_empty() {
+            return Ok(Vec::new());
+        }
+        let limit = TimelineCursor::clamp_limit(cursor.limit);
+        let limit = if limit == 0 { 50 } else { limit };
+        let page = TimelineCursor {
+            limit,
+            ..Default::default()
+        };
+        let all = self.list_all_notes(&page)?;
+        let mut out: Vec<Note> = all
+            .into_iter()
+            .filter(|n| !n.is_deleted && n.renote_id.as_deref() == Some(renote_id))
+            .filter(|n| {
+                if let Some(since) = cursor.since_id.as_deref() {
+                    if n.id.as_str() <= since {
+                        return false;
+                    }
+                }
+                if let Some(until) = cursor.until_id.as_deref() {
+                    if n.id.as_str() >= until {
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect();
+        out.truncate(limit);
+        Ok(out)
+    }
     /// Total stored note rows, local and remote (Batch P `stats`).
     fn count_notes(&self) -> Result<u64, PortError> {
         Err(PortError::StorageUnavailable(
@@ -324,7 +392,8 @@ pub trait NoteStore: Send + Sync {
         ))
     }
     /// Stored note rows by local authors (Batch P `stats`
-    /// `originalNotesCount`).
+    /// `originalNotesCount`; NodeInfo `usage.localPosts`). Backends serve
+    /// it from a maintained counter — never a table scan or row decode.
     fn count_local_notes(&self) -> Result<u64, PortError> {
         Err(PortError::StorageUnavailable(
             "NoteStore::count_local_notes not implemented".to_string(),

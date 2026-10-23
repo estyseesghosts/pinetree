@@ -434,7 +434,7 @@ impl AppServices {
         if let Some(pw) = password {
             let stored = self.auth.get_password_hash(account_id)?;
             let stored = stored.as_deref().unwrap_or("");
-            if !crate::api::misskey::auth::verify_password(pw, stored) {
+            if !crate::domain::password::verify_password(pw, stored) {
                 return Err(PortError::Validation("INCORRECT_PASSWORD".to_string()));
             }
         }
@@ -462,6 +462,7 @@ impl AppServices {
                 activity_id: self.ids.generate(),
                 undo: false,
                 inbox_override: None,
+                after: None,
             };
             jobs.push(self.federate_job(&broadcast, &format!("delete-account:{account_id}"))?);
         }

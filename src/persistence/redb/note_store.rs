@@ -29,6 +29,14 @@ pub(crate) const PINNINGS: TableDefinition<(&str, &str), &[u8]> = TableDefinitio
 /// databases created before the index existed.
 pub(crate) const NOTES_BY_REPLY: TableDefinition<(&str, &str), u8> =
     TableDefinition::new("notes_by_reply");
+/// Renote edges, keyed by `(renote_target_id, child_note_id)` (Wave 4
+/// scans: renote fan-out and `notes/renotes`-style reads page this index
+/// instead of scanning `NOTES`). `Note.renote_id` stays authoritative;
+/// maintained in the same transactions as the note row (create, delete,
+/// renote-changing edit) and backfilled by a versioned migration for
+/// databases created before the index existed.
+pub(crate) const NOTES_BY_RENOTE: TableDefinition<(&str, &str), u8> =
+    TableDefinition::new("notes_by_renote");
 /// Unresolved reply parents, keyed by `(parent_uri, child_note_id)`
 /// (`docs/replies.md` Slice B). One row per note waiting on an `inReplyTo`
 /// URI; removed atomically when the child links (or is deleted).

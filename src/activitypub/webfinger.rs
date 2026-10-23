@@ -22,7 +22,8 @@ pub use finger::{
 };
 pub use host_meta::{host_meta_json, host_meta_xrd, render_host_meta_jrd, render_host_meta_xrd};
 pub use nodeinfo::{
-    nodeinfo_2_0, nodeinfo_2_1, render_nodeinfo, render_well_known_nodeinfo, well_known_nodeinfo,
+    cached_nodeinfo, nodeinfo_2_0, nodeinfo_2_1, render_nodeinfo, render_well_known_nodeinfo,
+    well_known_nodeinfo,
 };
 pub use responses::{
     CONTENT_TYPE_JRD, CONTENT_TYPE_NODEINFO_2_0, CONTENT_TYPE_NODEINFO_2_1, CONTENT_TYPE_XRD,

@@ -122,6 +122,18 @@ impl AccountStore for Mem {
     ) -> Result<(Vec<String>, Option<String>), PortError> {
         Ok((Vec::new(), None))
     }
+    fn count_accounts(&self) -> Result<u64, PortError> {
+        Ok(self.accounts.lock().unwrap().len() as u64)
+    }
+    fn count_local_accounts(&self) -> Result<u64, PortError> {
+        Ok(self
+            .accounts
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|account| account.is_local() && !account.is_deleted && !account.is_suspended)
+            .count() as u64)
+    }
 }
 
 impl NoteStore for Mem {
@@ -149,6 +161,28 @@ impl NoteStore for Mem {
         _cursor: &crate::application::ports::TimelineCursor,
     ) -> Result<Vec<Note>, PortError> {
         Ok(Vec::new())
+    }
+    fn count_notes(&self) -> Result<u64, PortError> {
+        Ok(self.notes.lock().unwrap().len() as u64)
+    }
+    fn count_local_notes(&self) -> Result<u64, PortError> {
+        let author_ids: Vec<String> = self
+            .notes
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|note| !note.is_deleted)
+            .map(|note| note.author_id.clone())
+            .collect();
+        let accounts = self.accounts.lock().unwrap();
+        Ok(author_ids
+            .iter()
+            .filter(|id| {
+                accounts
+                    .get(id.as_str())
+                    .is_some_and(|account| account.is_local())
+            })
+            .count() as u64)
     }
     fn attach_remote_media(
         &self,

@@ -157,6 +157,7 @@ impl AppServices {
                 activity_id: self.ids.generate(),
                 undo: !suspended,
                 inbox_override: None,
+                after: None,
             };
             jobs.push(self.federate_job(
                 &broadcast,

@@ -633,6 +633,69 @@ fn extract_verified(
     Ok(bytes)
 }
 
+/// Chunk size for streaming framed row bytes. Declared lengths come from an
+/// untrusted bundle header, so no path allocates the declared size up front.
+const ROW_STREAM_CHUNK_BYTES: usize = 64 * 1024;
+/// Temp-file prefix for oversized framed values (always deleted before use).
+const ROW_SPILL_PREFIX: &str = "pinetree-row-spill-";
+
+static ROW_SPILL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Read exactly `len` framed bytes in bounded chunks. The caller already
+/// caps `len` at [`MAX_TABLE_ROW_BYTES`]; chunking still avoids trusting the
+/// transport to fill one huge allocation at once.
+fn read_framed_value(reader: &mut impl Read, len: usize) -> Result<Vec<u8>, BackupError> {
+    let mut out = Vec::with_capacity(len);
+    let mut remaining = len as u64;
+    let mut chunk = vec![0u8; ROW_STREAM_CHUNK_BYTES];
+    while remaining > 0 {
+        let want = remaining.min(ROW_STREAM_CHUNK_BYTES as u64) as usize;
+        let n = reader
+            .read(&mut chunk[..want])
+            .map_err(|_| BackupError::Corrupt("truncated table payload".to_string()))?;
+        if n == 0 {
+            return Err(BackupError::Corrupt("truncated table payload".to_string()));
+        }
+        out.extend_from_slice(&chunk[..n]);
+        remaining -= n as u64;
+    }
+    Ok(out)
+}
+
+/// Drain `len` framed bytes to a temp file in bounded chunks, then delete
+/// the file. Used only to consume an oversized (hence corrupt) declaration
+/// without allocating it in RAM; callers always fail closed afterwards. The
+/// drain is bounded by the entry's actual bytes (the reader hits EOF), so a
+/// huge declared length cannot fill the disk beyond what the bundle itself
+/// already occupies.
+fn drain_framed_to_temp(reader: &mut impl Read, len: u64) -> Result<(), BackupError> {
+    let seq = ROW_SPILL_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let path = std::env::temp_dir().join(format!(
+        "{ROW_SPILL_PREFIX}{}-{}-{seq}.tmp",
+        std::process::id(),
+        super::now_ms()
+    ));
+    let mut out = std::fs::File::create(&path)
+        .map_err(|e| BackupError::Storage(format!("spill oversized row: {e}")))?;
+    let mut remaining = len;
+    let mut chunk = vec![0u8; ROW_STREAM_CHUNK_BYTES];
+    while remaining > 0 {
+        let want = remaining.min(ROW_STREAM_CHUNK_BYTES as u64) as usize;
+        let n = reader
+            .read(&mut chunk[..want])
+            .map_err(|_| BackupError::Corrupt("truncated table payload".to_string()))?;
+        if n == 0 {
+            break;
+        }
+        out.write_all(&chunk[..n])
+            .map_err(|e| BackupError::Storage(format!("spill oversized row: {e}")))?;
+        remaining -= n as u64;
+    }
+    drop(out);
+    let _ = std::fs::remove_file(&path);
+    Ok(())
+}
+
 /// Stream one table entry into the store in bounded write transactions,
 /// collecting media references for the pool check. Single codec
 /// implementation shared with the slice decoder.
@@ -675,16 +738,15 @@ fn import_table_stream(
                 .map_err(|_| BackupError::Corrupt("bad row header".to_string()))?,
         ) as usize;
         if klen as u64 + vlen as u64 > MAX_TABLE_ROW_BYTES {
+            // Oversized declaration from an untrusted header: never
+            // `vec![0u8; len]`. Drain the framed bytes to a temp file in
+            // bounded chunks (then delete it) so the stream stays consumed
+            // without ever residing in RAM, and fail closed.
+            drain_framed_to_temp(reader, klen as u64 + vlen as u64)?;
             return Err(BackupError::Corrupt("table row exceeds cap".to_string()));
         }
-        let mut key = vec![0u8; klen];
-        let mut value = vec![0u8; vlen];
-        reader
-            .read_exact(&mut key)
-            .map_err(|_| BackupError::Corrupt("truncated table payload".to_string()))?;
-        reader
-            .read_exact(&mut value)
-            .map_err(|_| BackupError::Corrupt("truncated table payload".to_string()))?;
+        let key = read_framed_value(reader, klen)?;
+        let value = read_framed_value(reader, vlen)?;
         if table.name == "media_meta" {
             // MediaMeta rows are JSON; a decode failure here is a corrupt
             // bundle, never a skip.

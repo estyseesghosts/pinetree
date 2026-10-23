@@ -54,19 +54,79 @@ async fn async_main() {
     // errors naming the path). Every key below is optional in the file;
     // absent keys take the defaults. This loop's flags override the file.
     let mut cfg = cli::config_base();
+    // Wave 5: deprecated env-only overrides. They land in the merged config
+    // BEFORE `validate()` (same as file keys) and lose to explicit CLI
+    // flags below. Prefer the JSON keys named in each message.
+    if let Some(v) = std::env::var("PINETREE_ALLOW_PRIVATE_IPS")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    {
+        eprintln!(
+            "deprecated PINETREE_ALLOW_PRIVATE_IPS is set: use JSON federation.allow_private_ips instead"
+        );
+        cfg.federation.allow_private_ips = v.trim() == "1" || v.trim().eq_ignore_ascii_case("true");
+    }
+    if std::env::var("PINETREE_DEBUG_FEDERATION")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .is_some()
+    {
+        eprintln!(
+            "deprecated PINETREE_DEBUG_FEDERATION is set: use JSON federation.debug_federation or --debug-federation instead"
+        );
+        cfg.federation.debug_federation = true;
+    }
+    if let Some(limit_raw) = std::env::var("PINETREE_REPLY_REPAIR_LIMIT")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    {
+        eprintln!(
+            "deprecated PINETREE_REPLY_REPAIR_LIMIT is set: use JSON federation.reply_repair_limit instead"
+        );
+        match limit_raw.trim().parse::<usize>() {
+            Ok(limit) => cfg.federation.reply_repair_limit = Some(limit),
+            Err(_) => {
+                eprintln!(
+                    "invalid PINETREE_REPLY_REPAIR_LIMIT={limit_raw:?} (want 1..=5000); ignoring"
+                );
+            }
+        }
+    }
     let mut positional: Vec<String> = Vec::new();
     let mut debug_federation_flag = false;
     let mut debug_weak_rate_limits_flag = false;
     for arg in std::env::args().skip(1) {
         if arg == "--debug-federation" {
             debug_federation_flag = true;
+            cfg.federation.debug_federation = true;
         } else if arg == "--debug-weak-rate-limits" {
             debug_weak_rate_limits_flag = true;
         } else if let Some(path) = arg.strip_prefix("--federation-extra-ca=") {
-            pinetree::federation::delivery::set_extra_ca(path.into());
-            eprintln!(
-                "federation extra CA in force (--federation-extra-ca={path}): not for production"
-            );
+            // Wave 5: CLI override of the `federation.federation_extra_ca`
+            // file value (same merged-then-validated flow as every setting).
+            cfg.federation.federation_extra_ca = Some(path.into());
+        } else if let Some(flag) = arg.strip_prefix("--allow-private-ips") {
+            // Per-invocation override of the JSON
+            // `federation.allow_private_ips` (throwaway federation labs
+            // only): bare flag means true, `=true|false|1|0` explicit.
+            // The webhook delivery path ignores this (always strict).
+            cfg.federation.allow_private_ips = match flag {
+                "" | "=true" | "=1" => true,
+                "=false" | "=0" => false,
+                other => {
+                    eprintln!(
+                        "invalid --allow-private-ips{other} (want bare flag or =true|=false)"
+                    );
+                    std::process::exit(2);
+                }
+            };
+        } else if let Some(limit) = arg.strip_prefix("--reply-repair-limit=") {
+            cfg.federation.reply_repair_limit = Some(limit.parse().ok().unwrap_or_else(|| {
+                eprintln!("invalid --reply-repair-limit (want an integer 1..=5000): {limit}");
+                std::process::exit(2);
+            }));
+        } else if arg == "--storage-integrity-check-at-open" {
+            cfg.storage_integrity_check_at_open = true;
         } else if arg.starts_with("--config=") {
             // Consumed by `config_base()` (sets the base this loop
             // overrides); ignored here so it never falls through to
@@ -267,6 +327,30 @@ async fn async_main() {
         );
     }
 
+    // Wave 5: extra CA bundle (JSON `federation.federation_extra_ca` or
+    // `--federation-extra-ca=PATH`). Appended as an additional trust anchor
+    // — the platform default store is never replaced. A missing/unreadable
+    // file is a permanent startup error, never a transient retry. The
+    // file's SHA-256 fingerprint is logged so operators can confirm which
+    // bundle is in force.
+    if let Some(ca_path) = cfg.federation.federation_extra_ca.as_deref() {
+        let bytes = std::fs::read(ca_path).unwrap_or_else(|err| {
+            eprintln!(
+                "federation_extra_ca unreadable ({}): {err}; refusing to boot",
+                ca_path.display()
+            );
+            std::process::exit(1);
+        });
+        use sha2::Digest as _;
+        let fingerprint = hex::encode(sha2::Sha256::digest(&bytes));
+        eprintln!(
+            "federation extra CA in force ({} bytes, sha256={}): not for production",
+            bytes.len(),
+            fingerprint
+        );
+        pinetree::federation::delivery::set_extra_ca(ca_path.to_path_buf());
+    }
+
     // Batch B: conspicuous warning whenever the unsafe local-HTTP exception
     // is active. Host class only (loopback/localhost/private-lan/test-domain
     // /public) — never URLs, keys or other secrets.
@@ -278,19 +362,23 @@ async fn async_main() {
         );
     }
 
-    // Federation debug lines (accept/reject, delivery). Off unless the flag or
-    // PINETREE_DEBUG_FEDERATION is set. See `pinetree::observability`.
-    let env_debug = pinetree::observability::env_enables_federation_debug(
-        std::env::var(pinetree::observability::DEBUG_FEDERATION_ENV)
-            .ok()
-            .as_deref(),
-    );
-    if debug_federation_flag || env_debug {
+    // Federation debug lines (accept/reject, delivery). On when the JSON
+    // `federation.debug_federation`, the `--debug-federation` flag, or the
+    // deprecated `PINETREE_DEBUG_FEDERATION` env override (all merged into
+    // the config above) requests it. Non-production toggle: `validate()`
+    // rejects `true` in release builds. See `pinetree::observability`.
+    if cfg.federation.debug_federation {
         pinetree::observability::set_federation_debug(true);
         let source = if debug_federation_flag {
             "--debug-federation"
-        } else {
+        } else if std::env::var(pinetree::observability::DEBUG_FEDERATION_ENV)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .is_some()
+        {
             "PINETREE_DEBUG_FEDERATION"
+        } else {
+            "federation.debug_federation"
         };
         eprintln!("federation debug logging on (source: {source})");
     }
@@ -422,30 +510,21 @@ async fn async_main() {
     }
     // Opt-in bounded repair for pre-Slice-B historical remote notes whose
     // original `inReplyTo` was discarded (`docs/replies.md` §6.1). Off by
-    // default (no network I/O at startup); set
-    // `PINETREE_REPLY_REPAIR_LIMIT=<1..=5000>` to re-fetch at most that many
-    // of the newest stored notes' origin documents and mark the ones that
-    // still declare a parent. Sequential, restartable, and safe to re-run.
-    if let Some(limit_raw) = std::env::var("PINETREE_REPLY_REPAIR_LIMIT")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-    {
-        match limit_raw.trim().parse::<usize>() {
-            Ok(limit) if limit > 0 => {
-                eprintln!("reply repair: scanning up to {limit} stored notes");
-                match pinetree::application::commands::inbound::replies::repair_unresolved_reply_parents(
-                    &services, limit,
-                ) {
-                    Ok(report) => eprintln!(
-                        "reply repair: scanned={} marked={} (resolver jobs enqueued)",
-                        report.scanned, report.marked
-                    ),
-                    Err(err) => eprintln!("reply repair failed (continuing to serve): {err}"),
-                }
-            }
-            _ => eprintln!(
-                "invalid PINETREE_REPLY_REPAIR_LIMIT={limit_raw:?} (want 1..=5000); skipping reply repair"
+    // default (no network I/O at startup); set JSON
+    // `federation.reply_repair_limit` (1..=5000, `--reply-repair-limit=`,
+    // or deprecated `PINETREE_REPLY_REPAIR_LIMIT`) to re-fetch at most that
+    // many of the newest stored notes' origin documents and mark the ones
+    // that still declare a parent. Sequential, restartable, safe to re-run.
+    if let Some(limit) = cfg.federation.reply_repair_limit {
+        eprintln!("reply repair: scanning up to {limit} stored notes");
+        match pinetree::application::commands::inbound::replies::repair_unresolved_reply_parents(
+            &services, limit,
+        ) {
+            Ok(report) => eprintln!(
+                "reply repair: scanned={} marked={} (resolver jobs enqueued)",
+                report.scanned, report.marked
             ),
+            Err(err) => eprintln!("reply repair failed (continuing to serve): {err}"),
         }
     }
     // Outbound email transport (gaps WP3): the worker holds the sender
@@ -496,19 +575,39 @@ async fn async_main() {
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
-                match worker.drain_pending_backups(&backup_ctx, 1) {
-                    Ok(0) => {}
-                    Ok(done) => pinetree::observability::log_event(
+                // Wave 4 liveness: the drain runs a redb scan, zip, and
+                // sha256 under the backup `runner_lock` — all blocking. It
+                // must never run on a Tokio worker, so each step goes
+                // through `spawn_blocking` (blocking pool, 8 MiB stacks like
+                // the workers). The lock lives only inside the blocking
+                // thread, never across `.await`.
+                let worker = worker.clone();
+                let backup_ctx = backup_ctx.clone();
+                match tokio::task::spawn_blocking(move || {
+                    worker.drain_pending_backups(&backup_ctx, 1)
+                })
+                .await
+                {
+                    Ok(Ok(0)) => {}
+                    Ok(Ok(done)) => pinetree::observability::log_event(
                         pinetree::observability::LogLevel::Info,
                         "backup.drained",
                         &[("completed", done.to_string().as_str())],
                     ),
-                    Err(err) => pinetree::observability::log_event(
+                    Ok(Err(err)) => pinetree::observability::log_event(
                         pinetree::observability::LogLevel::Warn,
                         "backup.drain_failed",
                         &[(
                             "error_class",
                             pinetree::observability::error_class(&err.to_string()),
+                        )],
+                    ),
+                    Err(join_err) => pinetree::observability::log_event(
+                        pinetree::observability::LogLevel::Warn,
+                        "backup.drain_join_failed",
+                        &[(
+                            "error_class",
+                            pinetree::observability::error_class(&join_err.to_string()),
                         )],
                     ),
                 }

@@ -30,6 +30,26 @@ pub trait ReactionStore: Send + Sync {
             "ReactionStore::reactions_for_note not implemented".to_string(),
         ))
     }
+    /// Distinct reactor user ids for `note_id`, oldest-first, truncated to
+    /// `limit` (Wave 4 liveness: edit fan-out needs the audience, not the
+    /// full reaction rows). Backends serve it from the by-note index and
+    /// decode at most `limit` rows. The default truncates
+    /// `reactions_for_note` for test doubles.
+    fn reactor_ids_for_note(&self, note_id: &str, limit: usize) -> Result<Vec<String>, PortError> {
+        if note_id.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for reaction in self.reactions_for_note(note_id)? {
+            if !out.contains(&reaction.user_id) {
+                out.push(reaction.user_id);
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
     /// Total stored reaction rows (Batch P `stats`).
     fn count_reactions(&self) -> Result<u64, PortError> {
         Err(PortError::StorageUnavailable(

@@ -363,8 +363,24 @@ pub fn list_backup_statuses(backup_dir: &Path) -> Vec<BackupStatus> {
         if validate_job_id(job_id).is_err() {
             continue;
         }
-        if let Ok(Some(status)) = load_status(backup_dir, job_id) {
-            out.push(status);
+        match load_status(backup_dir, job_id) {
+            Ok(Some(status)) => out.push(status),
+            Ok(None) => {}
+            Err(e) => {
+                // Corrupt or unreadable status file: skip the record but
+                // stay observable (never silent). Only the error class is
+                // logged — never the raw message — so untrusted file bytes
+                // cannot reach the logs.
+                let message = e.to_string();
+                crate::observability::log_event(
+                    crate::observability::LogLevel::Warn,
+                    "backup.status_skip",
+                    &[
+                        ("job_id", job_id),
+                        ("error_class", crate::observability::error_class(&message)),
+                    ],
+                );
+            }
         }
     }
     out.sort_by_key(|s| s.requested_ms);
@@ -372,20 +388,91 @@ pub fn list_backup_statuses(backup_dir: &Path) -> Vec<BackupStatus> {
 }
 
 /// Newest `cap` statuses in `backup_dir` (newest-first) for diagnostics.
+///
 /// Unlike [`list_backup_statuses`] (oldest-first for the worker drain),
-/// this selects the newest tail: sorts descending by `requested_ms` and
-/// truncates to `cap` before callers compute last success, last failure,
-/// last duration, last bytes, or the recent list. Ties on `requested_ms`
-/// order by descending `job_id` (monotonic suffix), so the newest job wins.
+/// this selects the newest tail without ever holding every status in
+/// memory: the directory is scanned once and only the newest `cap`
+/// records are retained (ascending by `requested_ms`, ties by ascending
+/// `job_id`), evicting the current oldest whenever a newer record
+/// arrives. Each status file is still parsed once to read its key, but
+/// retained memory stays `O(cap)` no matter how large the history grows.
+/// Callers compute last success, last failure, last duration, last bytes,
+/// or the recent list from the returned tail. Ties on `requested_ms`
+/// order by descending `job_id` (monotonic suffix), so the newest job
+/// wins.
 pub fn newest_backup_statuses(backup_dir: &Path, cap: usize) -> Vec<BackupStatus> {
-    let mut all = list_backup_statuses(backup_dir);
-    all.sort_by(|a, b| {
+    if cap == 0 {
+        return Vec::new();
+    }
+    let entries =
+        std::fs::read_dir(backup_dir).map(|r| r.filter_map(|e| e.ok()).collect::<Vec<_>>());
+    let entries = match entries {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+    // Bounded tail, kept ascending so index 0 is the eviction candidate.
+    // Never holds more than `cap` records regardless of history size.
+    let mut newest: Vec<BackupStatus> = Vec::new();
+    for entry in entries {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(job_id) = name.strip_suffix(BACKUP_STATUS_SUFFIX) else {
+            continue;
+        };
+        if validate_job_id(job_id).is_err() {
+            continue;
+        }
+        let status = match load_status(backup_dir, job_id) {
+            Ok(Some(status)) => status,
+            Ok(None) => continue,
+            Err(e) => {
+                // Same observable-skip contract as the full listing above:
+                // corrupt records never load silently (class only, no raw
+                // bytes in the logs).
+                let message = e.to_string();
+                crate::observability::log_event(
+                    crate::observability::LogLevel::Warn,
+                    "backup.status_skip",
+                    &[
+                        ("job_id", job_id),
+                        ("error_class", crate::observability::error_class(&message)),
+                    ],
+                );
+                continue;
+            }
+        };
+        if newest.len() < cap {
+            let pos = newest
+                .binary_search_by(|s| {
+                    s.requested_ms
+                        .cmp(&status.requested_ms)
+                        .then_with(|| s.job_id.cmp(&status.job_id))
+                })
+                .unwrap_or_else(|pos| pos);
+            newest.insert(pos, status);
+        } else if let Some(oldest) = newest.first() {
+            let is_newer = status
+                .requested_ms
+                .cmp(&oldest.requested_ms)
+                .then_with(|| status.job_id.cmp(&oldest.job_id));
+            if is_newer == std::cmp::Ordering::Greater {
+                let pos = newest
+                    .binary_search_by(|s| {
+                        s.requested_ms
+                            .cmp(&status.requested_ms)
+                            .then_with(|| s.job_id.cmp(&status.job_id))
+                    })
+                    .unwrap_or_else(|pos| pos);
+                newest.insert(pos, status);
+                newest.remove(0);
+            }
+        }
+    }
+    newest.sort_by(|a, b| {
         b.requested_ms
             .cmp(&a.requested_ms)
             .then_with(|| b.job_id.cmp(&a.job_id))
     });
-    all.truncate(cap);
-    all
+    newest
 }
 
 /// Retention pruning outcome (best-effort counts for logs/diagnostics).

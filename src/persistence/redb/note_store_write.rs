@@ -1,9 +1,10 @@
 use super::super::codec::{decode_json, encode_json, map_redb_err};
 use super::super::store::{
-    ACCOUNTS, HANDLE_INDEX, MEDIA_META, NOTES, NOTES_BY_URI, POLLS, RedbStore, TOMBSTONES_BY_URI,
+    ACCOUNTS, COUNTER_NOTES_LOCAL, HANDLE_INDEX, MEDIA_META, NOTES, NOTES_BY_URI, POLLS, RedbStore,
+    TOMBSTONES_BY_URI,
 };
 use super::{
-    NOTES_BY_AUTHOR, NOTES_BY_QUOTE_REQUEST, NOTES_BY_QUOTE_STAMP, NOTES_BY_REPLY,
+    NOTES_BY_AUTHOR, NOTES_BY_QUOTE_REQUEST, NOTES_BY_QUOTE_STAMP, NOTES_BY_RENOTE, NOTES_BY_REPLY,
     NOTES_BY_REPLY_PENDING,
 };
 use crate::application::ports::{CreateNoteInput, NewJob, PortError};
@@ -497,6 +498,11 @@ impl RedbStore {
         accounts_table
             .insert(author.id.as_str(), author_bytes.as_slice())
             .map_err(map_redb_err)?;
+        // Wave 4 scans: a live note by a local author bumps the maintained
+        // local-note counter in the same transaction (remote notes never
+        // do — the counter feeds NodeInfo `localPosts`, same predicate as
+        // the old full-table scan).
+        let author_is_local = author.host.is_none();
 
         let note_bytes = encode_json(&note)?;
         notes_table
@@ -505,6 +511,17 @@ impl RedbStore {
         by_author_table
             .insert((note.author_id.as_str(), note.id.as_str()), &1u8)
             .map_err(map_redb_err)?;
+        if let Some(renote_target_id) = note.renote_id.as_deref() {
+            let mut by_renote_table = write_txn
+                .open_table(NOTES_BY_RENOTE)
+                .map_err(map_redb_err)?;
+            by_renote_table
+                .insert((renote_target_id, note.id.as_str()), &1u8)
+                .map_err(map_redb_err)?;
+        }
+        if author_is_local {
+            self.counter_add_in_txn(&write_txn, COUNTER_NOTES_LOCAL, 1)?;
+        }
         if let Some(uri) = note_uri.as_deref() {
             by_uri_table
                 .insert(uri, note.id.as_str())
@@ -604,6 +621,7 @@ impl RedbStore {
             let renote_target_id = note.renote_id.clone();
             let reply_parent_id = note.reply_id.clone();
             let reply_parent_uri = note.reply_parent_uri.clone();
+            let author_is_local = note.user_host.is_none();
 
             if let Some(uri) = note.uri.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
                 let mut by_uri = write_txn.open_table(NOTES_BY_URI).map_err(map_redb_err)?;
@@ -630,9 +648,9 @@ impl RedbStore {
                 .map_err(map_redb_err)?;
 
             if was_pure_renote {
-                if let Some(tid) = renote_target_id {
+                if let Some(tid) = renote_target_id.as_deref() {
                     let target_opt: Option<Note> =
-                        match notes_table.get(tid.as_str()).map_err(map_redb_err)? {
+                        match notes_table.get(tid).map_err(map_redb_err)? {
                             Some(tg) => Some(decode_json(tg.value())?),
                             None => None,
                         };
@@ -689,6 +707,20 @@ impl RedbStore {
                 accounts_table
                     .insert(author.id.as_str(), abytes.as_slice())
                     .map_err(map_redb_err)?;
+            }
+            // Wave 4 scans: a first-time delete drops the renote edge and
+            // debits the maintained local-note counter (same transaction;
+            // the already-deleted guard above keeps this exact).
+            if let Some(renote_target) = renote_target_id.as_deref() {
+                let mut by_renote_table = write_txn
+                    .open_table(NOTES_BY_RENOTE)
+                    .map_err(map_redb_err)?;
+                let _ = by_renote_table
+                    .remove((renote_target, note.id.as_str()))
+                    .map_err(map_redb_err)?;
+            }
+            if author_is_local {
+                self.counter_add_in_txn(&write_txn, COUNTER_NOTES_LOCAL, -1)?;
             }
         }
         self.enqueue_jobs_in_txn(write_txn, jobs, Some(id))?;

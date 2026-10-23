@@ -1,6 +1,10 @@
+use std::time::{Duration, Instant};
+
 use serde_json::Value;
 
-use super::super::payload::FederateDeliverPayload;
+use super::super::payload::{
+    FANOUT_INLINE_CONCURRENCY, FANOUT_JOB_DEADLINE_MS, FederateDeliverPayload,
+};
 use super::super::recipients::fanout_is_split;
 use crate::application::commands::AppServices;
 use crate::application::ports::{NewJob, PortError};
@@ -9,6 +13,21 @@ use crate::federation::retry::{
     DESTINATION_BACKOFF_BASE_MS, DeliveryOutcome, DestinationTracker, classify_inbox_status,
 };
 
+/// Deliver one fan-out activity job.
+///
+/// - Empty inbox list: `Delivered`, nothing to do.
+/// - More than [`FANOUT_INLINE_MAX`] inboxes: nothing is sent here. Every
+///   inbox becomes a one-inbox follow-up job (`Split`), so a 100-inbox job
+///   never occupies the only worker for 100 sequential round trips and
+///   `Notify` / `RemoteMediaFetch` / `PollExpiry` keep their turn.
+/// - At or below the threshold: inboxes are sent inline in waves of at most
+///   [`FANOUT_INLINE_CONCURRENCY`] concurrent POSTs under a
+///   [`FANOUT_JOB_DEADLINE_MS`] wall-clock deadline measured from entry.
+///   Inboxes still unattempted when the deadline expires become one-inbox
+///   follow-up jobs (`Split`); completed sends keep their outcomes.
+///   Permanent failures are dropped (logged), transient failures and
+///   cooldown defers become follow-ups. `deliver_single` never returns
+///   `Split`, so that arm is unreachable here.
 pub(crate) fn fan_out(
     services: &AppServices,
     client: &SafeHttpClient,
@@ -38,31 +57,77 @@ pub(crate) fn fan_out(
         return Ok(DeliveryOutcome::Split { followups });
     }
 
-    let mut followups = Vec::new();
-    for inbox in inboxes {
-        match deliver_single(
-            services,
-            client,
-            tracker,
-            sender_account_id,
-            inbox,
-            activity,
-        )? {
-            DeliveryOutcome::Delivered => {}
-            DeliveryOutcome::PermanentFailure(reason) => {
-                eprintln!("dropping delivery to {inbox}: {reason}");
+    // Inline path: bounded waves under a wall-clock deadline. Each wave
+    // sends at most FANOUT_INLINE_CONCURRENCY POSTs concurrently; before
+    // starting a wave the job checks its deadline so one activity job
+    // cannot pin the only worker for N sequential round trips.
+    let started = Instant::now();
+    let deadline = Duration::from_millis(FANOUT_JOB_DEADLINE_MS.max(0) as u64);
+    let width = FANOUT_INLINE_CONCURRENCY.max(1);
+    // `(inbox index, follow-up job)`; sorted back into inbox order after
+    // the waves so retries keep deterministic enqueue order.
+    let mut followups: Vec<(usize, NewJob)> = Vec::new();
+    let mut next = 0usize;
+    while next < inboxes.len() {
+        if started.elapsed() >= deadline {
+            let now_ms = services.clock.now_ms();
+            for (offset, inbox) in inboxes[next..].iter().enumerate() {
+                let job = per_inbox_job(job_key, inbox, now_ms, per_inbox)?;
+                followups.push((next + offset, job));
             }
-            DeliveryOutcome::TransientFailure { retry_after_ms, .. } => {
-                let not_before = retry_after_ms.unwrap_or(now_ms);
-                followups.push(per_inbox_job(job_key, inbox, not_before, per_inbox)?);
-            }
-            DeliveryOutcome::Deferred { until_ms } => {
-                followups.push(per_inbox_job(job_key, inbox, until_ms, per_inbox)?);
-            }
-            // `deliver_single` never produces a fan-out.
-            DeliveryOutcome::Split { .. } => {}
+            break;
         }
+        let end = (next + width).min(inboxes.len());
+        let wave: Vec<(usize, Result<DeliveryOutcome, PortError>)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = inboxes[next..end]
+                .iter()
+                .enumerate()
+                .map(|(offset, inbox)| {
+                    scope.spawn(move || {
+                        let outcome = deliver_single(
+                            services,
+                            client,
+                            tracker,
+                            sender_account_id,
+                            inbox,
+                            activity,
+                        );
+                        (next + offset, outcome)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("fan-out send thread panicked"))
+                .collect()
+        });
+        for (index, outcome) in wave {
+            match outcome? {
+                DeliveryOutcome::Delivered => {}
+                DeliveryOutcome::PermanentFailure(reason) => {
+                    eprintln!("dropping delivery to {}: {reason}", inboxes[index]);
+                }
+                DeliveryOutcome::TransientFailure { retry_after_ms, .. } => {
+                    let not_before = retry_after_ms.unwrap_or(now_ms);
+                    followups.push((
+                        index,
+                        per_inbox_job(job_key, &inboxes[index], not_before, per_inbox)?,
+                    ));
+                }
+                DeliveryOutcome::Deferred { until_ms } => {
+                    followups.push((
+                        index,
+                        per_inbox_job(job_key, &inboxes[index], until_ms, per_inbox)?,
+                    ));
+                }
+                // `deliver_single` never produces a fan-out.
+                DeliveryOutcome::Split { .. } => {}
+            }
+        }
+        next = end;
     }
+    followups.sort_by_key(|(index, _)| *index);
+    let followups: Vec<NewJob> = followups.into_iter().map(|(_, job)| job).collect();
     if followups.is_empty() {
         Ok(DeliveryOutcome::Delivered)
     } else {

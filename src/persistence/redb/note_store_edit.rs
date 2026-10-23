@@ -2,7 +2,7 @@ use super::super::codec::{decode_json, encode_json, map_redb_err, trim_to_none};
 use super::super::store::{
     ACCOUNTS, HANDLE_INDEX, MEDIA_META, NOTES, POLL_VOTES, POLLS, QUOTE_STAMPS, RedbStore,
 };
-use super::{NOTE_EDITS, NOTE_EDITS_BY_NOTE, contains_any_word};
+use super::{NOTES_BY_RENOTE, NOTE_EDITS, NOTE_EDITS_BY_NOTE, contains_any_word};
 use crate::application::ports::{EditNoteInput, NewJob, PortError};
 use crate::domain::account::Account;
 use crate::domain::media::MediaMeta;
@@ -425,6 +425,24 @@ impl RedbStore {
         notes_table
             .insert(edited.id.as_str(), edited_bytes.as_slice())
             .map_err(map_redb_err)?;
+        // Wave 4 scans: a renote detach/swap moves the `(target, child)`
+        // edge in the same transaction (the no-change early return above
+        // skips this when `renote_id` is untouched).
+        if old.renote_id != edited.renote_id {
+            let mut by_renote_table = write_txn
+                .open_table(NOTES_BY_RENOTE)
+                .map_err(map_redb_err)?;
+            if let Some(prev) = old.renote_id.as_deref() {
+                let _ = by_renote_table
+                    .remove((prev, edited.id.as_str()))
+                    .map_err(map_redb_err)?;
+            }
+            if let Some(next) = edited.renote_id.as_deref() {
+                by_renote_table
+                    .insert((next, edited.id.as_str()), &1u8)
+                    .map_err(map_redb_err)?;
+            }
+        }
         // WP5 federation: the quote relation may have detached (renote
         // cleared) or reset (renote swapped) — sync both index rows in
         // this same transaction. A carried-over quote keeps its rows.

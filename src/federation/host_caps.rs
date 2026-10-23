@@ -22,6 +22,10 @@
 //! [`crate::domain::fed_policy::reaction_style_for_software`] — lives in
 //! `domain`; only the probe/cache orchestration stays here.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use serde_json::Value;
 
 use crate::application::commands::AppServices;
@@ -35,6 +39,137 @@ pub const HOST_SOFTWARE_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 /// NodeInfo probe paths, newest schema first.
 const NODEINFO_PATHS: [&str; 2] = ["/nodeinfo/2.1", "/nodeinfo/2.0"];
 
+/// Maximum concurrent NodeInfo probes process-wide (Wave 4 liveness): a
+/// mention flood across many distinct hosts must not open an unbounded
+/// burst of outbound TLS connections from the delivery workers.
+pub const NODEINFO_PROBE_MAX_IN_FLIGHT: usize = 8;
+
+/// Maximum NodeInfo probe starts per minute process-wide (Wave 4
+/// liveness): sustained distinct-host traffic degrades to the
+/// emoji-aware default instead of probing forever.
+pub const NODEINFO_PROBE_BUDGET_PER_MIN: usize = 60;
+
+/// Budget window for [`NODEINFO_PROBE_BUDGET_PER_MIN`].
+const NODEINFO_PROBE_WINDOW_MS: i64 = 60_000;
+
+/// Singleflight slot for one in-progress host probe: followers block on
+/// the condvar until the leader publishes the fetch result.
+struct ProbeSlot {
+    done: bool,
+    result: Option<String>,
+}
+
+struct ProbeGateState {
+    in_flight: HashMap<String, Arc<(Mutex<ProbeSlot>, Condvar)>>,
+    window_start_ms: i64,
+    window_used: usize,
+}
+
+/// Process-local singleflight + probe budget for NodeInfo fetches (Wave 4
+/// liveness). Concurrent deliveries to one uncached host share a single
+/// fetch; when the in-flight cap or the per-minute budget is exhausted the
+/// probe is skipped (`None` — an uncached failure the caller treats as
+/// emoji-aware). Failures are never cached (see `resolve_*` below), so a
+/// skipped probe is retried on the next delivery, not stuck.
+pub struct NodeinfoProbeGate {
+    max_in_flight: usize,
+    budget_per_min: usize,
+    state: Mutex<ProbeGateState>,
+}
+
+impl NodeinfoProbeGate {
+    /// Gate with explicit bounds (tests pass small budgets; production
+    /// uses [`NODEINFO_PROBE_MAX_IN_FLIGHT`] /
+    /// [`NODEINFO_PROBE_BUDGET_PER_MIN`] via the shared gate inside
+    /// [`fetch_nodeinfo_software`]).
+    pub fn new(max_in_flight: usize, budget_per_min: usize) -> Self {
+        Self {
+            max_in_flight: max_in_flight.max(1),
+            budget_per_min,
+            state: Mutex::new(ProbeGateState {
+                in_flight: HashMap::new(),
+                window_start_ms: 0,
+                window_used: 0,
+            }),
+        }
+    }
+
+    /// Run `fetch` for `host` under the gate. `now_ms` is the caller's
+    /// clock (tests pass synthetic times); the shared gate passes wall
+    /// time. At most one `fetch` runs per host at a time and all waiters
+    /// share its result.
+    pub fn probe(
+        &self,
+        host: &str,
+        now_ms: i64,
+        fetch: impl FnOnce() -> Option<String>,
+    ) -> Option<String> {
+        let slot = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(existing) = state.in_flight.get(host) {
+                let existing = existing.clone();
+                drop(state);
+                return Self::wait(&existing);
+            }
+            if now_ms.saturating_sub(state.window_start_ms) >= NODEINFO_PROBE_WINDOW_MS {
+                state.window_start_ms = now_ms;
+                state.window_used = 0;
+            }
+            if state.in_flight.len() >= self.max_in_flight
+                || state.window_used >= self.budget_per_min
+            {
+                return None;
+            }
+            state.window_used = state.window_used.saturating_add(1);
+            let slot = Arc::new((
+                Mutex::new(ProbeSlot {
+                    done: false,
+                    result: None,
+                }),
+                Condvar::new(),
+            ));
+            state.in_flight.insert(host.to_string(), slot.clone());
+            slot
+        };
+        let result = fetch();
+        {
+            let (lock, cvar) = &*slot;
+            let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            guard.result = result.clone();
+            guard.done = true;
+            cvar.notify_all();
+        }
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.in_flight.remove(host);
+        }
+        result
+    }
+
+    /// Block until the leader publishes the shared fetch result.
+    fn wait(slot: &Arc<(Mutex<ProbeSlot>, Condvar)>) -> Option<String> {
+        let (lock, cvar) = &**slot;
+        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while !guard.done {
+            guard = cvar.wait(guard).unwrap_or_else(|e| e.into_inner());
+        }
+        guard.result.clone()
+    }
+}
+
+fn global_probe_gate() -> &'static NodeinfoProbeGate {
+    static GATE: LazyLock<NodeinfoProbeGate> = LazyLock::new(|| {
+        NodeinfoProbeGate::new(NODEINFO_PROBE_MAX_IN_FLIGHT, NODEINFO_PROBE_BUDGET_PER_MIN)
+    });
+    &GATE
+}
+
+fn wall_now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
 /// Software names known to render Misskey-style emoji reactions
 /// (`Like` + `_misskey_reaction`). Documented as known-good; classification
 /// itself is deny-list based (only [`PLAIN_LIKE_SOFTWARE`] and the
@@ -104,11 +239,33 @@ pub fn parse_nodeinfo_software(doc: &Value) -> Option<String> {
 /// fetcher's signed GET is for authenticated actor documents). `None` on any
 /// transport, status, or parse failure — the caller treats that as
 /// emoji-aware and does NOT cache it.
+///
+/// Wave 4 liveness: concurrent probes for one host share a single fetch
+/// (singleflight), and a process-wide in-flight cap plus per-minute budget
+/// ([`NODEINFO_PROBE_MAX_IN_FLIGHT`], [`NODEINFO_PROBE_BUDGET_PER_MIN`])
+/// shed excess probes as `None` instead of opening unbounded connections.
+/// Probe failures stay uncached by design.
+///
+/// Trust note: the NodeInfo `software.name` string is self-asserted,
+/// unsigned, and advisory only. It selects a rendering flavour for
+/// outbound reactions below — it is never pinned, never trusted for
+/// authentication or authorization, and an unknown/lying value only
+/// changes which benign emoji field a remote receives.
 pub fn fetch_nodeinfo_software(client: &SafeHttpClient, host: &str) -> Option<String> {
     let host = host.trim().trim_end_matches('.');
     if host.is_empty() {
         return None;
     }
+    let host_owned = host.to_string();
+    global_probe_gate().probe(&host_owned, wall_now_ms(), || {
+        fetch_nodeinfo_software_uncached(client, &host_owned)
+    })
+}
+
+/// The uncached NodeInfo probe: both schema versions over the
+/// SSRF-protected client. Reached only through the singleflight + budget
+/// gate in [`fetch_nodeinfo_software`].
+fn fetch_nodeinfo_software_uncached(client: &SafeHttpClient, host: &str) -> Option<String> {
     for path in NODEINFO_PATHS {
         let url = format!("https://{host}{path}");
         let resp = client
@@ -141,6 +298,8 @@ pub fn is_host_software_fresh(entry: &HostSoftware, now_ms: i64) -> bool {
 /// otherwise `fetch` (the NodeInfo probe, or a mock in tests) runs and its
 /// success is cached. Store errors are best-effort (a failed read is a miss,
 /// a failed write just skips caching). Unknown/failed → `MisskeyLike`.
+/// The resolved name is advisory rendering input only (see
+/// [`fetch_nodeinfo_software`); it never gates auth.
 pub fn resolve_reaction_style(
     services: &AppServices,
     host: &str,
@@ -172,7 +331,9 @@ pub fn resolve_reaction_style(
 /// Resolve whether `host` gets emoji-reaction `Like`s: fresh cache hit wins;
 /// otherwise `fetch` (the NodeInfo probe, or a mock in tests) runs and its
 /// success is cached. Store errors are best-effort (a failed read is a miss,
-/// a failed write just skips caching). Unknown/failed → emoji-aware.
+/// a failed write just skips caching). Unknown/failed → emoji-aware. The
+/// resolved name is advisory rendering input only (see
+/// [`fetch_nodeinfo_software`); it never gates auth.
 pub fn resolve_emoji_capable(
     services: &AppServices,
     host: &str,

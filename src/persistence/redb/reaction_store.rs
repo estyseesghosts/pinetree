@@ -331,6 +331,30 @@ impl ReactionStore for RedbStore {
         Ok(out)
     }
 
+    fn reactor_ids_for_note(&self, note_id: &str, limit: usize) -> Result<Vec<String>, PortError> {
+        // Wave 4 liveness: the range is lazy, so at most `limit` rows are
+        // decoded no matter how viral the note is (the full-row loader
+        // above stays for the `notes/reactions` read path).
+        if note_id.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn
+            .open_table(REACTIONS_BY_NOTE)
+            .map_err(map_redb_err)?;
+        let mut out = Vec::new();
+        for entry in table
+            .range((note_id, "")..=(note_id, "\u{10ffff}"))
+            .map_err(map_redb_err)?
+            .take(limit)
+        {
+            let (_, v) = entry.map_err(map_redb_err)?;
+            let reaction: Reaction = decode_json(v.value())?;
+            out.push(reaction.user_id);
+        }
+        Ok(out)
+    }
+
     fn count_reactions(&self) -> Result<u64, PortError> {
         let read_txn = self.db.begin_read().map_err(map_redb_err)?;
         let table = read_txn.open_table(REACTIONS).map_err(map_redb_err)?;

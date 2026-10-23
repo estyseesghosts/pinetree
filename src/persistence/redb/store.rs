@@ -24,13 +24,14 @@ use super::host_caps_store::HOST_SOFTWARE;
 use super::instance_settings_store::INSTANCE_SETTINGS;
 use super::invite_store::{INVITE_CODES, INVITES};
 use super::job_queue::{JOBS, JOBS_DUE_INDEX};
-use super::media_store::{CACHE_ACCOUNTING, REMOTE_CACHE};
+use super::media_store::{CACHE_ACCOUNTING, CACHE_BLOB_CLASS, REMOTE_CACHE, REMOTE_CACHE_BY_BLOB};
 use super::moderation_store::{
     ABUSE_REPORT_RECIPIENTS, ABUSE_REPORTS, MODERATION_LOGS, USER_MEMOS,
 };
 use super::note_store::{
     NOTE_DRAFTS, NOTE_DRAFTS_BY_USER, NOTE_EDITS, NOTE_EDITS_BY_NOTE, NOTES_BY_AUTHOR,
-    NOTES_BY_QUOTE_REQUEST, NOTES_BY_QUOTE_STAMP, NOTES_BY_REPLY, NOTES_BY_REPLY_PENDING, PINNINGS,
+    NOTES_BY_QUOTE_REQUEST, NOTES_BY_QUOTE_STAMP, NOTES_BY_RENOTE, NOTES_BY_REPLY,
+    NOTES_BY_REPLY_PENDING, PINNINGS,
 };
 use super::note_thread_mute_store::THREAD_MUTES;
 use super::notification_store::{NOTIFICATIONS, NOTIFICATIONS_BY_USER};
@@ -46,7 +47,10 @@ use super::webhook_store::{
 };
 use crate::application::ports::{Clock, IdGenerator, Job, NewJob, PortError, RegistryStore};
 use crate::domain::id::AidxGenerator;
-use redb::{Database, ReadableTableMetadata, TableDefinition, WriteTransaction};
+use redb::{
+    Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
+    WriteTransaction,
+};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -54,6 +58,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[path = "store_backfill.rs"]
 mod store_backfill;
 
+/// Wave 4 scans: maintained live counters backing O(1) reads
+/// (`count_local_notes`, `count_local_accounts`, `pending_count`) so
+/// hot paths never decode whole tables. Keys are [`COUNTER_NOTES_LOCAL`],
+/// [`COUNTER_ACCOUNTS_LOCAL`], and [`COUNTER_JOBS_PENDING`]; every writer
+/// bumps its key in the same transaction as the state change, and a
+/// versioned backfill seeds pre-counter databases exactly once at open.
+pub(crate) const COUNTERS: TableDefinition<&str, u64> = TableDefinition::new("counters");
+/// Live notes by local authors (NodeInfo `localPosts`, `stats`).
+pub(crate) const COUNTER_NOTES_LOCAL: &str = "notes:local";
+/// Local accounts that are neither deleted nor suspended (NodeInfo `users`).
+pub(crate) const COUNTER_ACCOUNTS_LOCAL: &str = "accounts:local";
+/// Claimable (non-quarantined) jobs (`JobQueue::pending_count`).
+pub(crate) const COUNTER_JOBS_PENDING: &str = "jobs:pending";
 pub(crate) const ACCOUNTS: TableDefinition<&str, &[u8]> = TableDefinition::new("accounts");
 pub(crate) const HANDLE_INDEX: TableDefinition<&str, &str> = TableDefinition::new("handle_index");
 pub(crate) const NOTES: TableDefinition<&str, &[u8]> = TableDefinition::new("notes");
@@ -122,6 +139,17 @@ pub(crate) const STORAGE_ACCOUNTING_PROGRESS_KEY: &str = "migration:storage_acco
 /// and one write transaction (counter deltas + progress + maybe the done
 /// marker), mirroring `REPLY_BACKFILL_BATCH` discipline.
 const STORAGE_ACCOUNTING_BATCH: usize = 500;
+/// META marker: `NOTES_BY_RENOTE` has been built from `NOTES`.
+pub(crate) const RENOTE_INDEX_DONE_KEY: &str = "migration:notes_by_renote:v1";
+/// Resume cursor for an interrupted renote-index backfill: the last
+/// scanned note id.
+pub(crate) const RENOTE_INDEX_PROGRESS_KEY: &str = "migration:notes_by_renote:v1:progress";
+/// META marker: the Wave 4 `COUNTERS` rows have been seeded from full
+/// scans exactly once (pre-counter databases only).
+pub(crate) const COUNTERS_DONE_KEY: &str = "migration:counters:v1";
+/// META marker: `REMOTE_CACHE_BY_BLOB` has been built from `REMOTE_CACHE`
+/// (adversarial-2 slice 2 blob-key alias index).
+pub(crate) const REMOTE_CACHE_BLOB_INDEX_DONE_KEY: &str = "migration:remote_cache_by_blob:v1";
 /// META marker: `ACCOUNTS_BY_URI` + `ACCOUNTS_BY_HANDLE` have been built
 /// from `ACCOUNTS` (WP5 federation backfill, single transaction at open).
 pub(crate) const ACCOUNT_URI_INDEX_DONE_KEY: &str = "migration:accounts_by_uri:v1";
@@ -174,8 +202,11 @@ impl RedbStore {
         store.run_reactions_by_note_backfill()?;
         store.run_token_id_backfill()?;
         store.run_storage_accounting_backfill()?;
+        store.run_remote_cache_blob_index_backfill()?;
         store.run_account_uri_index_backfill()?;
         store.run_quote_index_backfill()?;
+        store.run_renote_index_backfill()?;
+        store.run_counters_backfill()?;
         Ok(store)
     }
 
@@ -295,6 +326,7 @@ impl RedbStore {
         let _ = write_txn.open_table(POLL_VOTES).map_err(map_redb_err)?;
         let _ = write_txn.open_table(JOBS).map_err(map_redb_err)?;
         let _ = write_txn.open_table(JOBS_DUE_INDEX).map_err(map_redb_err)?;
+        let _ = write_txn.open_table(COUNTERS).map_err(map_redb_err)?;
         let _ = write_txn.open_table(ACTIVITY_DEDUP).map_err(map_redb_err)?;
         let _ = write_txn.open_table(MEDIA_META).map_err(map_redb_err)?;
         let _ = write_txn.open_table(BLOB_REFCOUNT).map_err(map_redb_err)?;
@@ -303,7 +335,14 @@ impl RedbStore {
             .map_err(map_redb_err)?;
         let _ = write_txn.open_table(REMOTE_CACHE).map_err(map_redb_err)?;
         let _ = write_txn
+            .open_table(REMOTE_CACHE_BY_BLOB)
+            .map_err(map_redb_err)?;
+        let _ = write_txn
             .open_table(CACHE_ACCOUNTING)
+            .map_err(map_redb_err)?;
+        // Slice 5: authoritative accounting class per physical blob key.
+        let _ = write_txn
+            .open_table(CACHE_BLOB_CLASS)
             .map_err(map_redb_err)?;
         let _ = write_txn.open_table(NOTIFICATIONS).map_err(map_redb_err)?;
         let _ = write_txn
@@ -337,6 +376,9 @@ impl RedbStore {
             .map_err(map_redb_err)?;
         let _ = write_txn.open_table(QUOTE_STAMPS).map_err(map_redb_err)?;
         let _ = write_txn.open_table(NOTES_BY_REPLY).map_err(map_redb_err)?;
+        let _ = write_txn
+            .open_table(NOTES_BY_RENOTE)
+            .map_err(map_redb_err)?;
         let _ = write_txn
             .open_table(NOTES_BY_REPLY_PENDING)
             .map_err(map_redb_err)?;
@@ -429,6 +471,43 @@ impl RedbStore {
         write_txn.commit().map_err(map_redb_err)
     }
 
+    /// Read one Wave 4 maintained counter (missing key reads as 0: the
+    /// at-open backfill seeds every key before the handle serves).
+    pub(crate) fn counter_get(&self, key: &str) -> Result<u64, PortError> {
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let table = read_txn.open_table(COUNTERS).map_err(map_redb_err)?;
+        Ok(table
+            .get(key)
+            .map_err(map_redb_err)?
+            .map(|g| g.value())
+            .unwrap_or(0))
+    }
+
+    /// Add `delta` to a Wave 4 maintained counter inside the ambient write
+    /// transaction. Saturates at 0 instead of panicking: a missed bump is a
+    /// repairable accounting skew (the at-open backfill recomputes from
+    /// scratch when its marker is absent), never a crash in a delivery path.
+    pub(crate) fn counter_add_in_txn(
+        &self,
+        write_txn: &WriteTransaction,
+        key: &str,
+        delta: i64,
+    ) -> Result<u64, PortError> {
+        let mut table = write_txn.open_table(COUNTERS).map_err(map_redb_err)?;
+        let current = table
+            .get(key)
+            .map_err(map_redb_err)?
+            .map(|g| g.value())
+            .unwrap_or(0);
+        let next = if delta >= 0 {
+            current.saturating_add(delta as u64)
+        } else {
+            current.saturating_sub(delta.unsigned_abs())
+        };
+        table.insert(key, next).map_err(map_redb_err)?;
+        Ok(next)
+    }
+
     pub(crate) fn enqueue_jobs_in_txn(
         &self,
         write_txn: &WriteTransaction,
@@ -470,6 +549,12 @@ impl RedbStore {
                 .insert((job.not_before, job.id.as_str()), &1u8)
                 .map_err(map_redb_err)?;
             out.push(job);
+        }
+        // Wave 4 scans: every inserted row is claimable (not failed), so the
+        // maintained pending counter grows by the batch size in the same
+        // transaction. Callers inserting zero jobs bump nothing.
+        if !out.is_empty() {
+            self.counter_add_in_txn(&write_txn, COUNTER_JOBS_PENDING, out.len() as i64)?;
         }
         Ok(out)
     }

@@ -482,6 +482,7 @@ pub fn execute_federate_deliver(
             activity_id,
             undo,
             inbox_override,
+            after,
         } => deliver_suspend_broadcast(
             services,
             client,
@@ -492,6 +493,7 @@ pub fn execute_federate_deliver(
             activity_id,
             undo,
             inbox_override,
+            after,
         ),
 
         FederateDeliverPayload::Flag {

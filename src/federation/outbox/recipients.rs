@@ -16,7 +16,7 @@
 use std::collections::HashSet;
 
 use crate::application::commands::AppServices;
-use crate::application::ports::{JobKind, NewJob, PortError};
+use crate::application::ports::{JobKind, NewJob, PortError, TimelineCursor};
 use crate::domain::account::Account;
 
 use super::dispatch::per_inbox_job;
@@ -67,22 +67,77 @@ where
     Ok(all)
 }
 
+/// Account rows scanned per shared-inbox sweep page (Wave 4 liveness):
+/// one bounded `remote_shared_inboxes` round trip. Pages chain via the
+/// returned cursor; dispatchers performing a sweep loop
+/// [`collect_shared_inbox_page`] and fan out per page instead of
+/// materializing every known inbox up front.
+pub const SUSPEND_SWEEP_PAGE_ROWS: usize = 500;
+
+/// One bounded page of an author's follower ids (Wave 4 liveness): at most
+/// `max_rows` ids strictly after `after` (`None` = from the start), plus
+/// the resume cursor — `Some(last)` when the page was full (the next page
+/// may be empty), `None` once the table is exhausted.
+pub fn collect_follower_id_page(
+    services: &AppServices,
+    author_id: &str,
+    after: Option<&str>,
+    max_rows: usize,
+) -> Result<(Vec<String>, Option<String>), PortError> {
+    let page = services
+        .follows
+        .followers_of(author_id, after, max_rows.max(1))?;
+    let full = page.len() >= max_rows.max(1);
+    let ids: Vec<String> = page.into_iter().map(|f| f.follower_id).collect();
+    let next = if full { ids.last().cloned() } else { None };
+    Ok((ids, next))
+}
+
+/// One bounded page of the known remote shared inboxes (Wave 4 liveness):
+/// the deduped inboxes seen in at most `max_rows` account rows strictly
+/// after `after` (`None` = from the start), plus the resume cursor for the
+/// next page (`None` once the accounts table is exhausted).
+///
+/// Deduplication is per page: the same inbox may reappear across pages
+/// when several cached accounts share it. Sweep deliveries sharing one
+/// `activity_id` are receiver-deduped, so repeats converge instead of
+/// duplicating effects; a dispatcher chaining pages into continuation
+/// jobs must carry the account cursor (not the inbox list) forward.
+pub fn collect_shared_inbox_page(
+    services: &AppServices,
+    after: Option<&str>,
+    max_rows: usize,
+) -> Result<(Vec<String>, Option<String>), PortError> {
+    let (page, next) = services
+        .accounts
+        .remote_shared_inboxes(after, max_rows.max(1))?;
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for inbox in page {
+        if seen.insert(inbox.clone()) {
+            out.push(inbox);
+        }
+    }
+    Ok((out, next))
+}
+
 /// Distinct remote shared inboxes the instance knows (Batch M WP3
 /// `Delete(Person)` sweep). Upstream gathers these from the `followings`
 /// rows' `followerSharedInbox`/`followeeSharedInbox` snapshots
 /// (`postSuspend`/`postUnsuspend`); pinetree reads them from the cached
 /// remote accounts (superset of upstream's set — a host known only through
-/// a mention still holds a cached actor). Walked in bounded pages and
-/// deduplicated here; the walk ends only at the table end.
+/// a mention still holds a cached actor). Walked in bounded pages via
+/// [`collect_shared_inbox_page`] and deduplicated here; the walk ends only
+/// at the table end. Dispatchers that must bound per-run memory page the
+/// walk themselves and chain pages via the account cursor (carried in a
+/// continuation job) instead of calling this whole-set helper.
 pub fn collect_known_shared_inboxes(services: &AppServices) -> Result<Vec<String>, PortError> {
-    const SCAN_PAGE: usize = 1_000;
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     let mut cursor: Option<String> = None;
     loop {
-        let (page, next) = services
-            .accounts
-            .remote_shared_inboxes(cursor.as_deref(), SCAN_PAGE)?;
+        let (page, next) =
+            collect_shared_inbox_page(services, cursor.as_deref(), SUSPEND_SWEEP_PAGE_ROWS)?;
         for inbox in page {
             if seen.insert(inbox.clone()) {
                 out.push(inbox);
@@ -141,60 +196,96 @@ pub fn collect_recipient_inboxes_for_author(
     Ok(inboxes)
 }
 
+/// Cap on distinct interacted-user ids collected for one edit fan-out
+/// (Wave 4 liveness): repliers, renoters, and reactors beyond the cap are
+/// best-effort audience the `Update(Note)` skips rather than pages the
+/// whole table for. The author's followers (the primary audience) are
+/// unaffected — they page through the follower walk, not this cap.
+pub const INTERACTED_AUDIENCE_CAP: usize = 2_000;
+
+/// Rows read per interacted-audience page (Wave 4 liveness): replies and
+/// renotes page through their indexes in small batches; reactions resolve
+/// through the bounded by-note id list.
+const INTERACTED_PAGE_ROWS: usize = 100;
+
 /// Account ids that interacted with `note` (§8 edit fan-out: Sharkey
 /// `postNoteEdited` delivers the `Update` to remote users who replied to,
 /// renoted, or reacted to the note, plus the reply/renote authors). Reads
 /// only; the caller pages deliveries through the standard split, and remote
 /// filtering happens in `collect_recipient_inboxes_for_author`.
-pub(crate) fn collect_note_interacted_ids(
+///
+/// Wave 4 liveness: repliers page the reply index, renoters page the
+/// renote index (never a whole-table scan), and reactors resolve
+/// through the bounded by-note id list — the whole walk touches at most
+/// [`INTERACTED_AUDIENCE_CAP`] ids.
+pub fn collect_note_interacted_ids(
     services: &AppServices,
     note: &crate::domain::note::Note,
 ) -> Result<Vec<String>, PortError> {
-    use crate::application::ports::TimelineCursor;
     let mut ids: Vec<String> = Vec::new();
-    let mut push = |id: &str| {
-        if id != note.author_id.as_str() && !ids.iter().any(|known| known == id) {
+    let author_id = note.author_id.clone();
+    let within_cap = |ids: &Vec<String>| ids.len() < INTERACTED_AUDIENCE_CAP;
+    let push = |ids: &mut Vec<String>, id: &str| {
+        if ids.len() >= INTERACTED_AUDIENCE_CAP {
+            return;
+        }
+        if id != author_id.as_str() && !ids.iter().any(|known| known == id) {
             ids.push(id.to_string());
         }
     };
     if let Some(uid) = note.reply_user_id.as_deref() {
-        push(uid);
+        push(&mut ids, uid);
     }
     if let Some(rid) = note.renote_id.as_deref() {
         if let Some(target) = services.notes.get_note(rid)? {
-            push(target.author_id.as_str());
+            push(&mut ids, target.author_id.as_str());
         }
     }
-    // Repliers: newest-first pages until exhausted.
+    // Repliers: newest-first index pages until exhausted or capped.
     let mut cursor = TimelineCursor {
-        limit: 100,
+        limit: INTERACTED_PAGE_ROWS,
         ..Default::default()
     };
-    loop {
+    while within_cap(&ids) {
         let batch = services.notes.notes_by_reply(&note.id, &cursor)?;
         if batch.is_empty() {
             break;
         }
         for reply in &batch {
-            push(reply.author_id.as_str());
+            push(&mut ids, reply.author_id.as_str());
         }
-        if batch.len() < 100 {
+        if batch.len() < INTERACTED_PAGE_ROWS {
             break;
         }
         cursor.until_id = batch.last().map(|n| n.id.clone());
     }
-    // Renoters: bounded scan (same 10k bound as the `notes/renotes` read).
-    for candidate in services
-        .notes
-        .list_all_notes(&TimelineCursor::with_limit(10_000))?
-    {
-        if candidate.renote_id.as_deref() == Some(note.id.as_str()) {
-            push(candidate.author_id.as_str());
+    // Renoters: renote-index pages until exhausted or capped.
+    let mut renote_cursor = TimelineCursor {
+        limit: INTERACTED_PAGE_ROWS,
+        ..Default::default()
+    };
+    while within_cap(&ids) {
+        let batch = services.notes.notes_by_renote(&note.id, &renote_cursor)?;
+        if batch.is_empty() {
+            break;
         }
+        for renote in &batch {
+            push(&mut ids, renote.author_id.as_str());
+        }
+        if batch.len() < INTERACTED_PAGE_ROWS {
+            break;
+        }
+        renote_cursor.until_id = batch.last().map(|n| n.id.clone());
     }
-    // Reactors.
-    for reaction in services.reactions.reactions_for_note(&note.id)? {
-        push(reaction.user_id.as_str());
+    // Reactors: bounded id list (no full reaction-row load).
+    if within_cap(&ids) {
+        let remaining = INTERACTED_AUDIENCE_CAP - ids.len();
+        for user_id in services
+            .reactions
+            .reactor_ids_for_note(&note.id, remaining)?
+        {
+            push(&mut ids, user_id.as_str());
+        }
     }
     Ok(ids)
 }

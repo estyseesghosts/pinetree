@@ -20,8 +20,13 @@ mod quotes;
 mod recipients;
 
 pub use self::dispatch::execute_federate_deliver;
-pub use self::payload::{FANOUT_INLINE_MAX, FOLLOWER_PAGE_SIZE, FederateDeliverPayload};
+pub use self::payload::{
+    FANOUT_INLINE_CONCURRENCY, FANOUT_INLINE_MAX, FANOUT_JOB_DEADLINE_MS, FOLLOWER_PAGE_SIZE,
+    FederateDeliverPayload,
+};
 pub use self::recipients::{
-    collect_follower_ids, collect_known_shared_inboxes, collect_recipient_inboxes_for_author,
-    fanout_is_split, preferred_inbox,
+    INTERACTED_AUDIENCE_CAP, SUSPEND_SWEEP_PAGE_ROWS, collect_follower_id_page,
+    collect_follower_ids, collect_known_shared_inboxes, collect_note_interacted_ids,
+    collect_recipient_inboxes_for_author, collect_shared_inbox_page, fanout_is_split,
+    preferred_inbox,
 };

@@ -2,7 +2,7 @@ use serde_json::Value;
 
 use super::super::payload::FederateDeliverPayload;
 use super::super::recipients::{
-    collect_known_shared_inboxes, collect_recipient_inboxes_for_author,
+    SUSPEND_SWEEP_PAGE_ROWS, collect_recipient_inboxes_for_author, collect_shared_inbox_page,
 };
 use super::{deliver_single, fan_out};
 use crate::activitypub::objects::{render_undo_activity, render_update_actor_activity};
@@ -109,6 +109,7 @@ pub(crate) fn deliver_suspend_broadcast(
     activity_id: String,
     undo: bool,
     inbox_override: Option<String>,
+    after: Option<String>,
 ) -> Result<DeliveryOutcome, PortError> {
     let actor = match services.accounts.find_by_id(&account_id)? {
         Some(a) if a.is_local() => a,
@@ -140,22 +141,43 @@ pub(crate) fn deliver_suspend_broadcast(
     match inbox_override {
         Some(inbox) => deliver_single(services, client, tracker, &account_id, &inbox, &activity),
         None => {
-            let inboxes = collect_known_shared_inboxes(services)?;
-            fan_out(
+            let (page, next) =
+                collect_shared_inbox_page(services, after.as_deref(), SUSPEND_SWEEP_PAGE_ROWS)?;
+            let mut outcome = fan_out(
                 services,
                 client,
                 tracker,
                 job_key,
                 &account_id,
-                &inboxes,
+                &page,
                 &activity,
                 &|inbox: &str| FederateDeliverPayload::SuspendBroadcast {
                     account_id: account_id.clone(),
                     activity_id: activity_id.clone(),
                     undo,
                     inbox_override: Some(inbox.to_string()),
+                    after: None,
                 },
-            )
+            )?;
+            if let Some(cursor) = next {
+                let cont = FederateDeliverPayload::SuspendBroadcast {
+                    account_id: account_id.clone(),
+                    activity_id: activity_id.clone(),
+                    undo,
+                    inbox_override: None,
+                    after: Some(cursor.clone()),
+                }
+                .into_job(format!("{job_key}:sweep:{cursor}"), services.clock.now_ms())?;
+                // `fan_out` only ever returns `Delivered` or `Split`.
+                let mut followups = match outcome {
+                    DeliveryOutcome::Split { followups } => followups,
+                    DeliveryOutcome::Delivered => Vec::new(),
+                    other => return Ok(other),
+                };
+                followups.push(cont);
+                outcome = DeliveryOutcome::Split { followups };
+            }
+            Ok(outcome)
         }
     }
 }

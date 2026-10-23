@@ -1,12 +1,12 @@
 use super::super::codec::{decode_json, encode_json, map_redb_err};
 use super::super::store::{
-    ACCOUNTS, BLOB_REFCOUNT, DURABLE_BYTES_BY_OWNER, MEDIA_META, NOTES, NOTES_BY_URI, QUOTE_STAMPS,
-    RedbStore,
+    ACCOUNTS, BLOB_REFCOUNT, COUNTER_NOTES_LOCAL, DURABLE_BYTES_BY_OWNER, MEDIA_META, NOTES,
+    NOTES_BY_URI, QUOTE_STAMPS, RedbStore,
 };
 use super::{
     NOTE_DRAFTS, NOTE_DRAFTS_BY_USER, NOTE_EDITS, NOTE_EDITS_BY_NOTE, NOTES_BY_AUTHOR,
-    NOTES_BY_QUOTE_REQUEST, NOTES_BY_QUOTE_STAMP, NOTES_BY_REPLY, NOTES_BY_REPLY_PENDING, PINNINGS,
-    matches_cursor,
+    NOTES_BY_QUOTE_REQUEST, NOTES_BY_QUOTE_STAMP, NOTES_BY_RENOTE, NOTES_BY_REPLY,
+    NOTES_BY_REPLY_PENDING, PINNINGS, matches_cursor,
 };
 use crate::application::ports::{
     CreateNoteInput, EditNoteInput, InsertMediaInput, MediaClass, NewJob, NoteStore, PortError,
@@ -137,7 +137,12 @@ impl NoteStore for RedbStore {
     }
 
     fn list_all_notes(&self, cursor: &TimelineCursor) -> Result<Vec<Note>, PortError> {
-        let limit = if cursor.limit == 0 { 100 } else { cursor.limit };
+        // Wave 4 liveness: the port clamps `limit` (`TimelineCursor::with_limit`
+        // and `clamp_limit`), and the backend enforces the same bound for
+        // struct-literal cursors — no request decodes more than one page.
+        // Deeper scans page with `until_id`.
+        let raw = TimelineCursor::clamp_limit(cursor.limit);
+        let limit = if raw == 0 { 100 } else { raw };
         let read_txn = self.db.begin_read().map_err(map_redb_err)?;
         let notes_table = read_txn.open_table(NOTES).map_err(map_redb_err)?;
         let mut out = Vec::new();
@@ -158,6 +163,48 @@ impl NoteStore for RedbStore {
         Ok(out)
     }
 
+    /// Renotes of one note from the `(renote_target, child)` index —
+    /// bounded to one target's rows, newest-first, deleted filtered. No
+    /// whole-table scan regardless of `limit`.
+    fn notes_by_renote(
+        &self,
+        renote_id: &str,
+        cursor: &TimelineCursor,
+    ) -> Result<Vec<Note>, PortError> {
+        let raw = TimelineCursor::clamp_limit(cursor.limit);
+        let limit = if raw == 0 { 50 } else { raw };
+        if renote_id.is_empty() {
+            return Ok(Vec::new());
+        }
+        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
+        let by_renote = read_txn.open_table(NOTES_BY_RENOTE).map_err(map_redb_err)?;
+        let notes_table = read_txn.open_table(NOTES).map_err(map_redb_err)?;
+
+        let range = by_renote
+            .range((renote_id, "")..=(renote_id, "\u{10ffff}"))
+            .map_err(map_redb_err)?;
+        let mut out = Vec::new();
+        for entry in range.rev() {
+            let (k, _) = entry.map_err(map_redb_err)?;
+            let (_, note_id) = k.value();
+            if !matches_cursor(note_id, cursor) {
+                continue;
+            }
+            if let Some(ng) = notes_table.get(note_id).map_err(map_redb_err)? {
+                let note: Note = decode_json(ng.value())?;
+                // Index rows of deleted notes are dropped at delete time;
+                // the guard stays so a torn index can never surface one.
+                if !note.is_deleted {
+                    out.push(note);
+                    if out.len() >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
     fn count_notes(&self) -> Result<u64, PortError> {
         let read_txn = self.db.begin_read().map_err(map_redb_err)?;
         let notes_table = read_txn.open_table(NOTES).map_err(map_redb_err)?;
@@ -165,30 +212,10 @@ impl NoteStore for RedbStore {
     }
 
     fn count_local_notes(&self) -> Result<u64, PortError> {
-        // One accounts pass builds the local-author set; one notes pass
-        // counts live rows by those authors. Both tables are small on a
-        // single node; FDB inherits the same bounded-shape discipline via
-        // its own adapter (this is a read, not a transaction).
-        let read_txn = self.db.begin_read().map_err(map_redb_err)?;
-        let accounts_table = read_txn.open_table(ACCOUNTS).map_err(map_redb_err)?;
-        let mut local: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for entry in accounts_table.iter().map_err(map_redb_err)? {
-            let (k, v) = entry.map_err(map_redb_err)?;
-            let acc: Account = decode_json(v.value())?;
-            if acc.is_local() {
-                local.insert(k.value().to_string());
-            }
-        }
-        let notes_table = read_txn.open_table(NOTES).map_err(map_redb_err)?;
-        let mut count = 0u64;
-        for entry in notes_table.iter().map_err(map_redb_err)? {
-            let (_, v) = entry.map_err(map_redb_err)?;
-            let note: Note = decode_json(v.value())?;
-            if !note.is_deleted && local.contains(&note.author_id) {
-                count += 1;
-            }
-        }
-        Ok(count)
+        // Wave 4 liveness: O(1) maintained counter (bumped in the same
+        // transactions as note create/delete, seeded once at open). The old
+        // code decoded every account row plus every note row per call.
+        self.counter_get(COUNTER_NOTES_LOCAL)
     }
 
     fn find_by_uri(&self, uri: &str) -> Result<Option<Note>, PortError> {
