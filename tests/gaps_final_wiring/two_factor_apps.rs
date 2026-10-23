@@ -41,14 +41,18 @@ pub async fn run(srv: &Live, alice_id: &str, alice_token: &str) {
         .api("i/2fa/done", json!({"token": good}), Some(&alice_token))
         .await;
     assert_eq!(status, 204);
-    let (status, _) = srv
+    // DIVERGENCE (adversarial-2 slice 6): passwordless sign-in is not
+    // implemented, so enabling it is refused with INVALID_PARAM instead
+    // of 204. The rest of the 2fa flow does not depend on the flag.
+    let (status, value) = srv
         .api(
             "i/2fa/password-less",
             json!({"value": true}),
             Some(&alice_token),
         )
         .await;
-    assert_eq!(status, 204);
+    assert_eq!(status, 400);
+    assert_eq!(code_of(&value), "INVALID_PARAM");
     let (status, value) = srv
         .api(
             "i/2fa/update-key",

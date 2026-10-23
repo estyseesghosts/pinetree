@@ -187,6 +187,7 @@ fn insert_remote_row(
             last_access_ms: BASE_MS,
             access_count: 1,
             bytes_absent: false,
+            generation: 0,
         })
         .unwrap();
     h.store

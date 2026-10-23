@@ -182,6 +182,7 @@ fn insert_cache_row(
             last_access_ms,
             access_count: 1,
             bytes_absent: false,
+            generation: 0,
         })
         .unwrap();
     meta

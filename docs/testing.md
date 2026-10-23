@@ -68,9 +68,11 @@ Node 22, or the built `./misskey` + `./sharkey` checkouts are absent:
 ```
 
 `cargo test` notes: needs `./misskey`/`./sharkey` re-linked first
-(packer snapshot + `client_profile` tests skip without them);
-`target-dir` is redirected to ext4 via `.cargo/config.toml`
-(git-ignored, machine-local).
+(packer snapshot + `client_profile` tests skip without them).
+The tracked `.cargo/config.toml` sets no `target-dir`; to share one target
+dir with birchtree locally, set `CARGO_TARGET_DIR` in the environment or in
+a gitignored user config, not in the committed file (build one tree at a
+time: Cargo locks the target directory).
 
 ## Browser topologies (need eyes, not automation)
 

@@ -1,6 +1,3 @@
-# Machine-local cargo settings. Shared with birchtree so identical registry
-# crates (same version, features, profile, rustc) are compiled once.
-# Build one of the two trees at a time: Cargo locks this directory.
-# Override with CARGO_TARGET_DIR if this path is wrong on another machine.
-[build]
-target-dir = "C:/Users/julie/.cargo/shared-target"
+# Tracked cargo config: sets no target-dir (a committed absolute path would
+# break every other machine). To share one target dir with birchtree locally,
+# set CARGO_TARGET_DIR in the environment or in a gitignored user config, not here.

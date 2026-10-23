@@ -56,6 +56,13 @@ pub struct RemoteCacheRecord {
     pub fetched_at_ms: i64,
     pub last_access_ms: i64,
     pub access_count: u64,
+    /// Monotonic per-row change counter (adversarial-2 slice 2, finding 5
+    /// guard half). The store bumps it on every mutation of the row
+    /// (insert, touch, eviction transition); eviction compares it — never
+    /// timestamps alone — so a same-millisecond touch still counts as
+    /// newer. Old rows decode as `0`.
+    #[serde(default)]
+    pub generation: u64,
     /// True once the bytes for this key have been charged off. Old rows
     /// decode as `false` (present). Set by `commit_cache_eviction`; a
     /// refetch clears it when bytes are restored.
@@ -78,6 +85,12 @@ pub enum CacheEvictionOutcome {
 
 /// Shell-free observability snapshot (`docs/remote-media-cache-plan.md`
 /// §5.6): totals plus per-class breakdown and hit/miss counters.
+///
+/// Class rule (adversarial-2 slice 5): `AudioVideo` has NO class counter —
+/// it is governed by `total_bytes` alone, in every backend, in apply and
+/// evict alike. `full_bytes` counts `Full` only; stored snapshots that
+/// predate the rule may still hold AudioVideo charges inside `full_bytes`
+/// (left alone, never re-attributed by guessing).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CacheStats {
     pub total_bytes: u64,
@@ -196,6 +209,61 @@ pub trait MediaStore: Send + Sync {
     ) -> Result<Vec<RemoteCacheRecord>, PortError> {
         Ok(Vec::new())
     }
+    /// Charged-row pagination for eviction (adversarial-2 slice 2): at most
+    /// `limit` CHARGED rows (`size_bytes > 0 && !bytes_absent`) starting at
+    /// `offset`, oldest `last_access_ms` first. Tombstones never occupy
+    /// this window. The eviction loop pages `offset` forward until the
+    /// budget fits or a page comes back short/empty (eligible set
+    /// exhausted). Test-double default: empty (no candidates).
+    fn remote_cache_charged_page(
+        &self,
+        _offset: usize,
+        _limit: usize,
+    ) -> Result<Vec<RemoteCacheRecord>, PortError> {
+        Ok(Vec::new())
+    }
+    /// Tombstone pagination for the retention pass (adversarial-2 slice 2,
+    /// finding 9): at most `limit` zero-byte/absent rows starting at
+    /// `offset`, oldest `last_access_ms` first. The retention consumer
+    /// (never eviction) filters by class TTL and live-media reference.
+    /// Test-double default: empty (nothing to retain).
+    fn remote_cache_tombstone_page(
+        &self,
+        _offset: usize,
+        _limit: usize,
+    ) -> Result<Vec<RemoteCacheRecord>, PortError> {
+        Ok(Vec::new())
+    }
+    /// Dangling-index pagination for the reconciler (adversarial-2 slice 4,
+    /// finding E): at most `limit` index rows whose media row is GONE,
+    /// starting at `offset`, in `(source_url, variant)` key order — never
+    /// LRU order, so a newer dangling row is visited even while old live
+    /// rows or tombstones would fill an oldest-N window. Every returned
+    /// row is still only a candidate: the caller re-reads the exact row
+    /// under the lifecycle gate plus the per-key lock and removes it with
+    /// [`MediaStore::remote_cache_remove_if`]. Test-double default: empty
+    /// (nothing dangling).
+    fn remote_cache_dangling_page(
+        &self,
+        _offset: usize,
+        _limit: usize,
+    ) -> Result<Vec<RemoteCacheRecord>, PortError> {
+        Ok(Vec::new())
+    }
+    /// Conditional index-row removal (adversarial-2 slice 2 retention; the
+    /// slice 4 dangling path reuses it): removes `(source_url, variant)`
+    /// only when the current row still points at (`media_id`, `blob_key`).
+    /// Returns `true` when a row was removed. A concurrent refetch installs
+    /// a new `media_id`, so the CAS fails and the fresh row survives.
+    fn remote_cache_remove_if(
+        &self,
+        _source_url: &str,
+        _variant: &str,
+        _media_id: &str,
+        _blob_key: &str,
+    ) -> Result<bool, PortError> {
+        Ok(false)
+    }
     fn remote_cache_remove(&self, _source_url: &str, _variant: &str) -> Result<(), PortError> {
         Ok(())
     }
@@ -205,6 +273,11 @@ pub trait MediaStore: Send + Sync {
     /// One physical-key eviction transition in a single write transaction.
     /// The caller holds `acquire_media_op` + `acquire_blob_key` and has
     /// already deleted the cache-pool bytes (or verified absence).
+    /// The backend debits the authoritative per-key accounting class
+    /// recorded at first charge (adversarial-2 slice 5), not necessarily
+    /// `class`: callers pass their best-known class (e.g. the max alias)
+    /// as the pre-migration fallback. `AudioVideo` never moves a class
+    /// counter — only `total_bytes` — on every backend.
     fn commit_cache_eviction(
         &self,
         blob_key: &str,
@@ -220,6 +293,8 @@ pub trait MediaStore: Send + Sync {
     ) -> Result<Vec<RemoteCacheRecord>, PortError>;
     /// Apply accounting deltas (all saturating). `total_delta`/`class_delta`
     /// are signed (eviction/release negative, insert positive).
+    /// `AudioVideo` moves `total_bytes` only: `class_delta` for that class
+    /// is ignored on every backend (adversarial-2 slice 5).
     fn cache_accounting_apply(
         &self,
         _total_delta: i64,

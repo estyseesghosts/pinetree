@@ -178,6 +178,42 @@ impl MediaStore for FakeMedia {
         out.truncate(limit);
         Ok(out)
     }
+    fn remote_cache_dangling_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<RemoteCacheRecord>, PortError> {
+        // Key order, never LRU: mirrors the production dangling window so
+        // the reconciler unit tests exercise the finding-E selection.
+        let rows = self.rows.lock().unwrap();
+        let index = self.index.lock().unwrap();
+        let mut out: Vec<RemoteCacheRecord> = index
+            .values()
+            .filter(|rec| !rows.contains_key(&rec.media_id))
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| (&a.source_url, &a.variant).cmp(&(&b.source_url, &b.variant)));
+        Ok(out.into_iter().skip(offset).take(limit).collect())
+    }
+    fn remote_cache_remove_if(
+        &self,
+        source_url: &str,
+        variant: &str,
+        media_id: &str,
+        blob_key: &str,
+    ) -> Result<bool, PortError> {
+        // Identity CAS mirroring the production backend: only the row
+        // still pointing at (`media_id`, `blob_key`) disappears.
+        let mut index = self.index.lock().unwrap();
+        let key = (source_url.to_string(), variant.to_string());
+        match index.get(&key) {
+            Some(current) if current.media_id == media_id && current.blob_key == blob_key => {
+                index.remove(&key);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
     fn remote_cache_remove(&self, source_url: &str, variant: &str) -> Result<(), PortError> {
         self.index
             .lock()

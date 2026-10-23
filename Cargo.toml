@@ -28,7 +28,7 @@ regex = "1.13.1"
 rand = "0.10.3"
 uuid = { version = "1.28.0", features = ["v4"] }
 axum = { version = "0.8", features = ["multipart", "ws"] }
-http-body-util = "0.1"
+http-body-util = { version = "0.1", features = ["channel"] }
 sha2 = "0.10"
 rsa = { version = "0.9", features = ["sha2"] }
 signature = "2"

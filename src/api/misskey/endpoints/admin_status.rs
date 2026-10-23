@@ -276,6 +276,8 @@ pub(crate) fn build_admin_status(state: &ApiState, detailed: bool) -> Value {
             "backup": pack_pool_presence(&ops.backup_dir),
         },
         "cache": match &cache {
+            // Slice 5 class rule: AudioVideo has no class counter — its
+            // bytes live in `usedBytes`/`total` only, never in `fullBytes`.
             Some(stats) => serde_json::json!({
                 "usedBytes": stats.total_bytes,
                 "capBytes": state.services.remote_cache_max_bytes,

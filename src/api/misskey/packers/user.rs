@@ -566,15 +566,21 @@ pub fn pack_me_detailed(
     // `i/2fa/*` is the supported second factor). A store fault propagates
     // as an error so `i` never reports `twoFactorEnabled: false` on a
     // failed read; enforcement stays fail-closed on the signin paths too.
-    let (two_factor_enabled, use_password_less_login) = services.totp_flags(&account.id)?;
+    // DIVERGENCE (adversarial-2 finding 7): `usePasswordLessLogin` packs
+    // `false` always. Pinetree implements no passwordless sign-in —
+    // `do_signin_flow` still requires the password before the TOTP
+    // challenge — so advertising the capability would invite clients to
+    // skip the password factor. The stored `TotpState::passwordless` bit
+    // is legacy data only: it is never surfaced here, and the
+    // `i/2fa/password-less` setter refuses to set it anew. The second
+    // value of `totp_flags` is kept for that stored bit (other readers
+    // may still inspect it) but is deliberately not client-visible.
+    let (two_factor_enabled, _) = services.totp_flags(&account.id)?;
     obj.insert(
         "twoFactorEnabled".to_string(),
         Value::Bool(two_factor_enabled),
     );
-    obj.insert(
-        "usePasswordLessLogin".to_string(),
-        Value::Bool(use_password_less_login),
-    );
+    obj.insert("usePasswordLessLogin".to_string(), Value::Bool(false));
     obj.insert("securityKeys".to_string(), Value::Bool(false));
     obj.insert(
         "followApprovalLocalSeconds".to_string(),
