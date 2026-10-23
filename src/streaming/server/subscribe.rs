@@ -290,7 +290,10 @@ pub(crate) async fn connect_channel(
                 .to_string()
                 .into(),
             );
-            let _ = sender.send(frame).await;
+            if sender.send(frame).await.is_err() {
+                // At-most-once by design: counted, not retried.
+                crate::observability::record_error("streaming.send_dropped");
+            }
             return;
         }
     };
@@ -339,7 +342,10 @@ pub(crate) async fn connect_channel(
     match &kind {
         ChannelKind::ServerStats => {
             let frame = channel_frame(id, "stats", server_stats_snapshot());
-            let _ = sender.send(frame).await;
+            if sender.send(frame).await.is_err() {
+                // At-most-once by design: counted, not retried.
+                crate::observability::record_error("streaming.send_dropped");
+            }
         }
         ChannelKind::QueueStats => {
             let services = state.services.clone();
@@ -347,7 +353,10 @@ pub(crate) async fn connect_channel(
                 .await
                 .unwrap_or_else(|_| serde_json::json!({ "waiting": 0 }));
             let frame = channel_frame(id, "stats", snapshot);
-            let _ = sender.send(frame).await;
+            if sender.send(frame).await.is_err() {
+                // At-most-once by design: counted, not retried.
+                crate::observability::record_error("streaming.send_dropped");
+            }
         }
         _ => {}
     }
@@ -408,7 +417,10 @@ pub(crate) async fn handle_stats_log_request(
     match channels.get(channel_id).map(|sub| &sub.kind) {
         Some(ChannelKind::ServerStats) => {
             let frame = channel_frame(channel_id, "statsLog", server_stats_snapshot());
-            let _ = sender.send(frame).await;
+            if sender.send(frame).await.is_err() {
+                // At-most-once by design: counted, not retried.
+                crate::observability::record_error("streaming.send_dropped");
+            }
         }
         Some(ChannelKind::QueueStats) => {
             let services = state.services.clone();
@@ -416,7 +428,10 @@ pub(crate) async fn handle_stats_log_request(
                 .await
                 .unwrap_or_else(|_| serde_json::json!({ "waiting": 0 }));
             let frame = channel_frame(channel_id, "statsLog", snapshot);
-            let _ = sender.send(frame).await;
+            if sender.send(frame).await.is_err() {
+                // At-most-once by design: counted, not retried.
+                crate::observability::record_error("streaming.send_dropped");
+            }
         }
         _ => {}
     }

@@ -1,9 +1,101 @@
 use super::protocol::note_updated_frame;
 use crate::api::misskey::endpoints::ApiState;
+use crate::domain::id::PortError;
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::SinkExt as _;
 use serde_json::Value;
 use std::collections::HashMap;
+
+/// One diagnosed streaming skip (same shape as `log_me_updated_skip` in
+/// `dispatch.rs`): a stable `streaming.skipped` warn line carrying the
+/// error class only (never secrets, bodies, or DB strings) plus the
+/// bounded error ledger.
+///
+/// Callers skip the frame: no retry (the next event re-delivers current
+/// state) and never a partial pack. Gone (`Ok(None)`) and invisible
+/// notes skip silently at the call site — only faults reach this helper.
+pub(crate) fn log_stream_skip(scope: &str, stage: &str, err: &PortError) {
+    let message = err.to_string();
+    crate::observability::record_error("streaming.skipped");
+    crate::observability::log_event(
+        crate::observability::LogLevel::Warn,
+        "streaming.skipped",
+        &[
+            ("scope", scope),
+            ("stage", stage),
+            ("error_class", crate::observability::error_class(&message)),
+        ],
+    );
+}
+
+/// A `spawn_blocking` join failure for one fan-out scope: same
+/// `streaming.skipped` diagnosis (error class only), then skip the frame.
+pub(crate) fn log_stream_join_skip(scope: &str, join_err: &tokio::task::JoinError) {
+    let message = join_err.to_string();
+    crate::observability::record_error("streaming.skipped");
+    crate::observability::log_event(
+        crate::observability::LogLevel::Warn,
+        "streaming.skipped",
+        &[
+            ("scope", scope),
+            ("stage", "dispatch-join"),
+            ("error_class", crate::observability::error_class(&message)),
+        ],
+    );
+}
+
+/// Load one fan-out row: gone (`Ok(None)`) returns `None` silently; a
+/// store fault is diagnosed via [`log_stream_skip`] and returns `None`
+/// (skip the frame, no retry).
+pub(crate) fn load_for_fanout<T>(
+    scope: &str,
+    stage: &str,
+    loaded: Result<Option<T>, PortError>,
+) -> Option<T> {
+    match loaded {
+        Ok(row) => row,
+        Err(err) => {
+            log_stream_skip(scope, stage, &err);
+            None
+        }
+    }
+}
+
+/// Fallible fan-out step (packer, filter, cache): `Ok` passes through; a
+/// fault is diagnosed via [`log_stream_skip`] and returns `None` (skip
+/// the frame, no retry, no partial pack).
+pub(crate) fn load_or_skip<T>(scope: &str, stage: &str, loaded: Result<T, PortError>) -> Option<T> {
+    match loaded {
+        Ok(value) => Some(value),
+        Err(err) => {
+            log_stream_skip(scope, stage, &err);
+            None
+        }
+    }
+}
+
+/// Join one fan-out blocking task: the task's own `Option` already
+/// diagnosed store/pack faults inside; a join failure is diagnosed here
+/// (`dispatch-join`) and skips the frame.
+pub(crate) fn join_fanout<T>(
+    scope: &str,
+    joined: Result<Option<T>, tokio::task::JoinError>,
+) -> Option<T> {
+    match joined {
+        Ok(value) => value,
+        Err(join_err) => {
+            log_stream_join_skip(scope, &join_err);
+            None
+        }
+    }
+}
+
+/// Count one at-most-once socket/hub drop. Delivery stays at-most-once by
+/// design (no retry, no policy change); the counter keeps the drop
+/// visible in the bounded error ledger.
+pub(crate) fn count_send_drop() {
+    crate::observability::record_error("streaming.send_dropped");
+}
 
 /// Shared read-time gate for the `hashtag`/`roleTimeline` note fan-out
 /// (upstream `isNoteVisibleForMe` + `NoteStreamingHidingService` +
@@ -98,13 +190,17 @@ pub(crate) async fn resolve_reaction_emoji(state: &ApiState, reaction: &str) -> 
                 Ok(Some(emoji)) => {
                     let base = services.public_url.trim_end_matches('/');
                     let url = match emoji.media_id.as_deref() {
-                        Some(media_id) => services
-                            .media
-                            .get(media_id)
-                            .ok()
-                            .flatten()
-                            .map(|meta| meta.url)
-                            .unwrap_or_else(|| format!("{base}/emojis/{}", emoji.shortcode)),
+                        Some(media_id) => match services.media.get(media_id) {
+                            Ok(row) => row
+                                .map(|meta| meta.url)
+                                .unwrap_or_else(|| format!("{base}/emojis/{}", emoji.shortcode)),
+                            Err(err) => {
+                                // Diagnosed, then the same static fallback
+                                // URL (never a partial frame).
+                                log_stream_skip("emoji", "media-load", &err);
+                                format!("{base}/emojis/{}", emoji.shortcode)
+                            }
+                        },
                         None => format!("{base}/emojis/{}", emoji.shortcode),
                     };
                     serde_json::json!({ "name": emoji.shortcode, "url": url })
@@ -134,15 +230,99 @@ pub(crate) async fn push_note_updated(
     let services = state.services.clone();
     let note_id_owned = note_id.to_string();
     let viewer = viewer_id.map(|s| s.to_string());
-    let visible = tokio::task::spawn_blocking(move || {
+    let gate = tokio::task::spawn_blocking(move || {
         services.capture_gate(viewer.as_deref(), &note_id_owned)
     })
-    .await
-    .unwrap_or(Ok(false))
-    .unwrap_or(false);
+    .await;
+    // Join and store faults are diagnosed and skip the frame; a gate
+    // verdict of invisible stays silent (nothing to send).
+    let visible = match gate {
+        Err(join_err) => {
+            log_stream_join_skip("capture", &join_err);
+            return;
+        }
+        Ok(loaded) => match loaded {
+            Ok(visible) => visible,
+            Err(err) => {
+                log_stream_skip("capture", "capture-gate", &err);
+                return;
+            }
+        },
+    };
     if !visible {
         return;
     }
     let frame = note_updated_frame(note_id, event, body);
-    let _ = sender.send(frame).await;
+    if sender.send(frame).await.is_err() {
+        // At-most-once by design: counted, not retried.
+        count_send_drop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn skipped_count() -> u64 {
+        crate::observability::error_counts()
+            .get("streaming.skipped")
+            .copied()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn fanout_load_fault_skips_and_counts() {
+        let before = skipped_count();
+        let out: Option<String> = load_for_fanout(
+            "test",
+            "note-load",
+            Err(PortError::StorageUnavailable("test outage".to_string())),
+        );
+        assert!(out.is_none(), "store fault must skip the frame");
+        assert_eq!(
+            skipped_count(),
+            before + 1,
+            "store fault must be counted once"
+        );
+    }
+
+    #[test]
+    fn fanout_load_gone_is_silent() {
+        let before = skipped_count();
+        let out: Option<String> = load_for_fanout("test", "note-load", Ok(None));
+        assert!(out.is_none(), "gone row must skip the frame");
+        assert_eq!(
+            skipped_count(),
+            before,
+            "gone rows stay silent: nothing to diagnose"
+        );
+    }
+
+    #[test]
+    fn fanout_pack_fault_skips_without_partial_value() {
+        let before = skipped_count();
+        let out: Option<String> = load_or_skip(
+            "test",
+            "pack",
+            Err(PortError::StorageUnavailable(
+                "test pack outage".to_string(),
+            )),
+        );
+        assert!(out.is_none(), "pack fault must skip, not send partial");
+        assert_eq!(skipped_count(), before + 1);
+    }
+
+    #[test]
+    fn fanout_success_passes_through_uncounted() {
+        let before = skipped_count();
+        assert_eq!(
+            load_for_fanout("test", "note-load", Ok(Some("n1".to_string()))),
+            Some("n1".to_string())
+        );
+        assert_eq!(
+            load_or_skip::<String>("test", "pack", Ok("packed".to_string())),
+            Some("packed".to_string())
+        );
+        assert_eq!(skipped_count(), before, "success must not count");
+    }
 }

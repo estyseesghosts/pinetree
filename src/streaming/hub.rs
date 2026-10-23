@@ -166,7 +166,13 @@ impl Hub {
     }
 
     pub fn send(&self, msg: HubMessage) {
-        let _ = self.tx.send(msg);
+        // At-most-once by design (see the `Hub` docs): a broadcast with
+        // no receivers, or one every receiver lagged, is dropped. The
+        // drop is counted so it is not invisible; delivery policy and
+        // the non-blocking contract are unchanged.
+        if self.tx.send(msg).is_err() {
+            crate::observability::record_error("streaming.hub_dropped");
+        }
     }
 
     /// Record a live authenticated streaming connection for `account_id`

@@ -183,9 +183,13 @@ impl ApiError {
     /// Map a domain/port error carrying a Misskey error ident
     /// (`NO_SUCH_NOTE`, `ALREADY_FOLLOWING`, …) to its exact Misskey
     /// error code, message, id, and HTTP status.
+    ///
+    /// A `StorageUnavailable` fault never reaches the HTTP body: the DB
+    /// string can carry paths, keys, or redacted row contents, so the
+    /// response is the generic `INTERNAL_ERROR` with no `info`.
     pub fn from_port_error(err: PortError) -> Self {
         match err {
-            PortError::StorageUnavailable(msg) => Self::internal().with_info(Value::String(msg)),
+            PortError::StorageUnavailable(_) => Self::internal(),
             PortError::Validation(msg) => Self::from_code_string(&msg, 400),
             PortError::Conflict(msg) => Self::from_code_string(&msg, 400),
             PortError::NotFound(msg) => {

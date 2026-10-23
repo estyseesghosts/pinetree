@@ -1,16 +1,69 @@
 use super::super::handshake::CallerInfo;
 use super::super::subscribe::{ChannelKind, ChannelSub};
 use super::protocol::{channel_frame, note_updated_frame};
-use super::support::{note_passes_stream_gate, push_note_updated, resolve_reaction_emoji};
+use super::support::{
+    count_send_drop, join_fanout, load_for_fanout, load_or_skip, note_passes_stream_gate,
+    push_note_updated, resolve_reaction_emoji,
+};
 use crate::api::misskey::endpoints::ApiState;
 use crate::api::misskey::packers::pack_me_detailed;
 use crate::application::events::MainEventKind;
 use crate::application::queries::TimelineChannelParams;
+use crate::domain::account::Account;
+use crate::domain::id::PortError;
 use crate::streaming::hub::HubMessage;
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::SinkExt as _;
 use serde_json::Value;
 use std::collections::HashMap;
+
+/// Resolve one `MeUpdated` frame body without ever emitting a partial
+/// `MeDetailed`.
+///
+/// A transient store or packer `PortError` is logged (and counted) and
+/// the frame is skipped; the next `MeUpdated` event carries the current
+/// state, so there is no in-loop retry. A gone account (`Ok(None)`)
+/// skips silently: the row is already gone, so there is nothing to
+/// diagnose. `lookup` and `pack` are parameters (rather than
+/// `AppServices`) so the skip logic is unit-testable without a socket.
+pub(crate) fn me_updated_body(
+    account_id: &str,
+    lookup: Result<Option<Account>, PortError>,
+    pack: impl FnOnce(&Account) -> Result<Value, PortError>,
+) -> Option<Value> {
+    let account = match lookup {
+        Ok(Some(account)) => account,
+        Ok(None) => return None,
+        Err(err) => {
+            log_me_updated_skip(account_id, "account-lookup", &err);
+            return None;
+        }
+    };
+    match pack(&account) {
+        Ok(body) => Some(body),
+        Err(err) => {
+            log_me_updated_skip(account_id, "pack", &err);
+            None
+        }
+    }
+}
+
+/// One diagnosed `MeUpdated` skip: a stable `streaming.me_updated_skipped`
+/// line (error class only, never secrets or bodies) plus the bounded
+/// error ledger.
+fn log_me_updated_skip(account_id: &str, stage: &str, err: &PortError) {
+    let message = err.to_string();
+    crate::observability::record_error("streaming.me_updated");
+    crate::observability::log_event(
+        crate::observability::LogLevel::Warn,
+        "streaming.me_updated_skipped",
+        &[
+            ("account_id", account_id),
+            ("stage", stage),
+            ("error_class", crate::observability::error_class(&message)),
+        ],
+    );
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch_hub_message(
@@ -66,10 +119,11 @@ pub(crate) async fn dispatch_hub_message(
                 let viewer = viewer_id.map(|s| s.to_string());
                 let note_id_timeline = note_id.clone();
                 let packed = tokio::task::spawn_blocking(move || {
-                    let note = match services.notes.get_note(&note_id_timeline) {
-                        Ok(Some(note)) => note,
-                        _ => return None,
-                    };
+                    let note = load_for_fanout(
+                        "timeline",
+                        "note-load",
+                        services.notes.get_note(&note_id_timeline),
+                    )?;
                     // Single eligibility pass: collect every eligible channel,
                     // then pack once per viewer for all of them.
                     let mut ids: Vec<String> = Vec::new();
@@ -86,18 +140,20 @@ pub(crate) async fn dispatch_hub_message(
                     if ids.is_empty() {
                         return None;
                     }
-                    let packed = crate::api::misskey::packers::pack_note(
-                        &note,
-                        viewer.as_deref(),
-                        &services,
-                        0,
-                    )
-                    .ok()?;
+                    let packed = load_or_skip(
+                        "timeline",
+                        "pack",
+                        crate::api::misskey::packers::pack_note(
+                            &note,
+                            viewer.as_deref(),
+                            &services,
+                            0,
+                        ),
+                    )?;
                     Some((ids, packed))
                 })
-                .await
-                .ok()
-                .flatten();
+                .await;
+                let packed = join_fanout("timeline", packed);
                 if let Some((ids, packed)) = packed {
                     for id in ids {
                         let frame = channel_frame(&id, "note", packed.clone());
@@ -117,15 +173,24 @@ pub(crate) async fn dispatch_hub_message(
                 let viewer = viewer_id.map(|s| s.to_string());
                 let note_id_owned = note_id.clone();
                 let packed = tokio::task::spawn_blocking(move || {
-                    let note = match services.notes.get_note(&note_id_owned) {
-                        Ok(Some(note)) if !note.is_deleted => note,
-                        _ => return None,
-                    };
+                    let note = load_for_fanout(
+                        "userList",
+                        "note-load",
+                        services.notes.get_note(&note_id_owned),
+                    )?;
+                    if note.is_deleted {
+                        return None;
+                    }
                     let viewer_ref = viewer.as_deref();
-                    let filter = services.feed_filter(viewer_ref).ok()?;
+                    let filter =
+                        load_or_skip("userList", "feed-filter", services.feed_filter(viewer_ref))?;
                     let mut account_cache = std::collections::HashMap::new();
                     let mut note_cache = std::collections::HashMap::new();
-                    let follows_cache = services.follows_cache(viewer_ref).ok()?;
+                    let follows_cache = load_or_skip(
+                        "userList",
+                        "follows-cache",
+                        services.follows_cache(viewer_ref),
+                    )?;
                     let viewer_ctx =
                         services.viewer_ctx(viewer_ref, &note.author_id, &follows_cache);
                     if !crate::domain::policy::is_visible(&note, &viewer_ctx) {
@@ -153,11 +218,16 @@ pub(crate) async fn dispatch_hub_message(
                         {
                             continue;
                         }
-                        let list = services.lists.get_user_list(list_id).ok()??;
-                        let membership = services
-                            .lists
-                            .get_list_membership(list_id, &note.author_id)
-                            .ok()??;
+                        let list = load_for_fanout(
+                            "userList",
+                            "list-load",
+                            services.lists.get_user_list(list_id),
+                        )?;
+                        let membership = load_for_fanout(
+                            "userList",
+                            "membership-load",
+                            services.lists.get_list_membership(list_id, &note.author_id),
+                        )?;
                         let reply_ok = match note.reply_id.as_deref() {
                             None => true,
                             Some(_) => {
@@ -175,14 +245,15 @@ pub(crate) async fn dispatch_hub_message(
                     if ids.is_empty() {
                         return None;
                     }
-                    let packed =
-                        crate::api::misskey::packers::pack_note(&note, viewer_ref, &services, 0)
-                            .ok()?;
+                    let packed = load_or_skip(
+                        "userList",
+                        "pack",
+                        crate::api::misskey::packers::pack_note(&note, viewer_ref, &services, 0),
+                    )?;
                     Some((ids, packed))
                 })
-                .await
-                .ok()
-                .flatten();
+                .await;
+                let packed = join_fanout("userList", packed);
                 if let Some((ids, packed)) = packed {
                     for id in ids {
                         let frame = channel_frame(&id, "note", packed.clone());
@@ -201,10 +272,14 @@ pub(crate) async fn dispatch_hub_message(
                 let viewer = viewer_id.map(|s| s.to_string());
                 let note_id_owned = note_id.clone();
                 let packed = tokio::task::spawn_blocking(move || {
-                    let note = match services.notes.get_note(&note_id_owned) {
-                        Ok(Some(note)) if !note.is_deleted => note,
-                        _ => return None,
-                    };
+                    let note = load_for_fanout(
+                        "hashtag",
+                        "note-load",
+                        services.notes.get_note(&note_id_owned),
+                    )?;
+                    if note.is_deleted {
+                        return None;
+                    }
                     let tags: std::collections::HashSet<String> =
                         note.tags.iter().map(|t| t.to_lowercase()).collect();
                     let mut ids: Vec<String> = Vec::new();
@@ -221,18 +296,20 @@ pub(crate) async fn dispatch_hub_message(
                     if !note_passes_stream_gate(&services, viewer.as_deref(), &note) {
                         return None;
                     }
-                    let packed = crate::api::misskey::packers::pack_note(
-                        &note,
-                        viewer.as_deref(),
-                        &services,
-                        0,
-                    )
-                    .ok()?;
+                    let packed = load_or_skip(
+                        "hashtag",
+                        "pack",
+                        crate::api::misskey::packers::pack_note(
+                            &note,
+                            viewer.as_deref(),
+                            &services,
+                            0,
+                        ),
+                    )?;
                     Some((ids, packed))
                 })
-                .await
-                .ok()
-                .flatten();
+                .await;
+                let packed = join_fanout("hashtag", packed);
                 if let Some((ids, packed)) = packed {
                     for id in ids {
                         let frame = channel_frame(&id, "note", packed.clone());
@@ -263,21 +340,28 @@ pub(crate) async fn dispatch_hub_message(
             let services = state.services.clone();
             let viewer = viewer_id.map(|s| s.to_string());
             let packed = tokio::task::spawn_blocking(move || {
-                let note = match services.notes.get_note(&note_id) {
-                    Ok(Some(note)) if !note.is_deleted => note,
-                    _ => return None,
-                };
+                let note = load_for_fanout(
+                    "roleTimeline",
+                    "note-load",
+                    services.notes.get_note(&note_id),
+                )?;
+                if note.is_deleted {
+                    return None;
+                }
                 if !matches!(note.visibility, crate::domain::note::Visibility::Public) {
                     return None;
                 }
                 if !note_passes_stream_gate(&services, viewer.as_deref(), &note) {
                     return None;
                 }
-                crate::api::misskey::packers::pack_note(&note, viewer.as_deref(), &services, 0).ok()
+                load_or_skip(
+                    "roleTimeline",
+                    "pack",
+                    crate::api::misskey::packers::pack_note(&note, viewer.as_deref(), &services, 0),
+                )
             })
-            .await
-            .ok()
-            .flatten();
+            .await;
+            let packed = join_fanout("roleTimeline", packed);
             if let Some(packed) = packed {
                 for id in targets {
                     let frame = channel_frame(&id, "note", packed.clone());
@@ -322,14 +406,13 @@ pub(crate) async fn dispatch_hub_message(
             }
             let services = state.services.clone();
             let packed = tokio::task::spawn_blocking(move || {
-                let meta = services.media.get(&file_id).ok()??;
+                let meta = load_for_fanout("drive", "file-load", services.media.get(&file_id))?;
                 Some(crate::api::misskey::packers::pack_drive_file(
                     &meta, &services,
                 ))
             })
-            .await
-            .ok()
-            .flatten();
+            .await;
+            let packed = join_fanout("drive", packed);
             if let Some(packed) = packed {
                 for id in targets {
                     let frame = channel_frame(&id, name, packed.clone());
@@ -406,7 +489,11 @@ pub(crate) async fn dispatch_hub_message(
             }
             let services = state.services.clone();
             let packed = tokio::task::spawn_blocking(move || {
-                let report = services.abuse_reports.get(&report_id).ok()??;
+                let report = load_for_fanout(
+                    "admin",
+                    "report-load",
+                    services.abuse_reports.get(&report_id),
+                )?;
                 Some(serde_json::json!({
                     "id": report.id,
                     "targetUserId": report.target_account,
@@ -414,9 +501,8 @@ pub(crate) async fn dispatch_hub_message(
                     "comment": report.comment,
                 }))
             })
-            .await
-            .ok()
-            .flatten();
+            .await;
+            let packed = join_fanout("admin", packed);
             if let Some(packed) = packed {
                 for id in targets {
                     let frame = channel_frame(&id, "newAbuseUserReport", packed.clone());
@@ -475,7 +561,10 @@ pub(crate) async fn dispatch_hub_message(
                 "deleted",
                 serde_json::json!({ "deletedAt": deleted_at }),
             );
-            let _ = sender.send(frame).await;
+            if sender.send(frame).await.is_err() {
+                // At-most-once by design: counted, not retried.
+                count_send_drop();
+            }
         }
         HubMessage::PollVoted {
             note_id,
@@ -512,11 +601,15 @@ pub(crate) async fn dispatch_hub_message(
             // notes anyway).
             let services = state.services.clone();
             let note_id_owned = note_id.clone();
-            let loaded =
-                tokio::task::spawn_blocking(move || services.notes.get_note(&note_id_owned))
-                    .await
-                    .unwrap_or(Ok(None))
-                    .unwrap_or(None);
+            let loaded = tokio::task::spawn_blocking(move || {
+                load_for_fanout(
+                    "noteUpdated",
+                    "note-load",
+                    services.notes.get_note(&note_id_owned),
+                )
+            })
+            .await;
+            let loaded = join_fanout("noteUpdated", loaded);
             if let Some(note) = loaded {
                 push_note_updated(
                     state,
@@ -580,13 +673,27 @@ pub(crate) async fn dispatch_hub_message(
                     let account_id = msg.user_id.clone();
                     let first_party = caller.as_ref().map(|c| c.is_first_party).unwrap_or(false);
                     match tokio::task::spawn_blocking(move || {
-                        let account = services.accounts.find_by_id(&account_id).ok()??;
-                        pack_me_detailed(&account, first_party, &services).ok()
+                        me_updated_body(
+                            &account_id,
+                            services.accounts.find_by_id(&account_id),
+                            |account| pack_me_detailed(account, first_party, &services),
+                        )
                     })
                     .await
                     {
                         Ok(Some(packed)) => packed,
-                        _ => return,
+                        // Store/pack failures already logged inside
+                        // `me_updated_body`; a gone account skips silently.
+                        Ok(None) => return,
+                        Err(join_err) => {
+                            crate::observability::record_error("streaming.me_updated");
+                            crate::observability::log_event(
+                                crate::observability::LogLevel::Warn,
+                                "streaming.me_updated_skipped",
+                                &[("stage", "dispatch-join"), ("cause", &join_err.to_string())],
+                            );
+                            return;
+                        }
                     }
                 }
                 _ => msg.body,
@@ -611,7 +718,10 @@ pub(crate) async fn dispatch_hub_message(
                     .to_string()
                     .into(),
             );
-            let _ = sender.send(frame).await;
+            if sender.send(frame).await.is_err() {
+                // At-most-once by design: counted, not retried.
+                count_send_drop();
+            }
         }
         HubMessage::AntennaNote {
             antenna_id,
@@ -636,15 +746,21 @@ pub(crate) async fn dispatch_hub_message(
             let services = state.services.clone();
             let viewer = viewer_id.map(|s| s.to_string());
             let packed = tokio::task::spawn_blocking(move || {
-                let note = match services.notes.get_note(&note_id) {
-                    Ok(Some(note)) if !note.is_deleted => note,
-                    _ => return None,
-                };
+                let note =
+                    load_for_fanout("antenna", "note-load", services.notes.get_note(&note_id))?;
+                if note.is_deleted {
+                    return None;
+                }
                 let viewer_ref = viewer.as_deref();
-                let filter = services.feed_filter(viewer_ref).ok()?;
+                let filter =
+                    load_or_skip("antenna", "feed-filter", services.feed_filter(viewer_ref))?;
                 let mut account_cache = std::collections::HashMap::new();
                 let mut note_cache = std::collections::HashMap::new();
-                let follows_cache = services.follows_cache(viewer_ref).ok()?;
+                let follows_cache = load_or_skip(
+                    "antenna",
+                    "follows-cache",
+                    services.follows_cache(viewer_ref),
+                )?;
                 let viewer_ctx = services.viewer_ctx(viewer_ref, &note.author_id, &follows_cache);
                 if !crate::domain::policy::is_visible(&note, &viewer_ctx) {
                     return None;
@@ -655,11 +771,14 @@ pub(crate) async fn dispatch_hub_message(
                 {
                     return None;
                 }
-                crate::api::misskey::packers::pack_note(&note, viewer_ref, &services, 0).ok()
+                load_or_skip(
+                    "antenna",
+                    "pack",
+                    crate::api::misskey::packers::pack_note(&note, viewer_ref, &services, 0),
+                )
             })
-            .await
-            .ok()
-            .flatten();
+            .await;
+            let packed = join_fanout("antenna", packed);
             if let Some(packed) = packed {
                 for id in targets {
                     let frame = channel_frame(&id, "note", packed.clone());
@@ -690,16 +809,19 @@ pub(crate) async fn dispatch_hub_message(
             let services = state.services.clone();
             let member_id_owned = member_id.clone();
             let packed = tokio::task::spawn_blocking(move || {
-                let member = services.accounts.find_by_id(&member_id_owned).ok()??;
+                let member = load_for_fanout(
+                    "userList",
+                    "member-load",
+                    services.accounts.find_by_id(&member_id_owned),
+                )?;
                 Some(crate::api::misskey::packers::pack_user_lite(
                     &member,
                     &services.public_url,
                     services.clock.now_ms(),
                 ))
             })
-            .await
-            .ok()
-            .flatten();
+            .await;
+            let packed = join_fanout("userList", packed);
             if let Some(packed) = packed {
                 let body = serde_json::to_value(&packed).unwrap_or(Value::Null);
                 let event = if added { "userAdded" } else { "userRemoved" };
@@ -711,5 +833,63 @@ pub(crate) async fn dispatch_hub_message(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_account() -> Account {
+        Account::new_local("a1".to_string(), "alice".to_string()).unwrap()
+    }
+
+    #[test]
+    fn me_updated_lookup_error_skips_without_packing() {
+        let mut packed = false;
+        let body = me_updated_body(
+            "a1",
+            Err(PortError::StorageUnavailable("test outage".to_string())),
+            |_| {
+                packed = true;
+                Ok(Value::Null)
+            },
+        );
+        assert!(body.is_none(), "lookup error must skip the frame");
+        assert!(
+            !packed,
+            "packer must not run after a failed lookup (no partial MeDetailed)"
+        );
+    }
+
+    #[test]
+    fn me_updated_gone_account_skips_without_packing() {
+        let mut packed = false;
+        let body = me_updated_body("a1", Ok(None), |_| {
+            packed = true;
+            Ok(Value::Null)
+        });
+        assert!(body.is_none(), "gone account must skip the frame");
+        assert!(!packed, "packer must not run without an account");
+    }
+
+    #[test]
+    fn me_updated_pack_error_skips_frame() {
+        let body = me_updated_body("a1", Ok(Some(test_account())), |_| {
+            Err(PortError::StorageUnavailable(
+                "test pack outage".to_string(),
+            ))
+        });
+        assert!(
+            body.is_none(),
+            "pack error must skip the frame, not send partial"
+        );
+    }
+
+    #[test]
+    fn me_updated_success_forwards_packed_body() {
+        let expected = serde_json::json!({ "id": "a1" });
+        let body = me_updated_body("a1", Ok(Some(test_account())), |_| Ok(expected.clone()));
+        assert_eq!(body, Some(expected));
     }
 }

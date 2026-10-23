@@ -88,8 +88,12 @@ pub(crate) async fn run_connection(socket: WebSocket, state: ApiState, caller: O
                         ).await;
                     }
                     // Lagged past the hub backlog: drop and resubscribe,
-                    // like a reconnect (at-most-once live hints).
-                    Err(_) => { hub_rx = state.hub.subscribe(); }
+                    // like a reconnect (at-most-once live hints). Counted
+                    // so the drop is not invisible; policy is unchanged.
+                    Err(_) => {
+                        crate::observability::record_error("streaming.lagged");
+                        hub_rx = state.hub.subscribe();
+                    }
                 }
             }
             _ = pings.tick() => {
