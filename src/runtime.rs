@@ -34,6 +34,28 @@ pub(crate) fn build_services(
 > {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let ids: Arc<dyn IdGenerator> = Arc::new(AidxGenerator::new(clock.clone()));
+    // LOW-6: opt-in live-redb integrity check at open (default off so boot
+    // stays fast). Runs the same `check_integrity` the restore path uses,
+    // before any store handle exists; a failure refuses to boot.
+    if cfg.storage_integrity_check_at_open {
+        let db_path = cfg.data_dir.join("pinetree.redb");
+        eprintln!("storage integrity check at open: {}", db_path.display());
+        match pinetree::persistence::redb::verify_backup_integrity(&db_path) {
+            Ok(true) => eprintln!("storage integrity check at open: ok"),
+            Ok(false) => {
+                return Err(format!(
+                    "storage integrity check failed for {}: refusing to boot",
+                    db_path.display()
+                ));
+            }
+            Err(err) => {
+                return Err(format!(
+                    "storage integrity check error for {}: {err}",
+                    db_path.display()
+                ));
+            }
+        }
+    }
     let store = RedbStore::open(
         cfg.data_dir.join("pinetree.redb"),
         clock.clone(),
@@ -102,7 +124,10 @@ pub(crate) fn build_services(
         abuse_recipients: store.clone(),
         memos: store.clone(),
         thread_mutes: store.clone(),
-        federation_http: SafeHttpClient::new(SafeHttpConfig::default()),
+        federation_http: SafeHttpClient::new(SafeHttpConfig {
+            allow_private_ips: cfg.federation.allow_private_ips,
+            ..SafeHttpConfig::default()
+        }),
         public_url: cfg.normalized_public_url(),
         max_file_size: cfg.max_file_size,
         preserved_usernames: cfg.preserved_usernames.clone(),

@@ -345,6 +345,89 @@ fn federation_keys_round_trip() {
     }
 }
 
+/// Wave 5: the env-only federation knobs are addressable JSON keys with
+/// sane defaults (empty object parses), round-trip through serde, reject
+/// typos at both levels, and fail closed on bad values.
+#[test]
+fn federation_wave5_keys_round_trip_typo_and_guards() {
+    let cfg: Config = serde_json::from_str("{}").expect("empty object parses");
+    assert!(!cfg.federation.allow_private_ips);
+    assert_eq!(cfg.federation.federation_extra_ca, None);
+    assert!(!cfg.federation.debug_federation);
+    assert_eq!(cfg.federation.reply_repair_limit, None);
+    assert!(!cfg.storage_integrity_check_at_open);
+    assert!(cfg.validate().is_ok());
+
+    let custom: Config = serde_json::from_str(
+        r#"{"federation": {"allow_private_ips": true, "federation_extra_ca": "/etc/pinetree/ca.pem", "reply_repair_limit": 500}, "storage_integrity_check_at_open": true}"#,
+    )
+    .expect("parse");
+    assert!(custom.federation.allow_private_ips);
+    assert_eq!(
+        custom.federation.federation_extra_ca,
+        Some(PathBuf::from("/etc/pinetree/ca.pem"))
+    );
+    assert_eq!(custom.federation.reply_repair_limit, Some(500));
+    assert!(custom.storage_integrity_check_at_open);
+    assert!(custom.validate().is_ok());
+    // Serde round-trip keeps the keys (typo safety works both ways).
+    let json = serde_json::to_value(&custom).expect("serialize");
+    assert_eq!(json["federation"]["allow_private_ips"], true);
+    assert_eq!(
+        json["federation"]["federation_extra_ca"],
+        "/etc/pinetree/ca.pem"
+    );
+    assert_eq!(json["federation"]["reply_repair_limit"], 500);
+    assert_eq!(json["storage_integrity_check_at_open"], true);
+    let back: Config = serde_json::from_value(json).expect("deserialize round-trip");
+    assert_eq!(back.federation, custom.federation);
+    assert_eq!(
+        back.storage_integrity_check_at_open,
+        custom.storage_integrity_check_at_open
+    );
+    // Typo safety at both levels.
+    assert!(
+        serde_json::from_str::<Config>(r#"{"federation": {"allow_private_ip": true}}"#).is_err(),
+        "nested typo rejected"
+    );
+    assert!(
+        serde_json::from_str::<Config>(r#"{"storage_integrity_check_at_opn": true}"#).is_err(),
+        "top-level typo rejected"
+    );
+    // Guards fail closed.
+    for bad in [Some(0), Some(5001)] {
+        let cfg = Config {
+            federation: FederationSection {
+                reply_repair_limit: bad,
+                ..FederationSection::default()
+            },
+            ..Config::default()
+        };
+        assert!(cfg.validate().is_err(), "reply bound {bad:?} must fail");
+    }
+    let empty_ca = Config {
+        federation: FederationSection {
+            federation_extra_ca: Some(PathBuf::new()),
+            ..FederationSection::default()
+        },
+        ..Config::default()
+    };
+    assert!(empty_ca.validate().is_err(), "empty CA path must fail");
+    // Debug toggle is a debug-build toggle only.
+    let debug = Config {
+        federation: FederationSection {
+            debug_federation: true,
+            ..FederationSection::default()
+        },
+        ..Config::default()
+    };
+    assert_eq!(
+        debug.validate().is_ok(),
+        cfg!(debug_assertions),
+        "debug_federation tracks the build profile"
+    );
+}
+
 #[test]
 fn file_round_trip() {
     let dir = std::env::temp_dir().join(format!("pinetree-config-test-{}", std::process::id()));

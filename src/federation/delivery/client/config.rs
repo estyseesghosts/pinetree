@@ -14,9 +14,12 @@ pub struct SafeHttpConfig {
     /// Bound on one DNS lookup.
     pub dns_timeout: Duration,
     pub max_redirects: usize,
-    /// SSRF exemption ONLY for local federation testing (env
-    /// `PINETREE_ALLOW_PRIVATE_IPS`): skips private/reserved-IP rejection.
-    /// NEVER affects TLS certificate verification, which stays enforced.
+    /// SSRF exemption ONLY for local federation testing: skips
+    /// private/reserved-IP rejection. NEVER affects TLS certificate
+    /// verification, and NEVER affects webhook delivery (always strict).
+    /// Addressable as JSON `federation.allow_private_ips` (default
+    /// `false`); the deprecated `PINETREE_ALLOW_PRIVATE_IPS` env override
+    /// maps there before `validate()`.
     pub allow_private_ips: bool,
     pub allowed_hosts: Vec<String>,
     pub user_agent: String,
@@ -24,15 +27,12 @@ pub struct SafeHttpConfig {
 
 impl Default for SafeHttpConfig {
     fn default() -> Self {
-        let allow_private = std::env::var("PINETREE_ALLOW_PRIVATE_IPS")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
         Self {
             timeout: DEFAULT_HTTP_TIMEOUT,
             total_timeout: DEFAULT_TOTAL_TIMEOUT,
             dns_timeout: DEFAULT_DNS_TIMEOUT,
             max_redirects: MAX_REDIRECTS,
-            allow_private_ips: allow_private,
+            allow_private_ips: false,
             allowed_hosts: Vec::new(),
             user_agent: "Pinetree/0.1.0 (+https://misskey-hub.net)".to_string(),
         }

@@ -57,6 +57,39 @@ pub struct FederationSection {
     /// error instead of spawning another thread.
     #[serde(default = "default_dns_max_in_flight")]
     pub dns_max_in_flight: usize,
+    /// SSRF exemption for outbound federation HTTP (default `false`).
+    /// `true` skips private/reserved-IP rejection for federation delivery
+    /// ONLY (local federation testing against loopback/LAN peers); TLS
+    /// verification stays enforced and the webhook delivery path ignores
+    /// this flag (always `false` there). Prefer the shipped default; the
+    /// deprecated `PINETREE_ALLOW_PRIVATE_IPS=1` env override maps here.
+    #[serde(default)]
+    pub allow_private_ips: bool,
+    /// Extra CA bundle for outbound federation HTTPS (default `None`).
+    /// Appended as an additional trust anchor — the platform default store
+    /// is never replaced. The startup gate logs the file's SHA-256
+    /// fingerprint and refuses to boot when the file is missing or
+    /// unreadable (permanent, not a transient retry). Prefer the CLI
+    /// `--federation-extra-ca=PATH`, which writes this same field.
+    #[serde(default)]
+    pub federation_extra_ca: Option<PathBuf>,
+    /// Federation debug lines (accept/reject, delivery). Default `false`.
+    /// Non-production toggle: honored only in debug builds
+    /// (`#[cfg(debug_assertions)]`); `validate()` rejects `true` in release
+    /// builds. Prefer the CLI `--debug-federation`, which writes this same
+    /// field. The deprecated `PINETREE_DEBUG_FEDERATION=1` env override
+    /// maps here.
+    #[serde(default)]
+    pub debug_federation: bool,
+    /// Opt-in bounded repair for pre-Slice-B historical remote notes whose
+    /// original `inReplyTo` was discarded (`docs/replies.md` §6.1).
+    /// `None` (default) disables the repair (no network I/O at startup);
+    /// `Some(n)` re-fetches at most `n` of the newest stored notes' origin
+    /// documents and marks the ones that still declare a parent.
+    /// Sequential, restartable, safe to re-run. The deprecated
+    /// `PINETREE_REPLY_REPAIR_LIMIT=<1..=5000>` env override maps here.
+    #[serde(default)]
+    pub reply_repair_limit: Option<usize>,
 }
 
 /// Default DNS resolver pool size (mirrors
@@ -75,6 +108,10 @@ impl Default for FederationSection {
         Self {
             rfc9421_mode: Rfc9421Mode::default(),
             dns_max_in_flight: default_dns_max_in_flight(),
+            allow_private_ips: false,
+            federation_extra_ca: None,
+            debug_federation: false,
+            reply_repair_limit: None,
         }
     }
 }
@@ -504,6 +541,13 @@ pub struct Config {
     /// Concurrent-upload slot bounds (nested `uploads` section; Batch D).
     /// Unknown keys rejected; see [`UploadsSection`].
     pub uploads: UploadsSection,
+    /// Opt-in live-redb integrity check at open (LOW-6). Default `false`
+    /// (boot stays fast): when `true`, the open path runs the same
+    /// `check_integrity` the restore path uses and refuses to boot on
+    /// failure. Prefer the CLI `--storage-integrity-check-at-open`, which
+    /// writes this same field.
+    #[serde(default)]
+    pub storage_integrity_check_at_open: bool,
 }
 
 impl Default for Config {
@@ -560,6 +604,7 @@ impl Default for Config {
             backup: BackupSection::default(),
             rate_limit: RateLimitSection::default(),
             uploads: UploadsSection::default(),
+            storage_integrity_check_at_open: false,
         }
     }
 }
@@ -731,6 +776,31 @@ impl Config {
             || self.federation.dns_max_in_flight > MAX_DNS_MAX_IN_FLIGHT
         {
             return Err("federation.dns_max_in_flight must be within 1..=256".to_string());
+        }
+        // Federation SSRF posture (Wave 5): the exemption is explicit and
+        // off by default; the webhook path ignores it (always strict).
+        // An empty extra-CA path is a config error, not a silent skip.
+        if self
+            .federation
+            .federation_extra_ca
+            .as_deref()
+            .is_some_and(|p| p.as_os_str().is_empty())
+        {
+            return Err("federation.federation_extra_ca must not be empty".to_string());
+        }
+        // Non-production toggle: only debug builds may enable it, so a
+        // release binary can never ship with federation debug logging on
+        // by configuration.
+        if self.federation.debug_federation && !cfg!(debug_assertions) {
+            return Err("federation.debug_federation is a debug-build toggle only".to_string());
+        }
+        // Opt-in reply repair bound (Wave 5): 1..=5000 when set.
+        if self
+            .federation
+            .reply_repair_limit
+            .is_some_and(|n| n == 0 || n > 5000)
+        {
+            return Err("federation.reply_repair_limit must be within 1..=5000".to_string());
         }
         if let Some(dir) = self.backup.dir.as_deref()
             && dir.as_os_str().is_empty()
