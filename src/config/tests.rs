@@ -846,6 +846,37 @@ fn batch_h_diagnostics_section_round_trip_and_typo_safety() {
 }
 
 #[test]
+fn diagnostics_log_level_round_trip_and_rejection() {
+    use crate::observability::LogLevel;
+    // Default: info (historical output unchanged).
+    let cfg: Config = serde_json::from_str("{}").expect("empty object parses");
+    assert_eq!(cfg.diagnostics.log_level, LogLevel::Info);
+    assert!(cfg.validate().is_ok());
+    // Every label parses, validates, and serializes back identically.
+    for (label, level) in [
+        ("error", LogLevel::Error),
+        ("warn", LogLevel::Warn),
+        ("info", LogLevel::Info),
+        ("debug", LogLevel::Debug),
+    ] {
+        let parsed: Config =
+            serde_json::from_str(&format!(r#"{{"diagnostics": {{"log_level": "{label}"}}}}"#))
+                .expect("parse");
+        assert_eq!(parsed.diagnostics.log_level, level);
+        assert!(parsed.validate().is_ok());
+        let json = serde_json::to_value(&parsed.diagnostics).expect("serialize");
+        assert_eq!(json["log_level"], label);
+        let back: DiagnosticsSection = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back.log_level, level);
+    }
+    // Unknown labels and typos are rejected.
+    assert!(
+        serde_json::from_str::<Config>(r#"{"diagnostics": {"log_level": "verbose"}}"#).is_err()
+    );
+    assert!(serde_json::from_str::<Config>(r#"{"diagnostics": {"loglevel": "debug"}}"#).is_err());
+}
+
+#[test]
 fn batch_h_backup_section_round_trip_and_guards() {
     // Defaults: dir unset (resolves under `data_dir`), 64 GiB cap, no
     // retention bounds (keep all).

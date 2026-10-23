@@ -20,6 +20,7 @@ use pinetree::federation::delivery::{SafeHttpClient, SafeHttpConfig};
 use pinetree::federation::retry::DestinationTracker;
 use pinetree::jobs::worker::JobWorker;
 use pinetree::media::storage::FsBlobStore;
+use pinetree::observability::LogLevel;
 use pinetree::persistence::redb::RedbStore;
 use pinetree::services::email::{EmailSender, SmtpEmailSender};
 use pinetree::streaming::hub::hub_and_sink;
@@ -149,6 +150,19 @@ async fn async_main() {
                 eprintln!("invalid --listen address: {listen}");
                 std::process::exit(1);
             });
+        } else if let Some(level) = arg.strip_prefix("--log-level=") {
+            // Per-invocation override of the JSON `diagnostics.log_level`
+            // (same merged-then-validated flow as every other setting).
+            cfg.diagnostics.log_level = match level {
+                "error" => LogLevel::Error,
+                "warn" => LogLevel::Warn,
+                "info" => LogLevel::Info,
+                "debug" => LogLevel::Debug,
+                other => {
+                    eprintln!("unknown log level: {other} (want error|warn|info|debug)");
+                    std::process::exit(2);
+                }
+            };
         } else if let Some(list) = arg.strip_prefix("--trusted-proxies=") {
             cfg.trusted_proxies = match cli::parse_trusted_proxies(list) {
                 Ok(proxies) => proxies,
@@ -302,6 +316,10 @@ async fn async_main() {
     // Batch H: publish the configured log shape process-wide before any
     // structured line is emitted.
     pinetree::observability::set_structured_logging(cfg.diagnostics.structured_logging);
+    // Debug verbosity is a config value like any other: the gate defaults
+    // to info (historical output) and `--log-level=` / the JSON
+    // `diagnostics.log_level` raises it process-wide.
+    pinetree::observability::set_max_log_level(cfg.diagnostics.log_level);
 
     // Batch H/F/C maintenance ops: store-backed one-shots that run instead
     // of serving (`backup`, `backup-status`, `restore`, `storage-backfill`).

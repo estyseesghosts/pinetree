@@ -2,6 +2,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 use crate::media::transcode::TranscodeConfig;
+use crate::observability::LogLevel;
 use crate::services::email::SmtpConfig;
 
 /// Deployment mode (Phase 4 owns `Cluster`; selecting it is a startup
@@ -121,7 +122,11 @@ impl Default for FederationSection {
 /// expensive/private status fields are unavailable; enabling it does NOT
 /// remove the admin-authentication requirement. `structured_logging: true`
 /// (default) emits stable `key=value` event lines; `false` emits only
-/// `level=` + `event=` (see `crate::observability`).
+/// `level=` + `event=` (see `crate::observability`). `log_level: "info"`
+/// (default) is the maximum emitted severity (`"error"`, `"warn"`,
+/// `"info"`, `"debug"`); `"debug"` adds per-request start lines, job
+/// claims, and fan-out plans. Unknown keys and unknown level labels are
+/// rejected (typo safety).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DiagnosticsSection {
@@ -129,14 +134,17 @@ pub struct DiagnosticsSection {
     pub detailed_admin_status: bool,
     /// Emit structured `key=value` event lines. Default `true`.
     pub structured_logging: bool,
+    /// Maximum emitted log severity. Default `"info"`.
+    pub log_level: LogLevel,
 }
 
 impl Default for DiagnosticsSection {
-    /// Batch H default: detail off, structured lines on.
+    /// Batch H default: detail off, structured lines on, info level.
     fn default() -> Self {
         Self {
             detailed_admin_status: false,
             structured_logging: true,
+            log_level: LogLevel::Info,
         }
     }
 }
@@ -793,6 +801,12 @@ impl Config {
         // by configuration.
         if self.federation.debug_federation && !cfg!(debug_assertions) {
             return Err("federation.debug_federation is a debug-build toggle only".to_string());
+        }
+        // Diagnostics verbosity: the label set is closed by serde, and this
+        // match pins every level through validation so a future variant
+        // cannot slip past review (it must land here to compile).
+        match self.diagnostics.log_level {
+            LogLevel::Error | LogLevel::Warn | LogLevel::Info | LogLevel::Debug => {}
         }
         // Opt-in reply repair bound (Wave 5): 1..=5000 when set.
         if self

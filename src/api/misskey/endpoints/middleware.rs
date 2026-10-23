@@ -144,11 +144,13 @@ pub(crate) async fn cors_middleware(req: Request, next: axum::middleware::Next) 
 /// without touching handler code.
 pub(crate) async fn request_id_middleware(req: Request, next: axum::middleware::Next) -> Response {
     // One structured line per request at info level (id + duration); the
-    // debug `http.request.start` helper exists for deep dives but stays
-    // off the normal path so steady-state volume is one line per request.
+    // debug `http.request.start` line below exists for deep dives and only
+    // fires when the configured log level admits it, so steady-state
+    // volume at the default info level stays one line per request.
     let method = req.method().to_string();
     let path = req.uri().path().to_string();
     let request_id = crate::observability::new_request_id();
+    crate::observability::log_request_start(&request_id, &method, &path);
     let started = std::time::Instant::now();
     let mut response = next.run(req).await;
     // The request id is a locally generated uuid (alphanumeric plus `-`),

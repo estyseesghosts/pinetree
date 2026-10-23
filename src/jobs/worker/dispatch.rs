@@ -57,6 +57,18 @@ impl JobWorker {
             None => return Ok(false),
             Some(job) => job,
         };
+        // Debug trace (birchtree `claimed jobs` parity): kind + id +
+        // attempt count at claim time. Gated by the configured log level,
+        // so info-level output is unchanged.
+        crate::observability::log_event(
+            crate::observability::LogLevel::Debug,
+            "jobs.claimed",
+            &[
+                ("kind", &format!("{:?}", job.kind)),
+                ("id", job.id.as_str()),
+                ("attempts", job.attempts.to_string().as_str()),
+            ],
+        );
         // Panic containment: a panicking handler must quarantine the job
         // (burning no extra attempt beyond the lease-reclaim count) instead
         // of unwinding the worker and looping forever on the same job.

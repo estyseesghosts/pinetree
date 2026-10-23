@@ -31,7 +31,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Environment variable that enables federation debug logging (any non-empty
@@ -50,15 +50,29 @@ pub const MAX_ERROR_CATEGORIES: usize = 128;
 
 static FEDERATION_DEBUG: AtomicBool = AtomicBool::new(false);
 static STRUCTURED_LOGGING: AtomicBool = AtomicBool::new(true);
+/// Process-wide maximum emitted severity (rank: Error < Warn < Info <
+/// Debug). `log_event` drops anything above it. Defaults to `Info` so a
+/// fresh process matches historical output; raised via
+/// `diagnostics.log_level` / `--log-level`.
+static MAX_LOG_LEVEL: AtomicU8 = AtomicU8::new(2);
 
 /// Log severity for [`log_event`]. Normal operation logs at `info`;
 /// `debug` lines require explicit opt-in at the call site.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum LogLevel {
-    Error,
-    Warn,
-    Info,
-    Debug,
+    Error = 0,
+    Warn = 1,
+    Info = 2,
+    Debug = 3,
+}
+
+impl Default for LogLevel {
+    fn default() -> Self {
+        LogLevel::Info
+    }
 }
 
 impl LogLevel {
@@ -104,6 +118,29 @@ pub fn set_structured_logging(on: bool) {
 /// [`log_event`] emits only `level=` + `event=` (no fields).
 pub fn structured_logging() -> bool {
     STRUCTURED_LOGGING.load(Ordering::Relaxed)
+}
+
+/// Publish the configured `diagnostics.log_level` process-wide (called once
+/// from `main`; tests default to `Info`, matching historical output).
+pub fn set_max_log_level(level: LogLevel) {
+    MAX_LOG_LEVEL.store(level as u8, Ordering::Relaxed);
+}
+
+/// The current process-wide maximum emitted severity.
+pub fn max_log_level() -> LogLevel {
+    match MAX_LOG_LEVEL.load(Ordering::Relaxed) {
+        0 => LogLevel::Error,
+        1 => LogLevel::Warn,
+        3.. => LogLevel::Debug,
+        _ => LogLevel::Info,
+    }
+}
+
+/// Whether a line at `level` is emitted under the current maximum.
+/// `log_event` consults this; tests assert on it directly (stderr capture
+/// is not wired in unit tests).
+pub fn level_enabled(level: LogLevel) -> bool {
+    level as u8 <= MAX_LOG_LEVEL.load(Ordering::Relaxed)
 }
 
 /// True when `key` names a secret or personal value that must never reach
@@ -189,8 +226,13 @@ pub fn error_class(message: &str) -> &'static str {
 /// One structured log line: `[pinetree] level=<l> event=<e> key=value...`.
 /// Values are redacted by key (see [`redact_value`]) and debug-formatted
 /// so untrusted text cannot forge lines. When [`structured_logging`] is
-/// off, only `level=` + `event=` are emitted (no fields).
+/// off, only `level=` + `event=` are emitted (no fields). Lines above the
+/// process-wide maximum (see [`set_max_log_level`]) are dropped before
+/// any formatting work.
 pub fn log_event(level: LogLevel, event: &str, fields: &[(&str, &str)]) {
+    if !level_enabled(level) {
+        return;
+    }
     let ts_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -375,6 +417,29 @@ mod tests {
         // Exercises the macro path; output goes to stderr.
         crate::fed_debug!("test line key={}", 1);
         set_federation_debug(false);
+    }
+
+    #[test]
+    fn max_level_gates_debug_lines() {
+        let prev = max_log_level();
+        // Default process level is Info: debug is dropped, info passes.
+        set_max_log_level(LogLevel::Info);
+        assert!(level_enabled(LogLevel::Error));
+        assert!(level_enabled(LogLevel::Warn));
+        assert!(level_enabled(LogLevel::Info));
+        assert!(!level_enabled(LogLevel::Debug));
+        // Debug opt-in passes everything at and below it.
+        set_max_log_level(LogLevel::Debug);
+        assert!(level_enabled(LogLevel::Debug));
+        // Serde round-trip uses the lowercase labels.
+        let level: LogLevel = serde_json::from_str("\"debug\"").expect("parse");
+        assert_eq!(level, LogLevel::Debug);
+        assert_eq!(
+            serde_json::to_string(&level).expect("serialize"),
+            "\"debug\""
+        );
+        assert!(serde_json::from_str::<LogLevel>("\"verbose\"").is_err());
+        set_max_log_level(prev);
     }
 
     #[test]

@@ -47,6 +47,22 @@ pub(crate) fn fan_out(
         inboxes.len(),
         fanout_is_split(inboxes.len())
     );
+    // Debug trace (birchtree `event planned` parity): one line per planned
+    // fan-out with the activity type and recipient count. Gated by the
+    // configured log level; the `fed_debug!` line above stays on its own
+    // federation-debug flag.
+    crate::observability::log_event(
+        crate::observability::LogLevel::Debug,
+        "federation.fanout_planned",
+        &[
+            (
+                "type",
+                activity.get("type").and_then(Value::as_str).unwrap_or("?"),
+            ),
+            ("recipients", inboxes.len().to_string().as_str()),
+            ("split", fanout_is_split(inboxes.len()).to_string().as_str()),
+        ],
+    );
     let now_ms = services.clock.now_ms();
     if fanout_is_split(inboxes.len()) {
         let mut followups = Vec::with_capacity(inboxes.len());
