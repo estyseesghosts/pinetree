@@ -101,7 +101,12 @@ impl ActivityDedup for RedbStore {
             Err(PortError::Conflict(m))
                 if m == "DUPLICATE_NOTE_URI" || m == "TOMBSTONED_NOTE_URI" =>
             {
-                let _ = write_txn.abort();
+                // The failed `create_note_in_txn` performed only reads
+                // before the URI check, so the only mutation in this
+                // transaction is the new activity's dedup mark. Commit it
+                // so the next delivery of this activity is `already_seen`
+                // instead of another full insert attempt (replay flood).
+                self.commit_write(write_txn)?;
                 Ok(None)
             }
             Err(e) => Err(e),
