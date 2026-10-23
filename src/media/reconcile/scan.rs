@@ -1,6 +1,6 @@
 use crate::application::commands::AppServices;
 use crate::application::ports::{
-    BlobStore, CacheEvictionOutcome, MediaClass, PortError, TimelineCursor,
+    BlobStore, CacheEvictionOutcome, MediaClass, PortError, RemoteCacheRecord, TimelineCursor,
 };
 use crate::media::storage;
 use crate::persistence::redb::MAX_MEDIA_PAGE_ROWS;
@@ -261,42 +261,120 @@ pub fn reconcile_media_paged(
     }
 
     // (b, trait-level half): dangling remote-cache index rows — indexed but
-    // the media row is gone. Drop the bytes only when nothing references
-    // the key, always drop the stale accounting, and always remove the
-    // index row so the next lookup misses and re-fetches cleanly. Each
-    // candidate is handled under the shared lifecycle gate plus the
-    // per-blob-key lock with the reference checks re-resolved under that
-    // serialization (deferred GC: a concurrent fetch may have recreated a
-    // reference after the candidate list was read).
+    // the media row is gone. Candidates come from the media-absence query
+    // in key order, never the LRU-oldest-N window (finding E): a newer
+    // dangling row is visited even while tombstones or live old rows would
+    // fill that window. Snapshot-then-sweep: candidates are collected
+    // before any delete, and every row is re-validated under the lock
+    // below, so a concurrent refetch can only cause a skip, never a wrong
+    // delete. Each candidate is handled under the shared lifecycle gate
+    // plus the per-blob-key lock with the reference checks re-resolved
+    // under that serialization (deferred GC: a concurrent fetch may have
+    // recreated a reference after the candidate list was read).
     let mut accounted_blobs: HashSet<String> = HashSet::new();
-    let candidates = services.media.remote_cache_evict_candidates(cap)?;
-    for rec in &candidates {
+    let mut dangling: Vec<RemoteCacheRecord> = Vec::new();
+    {
+        let mut offset = 0usize;
+        let page = cap.min(MAX_MEDIA_PAGE_ROWS);
+        while dangling.len() < cap {
+            let rows = services.media.remote_cache_dangling_page(offset, page)?;
+            if rows.is_empty() {
+                break;
+            }
+            let short = rows.len() < page;
+            dangling.extend(rows);
+            if short {
+                break;
+            }
+            offset = dangling.len();
+        }
+        dangling.truncate(cap);
+    }
+    for candidate in &dangling {
         let _lifecycle = storage::acquire_media_op("reconcile_dangling")?;
-        let _key_lock = storage::acquire_blob_key(&rec.blob_key)?;
-        if services.media.get(&rec.media_id)?.is_some() {
+        let _key_lock = storage::acquire_blob_key(&candidate.blob_key)?;
+        // Locked re-read of the EXACT index row (finding 4): a concurrent
+        // refetch may have replaced it after the listing snapshot. Proceed
+        // only while the row still points at the candidate's media/blob
+        // pair; otherwise leave the new index, metadata, and bytes intact.
+        let Some(current) = services
+            .media
+            .remote_cache_lookup(&candidate.source_url, &candidate.variant)?
+        else {
+            continue;
+        };
+        if current.media_id != candidate.media_id || current.blob_key != candidate.blob_key {
             continue;
         }
-        if services.media.blob_refcount(&rec.blob_key)? == 0 {
-            services.cache_blobs.delete(&rec.blob_key)?;
+        // The media row may have been recreated under the same id after
+        // the listing read: a live media row means not dangling.
+        if services.media.get(&current.media_id)?.is_some() {
+            continue;
+        }
+        // Already charged off: the stale index row still goes, but no
+        // accounting moves and no byte delete (finding E debit rule).
+        let charged = !current.bytes_absent && current.size_bytes > 0;
+        if charged && services.media.blob_refcount(&current.blob_key)? == 0 {
+            services.cache_blobs.delete(&current.blob_key)?;
             report.orphans_removed += 1;
         }
-        // One accounting adjustment per blob key even if several dangling
-        // index rows share it.
-        if accounted_blobs.insert(rec.blob_key.clone()) {
-            services.media.cache_accounting_apply(
-                -(rec.size_bytes as i64),
-                rec.class,
-                -(rec.size_bytes as i64),
-                0,
-                0,
-                0,
-                1,
-                0,
-            )?;
+        // Conditional remove (Slice 2 CAS, reused — never duplicated): the
+        // row disappears only while it still points at this pair. A
+        // concurrent refetch installs a new `media_id`, so the CAS fails
+        // and the fresh row survives.
+        let removed = services.media.remote_cache_remove_if(
+            &current.source_url,
+            &current.variant,
+            &current.media_id,
+            &current.blob_key,
+        )?;
+        if !removed {
+            continue;
         }
-        services
-            .media
-            .remote_cache_remove(&rec.source_url, &rec.variant)?;
+        // One accounting adjustment per physical key per pass, but only
+        // after the conditional delete succeeded for a charged row, only
+        // for the size still charged on the row actually removed (never
+        // the stale candidate's `size_bytes`), and only when the last
+        // charged alias is gone (H1): a sibling alias that is still
+        // charged keeps the whole physical key charged, so debiting here
+        // would undercount while live rows remain. A durable row sharing
+        // the key also keeps the charge (the size-0 `commit` below
+        // reports `SkippedDurableRef` without moving counters).
+        if charged {
+            let remaining = services
+                .media
+                .cache_entries_for_blob_key(&current.blob_key)?;
+            let still_charged = remaining
+                .iter()
+                .any(|entry| !entry.bytes_absent && entry.size_bytes > 0);
+            if still_charged {
+                continue;
+            }
+            match services.media.commit_cache_eviction(
+                &current.blob_key,
+                0,
+                current.class,
+                // The row is already removed, so no alias transitions; the
+                // point lookup skips the full-table fallback scan. The
+                // durable probe still runs first.
+                &[(current.source_url.clone(), current.variant.clone())],
+            )? {
+                CacheEvictionOutcome::SkippedDurableRef => continue,
+                CacheEvictionOutcome::AlreadyAbsent | CacheEvictionOutcome::Evicted { .. } => {}
+            }
+            if accounted_blobs.insert(current.blob_key.clone()) {
+                services.media.cache_accounting_apply(
+                    -(current.size_bytes as i64),
+                    current.class,
+                    -(current.size_bytes as i64),
+                    0,
+                    0,
+                    0,
+                    1,
+                    0,
+                )?;
+            }
+        }
     }
 
     // (c-d) refcount + durable-bytes drift. Repaired only when THIS run
@@ -451,6 +529,7 @@ mod tests {
                 last_access_ms: 1,
                 access_count: 1,
                 bytes_absent: false,
+                generation: 0,
             })
             .unwrap();
         // Legacy MD5-keyed row: flagged, never deleted.
@@ -498,6 +577,7 @@ mod tests {
                 last_access_ms: 1,
                 access_count: 1,
                 bytes_absent: false,
+                generation: 0,
             })
             .unwrap();
         let report = reconcile_media(&services).unwrap();

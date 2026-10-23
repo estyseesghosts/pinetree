@@ -17,6 +17,29 @@ pub const DEFAULT_VARIANT: &str = "original";
 /// `force_class = Some(MediaClass::Avatar)`).
 pub const AVATAR_VARIANT: &str = "avatar";
 
+/// Slice 1: best-effort staged-file cleanup. The staged temp file is
+/// removed on drop (post-`import_file` the remove is a harmless miss, so a
+/// double remove with the explicit post-import cleanup is safe). This only
+/// guards bytes on disk — reservation release stays explicit on the outer
+/// path so a failed release propagates as `PortError`.
+struct StagedFileGuard {
+    path: Option<std::path::PathBuf>,
+}
+
+impl StagedFileGuard {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+}
+
+impl Drop for StagedFileGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 /// Validate a remote media URL before any network fetch occurs.
 pub fn validate_remote_media_url(url: &str, client: &SafeHttpClient) -> Result<(), PortError> {
     let parsed = crate::federation::delivery::parse_http_url(url).map_err(PortError::Validation)?;
@@ -135,9 +158,10 @@ pub(crate) fn fetch_and_index_remote_media(
     validate_remote_media_url(source_url, client)?;
 
     // In-flight reservation under the global cap. The true size is unknown
-    // before the fetch, so reserve `max_file_size` first and true-up after
-    // the real size is known (release `max - actual`, account `actual`).
-    // Fail closed when the budget cannot be reserved — even after
+    // before the fetch, so reserve `max_file_size` first; on success the
+    // FULL reservation is released and the real size is added exactly once
+    // for the charge owner (shared-blob hits add nothing). Fail closed
+    // when the budget cannot be reserved — even after
     // `ensure_cache_budget` evicted everything it could.
     let max_bytes = services.max_file_size;
     let provisional = force_class.unwrap_or(MediaClass::Preview);
@@ -149,38 +173,46 @@ pub(crate) fn fetch_and_index_remote_media(
         return Err(PortError::Validation("CACHE_CAPACITY_EXCEEDED".to_string()));
     }
 
-    let attachment = ParsedAttachment {
-        url: source_url.to_string(),
-        media_type: None,
-        name: name_hint.map(ToOwned::to_owned),
-        is_sensitive,
-        blurhash,
-        width,
-        height,
-    };
-    let prepared = match download_and_sniff(services, client, &attachment) {
-        Ok(prepared) => prepared,
-        Err(e) => {
-            // Post-reservation fetch failure = failed origin fetch.
-            let _ = services.media.release_cache_reservation(max_bytes);
-            let _ = services
-                .media
-                .cache_accounting_apply(0, provisional, 0, 0, 0, 0, 0, 1);
-            return Err(e);
-        }
-    };
-    let actual = prepared.bytes.len() as u64;
+    // Slice 1 single cleanup path: everything below runs inside the
+    // closure, which never releases; the outer `match` releases the FULL
+    // reservation exactly once. Every `?` below (locks, lookups,
+    // `byte_len`, touch, staging) propagates to that release — no
+    // post-reserve exit can leak. A failed release propagates as
+    // `PortError` (never `let _ =`).
+    let outcome: Result<MediaMeta, PortError> = (move || -> Result<MediaMeta, PortError> {
+        let attachment = ParsedAttachment {
+            url: source_url.to_string(),
+            media_type: None,
+            name: name_hint.map(ToOwned::to_owned),
+            is_sensitive,
+            blurhash,
+            width,
+            height,
+        };
+        let prepared = match download_and_sniff(services, client, &attachment) {
+            Ok(prepared) => prepared,
+            Err(e) => {
+                // Post-reservation fetch failure = failed origin fetch.
+                // (Release is the outer single path; a failed accounting
+                // propagates and still releases there.)
+                services
+                    .media
+                    .cache_accounting_apply(0, provisional, 0, 0, 0, 0, 0, 1)?;
+                return Err(e);
+            }
+        };
+        let actual = prepared.bytes.len() as u64;
 
-    // Stage to disk under the cap (no locks held: pure fs + hashing of the
-    // already-fetched bytes). The coordinated commit below is the only
-    // section that touches shared pool/accounting state, and no redb
-    // transaction ever spans the network fetch above.
-    // (`SafeHttpClient` still buffers the body; the disk stage + cap
-    // re-enforcement + `import_file` are real, the end-to-end streaming
-    // transport is a follow-up.) The staging directory is a process-temp
-    // fallback: a pool-owned staging dir needs a `BlobStore` tmp-dir
-    // accessor the trait does not expose yet.
-    let (tmp_path, staged) = match (|| -> Result<
+        // Stage to disk under the cap (no locks held: pure fs + hashing of the
+        // already-fetched bytes). The coordinated commit below is the only
+        // section that touches shared pool/accounting state, and no redb
+        // transaction ever spans the network fetch above.
+        // (`SafeHttpClient` still buffers the body; the disk stage + cap
+        // re-enforcement + `import_file` are real, the end-to-end streaming
+        // transport is a follow-up.) The staging directory is a process-temp
+        // fallback: a pool-owned staging dir needs a `BlobStore` tmp-dir
+        // accessor the trait does not expose yet.
+        let (tmp_path, staged) = (|| -> Result<
         (
             std::path::PathBuf,
             crate::media::fetch_stream::StreamFetchResult,
@@ -197,221 +229,311 @@ pub(crate) fn fetch_and_index_remote_media(
             ));
         }
         Ok((tmp_path, staged))
-    })() {
-        Ok(staged) => staged,
-        Err(e) => {
-            let _ = services.media.release_cache_reservation(max_bytes);
-            return Err(e);
-        }
-    };
-    let class = force_class.unwrap_or_else(|| MediaClass::classify_mime(&staged.mime));
-
-    // Coordinated commit under the shared lifecycle gate + per-blob-key
-    // lock: the stage above ran unlocked, so a concurrent fetch of the same
-    // URL may have completed meanwhile — recheck the index and reuse the
-    // winner instead of double-installing and double-accounting. The inner
-    // `import_file` re-acquire nests safely (counted no-op). Bytes always
-    // land in the cache pool (`cache_blobs`), never the durable pool.
-    let _lifecycle = storage::acquire_media_op("fetch_commit")?;
-    let _key_lock = storage::acquire_blob_key(&prepared.blob_key)?;
-    if let Some(rec) = services.media.remote_cache_lookup(source_url, variant)? {
-        if !rec.bytes_absent
-            && rec.size_bytes > 0
-            && services.cache_blobs.byte_len(&rec.blob_key)?.is_some()
+    })()?;
+        // The staged file drops via the guard on every exit below (success or
+        // `?`); reservation release stays on the outer path.
+        let _staged_guard = StagedFileGuard::new(tmp_path.clone());
+        let class = force_class.unwrap_or_else(|| MediaClass::classify_mime(&staged.mime));
+        // Slice 1 (finding B): re-check the REAL class budget after sniff.
+        // The provisional check above may have charged Preview room for a
+        // Full or AudioVideo object. Fail closed before any commit: release
+        // (outer path) with no bytes and no totals moved.
         {
-            let _ = std::fs::remove_file(&tmp_path);
-            services
-                .media
-                .remote_cache_touch(source_url, variant, services.clock.now_ms())?;
-            services
-                .media
-                .cache_accounting_apply(0, rec.class, 0, 1, 0, 0, 0, 0)?;
-            if let Some(meta) = services.media.get(&rec.media_id)? {
-                let _ = services.media.release_cache_reservation(max_bytes);
-                return Ok(meta);
+            let stats = services.media.cache_stats()?;
+            let max = services.remote_cache_max_bytes;
+            let cap = evict::class_cap_bytes(services, class);
+            // Class slack borrows only unused global room after in-flight
+            // (L1, same rule as `is_over_budget`): fail closed at 0. The
+            // provisional check above already reserved `max_bytes`, so
+            // `in_flight` includes this fetch; borrowing past it would let
+            // concurrent class reservers jointly exceed the cap.
+            let slack = max
+                .saturating_sub(stats.total_bytes)
+                .saturating_sub(stats.in_flight_bytes);
+            let allowance = cap.saturating_add(slack);
+            let class_bytes = evict::class_bytes_in(&stats, class);
+            if class_bytes.saturating_add(actual) > allowance {
+                services
+                    .media
+                    .cache_accounting_apply(0, class, 0, 0, 1, 0, 0, 0)?;
+                return Err(PortError::Validation("CACHE_CAPACITY_EXCEEDED".to_string()));
             }
         }
-    }
 
-    // Metadata + index + accounting. These are separate store calls (no
-    // cross-table transaction on the trait): a crash between them heals
-    // via the reconciler (dangling meta without index re-fetches on next
-    // lookup miss; production backends should co-locate them).
-    //
-    // Exactly-once charge per physical key: bytes already in the pool
-    // (another URL/variant fetched them) are not charged again; a restore
-    // of a previously debited key (every index row zeroed and flagged)
-    // re-charges once; a still-charged key adds nothing (crash window).
-    // Our index row is updated in place (same media id, flags cleared);
-    // every other row sharing the key is restored the same way.
-    let stored = (|| -> Result<MediaMeta, PortError> {
-        // Presence BEFORE the import decides the charge.
-        let was_absent = services.cache_blobs.byte_len(&prepared.blob_key)?.is_none();
-        // `BlobStore::import_file` dispatches to the filesystem rename
-        // path on `FsBlobStore`; the staged file is removed either way
-        // (post-rename the remove is a harmless miss). Identical bytes are
-        // a no-op; torn bytes heal instead of lingering.
-        let out = services
-            .cache_blobs
-            .import_file(&prepared.blob_key, &tmp_path);
-        let _ = std::fs::remove_file(&tmp_path);
-        out?;
-        // Fresh index view for the key: sharers from other URLs/variants
-        // plus our own row when it already pointed here.
-        let entries = services
-            .media
-            .cache_entries_for_blob_key(&prepared.blob_key)?;
-        let previously_debited = !entries.is_empty()
-            && entries
-                .iter()
-                .all(|entry| entry.bytes_absent || entry.size_bytes == 0);
-        let charge = was_absent || previously_debited;
-        let now_ms = services.clock.now_ms();
-        let existing = services.media.remote_cache_lookup(source_url, variant)?;
-        let live_row = match &existing {
-            Some(rec) => services.media.get(&rec.media_id)?,
-            None => None,
-        };
-        // Same id when the indexed row still has its media row; fresh id
-        // only for a true first insert. The upsert clears `evicted`.
-        let media_id = live_row
-            .map(|meta| meta.id)
-            .unwrap_or_else(|| services.ids.generate());
-        let local_url = format!(
-            "{}/files/{media_id}",
-            services.public_url.trim_end_matches('/')
-        );
-        let meta = services.media.insert_metadata(InsertMediaInput {
-            id: Some(media_id.clone()),
-            owner_id: None,
-            name: prepared.name.clone(),
-            mime: staged.mime.clone(),
-            size_bytes: actual,
-            hash: staged.md5.clone(),
-            blob_key: prepared.blob_key.clone(),
-            blurhash: prepared.blurhash.clone(),
-            properties: prepared.properties.clone(),
-            is_sensitive: prepared.is_sensitive,
-            is_link: true,
-            url: local_url,
-            thumbnail_url: None,
-            comment: comment.or(prepared.comment.clone()),
-            source_url: Some(source_url.to_string()),
-            max_file_size: services.max_file_size,
-        })?;
-        let access_count = existing
-            .as_ref()
-            .map(|rec| rec.access_count.saturating_add(1))
-            .unwrap_or(1);
-        services.media.remote_cache_insert(&RemoteCacheRecord {
-            source_url: source_url.to_string(),
-            variant: variant.to_string(),
-            media_id: media_id.clone(),
-            blob_key: prepared.blob_key.clone(),
-            size_bytes: actual,
-            class,
-            fetched_at_ms: now_ms,
-            last_access_ms: now_ms,
-            access_count,
-            bytes_absent: false,
-        })?;
-        // Every other row sharing this key was restored by this fetch:
-        // clear its absence flags (and normalize its size) so eviction,
-        // reconcile, and backup all see present bytes. Its media row is
-        // upserted in place (same id) so its evicted flag clears too.
-        for entry in &entries {
-            if entry.source_url == source_url && entry.variant == variant {
-                continue;
+        // Coordinated commit under the shared lifecycle gate + per-blob-key
+        // locks in fixed stripe order (M3): the stage above ran unlocked,
+        // so a concurrent fetch of the same URL may have completed
+        // meanwhile — recheck the index and reuse the winner instead of
+        // double-installing and double-accounting. The pair held is the
+        // new key plus the abandoned old key (when the URL changed
+        // content): the old-key check-and-delete below must run under the
+        // old key's stripe, otherwise a concurrent refetch can reinstall
+        // the old bytes between the refcount/alias check and the byte
+        // delete. Both keys are acquired smallest-stripe-first via
+        // `acquire_blob_keys_ordered`, and the speculative old key is
+        // re-validated after acquisition (a change while unlocked retries
+        // with the fresh pair). The inner `import_file` re-acquire nests
+        // safely (counted no-op). Bytes always land in the cache pool
+        // (`cache_blobs`), never the durable pool.
+        let _lifecycle = storage::acquire_media_op("fetch_commit")?;
+        let (_ordered_first, _ordered_second) = {
+            let mut guards = None;
+            for _ in 0..5 {
+                let speculative_old: Option<String> = services
+                    .media
+                    .remote_cache_lookup(source_url, variant)?
+                    .and_then(|rec| {
+                        if rec.blob_key != prepared.blob_key && !rec.blob_key.is_empty() {
+                            Some(rec.blob_key)
+                        } else {
+                            None
+                        }
+                    });
+                let pair = match speculative_old.as_deref() {
+                    Some(old) => storage::acquire_blob_keys_ordered(&prepared.blob_key, old)?,
+                    None => {
+                        storage::acquire_blob_keys_ordered(&prepared.blob_key, &prepared.blob_key)?
+                    }
+                };
+                let actual_old: Option<String> = services
+                    .media
+                    .remote_cache_lookup(source_url, variant)?
+                    .and_then(|rec| {
+                        if rec.blob_key != prepared.blob_key && !rec.blob_key.is_empty() {
+                            Some(rec.blob_key)
+                        } else {
+                            None
+                        }
+                    });
+                if actual_old == speculative_old {
+                    guards = Some(pair);
+                    break;
+                }
             }
-            services.media.remote_cache_insert(&RemoteCacheRecord {
-                source_url: entry.source_url.clone(),
-                variant: entry.variant.clone(),
-                media_id: entry.media_id.clone(),
-                blob_key: prepared.blob_key.clone(),
-                size_bytes: actual,
-                class: entry.class,
-                fetched_at_ms: entry.fetched_at_ms,
-                last_access_ms: entry.last_access_ms,
-                access_count: entry.access_count,
-                bytes_absent: false,
-            })?;
-            if let Some(other) = services.media.get(&entry.media_id)? {
-                if other.owner_id.is_none() && other.id != media_id {
-                    services.media.insert_metadata(InsertMediaInput {
-                        id: Some(other.id.clone()),
-                        owner_id: None,
-                        name: other.name.clone(),
-                        mime: other.mime.clone(),
-                        size_bytes: actual,
-                        hash: other.hash.clone(),
-                        blob_key: prepared.blob_key.clone(),
-                        blurhash: other.blurhash.clone(),
-                        properties: other.properties.clone(),
-                        is_sensitive: other.is_sensitive,
-                        is_link: true,
-                        url: other.url.clone(),
-                        thumbnail_url: other.thumbnail_url.clone(),
-                        comment: other.comment.clone(),
-                        source_url: other.source_url.clone(),
-                        max_file_size: services.max_file_size,
-                    })?;
+            guards.ok_or_else(|| {
+                PortError::StorageUnavailable(
+                    "remote-cache commit lock stabilization failed under churn".to_string(),
+                )
+            })?
+        };
+        if let Some(rec) = services.media.remote_cache_lookup(source_url, variant)? {
+            if !rec.bytes_absent
+                && rec.size_bytes > 0
+                && services.cache_blobs.byte_len(&rec.blob_key)?.is_some()
+            {
+                // (Staged file drops via the guard; reservation releases on
+                // the outer path. Every `?` below does the same.)
+                services
+                    .media
+                    .remote_cache_touch(source_url, variant, services.clock.now_ms())?;
+                services
+                    .media
+                    .cache_accounting_apply(0, rec.class, 0, 1, 0, 0, 0, 0)?;
+                if let Some(meta) = services.media.get(&rec.media_id)? {
+                    return Ok(meta);
                 }
             }
         }
-        // The row may have abandoned a previous key (content changed at
-        // this URL): when nothing references the old key anymore, drop its
-        // bytes and its still-charged bytes exactly once.
-        if let Some(rec) = existing.as_ref() {
-            if rec.blob_key != prepared.blob_key && !rec.blob_key.is_empty() {
-                let old_refs = services.media.blob_refcount(&rec.blob_key)?;
-                let old_entries = services.media.cache_entries_for_blob_key(&rec.blob_key)?;
-                if old_refs == 0 && old_entries.is_empty() {
-                    services.cache_blobs.delete(&rec.blob_key)?;
-                    if !rec.bytes_absent && rec.size_bytes > 0 {
-                        services.media.cache_accounting_apply(
-                            -(rec.size_bytes as i64),
-                            rec.class,
-                            -(rec.size_bytes as i64),
-                            0,
-                            0,
-                            0,
-                            0,
-                            0,
-                        )?;
+
+        // Metadata + index + accounting. These are separate store calls (no
+        // cross-table transaction on the trait): a crash between them heals
+        // via the reconciler (dangling meta without index re-fetches on next
+        // lookup miss; production backends should co-locate them).
+        //
+        // Exactly-once charge per physical key: bytes already in the pool
+        // (another URL/variant fetched them) are not charged again; a restore
+        // of a previously debited key (every index row zeroed and flagged)
+        // re-charges once; a still-charged key adds nothing (crash window).
+        // Our index row is updated in place (same media id, flags cleared);
+        // every other row sharing the key is restored the same way.
+        let stored = (move || -> Result<MediaMeta, PortError> {
+            // Presence BEFORE the import decides the charge.
+            let was_absent = services.cache_blobs.byte_len(&prepared.blob_key)?.is_none();
+            // `BlobStore::import_file` dispatches to the filesystem rename
+            // path on `FsBlobStore`; the staged file is removed either way
+            // (post-rename the remove is a harmless miss). Identical bytes are
+            // a no-op; torn bytes heal instead of lingering.
+            let out = services
+                .cache_blobs
+                .import_file(&prepared.blob_key, &tmp_path);
+            let _ = std::fs::remove_file(&tmp_path);
+            out?;
+            // Fresh index view for the key: sharers from other URLs/variants
+            // plus our own row when it already pointed here.
+            let entries = services
+                .media
+                .cache_entries_for_blob_key(&prepared.blob_key)?;
+            let previously_debited = !entries.is_empty()
+                && entries
+                    .iter()
+                    .all(|entry| entry.bytes_absent || entry.size_bytes == 0);
+            // Pooled-but-never-indexed bytes (M4): `was_absent == false`
+            // with no index row yet is a crash orphan (import committed,
+            // index insert never ran). This commit indexes those bytes, so
+            // it charges `actual` exactly once — the later eviction debits
+            // that same amount. Never paper this over with a saturating
+            // adjustment; the charge owner is this commit.
+            let charge = was_absent || previously_debited || entries.is_empty();
+            let now_ms = services.clock.now_ms();
+            let existing = services.media.remote_cache_lookup(source_url, variant)?;
+            let live_row = match &existing {
+                Some(rec) => services.media.get(&rec.media_id)?,
+                None => None,
+            };
+            // Same id when the indexed row still has its media row; fresh id
+            // only for a true first insert. The upsert clears `evicted`.
+            let media_id = live_row
+                .map(|meta| meta.id)
+                .unwrap_or_else(|| services.ids.generate());
+            let local_url = format!(
+                "{}/files/{media_id}",
+                services.public_url.trim_end_matches('/')
+            );
+            let meta = services.media.insert_metadata(InsertMediaInput {
+                id: Some(media_id.clone()),
+                owner_id: None,
+                name: prepared.name.clone(),
+                mime: staged.mime.clone(),
+                size_bytes: actual,
+                hash: staged.md5.clone(),
+                blob_key: prepared.blob_key.clone(),
+                blurhash: prepared.blurhash.clone(),
+                properties: prepared.properties.clone(),
+                is_sensitive: prepared.is_sensitive,
+                is_link: true,
+                url: local_url,
+                thumbnail_url: None,
+                comment: comment.or(prepared.comment.clone()),
+                source_url: Some(source_url.to_string()),
+                max_file_size: services.max_file_size,
+            })?;
+            let access_count = existing
+                .as_ref()
+                .map(|rec| rec.access_count.saturating_add(1))
+                .unwrap_or(1);
+            services.media.remote_cache_insert(&RemoteCacheRecord {
+                source_url: source_url.to_string(),
+                variant: variant.to_string(),
+                media_id: media_id.clone(),
+                blob_key: prepared.blob_key.clone(),
+                size_bytes: actual,
+                class,
+                fetched_at_ms: now_ms,
+                last_access_ms: now_ms,
+                access_count,
+                bytes_absent: false,
+                // Store-assigned generation (slice 2): the insert bumps
+                // past the previous row generation.
+                generation: 0,
+            })?;
+            // Every other row sharing this key was restored by this fetch:
+            // clear its absence flags (and normalize its size) so eviction,
+            // reconcile, and backup all see present bytes. Its media row is
+            // upserted in place (same id) so its evicted flag clears too.
+            for entry in &entries {
+                if entry.source_url == source_url && entry.variant == variant {
+                    continue;
+                }
+                services.media.remote_cache_insert(&RemoteCacheRecord {
+                    source_url: entry.source_url.clone(),
+                    variant: entry.variant.clone(),
+                    media_id: entry.media_id.clone(),
+                    blob_key: prepared.blob_key.clone(),
+                    size_bytes: actual,
+                    class: entry.class,
+                    fetched_at_ms: entry.fetched_at_ms,
+                    last_access_ms: entry.last_access_ms,
+                    access_count: entry.access_count,
+                    bytes_absent: false,
+                    // Store-assigned: this restore bumps the row
+                    // generation, so an eviction listing from before the
+                    // refetch fails its alias-set CAS and stands down.
+                    generation: 0,
+                })?;
+                if let Some(other) = services.media.get(&entry.media_id)? {
+                    if other.owner_id.is_none() && other.id != media_id {
+                        services.media.insert_metadata(InsertMediaInput {
+                            id: Some(other.id.clone()),
+                            owner_id: None,
+                            name: other.name.clone(),
+                            mime: other.mime.clone(),
+                            size_bytes: actual,
+                            hash: other.hash.clone(),
+                            blob_key: prepared.blob_key.clone(),
+                            blurhash: other.blurhash.clone(),
+                            properties: other.properties.clone(),
+                            is_sensitive: other.is_sensitive,
+                            is_link: true,
+                            url: other.url.clone(),
+                            thumbnail_url: other.thumbnail_url.clone(),
+                            comment: other.comment.clone(),
+                            source_url: other.source_url.clone(),
+                            max_file_size: services.max_file_size,
+                        })?;
                     }
                 }
             }
-        }
-        if charge {
-            services.media.cache_accounting_apply(
-                actual as i64,
-                class,
-                actual as i64,
-                0,
-                1,
-                actual,
-                0,
-                0,
-            )?;
-        } else {
-            // Bytes already charged: count the miss without moving totals.
-            services
-                .media
-                .cache_accounting_apply(0, class, 0, 0, 1, actual, 0, 0)?;
-        }
-        Ok(meta)
+            // The row may have abandoned a previous key (content changed at
+            // this URL): when nothing references the old key anymore, drop its
+            // bytes and debit its still-charged bytes exactly once. This
+            // check-and-delete runs under BOTH stripes (M3, acquired above
+            // in fixed stripe order), so a concurrent refetch of the old
+            // key blocks on its stripe instead of reinstalling bytes between
+            // the refcount/alias check and the delete.
+            if let Some(rec) = existing.as_ref() {
+                if rec.blob_key != prepared.blob_key && !rec.blob_key.is_empty() {
+                    let old_refs = services.media.blob_refcount(&rec.blob_key)?;
+                    let old_entries = services.media.cache_entries_for_blob_key(&rec.blob_key)?;
+                    if old_refs == 0 && old_entries.is_empty() {
+                        services.cache_blobs.delete(&rec.blob_key)?;
+                        if !rec.bytes_absent && rec.size_bytes > 0 {
+                            services.media.cache_accounting_apply(
+                                -(rec.size_bytes as i64),
+                                rec.class,
+                                -(rec.size_bytes as i64),
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                            )?;
+                        }
+                    }
+                }
+            }
+            if charge {
+                services.media.cache_accounting_apply(
+                    actual as i64,
+                    class,
+                    actual as i64,
+                    0,
+                    1,
+                    actual,
+                    0,
+                    0,
+                )?;
+            } else {
+                // Bytes already charged: count the miss without moving totals.
+                services
+                    .media
+                    .cache_accounting_apply(0, class, 0, 0, 1, actual, 0, 0)?;
+            }
+            Ok(meta)
+        })();
+        // The commit above never releases: `stored` propagates to the outer
+        // single path, which releases the FULL reservation and relies on the
+        // exactly-once `actual` add already applied for the charge owner
+        // (shared-blob hits add nothing and release everything, so
+        // `in_flight_bytes` returns to its pre-reserve value).
+        stored
     })();
-    // True-up the reservation on success; release it whole on failure
-    // (storage fault — the caller retries and the lookup converges).
-    match stored {
+    match outcome {
         Ok(meta) => {
-            let _ = services
-                .media
-                .release_cache_reservation(max_bytes.saturating_sub(actual));
+            services.media.release_cache_reservation(max_bytes)?;
             Ok(meta)
         }
         Err(e) => {
-            let _ = services.media.release_cache_reservation(max_bytes);
+            services.media.release_cache_reservation(max_bytes)?;
             Err(e)
         }
     }

@@ -140,6 +140,44 @@ impl FsBlobStore {
         }
     }
 
+    /// Streaming open for `GET /files/{id}` (adversarial-2 slice 3): checks
+    /// the `.len` sidecar, then hands back the open file without reading a
+    /// single content byte. Same corruption rule as `get`: a missing or
+    /// mismatched sidecar reads as `Ok(None)`, never short bytes.
+    pub fn open(&self, hash: &str) -> Result<Option<std::fs::File>, PortError> {
+        let final_path = self.object_path(hash)?;
+        let sidecar = self.sidecar_path(hash)?;
+        let expected: u64 = match fs::read_to_string(&sidecar) {
+            Ok(s) => match s.trim().parse() {
+                Ok(n) => n,
+                Err(_) => return Ok(None),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(PortError::StorageUnavailable(format!(
+                    "read blob sidecar: {e}"
+                )));
+            }
+        };
+        let file = match fs::File::open(&final_path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(PortError::StorageUnavailable(format!(
+                    "open blob file: {e}"
+                )));
+            }
+        };
+        let len = file
+            .metadata()
+            .map(|m| m.len())
+            .map_err(|e| PortError::StorageUnavailable(format!("stat blob file: {e}")))?;
+        if len != expected {
+            return Ok(None);
+        }
+        Ok(Some(file))
+    }
+
     /// Direct stat + write-sidecar heal for sidecar-only tears. `get` and
     /// `byte_len` both require the sidecar, so a present-but-unsidecarred
     /// object reads as `None` through the trait and the generic reconciler
@@ -355,6 +393,10 @@ impl BlobStore for FsBlobStore {
         let _key = acquire_blob_key(hash)?;
         self.delete_under_guard(hash)
     }
+
+    fn open_reader(&self, hash: &str) -> Result<Option<std::fs::File>, PortError> {
+        self.open(hash)
+    }
 }
 
 #[cfg(test)]
@@ -428,6 +470,41 @@ mod tests {
         // A missing sidecar (e.g. a pre-slice-8 blob) is also `None`.
         std::fs::remove_file(&sidecar).unwrap();
         assert_eq!(store.get(hash).unwrap(), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn blob_store_open_streams_without_reading_content() {
+        // Adversarial-2 slice 3: `open` hands back a handle after the
+        // sidecar check, without reading content. Torn or sidecar-less
+        // objects read as `None`, never short.
+        use std::io::Read as _;
+        let dir = std::env::temp_dir().join(format!("pinetree-blob-test-{}", uuid::Uuid::new_v4()));
+        let store = FsBlobStore::new(&dir).unwrap();
+        let hash = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+        let payload = b"streamed blob bytes";
+
+        assert!(store.open(hash).unwrap().is_none());
+
+        store.put(hash, payload).unwrap();
+        let mut handle = store.open(hash).unwrap().expect("healthy blob opens");
+        let mut streamed = Vec::new();
+        handle.read_to_end(&mut streamed).unwrap();
+        assert_eq!(streamed, payload);
+
+        // Truncated object: sidecar mismatch reads as absent.
+        let object = store.object_path(hash).unwrap();
+        std::fs::write(&object, &payload[..4]).unwrap();
+        assert!(store.open(hash).unwrap().is_none());
+
+        // Missing sidecar is also absent, even though the file exists.
+        store.put(hash, payload).unwrap();
+        std::fs::remove_file(store.sidecar_path(hash).unwrap()).unwrap();
+        assert!(store.open(hash).unwrap().is_none());
+
+        // Traversal hashes are rejected, not probed on disk.
+        assert!(store.open("../etc/passwd").is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -640,6 +717,34 @@ fn blob_key_stripe(hash: &str) -> usize {
         hashed = hashed.wrapping_mul(0x100000001b3);
     }
     (hashed as usize) % BLOB_KEY_STRIPES
+}
+
+/// Acquire two per-blob-key stripe locks in a fixed stripe order (M3):
+/// the old-key abandon check-and-delete in the fetch commit must hold the
+/// old key's stripe across the whole check-and-delete, and it already holds
+/// the new key's stripe, so the pair is always taken smallest-stripe-first
+/// (ties broken by key bytes). Same-key pairs nest safely (the second
+/// acquire is a counted reentrant no-op on the same thread). Callers must
+/// re-validate any speculative reads after acquiring the pair, since the
+/// keys were learned before the locks were held.
+pub fn acquire_blob_keys_ordered(
+    first_key: &str,
+    second_key: &str,
+) -> Result<(BlobKeyGuard, BlobKeyGuard), PortError> {
+    let (first, second) = match blob_key_stripe(first_key).cmp(&blob_key_stripe(second_key)) {
+        std::cmp::Ordering::Less => (first_key, second_key),
+        std::cmp::Ordering::Greater => (second_key, first_key),
+        std::cmp::Ordering::Equal => {
+            if first_key <= second_key {
+                (first_key, second_key)
+            } else {
+                (second_key, first_key)
+            }
+        }
+    };
+    let first_guard = acquire_blob_key(first)?;
+    let second_guard = acquire_blob_key(second)?;
+    Ok((first_guard, second_guard))
 }
 
 /// Active backup id, mirrored outside the `RwLock` so a rejected second
